@@ -1,102 +1,405 @@
 # VideoEdit-diffusers 接入 SGLang Diffusion 方案
 
-## 目标
+## 1. 背景与目标
 
-将 `../VideoEdit-diffusers` 中的 Wan2.1-I2V 视频编辑 / inpainting 模型接入 `python/sglang/multimodal_gen`，先做原生 SGLang Diffusion pipeline 方案设计，后续再按方案实现。
+目标是把 `../VideoEdit-diffusers` 中基于 Wan2.1 的视频编辑 / inpainting 模型接入 `python/sglang/multimodal_gen`，但集成后的 SGLang 实现必须满足以下约束：
 
-参考 skill：`python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-add-model/SKILL.md`。
+1. 运行时不依赖原 `VideoEdit-diffusers` 仓库的目录、工具函数、私有数据结构和脚本调用。
+2. 优先复用 SGLang 已有的 Wan VAE、Wan DiT、通用 pipeline/stage、分布式和解码能力，只补 VideoEdit 专属的数据组装、scheduler 适配和 denoising hook。
+3. 预处理、模型推理、后处理三层解耦，后续无论是 SGLang 升级还是 VideoEdit upstream 更新，都能局部同步而不是整体重写。
+4. 文档中明确接口层级、数据流、模块边界和 upstream 对齐方式，便于维护和自动化回归。
 
-## 参考实现结论
+参考 skill：
+`python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-add-model/SKILL.md`
 
-`../VideoEdit-diffusers` 是一个基于 Wan2.1-I2V 的推理仓库，核心文件如下：
+本方案先定义原生 SGLang pipeline 的集成设计，后续实现按该设计推进。
 
-- `pipelines/pipeline_wan_edit.py`：Diffusers 风格 pipeline，核心 `__call__`。
-- `infer.py`：端到端 CLI，包括视频 / mask 预处理、滑窗推理、VAE encode/decode、paste-back。
-- `models/transformer_wan.py`：Wan DiT，默认 `in_channels=36`、`out_channels=16`。
-- `models/autoencoder_kl_wan.py`：Wan 3D causal VAE。
-- `models/flow_match.py`：简单 FlowMatch scheduler。
-- `utils/preprocess.py` / `utils/postprocess.py`：视频编辑专属预处理和回贴后处理。
+## 2. 参考实现拆解
 
-核心差异不在 Wan 主干结构，而在 DiT 输入构造：
+`../VideoEdit-diffusers` 的核心文件如下：
+
+- `pipelines/pipeline_wan_edit.py`
+- `infer.py`
+- `models/transformer_wan.py`
+- `models/autoencoder_kl_wan.py`
+- `models/flow_match.py`
+- `utils/preprocess.py`
+- `utils/postprocess.py`
+
+结论很明确：VideoEdit 的差异不在 Wan 主干，而在输入条件构造和调度逻辑。
+
+核心模型输入为：
 
 ```python
 latent_model_input = torch.cat([latents, cond_masks, cond_latents], dim=1)
 ```
 
-其中：
+各项语义：
 
-- `latents`：当前噪声 latent，形状 `[B, 16, F_lat, H/8, W/8]`。
-- `cond_masks`：由 mask video 下采样和 temporal packing 得到，形状 `[B, 4, F_lat, H/8, W/8]`。
-- `cond_latents`：masked video 经 Wan VAE encode 后的 latent，形状 `[B, 16, F_lat, H/8, W/8]`。
-- 拼接后输入通道数为 `36`，DiT 输出仍为 `16` 通道 noise prediction。
+- `latents`: 当前噪声 latent，`[B, 16, F_lat, H/8, W/8]`
+- `cond_masks`: 由 mask video 下采样和时域 packing 得到，`[B, 4, F_lat, H/8, W/8]`
+- `cond_latents`: masked video 经 Wan VAE 编码后的 latent，`[B, 16, F_lat, H/8, W/8]`
+- 拼接后 DiT 输入通道数为 `36`，输出仍为 `16`
 
-参考实现还包含三点需要对齐：
+此外还必须对齐三类行为：
 
-- scheduler 使用 `FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)`。
-- 支持 `video_latents` 初始化：`scheduler.add_noise(video_latents, noise, first_timestep)`。
-- 默认启用 dynamic CFG：前若干步 guidance scale 从 `guidance_scale` 逐步衰减到 `1.0`。
+- scheduler 使用 `FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)`
+- 支持 `video_latents` 初始化：`scheduler.add_noise(video_latents, noise, first_timestep)`
+- dynamic CFG：前若干步 guidance scale 从 `guidance_scale` 衰减到 `1.0`
 
-## 接入策略
+因此，SGLang 的接入不应复制一份 Wan pipeline，而应把 VideoEdit 视为“Wan family 的编辑变体”。
 
-采用 skill 中的“优先复用现有组件，再新增模型专属 Stage”的策略。
+## 3. 采用的接入风格
 
-不新写 Wan DiT / VAE 主体。SGLang 已有：
+按照 skill 的原则，本模型不适合重写一条 monolithic pipeline，也不适合硬塞进现有 I2V/TI2V 图像输入链路。推荐采用：
+
+- 以 SGLang 现有 Wan pipeline 为骨架
+- 以标准 `TextEncodingStage` / `LatentPreparationStage` / `TimestepPreparationStage` / `DecodingStage` 为主体
+- 仅新增 3 个 VideoEdit 专属扩展点：
+  - `VideoEditConditionStage`
+  - `VideoEditLatentInitStage`
+  - `VideoEditDenoisingStage`
+
+推荐 stage 链路：
+
+```text
+InputValidationStage
+  -> TextEncodingStage
+  -> VideoEditConditionStage
+  -> LatentPreparationStage
+  -> TimestepPreparationStage
+  -> VideoEditLatentInitStage
+  -> VideoEditDenoisingStage
+  -> DecodingStage
+  -> optional postprocess/helper
+```
+
+这条链路满足两件事：
+
+- Wan 通用能力保持完全复用
+- VideoEdit 专属逻辑被压缩在条件准备、首步 latent 初始化和 CFG 计算这三个局部模块中
+
+## 4. 为什么不能直接复用 I2V/TI2V 语义
+
+这是本次方案里最重要的边界设计。
+
+VideoEdit 的业务输入是：
+
+- `video_input_path`
+- `mask_input_path`
+- 可选长视频滑窗参数
+
+它不是现有 SGLang 里的：
+
+- `image_path`
+- `condition_image`
+- `TI2V` 第一帧条件图
+
+如果把 VideoEdit 伪装成 `I2V` 或 `TI2V`，会引入三个问题：
+
+1. `SamplingParams._validate_with_pipeline_config()` 会对 `image_path` 施加错误约束。
+2. `InputValidationStage` 会走通用 condition image resize / crop 分支，语义不对。
+3. `DenoisingStage` 对 `TI2V` 有专门分支，且默认假设 `batch.image_latent is None`，与 VideoEdit 的 20 通道条件 latent 设计冲突。
+
+因此建议：
+
+- `WanVideoEditPipelineConfig.task_type` 不复用 `I2V/TI2V`
+- 直接沿用 `T2V` 作为“输出类型是视频”的基础任务类型
+- VideoEdit 的输入约束全部由 `WanVideoEditSamplingParams` 和 `VideoEditConditionStage` 负责
+
+换言之，`task_type` 只表达“输出是什么”，不再错误地表达“输入长什么样”。
+
+这是后续保持低耦合的关键。
+
+## 5. 总体架构
+
+### 5.1 分层原则
+
+整体分为 4 层：
+
+1. 模型层
+   - Wan VAE
+   - Wan DiT
+   - tokenizer / text encoder
+   - scheduler adapter
+
+2. SGLang pipeline 适配层
+   - pipeline class
+   - pipeline config
+   - sampling params
+   - model-specific stages
+   - 纯函数预处理/后处理 adapter
+
+3. 应用编排层
+   - 单窗口推理 API
+   - 长视频滑窗编排
+   - paste-back 输出保存
+
+4. 验证与回归层
+   - scheduler 对齐测试
+   - preprocess/postprocess 对齐测试
+   - side-by-side latent 对齐脚本
+
+### 5.2 依赖方向
+
+必须保证依赖单向流动：
+
+```text
+SGLang Pipeline
+  -> VideoEdit Adapter Utilities
+  -> SGLang Core Wan Components
+
+Application Helpers
+  -> SGLang Pipeline
+
+Tests / Alignment Scripts
+  -> SGLang Pipeline
+  -> Reference outputs or frozen fixtures
+```
+
+禁止出现：
+
+- SGLang runtime `import ../VideoEdit-diffusers/...`
+- 运行时读取原 repo 私有目录结构
+- 用 `infer.py` 作为子进程或 helper
+- 让 pipeline 依赖原 repo 的 `prepare_*` / `paste_back` 函数
+
+## 6. 模块边界设计
+
+### 6.1 可直接复用的现有模块
+
+这些模块不应复制：
 
 - `runtime/models/dits/wanvideo.py`
 - `runtime/models/vaes/wanvae.py`
 - `configs/models/dits/wanvideo.py`
 - `configs/models/vaes/wanvae.py`
-- `configs/pipeline_configs/wan.py`
-- `configs/sample/wan.py`
+- `TextEncodingStage`
+- `LatentPreparationStage`
+- `TimestepPreparationStage`
+- `DecodingStage`
+- 通用 TP/SP、attention backend、offload、LoRA 机制
 
-VideoEdit 应作为 Wan 家族的一个编辑变体接入：
+### 6.2 必须新增的薄适配层
 
-```text
-标准文本编码
-  -> VideoEdit 专属视频/mask 条件准备
-  -> 标准 latent/timestep 准备
-  -> VideoEdit 专属 denoising 或标准 DenoisingStage 扩展
-  -> 标准 Wan VAE decoding
-```
+新增的内容只限于 VideoEdit 差异：
 
-原因：
+1. `WanVideoEditPipeline`
+   - 只负责组装 stages 和替换 scheduler
 
-- 文本编码、Wan VAE、Wan Transformer、TP/SP、attention backend 都能复用。
-- 条件输入、mask packing、滑窗、paste-back 是 VideoEdit 独有，不应污染通用 Wan pipeline。
-- 如果只追求最小 MVP，也必须先解决 scheduler 与通用 Stage 的接口兼容问题；之后可把 `batch.image_latent = torch.cat([cond_masks, cond_latents], dim=1)`，并用独立 `VideoEditLatentInitStage` 处理 `video_latents` 加噪，再临时复用标准 `DenoisingStage`。为了和参考实现完全对齐，仍建议新增 `VideoEditDenoisingStage` 处理 dynamic CFG 和 `video_latents` 初始化。
+2. `VideoEditFlowMatchScheduler`
+   - 只负责把 VideoEdit 的 scheduler 行为适配到 SGLang stage API
 
-## 模型目录与 pipeline 选择
+3. `VideoEditConditionStage`
+   - 只负责从 `video_input_path` / `mask_input_path` 生产 `cond_masks`、`cond_latents`、`video_latents`
 
-需要避免直接传入基础 `Wan2.1-I2V-14B-480P-Diffusers` 时被解析到现有 `WanImageToVideoPipeline`。
+4. `VideoEditLatentInitStage`
+   - 只负责在 denoising 前调用 `scheduler.add_noise(video_latents, noise, first_timestep)`
 
-推荐方案是提供一个 VideoEdit 的 diffusers-style wrapper / overlay 模型目录：
+5. `VideoEditDenoisingStage`
+   - 只负责 dynamic CFG 和少量 VideoEdit 特殊 hook
+
+6. VideoEdit 纯函数工具模块
+   - 预处理
+   - mask packing
+   - paste-back
+   - 元数据结构定义
+
+### 6.3 不建议新增的内容
+
+不建议做以下事情：
+
+- 不新写一份 Wan Transformer
+- 不新写一份 Wan VAE
+- 不复制整份 `pipeline_wan_edit.py`
+- 不让 `VideoEditConditionStage` 承担滑窗调度
+- 不把 paste-back 硬编码进通用 `DecodingStage`
+- 不为了 VideoEdit 修改通用 `DenoisingStage` 主流程分支
+
+## 7. 推荐文件布局
+
+### 7.1 Pipeline 与配置
+
+- `python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py`
+- `python/sglang/multimodal_gen/configs/pipeline_configs/videoedit_wan.py`
+- `python/sglang/multimodal_gen/configs/sample/videoedit_wan.py`
+
+### 7.2 Scheduler 与 model-specific stage
+
+- `python/sglang/multimodal_gen/runtime/models/schedulers/videoedit_flow_match.py`
+- `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py`
+
+### 7.3 纯函数工具与数据契约
+
+建议新增一个独立 adapter 目录，而不是把所有逻辑塞进 stage 文件：
+
+- `python/sglang/multimodal_gen/runtime/videoedit/contracts.py`
+- `python/sglang/multimodal_gen/runtime/videoedit/preprocess.py`
+- `python/sglang/multimodal_gen/runtime/videoedit/postprocess.py`
+
+职责：
+
+- `contracts.py`
+  - 定义 `VideoEditWindowInput`
+  - 定义 `VideoEditConditionBundle`
+  - 定义 `VideoEditPostprocessMeta`
+
+- `preprocess.py`
+  - 视频读取
+  - mask dilation / scale
+  - bbox 计算
+  - 裁剪与 resize
+  - tensor 化
+  - cond mask packing
+
+- `postprocess.py`
+  - crop-only 输出适配
+  - paste-back
+  - feather blend
+
+这些文件必须是纯函数模块，不依赖 `Req`、`PipelineStage` 或 `ServerArgs`。stage 只负责把这些纯函数拼起来。
+
+## 8. 模型目录与 overlay 方案
+
+### 8.1 必须使用 overlay 模型目录
+
+为了让 SGLang 自动解析到新的 pipeline，同时摆脱原 repo 目录耦合，建议提供一个独立的 diffusers-style overlay 模型目录：
 
 ```text
 VideoEdit-diffusers-model/
-  model_index.json                 # _class_name = "WanVideoEditPipeline"
-  tokenizer/                       # 来自基础 Wan2.1-I2V
-  text_encoder/                    # 来自基础 Wan2.1-I2V
-  vae/                             # 来自基础 Wan2.1-I2V
-  transformer/                     # VideoEdit finetuned transformer
-  scheduler/                       # 可沿用占位配置，运行时替换成 VideoEditFlowMatchScheduler
+  model_index.json
+  tokenizer/
+  text_encoder/
+  vae/
+  transformer/
+  scheduler/
 ```
 
-也可以支持运行时覆盖：
+约束：
+
+- `_class_name = "WanVideoEditPipeline"`
+- `tokenizer` / `text_encoder` / `vae` 可以来自基础 Wan2.1 模型
+- `transformer` 必须来自 VideoEdit finetuned 权重
+- `scheduler/` 只保留占位配置，真正运行时由 SGLang 替换成 `VideoEditFlowMatchScheduler`
+
+### 8.2 组件覆盖
+
+保留现有 `ServerArgs.component_paths` 机制，只允许覆盖标准模块，例如：
 
 ```bash
-sglang generate \
-  --model-path /path/to/VideoEdit-diffusers-model \
-  --transformer-path /path/to/finetuned_transformer \
-  --prompt "..." \
-  --video-path /path/to/input.mp4 \
-  --mask-path /path/to/mask.mp4
+--transformer-path /path/to/videoedit_transformer
 ```
 
-`--transformer-path` 已能通过 `ServerArgs.component_paths` 被解析为 `component_paths["transformer"]`。
+但不要把业务输入命名成 `--video-path` / `--mask-path` 后再依赖 unknown args 解析。因为当前 `ServerArgs._extract_component_paths()` 会把任意 `--<name>-path` 识别成组件路径覆盖。
 
-## 拟新增 / 修改文件
+## 9. SamplingParams 与 CLI 设计
 
-### 1. Pipeline
+### 9.1 建议新增 SamplingParams
+
+新增：
+
+`python/sglang/multimodal_gen/configs/sample/videoedit_wan.py`
+
+建议字段：
+
+```python
+@dataclass
+class WanVideoEditSamplingParams(SamplingParams):
+    _default_height = 480
+    _default_width = 832
+
+    video_input_path: str | None = None
+    mask_input_path: str | None = None
+
+    infer_len: int = 81
+    strength: float = 1.0
+    dynamic_cfg: bool = True
+    dynamic_cfg_max_step: int = 15
+    dynamic_cfg_min: float = 1.0
+
+    bbox_padding: int = 0
+    dilate_px: int = 15
+    mask_scale: float = 1.2
+    feather_px: int = 12
+    adain_boundary_dilate: int = 15
+
+    enable_paste_back: bool = False
+    save_crop_only: bool = True
+```
+
+注意这里建议改名为：
+
+- `video_input_path`
+- `mask_input_path`
+
+而不是：
+
+- `video_path`
+- `mask_path`
+
+原因是这样可以彻底避开当前 CLI 中 `--<name>-path` 被误识别为 component path 的问题。
+
+### 9.2 参数校验
+
+`WanVideoEditSamplingParams.__post_init__()` 中应显式校验：
+
+- `video_input_path` 必填
+- `mask_input_path` 必填
+- `num_frames == infer_len` 或明确规定二者的关系
+- `(infer_len - 1) % 4 == 0`
+- `strength` 范围合法
+- 输入视频和 mask 帧数一致
+- 当前 native pipeline 仅支持单窗口时，禁止传入长视频滑窗参数组合
+
+### 9.3 CLI 方案
+
+现状问题：
+
+- `generate.py` 只基于基类 `SamplingParams` 静态注册 CLI 参数
+- config 文件提取 sampling fields 时也只看 `SamplingParams`
+- `unknown_args` 中的 `--xxx-path` 会被 `ServerArgs._extract_component_paths()` 抢走
+
+所以建议分两阶段：
+
+1. MVP
+   - 提供专用 wrapper CLI 或 Python API
+   - 直接构造 `WanVideoEditSamplingParams`
+
+2. 正式接入
+   - `generate_cmd()` 先解析 `model_path` 得到 `model_info.sampling_param_cls`
+   - 再基于模型专属 SamplingParams 注册和提取 CLI/config 字段
+
+在通用 CLI 动态注册改完之前，不建议把 VideoEdit 直接暴露给通用 `sglang generate`。
+
+## 10. PipelineConfig 设计
+
+新增：
+
+`python/sglang/multimodal_gen/configs/pipeline_configs/videoedit_wan.py`
+
+建议不要继承 `WanI2V480PConfig`，而应继承 `WanT2V480PConfig`，再补充 VideoEdit 需要的 VAE encoder 和 frame 约束：
+
+```python
+@dataclass
+class WanVideoEditPipelineConfig(WanT2V480PConfig):
+    task_type: ModelTaskType = ModelTaskType.T2V
+    flow_shift: float | None = 5.0
+    vae_precision: str = "bf16"
+
+    def __post_init__(self) -> None:
+        self.vae_config.load_encoder = True
+        self.vae_config.load_decoder = True
+```
+
+这样做的好处：
+
+- 不会误走通用 I2V/TI2V 图像输入分支
+- 仍保持视频输出任务语义
+- 复用 Wan 的 latent 形状和解码流程
+
+如果后续需要更明确的任务类型，可以再引入新的 `ModelTaskType.VIDEO_EDIT`。但在第一阶段，为了最小侵入和低风险，建议先不修改全局 task enum。
+
+## 11. Pipeline 设计
 
 新增：
 
@@ -104,80 +407,177 @@ sglang generate \
 
 职责：
 
-- 定义 `WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase)`。
-- `pipeline_name = "WanVideoEditPipeline"`，必须和 wrapper `model_index.json` 的 `_class_name` 一致。
-- `_required_config_modules = ["text_encoder", "tokenizer", "vae", "transformer", "scheduler"]`。
-- `initialize_pipeline()` 中使用与通用 Stage 兼容的 VideoEdit scheduler adapter：
+- 定义 `WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase)`
+- `pipeline_name = "WanVideoEditPipeline"`
+- `_required_config_modules = ["text_encoder", "tokenizer", "vae", "transformer", "scheduler"]`
+- `initialize_pipeline()` 中把 model_index 的 scheduler 实例替换成 `VideoEditFlowMatchScheduler`
+- `create_pipeline_stages()` 中组装标准 stage 和 VideoEdit 专属 stage
+
+伪代码：
 
 ```python
-from sglang.multimodal_gen.runtime.models.schedulers.videoedit_flow_match import (
-    VideoEditFlowMatchScheduler,
-)
+class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
+    pipeline_name = "WanVideoEditPipeline"
 
-self.modules["scheduler"] = VideoEditFlowMatchScheduler(
-    shift=server_args.pipeline_config.flow_shift,
-    sigma_min=0.0,
-    extra_one_step=True,
-)
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+        "scheduler",
+    ]
+
+    def initialize_pipeline(self, server_args):
+        self.modules["scheduler"] = VideoEditFlowMatchScheduler(
+            shift=server_args.pipeline_config.flow_shift,
+            sigma_min=0.0,
+            extra_one_step=True,
+        )
+
+    def create_pipeline_stages(self, server_args):
+        self.add_stage(InputValidationStage())
+        self.add_standard_text_encoding_stage()
+        self.add_stage(VideoEditConditionStage(vae=self.get_module("vae")))
+        self.add_standard_latent_preparation_stage()
+        self.add_standard_timestep_preparation_stage()
+        self.add_stage(VideoEditLatentInitStage(scheduler=self.get_module("scheduler")))
+        self.add_stage(
+            VideoEditDenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+                vae=self.get_module("vae"),
+                pipeline=self,
+            )
+        )
+        self.add_standard_decoding_stage()
 ```
 
-配套新增：
+## 12. Scheduler 适配层
+
+新增：
 
 `python/sglang/multimodal_gen/runtime/models/schedulers/videoedit_flow_match.py`
 
-职责：
+职责不是重新发明 scheduler，而是适配 SGLang 的 stage 协议。
 
-- 对齐 `../VideoEdit-diffusers/models/flow_match.py` 的 sigma/timestep 公式。
-- 兼容 SGLang 通用 Stage API：接受 `device=`，提供 `set_begin_index()`，并在 `return_dict=False` 时让 `step()` 返回 `(prev_sample,)`。
-- 保留 `add_noise(original_samples, noise, timestep)`，用于 `video_latents` 初始化。
+必须对齐的接口：
 
-- `create_pipeline_stages()` 串接：
-  - `InputValidationStage`
-  - `TextEncodingStage`
-  - `VideoEditConditionStage`
-  - `LatentPreparationStage`
-  - `TimestepPreparationStage`
-  - `VideoEditLatentInitStage` 或 `VideoEditDenoisingStage` 内部处理
-  - `VideoEditDenoisingStage`
-  - `DecodingStage`
+- `set_timesteps(..., device=None, **kwargs)`
+- `set_begin_index()`，即使只是 no-op
+- `step(..., return_dict=False)` 返回 `(prev_sample,)`
+- `add_noise(original_samples, noise, timestep)`
 
-### 2. 模型专属 Stage
+必须对齐的行为：
+
+- sigma 公式
+- timestep 序列
+- `extra_one_step=True`
+- `shift=5`
+- `strength < 1.0` 时的 `get_timesteps()`
+
+适配层边界：
+
+- 不修改通用 `TimestepPreparationStage`
+- 不修改通用 `DenoisingStage` 的 scheduler 约定
+- 让 scheduler 自己满足通用 stage 的调用要求
+
+## 13. VideoEditConditionStage 设计
 
 新增：
 
 `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py`
 
-建议拆为两个 Stage：
+建议 stage 内只做 orchestration，真正的图像/视频处理放到 `runtime/videoedit/preprocess.py`。
 
-- `VideoEditConditionStage`
-  - 读取 `batch.video_path`、`batch.mask_path`。
-  - 复用 / 改写 `VideoEdit-diffusers/utils/preprocess.py` 逻辑。
-  - 生成 `masked_video_tensor`、`raw_video_tensor`、`cond_masks`。
-  - 用 Wan VAE encode 得到 `cond_latents`。
-  - 可选 encode `raw_video_tensor` 得到 `video_latents`。
-  - 设置 `batch.image_latent = torch.cat([cond_masks, cond_latents], dim=1)`。
-  - 把 paste-back 所需的 `bbox`、`crop_h`、`crop_w`、`fps`、原始帧等元数据放入 `batch.extra["videoedit"]`。
+### 13.1 输入
 
-- `VideoEditLatentInitStage`
-  - 在 `LatentPreparationStage` 和 `TimestepPreparationStage` 后执行。
-  - 如果存在 `batch.extra["videoedit"]["video_latents"]`，按参考实现执行：
+从 `batch.sampling_params` 读取：
+
+- `video_input_path`
+- `mask_input_path`
+- `infer_len`
+- `bbox_padding`
+- `dilate_px`
+- `mask_scale`
+
+### 13.2 输出契约
+
+stage 结束时必须写入：
+
+- `batch.image_latent = torch.cat([cond_masks, cond_latents], dim=1)`
+- `batch.extra["videoedit"]["video_latents"] = video_latents`
+- `batch.extra["videoedit"]["post_meta"] = VideoEditPostprocessMeta(...)`
+
+其中：
+
+- `batch.image_latent` 的 shape 必须是 `[B, 20, F_lat, H/8, W/8]`
+- 后续 `VideoEditDenoisingStage` 会把 `latents` 和 `batch.image_latent` 拼接成 `36` 通道
+
+### 13.3 纯函数输出对象建议
+
+建议 `preprocess.py` 输出：
 
 ```python
-batch.latents = scheduler.add_noise(video_latents, batch.latents, batch.timesteps[:1])
+@dataclass
+class VideoEditConditionBundle:
+    masked_video_tensor: torch.Tensor
+    raw_video_tensor: torch.Tensor
+    cond_masks: torch.Tensor
+    cond_latents: torch.Tensor
+    video_latents: torch.Tensor
+    post_meta: VideoEditPostprocessMeta
 ```
 
-如果实现 `VideoEditDenoisingStage`，该初始化也可以放进 denoising stage 的 `_before_denoising_loop()`。
+这样 stage 不感知具体图像处理步骤，只消费 bundle。
 
-### 3. VideoEditDenoisingStage
+### 13.4 关键对齐点
 
-新增或扩展：
+- 首帧 mask 必须强制全黑
+- `cond_masks` 必须保持 preserve=1、inpaint=0 语义
+- VAE encode 使用 Wan 的 mean/std 归一化
+- `cond_latents` / `video_latents` 与 reference shape、dtype、统计量一致
 
-`python/sglang/multimodal_gen/runtime/pipelines_core/stages/videoedit_denoising.py`
+## 14. VideoEditLatentInitStage 设计
 
-推荐继承 `DenoisingStage`，只覆盖必要 hook：
+职责很单一：
 
-- 复用标准 `_prepare_denoising_loop()`、CFG 并行、SP 处理、scheduler.step；前提是 scheduler adapter 已兼容 `TimestepPreparationStage` 和 `DenoisingStage` 的调用约定。
-- 覆盖 `_run_denoising_step()` 或 `_select_and_manage_model()`，在每步计算参考实现的 dynamic CFG：
+- 在 `LatentPreparationStage` 和 `TimestepPreparationStage` 之后
+- 在 `DenoisingStage` 之前
+- 使用 `video_latents` 替换默认纯噪声初始化
+
+逻辑：
+
+```python
+batch.latents = scheduler.add_noise(
+    video_latents,
+    batch.latents,
+    batch.timesteps[:1],
+)
+```
+
+为什么单独拆 stage：
+
+- 便于复用标准 `LatentPreparationStage`
+- 便于测试“首步 latent 是否和 reference 一致”
+- 避免把 VideoEdit 初始化埋在通用 denoising 流程内部
+
+如果后续确认更适合放进 `VideoEditDenoisingStage._before_denoising_loop()`，也可以迁移，但接口职责保持不变。
+
+## 15. VideoEditDenoisingStage 设计
+
+`VideoEditDenoisingStage` 应继承 `DenoisingStage`，只覆盖最少的 hook。
+
+建议保留的通用能力：
+
+- CFG parallel / SP / TP
+- scheduler.step
+- offload
+- profile
+- trajectory latents
+
+只覆盖以下逻辑：
+
+1. 每步 guidance 计算
 
 ```python
 current_cfg, do_cfg = calc_current_cfg(
@@ -189,80 +589,226 @@ current_cfg, do_cfg = calc_current_cfg(
 )
 ```
 
-- `latent_model_input` 保持标准逻辑：`ctx.latents` 与 `batch.image_latent` 拼接，得到 36 通道输入。
-
-MVP 阶段可以先关闭 dynamic CFG，并在 scheduler adapter 与 `VideoEditLatentInitStage` 完成后使用标准 `DenoisingStage`。但准确性验收必须补齐 dynamic CFG。
-
-### 4. PipelineConfig
-
-新增：
-
-`python/sglang/multimodal_gen/configs/pipeline_configs/videoedit_wan.py`
-
-建议定义：
+2. 构造 DiT 输入
 
 ```python
-@dataclass
-class WanVideoEditPipelineConfig(WanI2V480PConfig):
-    task_type: ModelTaskType = ModelTaskType.TI2V
-    flow_shift: float | None = 5.0
-    vae_precision: str = "bf16"
+latent_model_input = torch.cat(
+    [ctx.latents, batch.image_latent],
+    dim=1,
+)
 ```
 
-需要关注：
+3. `do_cfg=False` 时跳过 negative pass
 
-- `dit_config` 仍使用 `WanVideoConfig`，由 transformer `config.json` 覆盖到 `in_channels=36`。
-- `vae_config` 仍使用 `WanVAEConfig`，保持 Wan latent mean/std。
-- `postprocess_image_latent()` 不走通用 I2V 第一帧逻辑，VideoEdit 条件 Stage 直接构造 `batch.image_latent`。
-- 如需要 postprocess 输出视频并回贴，可在 `post_decoding()` 里根据 `batch.extra["videoedit"]` 做 paste-back；也可以先放在 CLI/helper 层。
+这样做的原因：
 
-### 5. SamplingParams
+- SGLang 通用 `DenoisingStage` 已支持 `batch.image_latent` 拼接
+- VideoEdit 的特殊点主要是 dynamic CFG，而不是完整 denoising 流程重写
 
-新增：
+## 16. 预处理 / 后处理解耦
 
-`python/sglang/multimodal_gen/configs/sample/videoedit_wan.py`
+### 16.1 预处理放在哪里
 
-建议字段：
+不要把 `utils/preprocess.py` 原样搬进 stage。
 
-```python
-@dataclass
-class WanVideoEditSamplingParams(SamplingParams):
-    height: int = 480
-    width: int = 832
-    num_frames: int = 81
-    fps: int = 16
-    num_inference_steps: int = 20
-    guidance_scale: float = 5.0
-    seed: int = 42
-    negative_prompt: str | None = "..."
+正确做法是：
 
-    video_path: str | None = None
-    mask_path: str | None = None
-    infer_len: int = 81
-    strength: float = 1.0
-    dynamic_cfg: bool = True
-    dynamic_cfg_max_step: int = 15
-    dynamic_cfg_min: float = 1.0
+- 把纯算法逻辑迁移到 `runtime/videoedit/preprocess.py`
+- 把 `Req` 读写和 device/dtype 管理留在 `VideoEditConditionStage`
 
-    bbox_padding: int = 0
-    dilate_px: int = 15
-    mask_scale: float = 1.2
-    feather_px: int = 12
-```
+建议预处理层只暴露纯函数，例如：
 
-`num_frames` 必须满足 Wan VAE 约束：`(num_frames - 1) % 4 == 0`。
+- `load_and_validate_video_pair()`
+- `compute_edit_bbox()`
+- `build_window_inputs()`
+- `pack_cond_masks()`
+- `encode_video_conditions()`
 
-同时需要扩展 CLI 参数注册，把 `--video-path`、`--mask-path`、`--infer-len`、`--dynamic-cfg` 等加入 `SamplingParams.add_cli_args()` 或 VideoEdit 专属 CLI wrapper。否则这些参数会出现在 `parse_known_args()` 的 unknown args 中，而 `ServerArgs._extract_component_paths()` 会把任何 `--<name>-path` 形式误解析成组件权重覆盖，例如 `--video-path` 会变成 `component_paths["video"]`。
+### 16.2 后处理放在哪里
 
-如果暂时不改通用 CLI parser，MVP 应提供专用 wrapper CLI 或 Python API 直接构造 `WanVideoEditSamplingParams`。JSON/YAML config 只有在 `generate_cmd` 改为按 `model_info.sampling_param_cls` 提取字段后才可靠；当前逻辑只识别基础 `SamplingParams` 字段。
+native pipeline 第一阶段建议只输出 crop-only 视频。
 
-### 6. 注册
+paste-back 不应一开始就耦合进 `DecodingStage`，原因：
 
-修改：
+- 它是应用层功能，不是核心 diffusion 推理功能
+- 它依赖 bbox、原始帧、mask、保存策略
+- 这些都不属于模型推理 contract
+
+建议阶段化处理：
+
+1. 阶段一
+   - native pipeline 只返回 crop-only 结果
+
+2. 阶段二
+   - 在 helper/API 层接入 paste-back
+   - 如确有必要，再通过 `PipelineConfig.post_decoding()` 接入
+
+`postprocess.py` 与 stage 的关系：
+
+- `postprocess.py` 是纯函数
+- helper/API 调用它
+- `Req.extra["videoedit"]["post_meta"]` 只负责传元数据
+
+## 17. 长视频策略
+
+长视频滑窗不应放进 native pipeline。
+
+建议明确拆分：
+
+### 17.1 Native pipeline 的职责
+
+- 只处理单窗口
+- 输入长度固定为 `infer_len`
+- 输出该窗口的 crop-only 编辑结果
+
+### 17.2 Helper / 应用层职责
+
+- 全局预处理
+- 统一 bbox
+- 按窗口切分
+- 多窗口逐次调用 native pipeline
+- 结果拼接与 paste-back
+
+这样可以保证：
+
+- pipeline 本身稳定、可测试、与推理内核强相关
+- 长视频编排独立演进，不污染 runtime core
+
+## 18. 数据流与接口契约
+
+### 18.1 请求入口
+
+API / CLI 传入：
+
+- `prompt`
+- `negative_prompt`
+- `video_input_path`
+- `mask_input_path`
+- `infer_len`
+- `guidance_scale`
+- `dynamic_cfg`
+- `dynamic_cfg_max_step`
+- `dynamic_cfg_min`
+- 预处理参数
+
+### 18.2 各 stage 的关键字段
+
+`TextEncodingStage` 后：
+
+- `batch.prompt_embeds`
+- `batch.negative_prompt_embeds`
+
+`VideoEditConditionStage` 后：
+
+- `batch.image_latent`
+- `batch.extra["videoedit"]["video_latents"]`
+- `batch.extra["videoedit"]["post_meta"]`
+
+`LatentPreparationStage` 后：
+
+- `batch.latents`
+
+`TimestepPreparationStage` 后：
+
+- `batch.timesteps`
+
+`VideoEditLatentInitStage` 后：
+
+- `batch.latents` 已从纯噪声替换为基于 `video_latents` 的 noisy latent
+
+`VideoEditDenoisingStage` 后：
+
+- `batch.latents` 为最终去噪 latent
+
+`DecodingStage` 后：
+
+- `batch.output`
+
+### 18.3 Contract 原则
+
+每层之间都只通过标准张量字段和 `batch.extra["videoedit"]` 交换信息：
+
+- 通用字段放标准字段
+- VideoEdit 专属元数据只放 `batch.extra["videoedit"]`
+- 不新增一堆散落在 `Req` 顶层的临时字段
+
+这能把模型私有上下文限制在一个命名空间内，避免 future merge 时污染全局 request schema。
+
+## 19. Upstream 同步策略
+
+这是长期维护里最重要的一部分。
+
+### 19.1 同步来源拆分
+
+后续同步应分三类来源：
+
+1. Wan 通用 upstream
+   - VAE
+   - DiT
+   - 通用 pipeline/stage
+   - 分布式优化
+
+2. VideoEdit upstream
+   - 条件组装公式
+   - scheduler 逻辑
+   - preprocess/postprocess 算法
+   - dynamic CFG 策略
+
+3. SGLang 内部框架演进
+   - `Req` / stage API
+   - CLI / config 注册
+   - loader / offload / executor
+
+### 19.2 如何保持可合并
+
+建议遵守以下规则：
+
+- Wan 主干代码不改或只做通用能力修复
+- VideoEdit 差异全部落在 adapter 层
+- preprocess/postprocess 写成纯函数，便于用 reference fixture 回归
+- scheduler 单独一层 adapter，避免未来 stage API 变化时牵连业务逻辑
+- 增加 reference alignment tests，而不是只看最终视频
+
+### 19.3 推荐的同步路径
+
+未来若 `VideoEdit-diffusers` 更新：
+
+1. 先对比 `pipeline_wan_edit.py` 的 `__call__`
+2. 如果变化只在条件组装，更新 `runtime/videoedit/preprocess.py` 或 `VideoEditDenoisingStage`
+3. 如果变化只在 scheduler，更新 `videoedit_flow_match.py`
+4. 如果变化只在后处理，更新 `runtime/videoedit/postprocess.py`
+5. Wan 主干无改动则不动 VAE/DiT
+
+未来若 SGLang Wan 升级：
+
+1. 优先合入通用 Wan VAE/DiT/pipeline 优化
+2. 检查 `batch.image_latent` contract 是否仍成立
+3. 检查 `DenoisingStage` hook 和 scheduler API 是否变化
+4. 只在 adapter 层做兼容修复
+
+## 20. 需要新增 / 修改的文件
+
+### 20.1 新增
+
+- `python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py`
+- `python/sglang/multimodal_gen/runtime/models/schedulers/videoedit_flow_match.py`
+- `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py`
+- `python/sglang/multimodal_gen/configs/pipeline_configs/videoedit_wan.py`
+- `python/sglang/multimodal_gen/configs/sample/videoedit_wan.py`
+- `python/sglang/multimodal_gen/runtime/videoedit/contracts.py`
+- `python/sglang/multimodal_gen/runtime/videoedit/preprocess.py`
+- `python/sglang/multimodal_gen/runtime/videoedit/postprocess.py`
+
+### 20.2 修改
 
 - `python/sglang/multimodal_gen/configs/pipeline_configs/__init__.py`
-- `python/sglang/multimodal_gen/configs/sample/__init__.py` 如该目录维护导出。
+- `python/sglang/multimodal_gen/configs/sample/__init__.py`
 - `python/sglang/multimodal_gen/registry.py`
+- 视正式 CLI 接入时机决定是否修改：
+  - `python/sglang/multimodal_gen/runtime/entrypoints/cli/generate.py`
+  - `python/sglang/multimodal_gen/runtime/server_args.py`
+
+## 21. 注册策略
 
 在 `registry.py` 中新增：
 
@@ -274,92 +820,110 @@ register_configs(
         "VideoEdit-diffusers",
         "Wan2.1-VideoEdit-Diffusers",
     ],
-    model_detectors=[lambda hf_id: "videoedit" in hf_id.lower()],
+    model_detectors=[
+        lambda s: "videoedit" in s.lower(),
+    ],
 )
 ```
 
-实际 pipeline class 仍由 `model_index.json` 的 `_class_name = "WanVideoEditPipeline"` 触发。
+真正决定 pipeline class 的仍然是 overlay 模型目录里的：
 
-## 预处理与长视频策略
+```json
+{
+  "_class_name": "WanVideoEditPipeline"
+}
+```
 
-分两阶段实现。
+## 22. 风险与解决方案
 
-第一阶段只支持单窗口：
-
-- 输入一段长度为 `infer_len` 的视频和 mask。
-- 复用参考实现的 crop、mask dilation、mask scale、对齐到 16。
-- 直接输出 crop 区域编辑后的视频。
-
-第二阶段补齐长视频：
-
-- 把 `infer.py` 的 global preprocess、sliding window、paste-back 迁移为 CLI/helper。
-- 每个窗口独立调用 native pipeline。
-- 保存完整回贴结果和 crop-only 结果。
-
-这样可以先验证核心 DiT/VAE/scheduler 对齐，避免把窗口调度和后处理问题混入第一轮准确性调试。
-
-## 准确性验收
-
-必须和 `../VideoEdit-diffusers` 做同 seed、同 prompt、同窗口输入的对齐。
-
-建议逐层比较：
-
-1. 文本编码：`prompt_embeds`、`negative_prompt_embeds` 形状和均值范围。
-2. VAE encode：`cond_latents`、`video_latents` 的 shape、mean/std、dtype。
-3. mask packing：`cond_masks` 是否为 `[B, 4, F_lat, H/8, W/8]`，且取值语义为 preserve=1、inpaint=0。
-4. scheduler：`timesteps` / `sigmas` 与参考实现完全一致。
-5. 首步 DiT：同输入下 `noise_pred` 误差在合理范围内。
-6. 最终 latent：同 seed 输出不应是噪声。
-7. 解码视频：视觉效果与参考实现一致；首帧跳过、paste-back 边界无明显错误。
-
-## 主要风险
-
-- pipeline 选择风险：如果没有 VideoEdit wrapper `model_index.json`，会被解析到已有 `WanImageToVideoPipeline`。
-- scheduler 风险：现有 Wan pipeline 用 `FlowUniPCMultistepScheduler`，VideoEdit 必须用参考实现的简单 `FlowMatchScheduler`。
-- dynamic CFG 风险：标准 `DenoisingStage` 当前按固定 guidance scale 设计；完全对齐需要新增 VideoEdit denoising hook。
-- mask 语义风险：参考实现中 mask 会取反，必须保持 preserve=1、inpaint=0。
-- VAE 归一化风险：Wan latent 必须使用 `latents_mean` / `latents_std`，否则输出容易变成噪声。
-- 长视频风险：滑窗和 paste-back 属于应用层逻辑，建议晚于单窗口准确性验收实现。
-
-## 风险解决方案
-
-### P0：先解除会直接阻断运行的风险
+### 22.1 P0 风险
 
 | 风险 | 解决方案 | 验收方式 |
 | --- | --- | --- |
-| pipeline 选错 | 必须准备 VideoEdit wrapper 模型目录，并让 `model_index.json` 的 `_class_name` 固定为 `WanVideoEditPipeline`。同时注册 `WanVideoEditPipeline` 的 `EntryClass`、`WanVideoEditPipelineConfig` 和 `WanVideoEditSamplingParams`。本地调试可额外支持 `--pipeline-class-name WanVideoEditPipeline` 和 `--model-id VideoEdit-diffusers` 作为兜底。 | 单测调用 `get_model_info(videoedit_model_path, backend="sglang")`，断言返回的 pipeline 是 `WanVideoEditPipeline`，且传基础 Wan I2V 目录不会误进 VideoEdit。 |
-| `FlowMatchScheduler` 和通用 Stage API 不兼容 | 不要直接把当前 `flow_match_pair.FlowMatchScheduler` 塞进标准 `TimestepPreparationStage` / `DenoisingStage` 后期望可用。当前通用 Stage 会传 `device=`、调用 `set_begin_index()`，并假设 `scheduler.step(..., return_dict=False)[0]`；而 `FlowMatchScheduler` 没有这些兼容接口。应新增 `VideoEditFlowMatchScheduler` 适配层，或扩展现有 `FlowMatchScheduler`：`set_timesteps(..., device=None, **kwargs)`、`set_begin_index()` no-op、`step(..., return_dict=False)` 返回 `(prev_sample,)`。 | 单测逐项比较 SGLang scheduler 与 `../VideoEdit-diffusers/models/flow_match.py` 的 `sigmas`、`timesteps`、`add_noise()`、`step()`，误差在 dtype 允许范围内。 |
-| `--video-path` / `--mask-path` 被误解析 | 当前 CLI 只注册基础 `SamplingParams`，未知的 `--<name>-path` 会被 `ServerArgs._extract_component_paths()` 当作组件权重覆盖，`--video-path` 会变成 `component_paths["video"]`。MVP 用专用 wrapper CLI 或 Python API 传参；正式方案要让 generate CLI 先根据 `--model-path` 解析模型，再注册模型专属 `SamplingParams.add_cli_args()`，或把 `video_path` / `mask_path` 加入通用 `SamplingParams`。 | 加 CLI 单测：`--video-path a.mp4 --mask-path m.mp4 --transformer-path ckpt` 后，`video_path/mask_path` 进入 sampling params，只有 `transformer_path` 进入 `component_paths["transformer"]`。 |
-| transformer 通道数不匹配 | VideoEdit transformer 必须是 `in_channels=36, out_channels=16`。在 pipeline 初始化或 condition stage 之后做 fail-fast 校验，禁止使用基础 Wan I2V transformer 静默跑。wrapper 目录中 `transformer/config.json` 应来自 finetuned 权重；运行时覆盖时只允许 `--transformer-path` 指向 VideoEdit finetuned transformer。 | 加启动前校验：`server_args.pipeline_config.dit_config.in_channels == 36`、`out_channels == 16`；错误时提示使用 VideoEdit finetuned transformer。 |
+| pipeline 选错 | 必须提供 overlay `model_index.json`，并固定 `_class_name = "WanVideoEditPipeline"` | `get_model_info()` 返回 `WanVideoEditPipeline` |
+| scheduler 与通用 stage 不兼容 | 用 `VideoEditFlowMatchScheduler` 适配，不直接把 reference scheduler 塞入 runtime | 单测比较 `timesteps` / `sigmas` / `step()` / `add_noise()` |
+| 输入参数与 component path 冲突 | 业务参数改名为 `video_input_path` / `mask_input_path`，并优先走专用 wrapper CLI | CLI 单测确认不进入 `component_paths` |
+| transformer 通道数错误 | 启动时 fail-fast 校验 `in_channels=36`, `out_channels=16` | 错误权重加载时直接报错 |
 
-### P1：保证单窗口结果正确
-
-| 风险 | 解决方案 | 验收方式 |
-| --- | --- | --- |
-| 条件构造错误 | 新增 `VideoEditConditionStage`，从 `batch.video_path`、`batch.mask_path` 读取输入，先只支持单窗口；移植 `prepare_window_inputs()` 中的 tensor 构造逻辑，生成 `cond_masks`、`cond_latents`、`video_latents`。设置 `batch.image_latent = torch.cat([cond_masks, cond_latents], dim=1)`，并把 `video_latents` 放入 `batch.extra["videoedit"]`。 | 断言 `latents=[B,16,F_lat,H/8,W/8]`、`cond_masks=[B,4,F_lat,H/8,W/8]`、`cond_latents=[B,16,F_lat,H/8,W/8]`、拼接后 20 通道；denoising 时与当前噪声 latent 拼接后正好 36 通道。 |
-| mask 语义反了 | 严格复用参考实现：window-local 第 0 帧 mask 强制全黑；`first_frame_mask = mask_video_tensor[0:1].repeat(4, ...)`；下采样后执行 `(cond_masks < 0.5).float()`，保证 preserve=1、inpaint=0。 | 用一段 synthetic mask 做单测，检查白色编辑区域进入模型前为 0，黑色保留区域为 1，第 0 帧全 preserve。 |
-| VAE encode/decode 归一化错误 | condition 和 raw video VAE encode 使用 `argmax/mode()`，然后按 Wan `latents_mean`、`latents_std` 做 `(latent - mean) / std`；decode 继续复用 `DecodingStage.scale_and_shift()`，避免重复手写反归一化。`WanVideoEditPipelineConfig.__post_init__()` 必须设置 `vae_config.load_encoder = True` 且 `load_decoder = True`。 | 对同一窗口比较参考实现与 SGLang 的 `cond_latents`、`video_latents` shape、dtype、mean/std 和最大误差。 |
-| `video_latents` 加噪时机错误 | 在 `LatentPreparationStage` 和 `TimestepPreparationStage` 之后、SP 分片之前执行初始化：`batch.latents = scheduler.add_noise(video_latents, noise, batch.timesteps[:1])`。如果复用 `DenoisingStage`，放入 `VideoEditDenoisingStage._before_denoising_loop()`；如果独立 Stage，则放在 denoising 前。 | 同 seed 比较参考实现首步输入 latent；开启 SP 时确认 `video_latents` 未被重复分片或漏分片。 |
-| dynamic CFG 不一致 | 新增 `VideoEditDenoisingStage`，继承 `DenoisingStage`，只覆盖必要 hook。每步按参考实现 `calc_current_cfg()` 计算 `current_guidance_scale` 和 `do_cfg`；当 `do_cfg=False` 时跳过 negative pass。不要在通用 `DenoisingStage` 里硬编码 VideoEdit 逻辑。 | 单测检查 `guidance_scale=5, dynamic_cfg_max_step=15, dynamic_cfg_min=1` 时每步 CFG 序列与参考实现一致；再做首步 DiT `noise_pred` 对齐。 |
-
-### P2：降低集成和维护风险
+### 22.2 P1 风险
 
 | 风险 | 解决方案 | 验收方式 |
 | --- | --- | --- |
-| 长视频逻辑污染 native pipeline | native pipeline 只负责单窗口 VideoEdit。滑窗、paste-back、跳过首帧保存等放到 CLI/helper 层，第二阶段再迁移 `prepare_global_inputs()`、`paste_back()`。 | 单窗口测试先通过；长视频 helper 对齐参考 `infer.py`，输出 crop-only 和 paste-back 两个结果。 |
-| 输入参数和 frame 约束漂移 | `WanVideoEditSamplingParams` 中显式校验 `video_path`、`mask_path` 必填，`num_frames == infer_len`，且 `(num_frames - 1) % 4 == 0`。如果输入视频不足一个窗口，直接报错或由 wrapper 明确补帧策略。 | 参数单测覆盖缺 video/mask、非法 `infer_len`、视频和 mask 帧数不一致。 |
-| SP / CFG parallel 引入隐性差异 | MVP 建议先固定 `num_gpus=1`、关闭 CFG parallel，完成准确性对齐；随后再开启 SP，依赖通用 `shard_latents_for_sp()` 同步切分 `latents` 和 `batch.image_latent`。dynamic CFG 支持 CFG parallel 前，要验证 `do_cfg=False` 的 rank 行为。 | 先单卡逐层对齐；再多卡只比较 shape、无报错、输出非噪声；最后做多卡一致性阈值测试。 |
-| 回归定位困难 | 增加 side-by-side 脚本，固定 seed、prompt、窗口输入，逐层 dump `prompt_embeds`、`cond_masks`、`cond_latents`、`video_latents`、`timesteps/sigmas`、首步 `noise_pred`、最终 latent。 | CI 中至少跑轻量 shape/参数单测；人工准确性验收用 side-by-side 脚本，不只看最终视频。 |
+| mask packing 语义错误 | 固定 preserve=1、inpaint=0，并对首帧做黑帧约束 | synthetic mask 单测 |
+| VAE 归一化错误 | 统一走 Wan latent mean/std 归一化 | `cond_latents` / `video_latents` 与 reference 对齐 |
+| `video_latents` 加噪时机错误 | 独立 `VideoEditLatentInitStage` | 比较首步 denoising 输入 |
+| dynamic CFG 不一致 | `VideoEditDenoisingStage` 单独实现 CFG hook | 比较每步 CFG 序列和首步 `noise_pred` |
 
-## 实施顺序
+### 22.3 P2 风险
 
-1. 准备 VideoEdit wrapper 模型目录，确认 `_class_name = "WanVideoEditPipeline"`，transformer 指向 finetuned 权重。
-2. 新增 `WanVideoEditSamplingParams` 和 `WanVideoEditPipelineConfig`，补齐 `video_path`、`mask_path`、`infer_len` 等校验。
-3. 新增 `VideoEditFlowMatchScheduler` adapter，先通过 scheduler 对齐单测。
-4. 新增 `WanVideoEditPipeline`，串标准 text / latent / timestep / decode，并使用 VideoEdit scheduler adapter。
-5. 新增 `VideoEditConditionStage`，完成 video/mask 到 `batch.image_latent`、`video_latents` 的构造。
-6. 新增 `VideoEditLatentInitStage`，先关闭 dynamic CFG，用标准 `DenoisingStage` 跑通单窗口，确认非噪声输出。
-7. 新增 `VideoEditDenoisingStage`，补齐 dynamic CFG 和 `do_cfg=False` 时跳过 negative pass。
-8. 注册模型并补 CLI 方案；MVP 用专用 wrapper，正式方案再改通用 generate CLI。
-9. 加单元测试和 Diffusers side-by-side 准确性脚本。
-10. 再迁移滑窗、paste-back 和保存完整视频的应用层逻辑。
+| 风险 | 解决方案 | 验收方式 |
+| --- | --- | --- |
+| 长视频逻辑污染 runtime core | 滑窗和 paste-back 放 helper 层 | 单窗口 native pipeline 保持稳定 |
+| future merge 难 | 差异都下沉到 adapter 层 | 未来升级只改局部文件 |
+| 回归定位困难 | 增加 side-by-side dump | 逐层对齐而不是只看最终视频 |
+
+## 23. 准确性验收
+
+必须和 `../VideoEdit-diffusers` 做同 seed、同 prompt、同窗口输入的逐层对齐。
+
+建议验收顺序：
+
+1. 文本编码
+   - `prompt_embeds`
+   - `negative_prompt_embeds`
+
+2. 预处理
+   - bbox
+   - resize 后尺寸
+   - `cond_masks`
+
+3. VAE 编码
+   - `cond_latents`
+   - `video_latents`
+
+4. scheduler
+   - `timesteps`
+   - `sigmas`
+   - `add_noise()` 输出
+
+5. 首步 DiT
+   - `latent_model_input`
+   - `noise_pred`
+
+6. 最终 latent
+   - `latents`
+
+7. 解码与后处理
+   - crop-only 结果
+   - paste-back 结果
+
+## 24. 实施顺序
+
+1. 准备 overlay 模型目录，固定 `_class_name = "WanVideoEditPipeline"`。
+2. 新增 `WanVideoEditSamplingParams`，避免 `video_path`/`mask_path` 命名冲突。
+3. 新增 `WanVideoEditPipelineConfig`，基于 `WanT2V480PConfig` 打开 VAE encoder。
+4. 实现 `VideoEditFlowMatchScheduler` adapter，并先完成 scheduler 对齐测试。
+5. 落地 `runtime/videoedit/contracts.py`、`preprocess.py`、`postprocess.py`，把纯函数从原 repo 解耦出来。
+6. 实现 `VideoEditConditionStage`，完成 `batch.image_latent` 和 `video_latents` 生产。
+7. 实现 `VideoEditLatentInitStage`，先在关闭 dynamic CFG 条件下跑通单窗口。
+8. 实现 `VideoEditDenoisingStage`，补齐 dynamic CFG 和 negative pass 控制。
+9. 注册 pipeline/config/sampling params。
+10. 增加 side-by-side 对齐测试和回归脚本。
+11. 最后再补长视频滑窗 helper 和 paste-back。
+
+## 25. 最终结论
+
+VideoEdit 接入 SGLang 的正确方式，不是把原仓库整套搬进来，而是把它拆成：
+
+- 可复用的 Wan 通用主干
+- 最小化的 VideoEdit adapter 层
+- 独立的应用编排与后处理层
+
+最终形态应满足：
+
+- runtime 不依赖 `../VideoEdit-diffusers`
+- Wan 主干和 SGLang 通用 stage 最大化复用
+- VideoEdit 差异被限制在 scheduler、condition stage、denoising hook、纯函数预处理/后处理
+- 后续无论同步 SGLang 还是同步 VideoEdit upstream，都能局部更新、低冲突合并
+
+这就是本方案的核心目标：模块边界清晰、可配置、松耦合，并且对 future merge 友好。
