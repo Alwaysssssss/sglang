@@ -13,11 +13,18 @@ RUN apt-get update && apt-get install -y sudo && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
+# Install Node.js and npm for host-mounted Codex / Claude Code CLI packages.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
 # Set up oh-my-zsh for devuser
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
-    cp /root/.vimrc /home/devuser/.vimrc && \
-    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
+    # cp /root/.vimrc /home/devuser/.vimrc && \
+    # cp /root/.tmux.conf /home/devuser/.tmux.conf && \
     sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
     chown -R devuser:devuser /home/devuser/
 

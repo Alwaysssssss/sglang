@@ -4,6 +4,16 @@
         "dockerfile": "Dockerfile"
     },
     "remoteUser": "devuser",
+    "mounts": [
+      "source=/home/model/models,target=/home/model/models,type=bind",
+      "source=/usr/lib/node_modules/@openai/codex,target=/usr/lib/node_modules/@openai/codex,type=bind,readonly",
+    //   "source=/usr/lib/node_modules/@anthropic-ai/claude-code,target=/usr/lib/node_modules/@anthropic-ai/claude-code,type=bind,readonly",
+      "source=/home/zhiheng/.codex,target=/home/devuser/.codex,type=bind"
+    ],
+    "containerEnv": {
+        "CODEX_HOME": "/home/devuser/.codex"
+    },
+    "postCreateCommand": "sudo ln -sf /usr/lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex",
     "customizations": {
         "vscode": {
             "extensions": [
