@@ -47,7 +47,7 @@
         "host"
     ],
     "mounts": [
-        "source=/home/model/models,target=/models,type=bind,readonly",
+        "source=/home/model/models,target=/sgl-workspace/sglang/models,type=bind,readonly",
         "source=${localEnv:HOME}/.codex,target=/home/devuser/.codex,type=bind",
         "source=${localEnv:HOME}/.claude,target=/home/devuser/.claude,type=bind",
         "source=/usr/lib/node_modules/@openai/codex,target=/usr/lib/node_modules/@openai/codex,type=bind,readonly",
