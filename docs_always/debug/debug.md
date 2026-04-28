@@ -40,15 +40,15 @@ export HF_HOME=/root/.cache/huggingface
 # 如果网络慢，可以打开镜像
 # export HF_ENDPOINT=https://hf-mirror.com
 
-huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-huggingface-cli download Wan-AI/Wan2.1-T2V-14B-Diffusers
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P-Diffusers
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers
-huggingface-cli download IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers
-huggingface-cli download IPostYellow/TurboWan2.1-T2V-14B-Diffusers
-huggingface-cli download IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers
-huggingface-cli download FastVideo/FastWan2.1-T2V-1.3B-Diffusers
-huggingface-cli download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers
+hf download Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+hf download Wan-AI/Wan2.1-T2V-14B-Diffusers
+hf download Wan-AI/Wan2.1-I2V-14B-480P-Diffusers
+hf download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers
+hf download IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers
+hf download IPostYellow/TurboWan2.1-T2V-14B-Diffusers
+hf download IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers
+hf download FastVideo/FastWan2.1-T2V-1.3B-Diffusers
+hf download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers
 ```
 
 下载后可用下面的方式查看实际 snapshot 目录：
@@ -67,38 +67,38 @@ ls -d /root/.cache/huggingface/hub/models--Wan-AI--Wan2.1-I2V-14B-720P-Diffusers
 ```bash
 mkdir -p /data/models
 
-huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --local-dir /data/models/Wan2.1-T2V-1.3B-Diffusers
+hf download Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --local-dir /root/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers
 
-huggingface-cli download Wan-AI/Wan2.1-T2V-14B-Diffusers \
-    --local-dir /data/models/Wan2.1-T2V-14B-Diffusers
+hf download Wan-AI/Wan2.1-T2V-14B-Diffusers \
+    --local-dir /root/zhouhao6/models/Wan2.1-T2V-14B-Diffusers
 
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
-    --local-dir /data/models/Wan2.1-I2V-14B-480P-Diffusers
+hf download Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
+    --local-dir /root/zhouhao6/models/Wan2.1-I2V-14B-480P-Diffusers
 
-huggingface-cli download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers \
-    --local-dir /data/models/Wan2.1-I2V-14B-720P-Diffusers
+hf download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers \
+    --local-dir /root/zhouhao6/models/Wan2.1-I2V-14B-720P-Diffusers
 
-huggingface-cli download IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers \
-    --local-dir /data/models/TurboWan2.1-T2V-1.3B-Diffusers
+hf download IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers \
+    --local-dir /root/zhouhao6/models/TurboWan2.1-T2V-1.3B-Diffusers
 
-huggingface-cli download IPostYellow/TurboWan2.1-T2V-14B-Diffusers \
-    --local-dir /data/models/TurboWan2.1-T2V-14B-Diffusers
+hf download IPostYellow/TurboWan2.1-T2V-14B-Diffusers \
+    --local-dir /root/zhouhao6/models/TurboWan2.1-T2V-14B-Diffusers
 
-huggingface-cli download IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers \
-    --local-dir /data/models/TurboWan2.1-T2V-14B-720P-Diffusers
+hf download IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers \
+    --local-dir /root/zhouhao6/models/TurboWan2.1-T2V-14B-720P-Diffusers
 
-huggingface-cli download FastVideo/FastWan2.1-T2V-1.3B-Diffusers \
-    --local-dir /data/models/FastWan2.1-T2V-1.3B-Diffusers
+hf download FastVideo/FastWan2.1-T2V-1.3B-Diffusers \
+    --local-dir /root/zhouhao6/models/FastWan2.1-T2V-1.3B-Diffusers
 
-huggingface-cli download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers \
-    --local-dir /data/models/Wan2.1-Fun-1.3B-InP-Diffusers
+hf download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers \
+    --local-dir /root/zhouhao6/models/Wan2.1-Fun-1.3B-InP-Diffusers
 ```
 
 下载到固定目录后，`--model-path` 可以直接写：
 
 ```bash
---model-path /data/models/Wan2.1-T2V-1.3B-Diffusers
+--model-path /root/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers
 ```
 
 ## 2. 已跑通过的命令
@@ -107,7 +107,7 @@ huggingface-cli download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers \
 
 ```bash
 sglang generate \
-    --model-path /root/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B-Diffusers/snapshots/0fad780a534b6463e45facd96134c9f345acfa5b \
+    --model-path /root/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers \
     --text-encoder-cpu-offload \
     --pin-cpu-memory \
     --prompt "A curious raccoon walking through an autumn forest, cinematic lighting" \

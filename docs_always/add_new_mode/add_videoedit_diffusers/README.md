@@ -54,9 +54,10 @@ latent_model_input = torch.cat([latents, cond_masks, cond_latents], dim=1)
 按照 skill 的原则，本模型不适合重写一条 monolithic pipeline，也不适合硬塞进现有 I2V/TI2V 图像输入链路。推荐采用：
 
 - 以 SGLang 现有 Wan pipeline 为骨架
-- 以标准 `TextEncodingStage` / `LatentPreparationStage` / `TimestepPreparationStage` / `DecodingStage` 为主体
-- 仅新增 3 个 VideoEdit 专属扩展点：
+- 以标准 `TextEncodingStage` / `LatentPreparationStage` / `DecodingStage` 为主体
+- 新增少量 VideoEdit 专属扩展点：
   - `VideoEditConditionStage`
+  - `VideoEditTimestepPreparationStage`
   - `VideoEditLatentInitStage`
   - `VideoEditDenoisingStage`
 
@@ -67,7 +68,7 @@ InputValidationStage
   -> TextEncodingStage
   -> VideoEditConditionStage
   -> LatentPreparationStage
-  -> TimestepPreparationStage
+  -> VideoEditTimestepPreparationStage
   -> VideoEditLatentInitStage
   -> VideoEditDenoisingStage
   -> DecodingStage
@@ -176,7 +177,7 @@ Tests / Alignment Scripts
 - `configs/models/vaes/wanvae.py`
 - `TextEncodingStage`
 - `LatentPreparationStage`
-- `TimestepPreparationStage`
+- `TimestepPreparationStage` 的通用接口与校验逻辑
 - `DecodingStage`
 - 通用 TP/SP、attention backend、offload、LoRA 机制
 
@@ -196,10 +197,14 @@ Tests / Alignment Scripts
 4. `VideoEditLatentInitStage`
    - 只负责在 denoising 前调用 `scheduler.add_noise(video_latents, noise, first_timestep)`
 
-5. `VideoEditDenoisingStage`
+5. `VideoEditTimestepPreparationStage`
+   - 只负责按 VideoEdit scheduler 生成 timesteps
+   - `strength < 1.0` 时按 reference 逻辑裁剪 timesteps，并同步更新 `batch.num_inference_steps`
+
+6. `VideoEditDenoisingStage`
    - 只负责 dynamic CFG 和少量 VideoEdit 特殊 hook
 
-6. VideoEdit 纯函数工具模块
+7. VideoEdit 纯函数工具模块
    - 预处理
    - mask packing
    - paste-back
@@ -272,7 +277,6 @@ VideoEdit-diffusers-model/
   text_encoder/
   vae/
   transformer/
-  scheduler/
 ```
 
 约束：
@@ -280,7 +284,6 @@ VideoEdit-diffusers-model/
 - `_class_name = "WanVideoEditPipeline"`
 - `tokenizer` / `text_encoder` / `vae` 可以来自基础 Wan2.1 模型
 - `transformer` 必须来自 VideoEdit finetuned 权重
-- `scheduler/` 只保留占位配置，真正运行时由 SGLang 替换成 `VideoEditFlowMatchScheduler`
 
 ### 8.2 组件覆盖
 
@@ -439,7 +442,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_text_encoding_stage()
         self.add_stage(VideoEditConditionStage(vae=self.get_module("vae")))
         self.add_standard_latent_preparation_stage()
-        self.add_standard_timestep_preparation_stage()
+        self.add_stage(VideoEditTimestepPreparationStage(scheduler=self.get_module("scheduler")))
         self.add_stage(VideoEditLatentInitStage(scheduler=self.get_module("scheduler")))
         self.add_stage(
             VideoEditDenoisingStage(
@@ -458,28 +461,107 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
 `python/sglang/multimodal_gen/runtime/models/schedulers/videoedit_flow_match.py`
 
-职责不是重新发明 scheduler，而是适配 SGLang 的 stage 协议。
+职责不是重新发明 scheduler，而是把原始仓库 `models/flow_match.py` 的行为精确搬到 SGLang scheduler 协议里。
 
-必须对齐的接口：
+### 12.1 Reference 行为
 
-- `set_timesteps(..., device=None, **kwargs)`
-- `set_begin_index()`，即使只是 no-op
-- `step(..., return_dict=False)` 返回 `(prev_sample,)`
+原始推理固定创建：
+
+```python
+FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
+```
+
+`set_timesteps(num_inference_steps, shift=5)` 的实际逻辑是：
+
+```python
+sigma_start = sigma_min + (sigma_max - sigma_min) * denoising_strength
+if extra_one_step:
+    sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps + 1)[:-1]
+else:
+    sigmas = torch.linspace(sigma_start, sigma_min, num_inference_steps)
+sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+timesteps = sigmas * num_train_timesteps
+```
+
+在当前 VideoEdit 推理路径中，`denoising_strength` 没有传给 `set_timesteps()`，默认是 `1.0`。因此 `strength < 1.0` 的编辑强度不是通过降低 `sigma_start` 实现，而是在完整 schedule 生成后调用 `get_timesteps()` 裁掉前段：
+
+```python
+init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+t_start = max(num_inference_steps - init_timestep, 0)
+timesteps = timesteps[t_start:]
+num_inference_steps = num_inference_steps - t_start
+```
+
+这个细节必须保留。否则同样的 `strength` 会得到不同的首步 timestep、不同的 `add_noise()` 输入和不同的最终结果。
+
+### 12.2 与 SGLang 现有 FlowMatch 的差异
+
+不要直接继承并配置现有 `FlowMatchEulerDiscreteScheduler` 来冒充 VideoEdit scheduler，原因如下：
+
+- SGLang 通用 FlowMatch 会在 `sigmas` 末尾追加 terminal sigma；VideoEdit reference 不把 terminal sigma 存入 `self.sigmas`，而是在最后一步 `step()` 中显式把 `sigma_` 置为 `0`。
+- 通用 FlowMatch 的 `step()` 依赖 `_step_index` 递增；VideoEdit reference 每次通过 `argmin(abs(self.timesteps - timestep))` 查 index，对外部裁剪后的 timesteps 更直接。
+- VideoEdit 支持 `inverse_timesteps` / `reverse_sigmas` 的末步 `sigma_=1` 分支，虽然当前推理未启用，但 adapter 应保留参数以便和 reference 单测一致。
+- `add_noise()` 语义必须是 `(1 - sigma) * original_samples + sigma * noise`，并同样通过最接近的 timestep 查 sigma。
+
+### 12.3 SGLang adapter 接口
+
+`VideoEditFlowMatchScheduler` 必须提供：
+
+- `order = 1`
+- `num_train_timesteps = 1000`
+- `set_shift(shift: float)`
+- `set_timesteps(num_inference_steps, device=None, denoising_strength=1.0, training=False, shift=None, timesteps=None, sigmas=None, **kwargs)`
+- `set_begin_index(begin_index: int = 0)`，可以记录值但不应改变 reference index 查找语义
+- `scale_model_input(sample, timestep=None)`，直接返回 `sample`
+- `step(model_output, timestep, sample, to_final=False, return_dict=False, **kwargs)`
 - `add_noise(original_samples, noise, timestep)`
+- `get_timesteps(num_inference_steps, timesteps, strength)`
 
-必须对齐的行为：
+`step()` 返回值要兼容 SGLang 通用 denoising 调用：
 
-- sigma 公式
-- timestep 序列
-- `extra_one_step=True`
-- `shift=5`
-- `strength < 1.0` 时的 `get_timesteps()`
+```python
+prev_sample = sample + model_output * (sigma_next - sigma)
+return (prev_sample,) if not return_dict else SchedulerOutput(prev_sample=prev_sample)
+```
 
-适配层边界：
+`sigma_next` 的规则必须和 reference 一致：
 
-- 不修改通用 `TimestepPreparationStage`
-- 不修改通用 `DenoisingStage` 的 scheduler 约定
-- 让 scheduler 自己满足通用 stage 的调用要求
+- 如果 `to_final=True` 或当前是最后一个 timestep，常规路径 `sigma_next = 0`
+- 如果启用 `inverse_timesteps` 或 `reverse_sigmas`，末步 `sigma_next = 1`
+- 否则 `sigma_next = self.sigmas[timestep_id + 1]`
+
+### 12.4 Timestep stage 设计
+
+由于 `strength < 1.0` 会改变 `timesteps` 长度和实际 denoising 步数，仅靠通用 `TimestepPreparationStage` 不够。需要新增 `VideoEditTimestepPreparationStage`，逻辑如下：
+
+```python
+scheduler.set_timesteps(
+    batch.num_inference_steps,
+    device=device,
+    shift=server_args.pipeline_config.flow_shift,
+)
+timesteps = scheduler.timesteps
+
+strength = batch.sampling_params.strength
+if strength < 1.0:
+    timesteps, num_steps = scheduler.get_timesteps(
+        batch.num_inference_steps,
+        timesteps,
+        strength,
+    )
+    batch.num_inference_steps = num_steps
+
+batch.timesteps = timesteps
+```
+
+不要把 `strength` 传给 `set_timesteps(denoising_strength=...)` 来替代裁剪逻辑；那和原始 `pipeline_wan_edit.py` 不等价。
+
+### 12.5 适配层边界
+
+- 不修改通用 `TimestepPreparationStage`，VideoEdit 使用自己的 timestep stage。
+- 不修改通用 `DenoisingStage` 的 scheduler 约定，scheduler 自己适配 `return_dict=False` 和 `order=1`。
+- scheduler 文件只包含调度数学和 SGLang 接口适配，不读取 VideoEdit 输入、不处理 mask、不依赖 pipeline。
+- 单测先只比较 scheduler 张量，不跑 DiT：`sigmas`、`timesteps`、`get_timesteps()`、`add_noise()`、单步 `step()` 必须和 `models/flow_match.py` 完全一致。
 
 ## 13. VideoEditConditionStage 设计
 
@@ -541,7 +623,7 @@ class VideoEditConditionBundle:
 
 职责很单一：
 
-- 在 `LatentPreparationStage` 和 `TimestepPreparationStage` 之后
+- 在 `LatentPreparationStage` 和 `VideoEditTimestepPreparationStage` 之后
 - 在 `DenoisingStage` 之前
 - 使用 `video_latents` 替换默认纯噪声初始化
 
@@ -708,7 +790,7 @@ API / CLI 传入：
 
 - `batch.latents`
 
-`TimestepPreparationStage` 后：
+`VideoEditTimestepPreparationStage` 后：
 
 - `batch.timesteps`
 
@@ -816,13 +898,6 @@ API / CLI 传入：
 register_configs(
     sampling_param_cls=WanVideoEditSamplingParams,
     pipeline_config_cls=WanVideoEditPipelineConfig,
-    hf_model_paths=[
-        "VideoEdit-diffusers",
-        "Wan2.1-VideoEdit-Diffusers",
-    ],
-    model_detectors=[
-        lambda s: "videoedit" in s.lower(),
-    ],
 )
 ```
 
@@ -842,6 +917,7 @@ register_configs(
 | --- | --- | --- |
 | pipeline 选错 | 必须提供 overlay `model_index.json`，并固定 `_class_name = "WanVideoEditPipeline"` | `get_model_info()` 返回 `WanVideoEditPipeline` |
 | scheduler 与通用 stage 不兼容 | 用 `VideoEditFlowMatchScheduler` 适配，不直接把 reference scheduler 塞入 runtime | 单测比较 `timesteps` / `sigmas` / `step()` / `add_noise()` |
+| `strength < 1.0` schedule 不一致 | 用 `VideoEditTimestepPreparationStage` 先生成完整 schedule 再裁剪，并更新 `batch.num_inference_steps` | 比较 `get_timesteps()` 后的 timesteps 和首步 noisy latent |
 | 输入参数与 component path 冲突 | 业务参数改名为 `video_input_path` / `mask_input_path`，并优先走专用 wrapper CLI | CLI 单测确认不进入 `component_paths` |
 | transformer 通道数错误 | 启动时 fail-fast 校验 `in_channels=36`, `out_channels=16` | 错误权重加载时直接报错 |
 
@@ -884,6 +960,7 @@ register_configs(
 4. scheduler
    - `timesteps`
    - `sigmas`
+   - `strength < 1.0` 裁剪后的 `timesteps` 和 `num_inference_steps`
    - `add_noise()` 输出
 
 5. 首步 DiT
@@ -903,13 +980,14 @@ register_configs(
 2. 新增 `WanVideoEditSamplingParams`，避免 `video_path`/`mask_path` 命名冲突。
 3. 新增 `WanVideoEditPipelineConfig`，基于 `WanT2V480PConfig` 打开 VAE encoder。
 4. 实现 `VideoEditFlowMatchScheduler` adapter，并先完成 scheduler 对齐测试。
-5. 落地 `runtime/videoedit/contracts.py`、`preprocess.py`、`postprocess.py`，把纯函数从原 repo 解耦出来。
-6. 实现 `VideoEditConditionStage`，完成 `batch.image_latent` 和 `video_latents` 生产。
-7. 实现 `VideoEditLatentInitStage`，先在关闭 dynamic CFG 条件下跑通单窗口。
-8. 实现 `VideoEditDenoisingStage`，补齐 dynamic CFG 和 negative pass 控制。
-9. 注册 pipeline/config/sampling params。
-10. 增加 side-by-side 对齐测试和回归脚本。
-11. 最后再补长视频滑窗 helper 和 paste-back。
+5. 实现 `VideoEditTimestepPreparationStage`，确认 `strength=1.0` 和 `strength<1.0` 都与 reference 一致。
+6. 落地 `runtime/videoedit/contracts.py`、`preprocess.py`、`postprocess.py`，把纯函数从原 repo 解耦出来。
+7. 实现 `VideoEditConditionStage`，完成 `batch.image_latent` 和 `video_latents` 生产。
+8. 实现 `VideoEditLatentInitStage`，先在关闭 dynamic CFG 条件下跑通单窗口。
+9. 实现 `VideoEditDenoisingStage`，补齐 dynamic CFG 和 negative pass 控制。
+10. 注册 pipeline/config/sampling params。
+11. 增加 side-by-side 对齐测试和回归脚本。
+12. 最后再补长视频滑窗 helper 和 paste-back。
 
 ## 25. 最终结论
 
