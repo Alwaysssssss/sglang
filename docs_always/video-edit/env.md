@@ -16,3 +16,13 @@ https://github.com/shanhai-mgtv/VideoEdit-diffusers
     )
 
 python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/videos/1144932-hd_1920_1080_30fps_short.mp4 --mask_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/masks/1144932-hd_1920_1080_30fps_No_bbox_mask.mp4 --output_name 1144932-hd_1920_1080_30fps_No_bbox_mask.mp4 --prompt "A vibrant pink flower with a yellow center remains the focal point against green foliage throughout the video." --num_frames 81
+
+
+python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/videos/20729655-hd_1920_1080_25fps_short.mp4 --mask_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/masks/20729655-hd_1920_1080_25fps_No_bbox_mask.mp4 --output_name 20729655-hd_1920_1080_25fps_No_bbox_mask.mp4 --prompt "AA person stands on a bridge by a river, facing city buildings, spreading arms wide against a cloudy sky." --num_frames 81
+
+export PATH="/opt/node-v22/bin:$PATH" && codex
+
+UV_HTTP_TIMEOUT=1800 uv pip install \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://pypi.org/simple \
+  -e "python[diffusion]" --prerelease=allow
