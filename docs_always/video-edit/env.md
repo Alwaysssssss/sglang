@@ -1,0 +1,28 @@
+https://github.com/shanhai-mgtv/VideoEdit-diffusers
+/mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410
+/mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/prompt.txt prompt直接在这个文件内拿匹配的就行
+
+    g.add_argument(
+        "--model_path",
+        default="/mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/"
+                "VideoEdit-diffusers/pretrain_models/Wan2.1-I2V-14B-480P-Diffusers/",
+        help="Base Wan2.1 diffusers model directory",
+    )
+    g.add_argument(
+        "--transformer_path",
+        default="/mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/"
+                "VideoEdit-diffusers/utils/wan_converted_step_9500/",
+        help="Fine-tuned transformer checkpoint directory",
+    )
+
+python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/videos/1144932-hd_1920_1080_30fps_short.mp4 --mask_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/masks/1144932-hd_1920_1080_30fps_No_bbox_mask.mp4 --output_name 1144932-hd_1920_1080_30fps_No_bbox_mask.mp4 --prompt "A vibrant pink flower with a yellow center remains the focal point against green foliage throughout the video." --num_frames 81
+
+
+python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/videos/20729655-hd_1920_1080_25fps_short.mp4 --mask_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/projects/VideoEdit-new/DiffSynth-Studio/test_videos/pexel_test_data_0410/masks/20729655-hd_1920_1080_25fps_No_bbox_mask.mp4 --output_name 20729655-hd_1920_1080_25fps_No_bbox_mask.mp4 --prompt "AA person stands on a bridge by a river, facing city buildings, spreading arms wide against a cloudy sky." --num_frames 81
+
+export PATH="/opt/node-v22/bin:$PATH" && codex
+
+UV_HTTP_TIMEOUT=1800 uv pip install \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://pypi.org/simple \
+  -e "python[diffusion]" --prerelease=allow
