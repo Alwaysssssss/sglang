@@ -23,7 +23,7 @@ python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/project
 export HTTP_PROXY="http://localhost:10909"
 export HTTPS_PROXY="http://localhost:10909"
 export ALL_PROXY="http://localhost:10909"
-export PATH="/opt/node-v22/bin:$PATH" && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models --add-dir /root/zhouhao6/VideoEdit-diffusers
+export PATH="/opt/node-v22/bin:$PATH" && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /root/zhouhao6/VideoEdit-diffusers --add-dir /root/zhouhao6/video_diffusers/pexel_test_data_0410
 
 UV_HTTP_TIMEOUT=1800 uv pip install \
   --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -38,3 +38,5 @@ UV_HTTP_TIMEOUT=1800 uv pip install \
 
   根据方案 @sglang/docs_always/add_new_mode/add_videoedit_diffusers/README.md，以及原始算法仓库 @/root/zhouhao6/VideoEdit-diffusers，完善/root/zhouhao6/video_diffusers/
   pretrain_models/Wan2.1-I2V-14B-480P-Diffusers，要求不新增文件，不要删除文件
+
+python3 infer.py  --video_path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 --mask_path  /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 --output_name 15108907_3840_2160_50fps_No_bbox_mask.mp4 --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." --num_frames 81
