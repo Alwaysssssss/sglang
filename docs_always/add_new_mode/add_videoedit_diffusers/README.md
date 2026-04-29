@@ -7,6 +7,211 @@
 > 输入视频：/root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4
 > mask视频：/root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4
 > 提示词："A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video."
+> 输出视频路径：/root/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4
+> 只需要跑通前81帧即可，不需要跑完完整的视频
+
+## 0. 当前真实环境与验收目标
+
+本方案以当前机器上的真实 VideoEdit 环境为准，不再使用占位路径或抽象 case。
+
+固定环境：
+
+```bash
+source /opt/venv/bin/activate
+```
+
+固定路径：
+
+```text
+SGLang 仓库       : /root/zhouhao6/sglang
+参考算法仓库     : /root/zhouhao6/VideoEdit-diffusers
+serve 参考实现   : /root/zhouhao6/wan_eraser/run_parallel_ray_95_erase.py
+模型 overlay     : /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model
+VideoEdit transformer:
+                  /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+输入视频          : /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4
+mask 视频         : /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4
+输出视频          : /root/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4
+```
+
+固定 prompt：
+
+```text
+A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.
+```
+
+本次首要验收目标：
+
+- 只跑通前 `81` 帧，不需要跑完整视频。
+- CLI 和 server 都必须通过命令行方式测试，不能只做 in-process parser 单测。
+- CLI 首先用 `/root/zhouhao6/VideoEdit-diffusers/infer.py` 作为 reference baseline，再用 SGLang `videoedit.cli repair` 对齐同一组输入。
+- server 参考 `/root/zhouhao6/wan_eraser/run_parallel_ray_95_erase.py` 的资源占用和异步任务语义：FastAPI 提交、后台执行、单任务 admission、`/healthz`。但不要复用它的请求协议；该脚本的 `/generate` 当前绑定 MinIO object key、mask RLE JSON 和 bbox CSV，不适合直接作为本地 mp4 + mask mp4 的 VideoEdit SGLang 验收入口。
+
+### 0.1 Reference CLI 基线命令
+
+先用原始 `VideoEdit-diffusers` 仓库验证真实权重、输入视频、mask 视频和 prompt 能跑通 81 帧：
+
+```bash
+source /opt/venv/bin/activate
+cd /root/zhouhao6/VideoEdit-diffusers
+
+python infer.py \
+  --video_path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
+  --mask_path /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
+  --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
+  --model_path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --transformer_path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --output_dir /root/zhouhao6/sglang/outputs \
+  --output_name 15108907_3840_2160_50fps \
+  --num_frames 81 \
+  --infer_len 81 \
+  --num_inference_steps 20 \
+  --guidance_scale 5.0 \
+  --seed 42 \
+  --dtype bf16
+```
+
+注意：reference `infer.py` 中 `WanTransformer3DModel.from_pretrained(args.transformer_path, subfolder="transformer")` 要求 `--transformer_path` 传 overlay 根目录，而不是 `transformer/` 子目录。SGLang 的 `--transformer-path` 是组件覆盖路径，才传 `.../transformer`。
+
+reference 脚本保存 pasted result 时会跳过第 0 帧：
+
+```python
+save_video(result_frames[1:], pasted_path, fps)
+```
+
+因此 reference 输出文件名是 `/root/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4`，但帧数预期为 `80`。SGLang native pipeline 的单窗口内部仍应处理完整 `81` 帧；是否跳过第 0 帧属于 helper / postprocess 保存策略，不能混进 denoising stage。
+
+### 0.2 SGLang CLI 验收命令
+
+实现完成后，本地 CLI 必须能用同一组真实输入跑出指定输出：
+
+```bash
+source /opt/venv/bin/activate
+cd /root/zhouhao6/sglang
+mkdir -p /root/zhouhao6/sglang/outputs
+
+python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
+  --model-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --transformer-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
+  --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
+  --video-input-path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
+  --mask-input-path /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
+  --output-path /root/zhouhao6/sglang/outputs \
+  --output-file-name 15108907_3840_2160_50fps.mp4 \
+  --num-frames 81 \
+  --infer-len 81 \
+  --overlap 0 \
+  --num-inference-steps 20 \
+  --guidance-scale 5.0 \
+  --seed 42 \
+  --dtype bf16 \
+  --enable-paste-back
+```
+
+CLI dry-run 也必须是命令行入口，供 CPU-only smoke test 使用：
+
+```bash
+python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
+  --model-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --transformer-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
+  --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
+  --video-input-path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
+  --mask-input-path /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
+  --output-path /root/zhouhao6/sglang/outputs \
+  --output-file-name 15108907_3840_2160_50fps.mp4 \
+  --num-frames 81 \
+  --infer-len 81 \
+  --overlap 0 \
+  --dry-run
+```
+
+`--dry-run` 的验收范围：解析参数、读取 overlay `model_index.json`、确认 `_class_name=WanVideoEditPipeline`、检查 transformer `in_channels=36/out_channels=16`、规划 81 帧窗口、打印将要写入的输出路径；不得加载 DiT / VAE 权重。
+
+### 0.3 SGLang Server 验收命令
+
+服务启动使用 SGLang diffusion serve，不用 `wan_eraser/run_parallel_ray_95_erase.py` 作为最终入口：
+
+```bash
+source /opt/venv/bin/activate
+cd /root/zhouhao6/sglang
+mkdir -p /root/zhouhao6/sglang/outputs /tmp/sglang-videoedit-inputs
+
+VIDEOEDIT_QUEUE_CAPACITY=1 \
+sglang serve \
+  --model-type diffusion \
+  --model-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --tp-size 1 \
+  --output-path /root/zhouhao6/sglang/outputs \
+  --input-save-path /tmp/sglang-videoedit-inputs \
+  --transformer-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+```
+
+健康检查：
+
+```bash
+curl -s http://127.0.0.1:30000/healthz
+```
+
+提交本地路径任务：
+
+```bash
+curl -s -X POST http://127.0.0.1:30000/v1/videos/repairs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "task_id": "pexel_15108907_first_81",
+    "prompt": "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.",
+    "video_input_path": "/root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4",
+    "mask_input_path": "/root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4",
+    "output_storage": "local",
+    "output_path": "/root/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4",
+    "num_frames": 81,
+    "infer_len": 81,
+    "overlap": 0,
+    "num_inference_steps": 20,
+    "guidance_scale": 5.0,
+    "seed": 42,
+    "enable_paste_back": true
+  }'
+```
+
+轮询任务状态：
+
+```bash
+JOB_ID=video_repair_xxx
+
+while true; do
+  resp=$(curl -s "http://127.0.0.1:30000/v1/videos/${JOB_ID}")
+  python -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status"), d.get("progress"), d.get("file_path") or d.get("url"))' <<< "$resp"
+  status=$(python -c 'import json,sys; print(json.load(sys.stdin).get("status"))' <<< "$resp")
+  [ "$status" = "completed" ] && break
+  [ "$status" = "failed" ] && exit 1
+  sleep 5
+done
+```
+
+### 0.4 输出验收
+
+最小输出检查：
+
+```bash
+python - <<'PY'
+import cv2
+path = "/root/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4"
+cap = cv2.VideoCapture(path)
+frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+cap.release()
+print({"frames": frames, "width": width, "height": height, "fps": fps})
+assert frames in (80, 81), frames
+assert width > 0 and height > 0
+PY
+```
+
+`80` 帧表示沿用 reference 保存策略跳过第 0 帧；`81` 帧表示 SGLang helper 保留完整单窗口输出。最终采用哪一种必须在 CLI/server 参数中显式命名，例如 `--drop-reference-frame`，不要让不同入口隐式不一致。
 
 ## 1. 背景与目标
 
@@ -1212,6 +1417,7 @@ class VideoRepairRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
 
+    num_frames: Optional[int] = 81
     infer_len: Optional[int] = 81
     overlap: Optional[int] = 0
     use_repaired_context: Optional[bool] = True
@@ -2066,7 +2272,7 @@ EntryClass = WanVideoEditPipeline
 
 ### 23.1 P0：CLI / serve 先跑通
 
-这一级是第一阶段必须先补的功能性测试。要求测试不依赖真实大模型权重、不下载模型、不要求 GPU 推理完成；可以通过 monkeypatch / mock 隔离重模型加载，但必须覆盖真实入口函数和 argparse / FastAPI 路由。
+这一级是第一阶段必须先补的功能性测试。要求测试不依赖真实大模型权重、不下载模型、不要求 GPU 推理完成；可以通过 monkeypatch / mock 隔离重模型加载，但触发方式必须是命令行。也就是说，测试用 `subprocess.run()` / `subprocess.Popen()` 调真实 CLI 和 serve 命令，而不是直接 import 内部 parser 函数后构造对象。
 
 新增：
 
@@ -2075,19 +2281,61 @@ EntryClass = WanVideoEditPipeline
 
 `test_videoedit_cli.py` 覆盖：
 
-- `python -m sglang.multimodal_gen.runtime.videoedit.cli repair --help` 返回 0，并展示 `--video-input-path`、`--mask-input-path`、`--overlap`、`--enable-paste-back`。
-- `repair` 能解析本地离线参数，并构造 `ServerArgs` 与 `WanVideoEditSamplingParams`；mock `DiffGenerator.from_pretrained()` 和 `run_videoedit_long_video()`，断言二者被调用一次。
-- `repair-remote` 能解析远程提交参数；mock HTTP client，断言请求发送到 `/v1/videos/repairs`，请求体包含 `video_input_path`、`mask_input_path`、`infer_len`、`overlap`。
+- `subprocess.run(["python", "-m", "sglang.multimodal_gen.runtime.videoedit.cli", "repair", "--help"])` 返回 0，并展示 `--video-input-path`、`--mask-input-path`、`--overlap`、`--enable-paste-back`。
+- `repair --dry-run` 使用 0.2 中的真实本地路径命令，能解析本地离线参数、读取 overlay、规划 81 帧窗口，并在 stdout 打印 `WanVideoEditPipeline`、`in_channels=36`、输出路径；dry-run 不加载 DiT / VAE。
+- `repair` 非 dry-run 的测试可以通过环境变量启用轻量 mock，例如 `SGLANG_VIDEOEDIT_TEST_MODE=1`，但仍必须从命令行启动；断言最终走到 `run_videoedit_long_video()` 的 mock 分支并创建一个占位 mp4。
+- `repair-remote --dry-run` 能解析远程提交参数，打印将要发送到 `/v1/videos/repairs` 的 JSON；请求体包含 `video_input_path`、`mask_input_path`、`num_frames`、`infer_len`、`overlap`。
+- `repair-remote` 非 dry-run 用本地测试 HTTP server 接收请求，测试通过命令行发起真实 HTTP POST，断言 endpoint 是 `/v1/videos/repairs`。
 - `--video-input-path` / `--mask-input-path` 不会进入 `ServerArgs.component_paths`。这是必须显式断言的回归点，因为当前通用 unknown args 会把 `--<name>-path` 误解析成组件覆盖。
 - `repair --dry-run` 或等价调试模式只做参数解析、模型解析和窗口规划，不启动模型；这个模式用于 CI 快速验证 CLI 契约。
 
+CLI smoke 命令必须固定成可复制形式：
+
+```bash
+python -m sglang.multimodal_gen.runtime.videoedit.cli repair --help
+
+python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
+  --model-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --transformer-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
+  --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
+  --video-input-path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
+  --mask-input-path /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
+  --output-path /root/zhouhao6/sglang/outputs \
+  --output-file-name 15108907_3840_2160_50fps.mp4 \
+  --num-frames 81 \
+  --infer-len 81 \
+  --overlap 0 \
+  --dry-run
+```
+
 `test_videoedit_serve.py` 覆盖：
 
-- `sglang serve --model-path <overlay>` 的参数能被 `ServeSubcommand` / `ServerArgs.from_cli_args()` 解析；mock `launch_server()`，断言 `model_path`、`host`、`port`、`output_path`、`input_save_path`、`component_paths["transformer"]` 正确。
+- `subprocess.run(["sglang", "serve", "--model-type", "diffusion", ...])` 或 `subprocess.Popen()` 在 `SGLANG_VIDEOEDIT_TEST_MODE=1` 下能解析 0.3 中的真实 serve 命令；轻量测试分支断言 `model_path`、`host`、`port`、`output_path`、`input_save_path`、`component_paths["transformer"]` 正确。
 - overlay `model_index.json` 中 `_class_name = "WanVideoEditPipeline"` 时，registry 能解析到 `WanVideoEditPipeline`，且 pipeline class 暴露 `pipeline_config_cls` 和 `sampling_params_cls`。
-- 启动 serve 时如果模型不是 `WanVideoEditPipeline`，`/v1/videos/repairs` 返回 400；如果是 VideoEdit 模型，route 存在且能完成 admission 前的参数校验。
-- `/healthz` 在 mock model loaded 状态下返回 200，响应包含 `model_loaded`、`queue_capacity`、`active_jobs`、`queued_jobs`。
-- admission 队列容量为 1 时，已有 queued / in_progress VideoEdit job 会让第二个请求返回 429。
+- `subprocess.Popen()` 启动轻量测试 server，例如 `SGLANG_VIDEOEDIT_TEST_MODE=1 sglang serve --model-type diffusion ...`；真实 `curl http://127.0.0.1:${PORT}/healthz` 返回 200，响应包含 `model_loaded`、`queue_capacity`、`active_jobs`、`queued_jobs`。
+- 用真实 `curl -X POST /v1/videos/repairs` 提交本地路径 JSON；如果模型不是 `WanVideoEditPipeline`，返回 400；如果是 VideoEdit 模型，route 存在且能完成 admission 前的参数校验。
+- admission 队列容量为 1 时，用两次 `curl` 连续提交，第二个请求返回 429。
+
+serve smoke 命令必须固定成可复制形式：
+
+```bash
+VIDEOEDIT_QUEUE_CAPACITY=1 \
+SGLANG_VIDEOEDIT_TEST_MODE=1 \
+sglang serve \
+  --model-type diffusion \
+  --model-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --host 127.0.0.1 \
+  --port ${PORT} \
+  --tp-size 1 \
+  --output-path /root/zhouhao6/sglang/outputs \
+  --input-save-path /tmp/sglang-videoedit-inputs \
+  --transformer-path /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+
+curl -s "http://127.0.0.1:${PORT}/healthz"
+curl -s -X POST "http://127.0.0.1:${PORT}/v1/videos/repairs" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.","video_input_path":"/root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4","mask_input_path":"/root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4","num_frames":81,"infer_len":81,"overlap":0,"output_storage":"local","output_path":"/root/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4"}'
+```
 
 建议命令：
 
@@ -2101,6 +2349,7 @@ pytest -q python/sglang/multimodal_gen/test/videoedit/test_videoedit_serve.py
 - 两个测试文件在 CPU-only 环境可运行。
 - 不访问 Hugging Face / 对象存储 / 原 `../VideoEdit-diffusers` 仓库。
 - 不启动真实 DiT / VAE 权重加载。
+- 测试内部必须通过命令行触发真实入口，不能只 import 内部函数。
 - 失败信息能定位到 CLI 参数、serve 参数、route 注册、admission 或 registry 中的具体一层。
 
 ### 23.2 P1：单窗口与 API 功能测试

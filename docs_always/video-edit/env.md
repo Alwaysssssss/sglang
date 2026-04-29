@@ -23,7 +23,7 @@ python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/project
 export HTTP_PROXY="http://localhost:10909"
 export HTTPS_PROXY="http://localhost:10909"
 export ALL_PROXY="http://localhost:10909"
-export PATH="/opt/node-v22/bin:$PATH" && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /root/zhouhao6/VideoEdit-diffusers --add-dir /root/zhouhao6/video_diffusers/pexel_test_data_0410
+export PATH="/opt/node-v22/bin:$PATH" && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /root/zhouhao6/VideoEdit-diffusers --add-dir /root/zhouhao6/video_diffusers/pexel_test_data_0410 --add-dir /root/zhouhao6/wan_eraser
 
 UV_HTTP_TIMEOUT=1800 uv pip install \
   --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -40,3 +40,6 @@ UV_HTTP_TIMEOUT=1800 uv pip install \
   pretrain_models/Wan2.1-I2V-14B-480P-Diffusers，要求不新增文件，不要删除文件
 
 python3 infer.py  --video_path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 --mask_path  /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 --output_name 15108907_3840_2160_50fps_No_bbox_mask.mp4 --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." --num_frames 81
+
+
+请将方案 @sglang/docs_always/add_new_mode/add_videoedit_diffusers/README.md 进行结构化拆解，细分为大约四个可操作、可复用的步骤性文档。每个步骤文档需具备明确的标题、详细的操作步骤（可包含代码片段）、必要的注意事项，并附带可量化的验收标准。每个文档需指定交由一个agent独立负责实现，整体以串行流水线形式衔接推进，确保每一环节产出可作为下游输入，最终确保集成方案高效落地。
