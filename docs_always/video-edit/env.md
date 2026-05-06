@@ -23,7 +23,7 @@ python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/project
 export HTTP_PROXY="http://localhost:10909"
 export HTTPS_PROXY="http://localhost:10909"
 export ALL_PROXY="http://localhost:10909"
-source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /root/zhouhao6/VideoEdit-diffusers --add-dir /root/zhouhao6/video_diffusers/pexel_test_data_0410 --add-dir /root/zhouhao6/wan_eraser
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410 --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/wan_eraser
 
 UV_HTTP_TIMEOUT=1800 uv pip install \
   --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -36,10 +36,18 @@ UV_HTTP_TIMEOUT=1800 uv pip install \
 
   FlowMatchScheduler是否是一样的？
 
-  根据方案 @sglang/docs_always/add_new_mode/add_videoedit_diffusers/README.md，以及原始算法仓库 @/root/zhouhao6/VideoEdit-diffusers，完善/root/zhouhao6/video_diffusers/
+  根据方案 @sglang/docs_always/add_new_mode/add_videoedit_diffusers/README.md，以及原始算法仓库 @/mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers，完善/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/
   pretrain_models/Wan2.1-I2V-14B-480P-Diffusers，要求不新增文件，不要删除文件
 
-python3 infer.py  --video_path /root/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 --mask_path  /root/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 --output_name 15108907_3840_2160_50fps_No_bbox_mask.mp4 --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." --num_frames 81
+python3 infer.py  --video_path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 --mask_path  /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 --output_name 15108907_3840_2160_50fps_No_bbox_mask.mp4 --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." --num_frames 81
 
 
-请将方案 @sglang/docs_always/add_new_mode/add_videoedit_diffusers/README.md 进行结构化拆解，细分为大约四个可操作、可复用的步骤性文档。每个步骤文档需具备明确的标题、详细的操作步骤（可包含代码片段）、必要的注意事项，并附带可量化的验收标准。每个文档需指定交由一个agent独立负责实现，整体以串行流水线形式衔接推进，确保每一环节产出可作为下游输入，最终确保集成方案高效落地。
+依照 @/mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers 及 @/mnt/shanhai-ai/shanhai-workspace/zhouhao6/wan_eraser 源码，同时参考 @sglang/python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-add-model/SKILL.md 所述最佳实践，并以当前 @/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/docs_always/add_new_mode/add_videoedit_diffusers/README.md 集成方案为基础，提出优化和可落地的集成重构方案，具体完善如下：
+
+- 最好是新增文件，尽量不要修改原来的文件
+- 所有stage的中间变量全部放到WanVideoEditSamplingParams中，先给出stage，在给出WanVideoEditSamplingParams
+- 原始仓库基于i2v而来，不采用t2v，要新增任务VIDEO_EDIT任务，不复用t2v了
+- 重写WanVideoEditPipeline的forward函数，在forward函数中加一个for循环处理多个阶段，把多帧处理放在stage的外部，所有stage处理每81帧
+- 不要冒烟测试，直接端到端测试
+- 移除方案中冗余的部分
+- 完善文档中的目录

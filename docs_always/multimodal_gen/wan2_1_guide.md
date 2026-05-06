@@ -45,7 +45,7 @@ SGLang 的扩散能力打包在 `diffusion` extras 中，可以直接基于仓�
 ```bash
 cd /path/to/sglang/python
 uv venv --python 3.12 --seed /opt/venv
-source /opt/venv/bin/activate
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
 uv pip install --prerelease=allow ".[diffusion]"
 ```
 

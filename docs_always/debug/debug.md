@@ -6,7 +6,7 @@
 
 ```bash
 docker exec -it sglang-dev zsh
-source /opt/venv/bin/activate
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
 ```
 
 说明：
@@ -65,40 +65,40 @@ ls -d /root/.cache/huggingface/hub/models--Wan-AI--Wan2.1-I2V-14B-720P-Diffusers
 如果你不想手动找 snapshot hash，推荐直接下载到固定目录：
 
 ```bash
-mkdir -p /data/models
+mkdir -p /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models
 
 hf download Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --local-dir /root/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers
 
 hf download Wan-AI/Wan2.1-T2V-14B-Diffusers \
-    --local-dir /root/zhouhao6/models/Wan2.1-T2V-14B-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-T2V-14B-Diffusers
 
 hf download Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
-    --local-dir /root/zhouhao6/models/Wan2.1-I2V-14B-480P-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-I2V-14B-480P-Diffusers
 
 hf download Wan-AI/Wan2.1-I2V-14B-720P-Diffusers \
-    --local-dir /root/zhouhao6/models/Wan2.1-I2V-14B-720P-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-I2V-14B-720P-Diffusers
 
 hf download IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers \
-    --local-dir /root/zhouhao6/models/TurboWan2.1-T2V-1.3B-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/TurboWan2.1-T2V-1.3B-Diffusers
 
 hf download IPostYellow/TurboWan2.1-T2V-14B-Diffusers \
-    --local-dir /root/zhouhao6/models/TurboWan2.1-T2V-14B-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/TurboWan2.1-T2V-14B-Diffusers
 
 hf download IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers \
-    --local-dir /root/zhouhao6/models/TurboWan2.1-T2V-14B-720P-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/TurboWan2.1-T2V-14B-720P-Diffusers
 
 hf download FastVideo/FastWan2.1-T2V-1.3B-Diffusers \
-    --local-dir /root/zhouhao6/models/FastWan2.1-T2V-1.3B-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/FastWan2.1-T2V-1.3B-Diffusers
 
 hf download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers \
-    --local-dir /root/zhouhao6/models/Wan2.1-Fun-1.3B-InP-Diffusers
+    --local-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-Fun-1.3B-InP-Diffusers
 ```
 
 下载到固定目录后，`--model-path` 可以直接写：
 
 ```bash
---model-path /root/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers
+--model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers
 ```
 
 ## 2. 已跑通过的命令
@@ -107,7 +107,7 @@ hf download weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers \
 
 ```bash
 sglang generate \
-    --model-path /root/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers \
+    --model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers \
     --text-encoder-cpu-offload \
     --pin-cpu-memory \
     --prompt "A curious raccoon walking through an autumn forest, cinematic lighting" \
