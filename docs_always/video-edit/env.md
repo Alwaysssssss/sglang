@@ -23,7 +23,7 @@ python3 infer.py --video_path /mnt/shanhai-ai/shanhai-workspace/fanruidi/project
 export HTTP_PROXY="http://localhost:10909"
 export HTTPS_PROXY="http://localhost:10909"
 export ALL_PROXY="http://localhost:10909"
-export PATH="/opt/node-v22/bin:$PATH" && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /root/zhouhao6/VideoEdit-diffusers --add-dir /root/zhouhao6/video_diffusers/pexel_test_data_0410 --add-dir /root/zhouhao6/wan_eraser
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --full-auto --add-dir /root/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model --add-dir /root/zhouhao6/VideoEdit-diffusers --add-dir /root/zhouhao6/video_diffusers/pexel_test_data_0410 --add-dir /root/zhouhao6/wan_eraser
 
 UV_HTTP_TIMEOUT=1800 uv pip install \
   --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
