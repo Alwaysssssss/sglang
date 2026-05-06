@@ -146,7 +146,7 @@ sglang generate \
 
 ```bash
 sglang generate \
-    --model-path /root/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B-Diffusers/snapshots/0fad780a534b6463e45facd96134c9f345acfa5b \
+    --model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/models/Wan2.1-T2V-1.3B-Diffusers \
     --num-gpus 2 \
     --ulysses-degree 2 \
     --text-encoder-cpu-offload \
