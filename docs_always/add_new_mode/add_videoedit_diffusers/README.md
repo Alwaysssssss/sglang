@@ -9,7 +9,7 @@
 - 测试视频：`/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4`
 - 测试 mask：`/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4`
 
-目标不是把 `VideoEdit-diffusers` 原仓库整体搬进 SGLang，而是新增一条原生 `VIDEO_EDIT` 任务链路。除注册点和 enum 这类必要入口外，优先新增文件，尽量不改已有 Wan / T2V / I2V 实现。
+目标不是把 `VideoEdit-diffusers` 原仓库整体搬进 SGLang，而是新增一条原生 `VIDEO_EDIT` 任务链路。除注册点和 enum 这类必要入口外，优先新增文件，尽量不改已有 Wan 实现。
 
 ## 目录
 
@@ -17,24 +17,25 @@
 2. Reference 行为拆解
 3. 新任务类型 `VIDEO_EDIT`
 4. 新增文件与最小修改清单
-5. `WanVideoEditPipeline.forward` 重构
-6. Stage 设计
-7. `WanVideoEditSamplingParams` 设计
-8. 长视频窗口策略
-9. 服务与 CLI 方案
-10. 端到端测试方案
-11. 实施顺序
+5. WanTransformer3DModel 结构比较
+6. `WanVideoEditPipeline.forward` 重构
+7. Stage 设计
+8. `WanVideoEditSamplingParams` 设计
+9. 长视频窗口策略
+10. 服务与 CLI 方案
+11. 端到端测试方案
+12. 实施顺序
 
 ## 1. 结论与关键改动
 
 本次重构采用 skill 中推荐的 Hybrid 思路，但不是把 reference `__call__` 原样复制为一个巨型函数。推荐做法是：
 
-- 新增 `ModelTaskType.VIDEO_EDIT`，不复用 `T2V`，也不伪装成 `I2V/TI2V`。
+- 新增 `ModelTaskType.VIDEO_EDIT`，不伪装成已有生成任务。
 - 新增 `WanVideoEditPipeline`，重写 `forward`，由 `forward` 做长视频窗口编排和 stage 循环。
 - 所有 stage 只处理单个 81 帧窗口；多窗口、反射补齐、窗口融合、paste-back 编排放在 stage 外部。
 - 所有 stage 的运行态中间变量统一写入 `WanVideoEditSamplingParams`，不再散落到 `batch.extra`、`Req` 顶层或 helper 私有字段。
-- 复用现有 Wan DiT / VAE / text encoder / tokenizer loader；新增 VideoEdit scheduler adapter、stage、preprocess/postprocess 纯函数。
-- 删除 dry-run / 冒烟测试方案，验收只保留 reference baseline、SGLang CLI、SGLang serve 三条端到端测试。
+- 复用现有 Wan VAE / text encoder / tokenizer loader；DiT 复用底层模块和权重映射，但新增 VideoEdit 专用入口文件；同时新增 VideoEdit scheduler adapter、stage、preprocess/postprocess 纯函数。
+- 验收只保留 reference baseline、SGLang CLI、SGLang serve 三条端到端测试。
 
 必须对齐的模型契约：
 
@@ -99,9 +100,6 @@ wan_eraser 只作为服务行为参考，不复用其协议：
 
 ```python
 class ModelTaskType(Enum):
-    I2V = auto()
-    T2V = auto()
-    TI2V = auto()
     VIDEO_EDIT = auto()
 ```
 
@@ -132,8 +130,10 @@ def data_type(self) -> DataType:
 ```text
 python/sglang/multimodal_gen/configs/pipeline_configs/videoedit_wan.py
 python/sglang/multimodal_gen/configs/sample/videoedit_wan.py
+python/sglang/multimodal_gen/configs/models/dits/wan_videoedit.py
 python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py
 python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py
+python/sglang/multimodal_gen/runtime/models/dits/wan_videoedit.py
 python/sglang/multimodal_gen/runtime/models/schedulers/videoedit_flow_match.py
 python/sglang/multimodal_gen/runtime/videoedit/__init__.py
 python/sglang/multimodal_gen/runtime/videoedit/contracts.py
@@ -141,6 +141,7 @@ python/sglang/multimodal_gen/runtime/videoedit/preprocess.py
 python/sglang/multimodal_gen/runtime/videoedit/postprocess.py
 python/sglang/multimodal_gen/runtime/videoedit/windowing.py
 python/sglang/multimodal_gen/runtime/videoedit/io.py
+python/sglang/multimodal_gen/runtime/videoedit/compare.py
 python/sglang/multimodal_gen/runtime/videoedit/cli.py
 ```
 
@@ -156,7 +157,7 @@ python/sglang/multimodal_gen/runtime/entrypoints/openai/protocol.py
 python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py
 ```
 
-这些修改只做注册、协议和 endpoint 增量，不改现有 Wan T2V/I2V pipeline 的行为。
+这些修改只做注册、协议和 endpoint 增量，不改现有 Wan pipeline 的行为。
 
 ### 4.3 模型目录
 
@@ -179,8 +180,8 @@ VideoEdit-diffusers-model/
   "_class_name": "WanVideoEditPipeline",
   "tokenizer": ["transformers", "AutoTokenizer"],
   "text_encoder": ["transformers", "UMT5EncoderModel"],
-  "vae": ["sglang", "WanVAE"],
-  "transformer": ["sglang", "WanTransformer3DModel"],
+  "vae": ["diffusers", "AutoencoderKLWan"],
+  "transformer": ["sglang", "WanVideoEditTransformer3DModel"],
   "scheduler": ["sglang", "VideoEditFlowMatchScheduler"]
 }
 ```
@@ -193,7 +194,147 @@ VideoEdit-diffusers-model/
 
 业务参数不要用通用 unknown args 传给 `sglang serve`，避免 `--xxx-path` 被 `ServerArgs._extract_component_paths()` 误解析为组件路径。
 
-## 5. `WanVideoEditPipeline.forward` 重构
+## 5. WanTransformer3DModel 结构比较
+
+对比对象：
+
+- reference：`VideoEdit-diffusers/models/transformer_wan.py`
+- SGLang：`python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py`
+- 本地权重配置：`VideoEdit-diffusers-model/transformer/config.json`
+
+### 5.1 配置对比
+
+VideoEdit transformer config：
+
+```json
+{
+  "_class_name": "WanTransformer3DModel",
+  "patch_size": [1, 2, 2],
+  "num_attention_heads": 40,
+  "attention_head_dim": 128,
+  "in_channels": 36,
+  "out_channels": 16,
+  "text_dim": 4096,
+  "freq_dim": 256,
+  "ffn_dim": 13824,
+  "num_layers": 40,
+  "cross_attn_norm": true,
+  "qk_norm": "rms_norm_across_heads",
+  "eps": 1e-6,
+  "image_dim": 1280,
+  "added_kv_proj_dim": 5120,
+  "rope_max_seq_len": 1024,
+  "pos_embed_seq_len": null
+}
+```
+
+SGLang `WanVideoConfig` 已支持这些字段，但默认 `in_channels=16`。VideoEdit 必须用专属 config 覆盖为：
+
+```python
+in_channels = 36
+out_channels = 16
+image_dim = 1280
+added_kv_proj_dim = 5120
+num_channels_latents = 16
+```
+
+### 5.2 模块结构对比
+
+| 模块 | reference | SGLang 当前 Wan | 结论 |
+| --- | --- | --- | --- |
+| patch embedding | `nn.Conv3d(in_channels, inner_dim, kernel_size=patch_size, stride=patch_size)` | `PatchEmbed(...).proj` | 参数结构可映射，设置 `in_channels=36` 后可加载 |
+| rope | `WanRotaryPosEmbed` | `NDRotaryEmbedding` | 数学等价，SGLang 额外支持 SP shard |
+| time embedding | `Timesteps + TimestepEmbedding + time_proj` | `TimestepEmbedder + ModulateProjection` | 参数通过 `param_names_mapping` 映射 |
+| text embedder | `PixArtAlphaTextProjection` | `MLP(..., act_type="gelu_pytorch_tanh")` | 参数通过 `param_names_mapping` 映射 |
+| image embedder | `WanImageEmbedding(1280 -> 5120)` | `WanImageEmbedding(1280 -> 5120)` | 结构等价 |
+| self attention | `attn1.to_q/to_k/to_v/to_out + RMSNorm` | 同名语义，TP/SP 优化实现 | 参数结构可映射 |
+| cross attention | `attn2.to_q/to_k/to_v/to_out + add_k_proj/add_v_proj` | 同样有 I2V cross-attn 分支 | 参数结构可映射，但上下文切分语义不同 |
+| ffn | diffusers `FeedForward` | SGLang `MLP` | 参数通过 `param_names_mapping` 映射 |
+| output projection | `proj_out` | `ColumnParallelLinear proj_out` | 参数结构可映射 |
+
+结论：权重参数结构接近 Wan I2V，且 SGLang 当前 `wanvideo.py` 已经具备大部分可复用低层模块和权重映射能力。但按可执行模型结构判断，VideoEdit 与当前 `WanTransformer3DModel` 的 I2V forward 语义不同，不能直接复用当前类。
+
+### 5.3 关键差异：cross-attention image context 切分
+
+reference 的 `WanAttnProcessor` 在有 `add_k_proj` 时这样切分：
+
+```python
+image_context_length = encoder_hidden_states.shape[1] - 512
+encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+```
+
+VideoEdit pipeline 只传文本 embedding，长度为 512，因此：
+
+```python
+image_context_length = 0
+```
+
+也就是说，VideoEdit 权重虽然保留 I2V 的 `add_k_proj/add_v_proj` 结构，但该路径在当前推理输入中没有真实 image tokens。reference 的行为是“允许 0 个 image tokens”。
+
+SGLang 当前 `WanI2VCrossAttention` 固定切分：
+
+```python
+context_img = context[:, :257]
+context = context[:, 257:]
+```
+
+这适合现有 Wan I2V 图像条件链路，但不适合 VideoEdit。若 VideoEdit 只传 512 个 text tokens，当前 SGLang 会错误地把前 257 个 text tokens 当成 image context，导致 cross-attention 语义偏离 reference。
+
+### 5.4 决策：新增 VideoEdit DiT 文件
+
+由于关键 forward 语义不同，首版不要直接复用 `runtime/models/dits/wanvideo.py` 的 `WanTransformer3DModel`。新增：
+
+```text
+python/sglang/multimodal_gen/configs/models/dits/wan_videoedit.py
+python/sglang/multimodal_gen/runtime/models/dits/wan_videoedit.py
+```
+
+新增类：
+
+```python
+class WanVideoEditConfig(WanVideoConfig):
+    arch_config = WanVideoEditArchConfig()
+
+
+class WanVideoEditTransformer3DModel(WanTransformer3DModel):
+    ...
+```
+
+实现策略：
+
+- 复用 SGLang `PatchEmbed`、`WanTimeTextImageEmbedding`、`WanImageEmbedding`、rotary、TP/SP、offload、Teacache 和权重映射。
+- 新增 `WanVideoEditCrossAttention`，不要硬编码 257。
+- 新增 `WanVideoEditTransformerBlock`，只替换 cross-attention 类型。
+- `WanVideoEditTransformer3DModel.forward()` 保持 SGLang 的 TP/SP/缓存能力，但在 cross-attention 前保留 reference 的动态切分语义。
+
+建议 cross-attention 切分：
+
+```python
+text_context_len = 512
+image_context_length = max(context.shape[1] - text_context_len, 0)
+context_img = context[:, :image_context_length]
+context_text = context[:, image_context_length:]
+```
+
+当 `image_context_length == 0` 时：
+
+- 不调用 `add_k_proj/add_v_proj` attention。
+- 只执行 text cross-attention。
+- 保留 `add_k_proj/add_v_proj` 参数用于加载 VideoEdit 权重，但 forward 中不让空 image context 改变结果。
+
+### 5.5 何时可以回退为复用
+
+只有同时满足以下条件，才可以不新增 DiT 文件、直接复用现有 `wanvideo.py`：
+
+- SGLang 当前 `WanI2VCrossAttention` 改为支持动态 image token 数。
+- 对现有 Wan I2V 的 257 image token 行为保持兼容。
+- VideoEdit 只传 512 text tokens 时，与 reference 首步 DiT 输出对齐。
+- VideoEdit 权重 `in_channels=36/out_channels=16` 通过同一个 config 路径 fail-fast 校验。
+
+在这些条件未满足前，新增 `wan_videoedit.py` 是更稳妥的落地方案，也符合“优先新增文件，尽量不修改原文件”的约束。
+
+## 6. `WanVideoEditPipeline.forward` 重构
 
 新增 pipeline：
 
@@ -256,7 +397,7 @@ def forward(self, req, server_args):
 - 多帧 / 长视频编排不进入 stage。
 - stage 不需要知道全局视频长度、窗口数量、overlap 融合或最终输出路径。
 
-## 6. Stage 设计
+## 7. Stage 设计
 
 先定义 stage，再定义 `WanVideoEditSamplingParams`。所有 stage 间中间变量都写入 `params`。
 
@@ -274,7 +415,7 @@ VideoEditWindowValidationStage
   -> VideoEditWindowPostprocessStage
 ```
 
-### 6.1 VideoEditWindowValidationStage
+### 7.1 VideoEditWindowValidationStage
 
 输入：`params.runtime_window_frames`、`params.runtime_window_masks`。
 
@@ -293,7 +434,7 @@ VideoEditWindowValidationStage
 - `(infer_len - 1) % 4 == 0`。
 - `height`、`width` 可被 16 整除。
 
-### 6.2 VideoEditTextEncodingStage
+### 7.2 VideoEditTextEncodingStage
 
 复用 Wan T5 tokenizer / text encoder，但输出写入 `params`：
 
@@ -303,7 +444,7 @@ VideoEditWindowValidationStage
 
 当当前 dynamic CFG 已经降到 `<= 1.0` 时，denoising stage 可以跳过 negative pass，但 text encoding stage 仍可提前准备 negative embeds，避免控制流分散。
 
-### 6.3 VideoEditConditionEncodingStage
+### 7.3 VideoEditConditionEncodingStage
 
 职责：
 
@@ -334,7 +475,7 @@ params.runtime_condition_latent = torch.cat(
 
 不再写 `batch.image_latent` 作为 VideoEdit 的主要上下文来源；如果复用底层 denoising helper 需要该字段，可以在 denoising 前由 stage 从 `params.runtime_condition_latent` 同步一次。
 
-### 6.4 VideoEditLatentPreparationStage
+### 7.4 VideoEditLatentPreparationStage
 
 职责：
 
@@ -349,7 +490,7 @@ params.runtime_condition_latent = torch.cat(
 
 此 stage 只准备纯噪声，不做 `add_noise(video_latents)`。
 
-### 6.5 VideoEditTimestepPreparationStage
+### 7.5 VideoEditTimestepPreparationStage
 
 职责：
 
@@ -364,7 +505,7 @@ params.runtime_condition_latent = torch.cat(
 
 reference 语义是“先生成完整 timesteps，再按 strength 裁剪”，不要把 `strength` 伪装成 `set_timesteps()` 参数。
 
-### 6.6 VideoEditLatentInitStage
+### 7.6 VideoEditLatentInitStage
 
 职责：
 
@@ -381,7 +522,7 @@ params.runtime_latents = scheduler.add_noise(
 - `params.runtime_latents`
 - `params.runtime_initial_timestep`
 
-### 6.7 VideoEditDenoisingStage
+### 7.7 VideoEditDenoisingStage
 
 职责：
 
@@ -443,7 +584,7 @@ for i, t in enumerate(params.runtime_timesteps):
 
 MVP 可以先不支持 CFG parallel；如果后续启用，需要保证 `do_cfg=False` 时各 rank 控制流一致。
 
-### 6.8 VideoEditDecodingStage
+### 7.8 VideoEditDecodingStage
 
 职责：
 
@@ -455,7 +596,7 @@ MVP 可以先不支持 CFG parallel；如果后续启用，需要保证 `do_cfg=
 - `params.runtime_decoded_video_tensor`
 - `params.runtime_window_output_frames`
 
-### 6.9 VideoEditWindowPostprocessStage
+### 7.9 VideoEditWindowPostprocessStage
 
 职责：
 
@@ -470,7 +611,7 @@ MVP 可以先不支持 CFG parallel；如果后续启用，需要保证 `do_cfg=
 
 全局 paste-back、overlap 融合、音频拷贝由 `WanVideoEditPipeline.forward()` 的 `_finalize_long_video_output()` 完成。
 
-## 7. `WanVideoEditSamplingParams` 设计
+## 8. `WanVideoEditSamplingParams` 设计
 
 `WanVideoEditSamplingParams` 同时承担两类字段：
 
@@ -601,7 +742,7 @@ class WanVideoEditSamplingParams(SamplingParams):
 - `guidance_scale <= 1.0` 时 negative prompt 可为空。
 - `drop_reference_frame` 显式控制是否沿用 reference 保存策略跳过第 0 帧。
 
-## 8. 长视频窗口策略
+## 9. 长视频窗口策略
 
 窗口生成由 `runtime/videoedit/windowing.py` 提供，pipeline forward 调用。stage 不直接接触窗口规划。
 
@@ -646,9 +787,9 @@ class VideoEditWindowSpec:
 - 若 bbox 面积过小，沿用 reference 的小 bbox 扩张策略。
 - 后续可以新增 `bbox_mode="window"`，但不作为首版目标。
 
-## 9. 服务与 CLI 方案
+## 10. 服务与 CLI 方案
 
-### 9.1 本地 CLI
+### 10.1 本地 CLI
 
 新增：
 
@@ -659,7 +800,8 @@ python/sglang/multimodal_gen/runtime/videoedit/cli.py
 命令：
 
 ```bash
-source /opt/venv/bin/activate
+conda deactivate
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
 cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 
 python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
@@ -681,9 +823,7 @@ python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --drop-reference-frame
 ```
 
-不提供 `--dry-run` 作为验收路径。参数解析类测试可以有，但文档验收以端到端为准。
-
-### 9.2 Serve API
+### 10.2 Serve API
 
 新增专用 endpoint：
 
@@ -742,7 +882,8 @@ if active_videoedit_jobs + queued_videoedit_jobs >= queue_capacity:
 服务启动：
 
 ```bash
-source /opt/venv/bin/activate
+conda deactivate
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
 cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 
 VIDEOEDIT_QUEUE_CAPACITY=1 \
@@ -780,14 +921,13 @@ curl -s -X POST http://127.0.0.1:30000/v1/videos/repairs \
   }'
 ```
 
-## 10. 端到端测试方案
+## 11. 端到端测试与逐帧对齐
 
-不再写冒烟测试作为验收。端到端测试分三步。
-
-### 10.1 Reference baseline
+### 11.1 Reference baseline
 
 ```bash
-source /opt/venv/bin/activate
+deactivate
+conda activate VideoEdit
 cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers
 
 python infer.py \
@@ -795,7 +935,7 @@ python infer.py \
   --mask_path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
   --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
   --model_path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
-  --transformer_path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
+  --transformer_path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/wan_converted_step_9500 \
   --output_dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/reference \
   --output_name 15108907_3840_2160_50fps \
   --num_frames 81 \
@@ -808,15 +948,15 @@ python infer.py \
 
 注意：reference `--transformer_path` 传 overlay 根目录，因为其代码内部再加 `subfolder="transformer"`。
 
-### 10.2 SGLang CLI 端到端
+### 11.2 SGLang CLI 端到端
 
-使用第 9.1 节的 `videoedit.cli repair` 命令，输出：
+使用第 10.1 节的 `videoedit.cli repair` 命令，输出：
 
 ```text
 /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4
 ```
 
-### 10.3 SGLang Serve 端到端
+### 11.3 SGLang Serve 端到端
 
 启动服务、提交 `/v1/videos/repairs`、轮询状态，直到 `completed`。
 
@@ -835,7 +975,7 @@ while true; do
 done
 ```
 
-### 10.4 输出检查
+### 11.4 输出检查
 
 ```bash
 python - <<'PY'
@@ -856,24 +996,156 @@ PY
 
 `80` 帧表示显式启用了 `drop_reference_frame`，`81` 帧表示保留完整窗口输出。两种行为都必须由 CLI/API 参数显式控制，不能让 CLI 和 serve 隐式不一致。
 
-## 11. 实施顺序
+### 11.5 Reference 逐帧对齐
+
+集成后的输出必须与原始 `VideoEdit-diffusers/infer.py` 的输出做自动化逐帧对齐。只检查视频能打开、帧数正确还不够；必须验证视觉效果和数值尺度没有大范围偏移。
+
+新增独立模块：
+
+```text
+python/sglang/multimodal_gen/runtime/videoedit/compare.py
+```
+
+比较口径：
+
+- 逐帧读取 reference mp4 和 SGLang candidate mp4。
+- 对每一帧计算 `SSIM`、`MSE`、`MAE`、`PSNR`、`max_abs_diff`。
+- 输出全局统计：`ssim_mean`、`ssim_min`、`mse_mean`、`mse_max`、`mae_mean`、`mae_max`、`failed_frames`。
+- 任一帧低于阈值即记录到 `failed_frames`；默认允许少量失败帧，用于兼容 H.264/HEVC 编码器以及不同 attention backend / GPU kernel 引入的微小漂移。
+- 允许 frame count 有 1 帧差异,用于兼容 reference 默认跳过第 0 帧的保存策略；差异必须通过 `drop_reference_first_frame` 或 `drop_candidate_first_frame` 显式指定。
+
+默认阈值建议（宽松基线，用于发现「质性偏差」而不是 bit-exact 一致性）：
+
+```text
+min_ssim = 0.90
+max_mse = 150.0
+max_mae = 8.0
+allow_frame_count_delta = 1
+max_failed_frame_ratio = 0.05
+```
+
+这些阈值用于发现整帧错误、通道顺序错误、尺度错误、mask packing 错误、窗口提交错位和解码后处理错误，而不要求逐像素一致。视频编码器（H.264/HEVC）的有损压缩、不同 attention backend（FA2/FA3/torch SDPA）、不同 GPU 数值精度、VAE/dtype 差异都可能带来 SSIM 0.93-0.98 量级的小波动，按 0.985 这种严格阈值会大量误报。
+
+如果只关心是否完全跑通，不关心微小漂移，可以使用更宽松的「smoke」阈值：
+
+```text
+min_ssim = 0.80
+max_mse = 400.0
+max_mae = 15.0
+max_failed_frame_ratio = 0.10
+```
+
+如果是非常稳定的对照（同一台机、同一个 backend、同一个视频编码器），可以收紧成「strict」阈值用于 release gate：
+
+```text
+min_ssim = 0.95
+max_mse = 60.0
+max_mae = 5.0
+max_failed_frame_ratio = 0.0
+```
+
+无论选择哪一档，都必须保留 `ssim_min` 和 `mse_max` 的上报，便于事后定位回归。
+
+CLI 用法：
+
+```bash
+python python/sglang/multimodal_gen/runtime/videoedit/compare.py \
+  --reference /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/reference/15108907_3840_2160_50fps.mp4 \
+  --candidate /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4 \
+  --report-json /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/videoedit_compare_report.json \
+  --min-ssim 0.90 \
+  --max-mse 150.0 \
+  --max-mae 8.0 \
+  --allow-frame-count-delta 1 \
+  --max-failed-frame-ratio 0.05
+```
+
+如果 reference 输出是 80 帧、candidate 输出是 81 帧，则必须明确指定丢弃哪一侧的第 0 帧：
+
+```bash
+python python/sglang/multimodal_gen/runtime/videoedit/compare.py \
+  --reference /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/reference/15108907_3840_2160_50fps.mp4 \
+  --candidate /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps.mp4 \
+  --drop-candidate-first-frame \
+  --report-json /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/videoedit_compare_report.json
+```
+
+退出码语义：
+
+- `0`：逐帧指标全部通过。
+- `1`：存在失败帧或全局统计不满足阈值。
+- 非 `0/1` 异常：视频打不开、帧数差异超过容忍范围、无帧可比或参数错误。
+
+JSON report 结构：
+
+```json
+{
+  "summary": {
+    "compared_frames": 80,
+    "ssim_mean": 0.952,
+    "ssim_min": 0.918,
+    "mse_mean": 60.4,
+    "mse_max": 132.7,
+    "mae_mean": 4.6,
+    "mae_max": 7.4,
+    "psnr_mean": 30.3,
+    "max_abs_diff": 64,
+    "failed_frames": [],
+    "pass_compare": true,
+    "thresholds": {
+      "min_ssim": 0.90,
+      "max_mse": 150.0,
+      "max_mae": 8.0,
+      "max_failed_frame_ratio": 0.05
+    }
+  },
+  "frames": [
+    {
+      "index": 0,
+      "ssim": 0.948,
+      "mse": 65.1,
+      "mae": 4.8,
+      "psnr": 30.0,
+      "max_abs_diff": 58,
+      "pass_frame": true
+    }
+  ]
+}
+```
+
+CI / nightly 建议：
+
+- PR 阶段：只跑 lightweight unit，确保 comparison 模块能对 synthetic identical / shifted videos 给出正确通过和失败。
+- GPU nightly：跑 reference `infer.py`、SGLang CLI、逐帧 compare，保存 JSON report 为 artifact。
+- release gate：必须对固定 seed、固定 prompt、固定前 81 帧样例通过逐帧对齐。
+- future update：每次更新 DiT、scheduler、VAE、preprocess/postprocess、attention backend 或 windowing，都必须重新生成 compare report。
+
+对齐失败定位顺序：
+
+1. `ssim_min` 很低且 `mse_max` 很高：优先检查帧错位、BGR/RGB 通道、`drop_reference_frame`、视频 resize。
+2. 全部帧 MSE 接近常数偏大：优先检查像素归一化、VAE mean/std、decode 后 `[0,1]` 到 `[0,255]` 尺度转换。
+3. 只有 mask 区域差异大：优先检查 `cond_masks` preserve/inpaint 语义、mask packing、首帧黑 mask。
+4. 越到后面差异越大：优先检查 scheduler timesteps、`add_noise(video_latents)`、dynamic CFG。
+5. 每 81 帧边界附近差异大：优先检查 window commit map、overlap 融合和 `use_repaired_context`。
+
+## 12. 实施顺序
 
 1. 新增 `ModelTaskType.VIDEO_EDIT` 和 registry 注册。
-2. 新增 `WanVideoEditPipelineConfig`，显式设置 `task_type=VIDEO_EDIT`、DiT `in_channels=36`、`out_channels=16`，VAE encoder/decoder 都加载。
-3. 新增 `WanVideoEditSamplingParams`，先落请求字段，再落全部 `runtime_*` 中间变量。
-4. 新增 `VideoEditFlowMatchScheduler`，对齐 `shift=5`、`sigma_min=0.0`、`extra_one_step=True`、`add_noise()`、`get_timesteps()`。
-5. 新增 `runtime/videoedit/preprocess.py`、`postprocess.py`、`windowing.py`、`io.py`，从 reference 迁移纯函数，不 import 原仓库。
-6. 新增 `videoedit_wan.py` stages，所有中间结果只写 `WanVideoEditSamplingParams`。
-7. 新增 `WanVideoEditPipeline.forward`，外层处理窗口，内层循环 stage，每个 stage 固定 81 帧。
-8. 新增本地 CLI `repair`，跑通第一条端到端。
-9. 新增 serve `/v1/videos/repairs`，实现单任务 admission、后台执行、查询、下载和 `/healthz`。
-10. 跑 reference baseline、SGLang CLI、SGLang serve 三条端到端验收。
+2. 新增 `WanVideoEditTransformer3DModel` 和 `WanVideoEditConfig`，保留 SGLang Wan 底层模块，修正 VideoEdit 的 cross-attention context 切分语义。
+3. 新增 `WanVideoEditPipelineConfig`，显式设置 `task_type=VIDEO_EDIT`、DiT `in_channels=36`、`out_channels=16`，VAE encoder/decoder 都加载。
+4. 新增 `WanVideoEditSamplingParams`，先落请求字段，再落全部 `runtime_*` 中间变量。
+5. 新增 `VideoEditFlowMatchScheduler`，对齐 `shift=5`、`sigma_min=0.0`、`extra_one_step=True`、`add_noise()`、`get_timesteps()`。
+6. 新增 `runtime/videoedit/preprocess.py`、`postprocess.py`、`windowing.py`、`io.py`、`compare.py`，从 reference 迁移纯函数，不 import 原仓库，并提供逐帧对齐统计。
+7. 新增 `videoedit_wan.py` stages，所有中间结果只写 `WanVideoEditSamplingParams`。
+8. 新增 `WanVideoEditPipeline.forward`，外层处理窗口，内层循环 stage，每个 stage 固定 81 帧。
+9. 新增本地 CLI `repair`，跑通第一条端到端。
+10. 新增 serve `/v1/videos/repairs`，实现单任务 admission、后台执行、查询、下载和 `/healthz`。
+11. 跑 reference baseline、SGLang CLI、SGLang serve 三条端到端验收。
+12. 运行 `runtime/videoedit/compare.py` 生成逐帧对齐 JSON report，只有 SSIM/MSE/MAE 阈值全部通过才算集成完成。
 
 首版不要做的事：
 
-- 不复用 `T2V` task_type。
 - 不复用 I2V/TI2V 的 image input 分支。
-- 不复制 Wan Transformer / Wan VAE。
+- 不复制整份通用 Wan Transformer / Wan VAE；DiT 只新增 VideoEdit 必需的差异入口和 cross-attention 适配。
 - 不把长视频窗口逻辑放进 stage。
 - 不把 stage 中间变量放到 `batch.extra` 或新增一堆 `Req` 顶层字段。
-- 不用 dry-run / smoke test 代替端到端验收。
