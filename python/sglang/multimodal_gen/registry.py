@@ -39,6 +39,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanI2V720PConfig,
     WanT2V480PConfig,
     WanT2V720PConfig,
+    WanVideoEditPipelineConfig,
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
@@ -112,6 +113,9 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanI2V_14B_720P_SamplingParam,
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.videoedit_wan import (
+    WanVideoEditSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
@@ -708,6 +712,17 @@ def _register_configs():
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=WanVideoEditSamplingParams,
+        pipeline_config_cls=WanVideoEditPipelineConfig,
+        hf_model_paths=[
+            "VideoEdit-diffusers-model",
+        ],
+        model_detectors=[
+            lambda hf_id: "videoedit" in hf_id.lower(),
+            lambda hf_id: "wanvideoeditpipeline" in hf_id.lower(),
         ],
     )
     # MOVA

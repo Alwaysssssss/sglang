@@ -49,6 +49,7 @@ class ModelTaskType(Enum):
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
+    VIDEO_EDIT = auto()  # Video + Mask to Video
 
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image

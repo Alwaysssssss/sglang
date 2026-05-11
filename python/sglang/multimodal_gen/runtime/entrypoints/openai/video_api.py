@@ -8,6 +8,7 @@ import tempfile
 import time
 from typing import Any, Dict, Optional
 
+import httpx
 from fastapi import (
     APIRouter,
     File,
@@ -24,9 +25,13 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.sample.videoedit_wan import (
+    WanVideoEditSamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
     VideoListResponse,
+    VideoRepairRequest,
     VideoResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
@@ -47,6 +52,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
+
+_VIDEOEDIT_QUEUE_CAPACITY = max(1, int(os.environ.get("VIDEOEDIT_QUEUE_CAPACITY", "1")))
+_VIDEOEDIT_SEMAPHORE = asyncio.Semaphore(_VIDEOEDIT_QUEUE_CAPACITY)
 
 
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
@@ -162,6 +170,178 @@ async def _dispatch_job_async(
     finally:
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
+
+
+async def _save_video_source_to_path(source: str, target_path: str) -> str:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    if source.lower().startswith(("http://", "https://")):
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(source, timeout=60.0)
+            response.raise_for_status()
+        if not os.path.splitext(target_path)[1]:
+            target_path = f"{target_path}.mp4"
+        with open(target_path, "wb") as f:
+            f.write(response.content)
+        return target_path
+
+    if not os.path.exists(source):
+        raise FileNotFoundError(f"Input video path does not exist: {source}")
+    if os.path.abspath(source) == os.path.abspath(target_path):
+        return source
+    if not os.path.splitext(target_path)[1]:
+        _, ext = os.path.splitext(source)
+        target_path = f"{target_path}{ext or '.mp4'}"
+    shutil.copyfile(source, target_path)
+    return target_path
+
+
+def _split_output_path(output_path: str | None, job_id: str, server_output_path: str | None):
+    if output_path and os.path.splitext(output_path)[1].lower() == ".mp4":
+        return os.path.dirname(os.path.abspath(output_path)), os.path.basename(output_path)
+    output_dir = output_path or server_output_path
+    return output_dir, f"{job_id}.mp4"
+
+
+def _video_repair_job_from_sampling(
+    request_id: str, req: VideoRepairRequest, sampling: SamplingParams
+) -> Dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "video",
+        "model": req.model or "videoedit",
+        "status": "queued",
+        "progress": 0,
+        "created_at": int(time.time()),
+        "size": "",
+        "seconds": "",
+        "quality": "standard",
+        "file_path": os.path.abspath(sampling.output_file_path()),
+    }
+
+
+async def _dispatch_video_repair_job_async(
+    job_id: str,
+    batch: Req,
+    *,
+    temp_dirs: list[str] | None = None,
+    output_persistent: bool = True,
+) -> None:
+    try:
+        await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
+        await _dispatch_job_async(
+            job_id,
+            batch,
+            temp_dirs=None,
+            output_persistent=output_persistent,
+        )
+    finally:
+        _VIDEOEDIT_SEMAPHORE.release()
+        for td in temp_dirs or []:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+@router.post("/repairs", response_model=VideoResponse)
+async def create_video_repair(req: VideoRepairRequest):
+    if _VIDEOEDIT_SEMAPHORE.locked():
+        raise HTTPException(status_code=429, detail="videoedit_queue_full")
+    await _VIDEOEDIT_SEMAPHORE.acquire()
+
+    server_args = get_global_server_args()
+    request_id = req.task_id or generate_request_id()
+    temp_dirs: list[str] = []
+
+    try:
+        uploads_dir = server_args.input_save_path
+        if uploads_dir is None:
+            uploads_dir = tempfile.mkdtemp(prefix="sglang_videoedit_input_")
+            temp_dirs.append(uploads_dir)
+        os.makedirs(uploads_dir, exist_ok=True)
+
+        video_input_path = req.video_input_path
+        mask_input_path = req.mask_input_path
+        if req.video_url:
+            video_input_path = await _save_video_source_to_path(
+                req.video_url, os.path.join(uploads_dir, f"{request_id}_video")
+            )
+        if req.mask_url:
+            mask_input_path = await _save_video_source_to_path(
+                req.mask_url, os.path.join(uploads_dir, f"{request_id}_mask")
+            )
+        if not video_input_path:
+            raise HTTPException(status_code=400, detail="video_input_path or video_url is required")
+        if not mask_input_path:
+            raise HTTPException(status_code=400, detail="mask_input_path or mask_url is required")
+
+        output_dir, output_file_name = _split_output_path(
+            req.output_path, request_id, server_args.output_path
+        )
+        output_persistent = output_dir is not None
+        if output_dir is None:
+            output_dir = tempfile.mkdtemp(prefix="sglang_videoedit_output_")
+            temp_dirs.append(output_dir)
+            output_persistent = False
+
+        sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
+            server_args,
+            request_id=request_id,
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            video_input_path=video_input_path,
+            mask_input_path=mask_input_path,
+            output_path=output_dir,
+            output_file_name=output_file_name,
+            num_frames=req.num_frames,
+            infer_len=req.infer_len,
+            overlap=req.overlap,
+            strength=req.strength,
+            num_inference_steps=req.num_inference_steps,
+            guidance_scale=req.guidance_scale,
+            seed=req.seed,
+            generator_device=req.generator_device,
+            dtype=req.dtype,
+            dynamic_cfg=req.dynamic_cfg,
+            dynamic_cfg_max_step=req.dynamic_cfg_max_step,
+            dynamic_cfg_min=req.dynamic_cfg_min,
+            bbox_padding=req.bbox_padding,
+            dilate_px=req.dilate_px,
+            mask_scale=req.mask_scale,
+            feather_px=req.feather_px,
+            adain_boundary_dilate=req.adain_boundary_dilate,
+            enable_paste_back=req.enable_paste_back,
+            save_crop_only=req.save_crop_only,
+            drop_reference_frame=req.drop_reference_frame,
+            keep_intermediate_windows=req.keep_intermediate_windows,
+            use_repaired_context=req.use_repaired_context,
+            vary_seed_by_window=req.vary_seed_by_window,
+            enable_teacache=req.enable_teacache,
+            enable_frame_interpolation=req.enable_frame_interpolation,
+            frame_interpolation_exp=req.frame_interpolation_exp,
+            frame_interpolation_scale=req.frame_interpolation_scale,
+            frame_interpolation_model_path=req.frame_interpolation_model_path,
+            enable_upscaling=req.enable_upscaling,
+            upscaling_model_path=req.upscaling_model_path,
+            upscaling_scale=req.upscaling_scale,
+            output_quality=req.output_quality,
+            output_compression=req.output_compression,
+            perf_dump_path=req.perf_dump_path,
+        )
+        job = _video_repair_job_from_sampling(request_id, req, sampling_params)
+        await VIDEO_STORE.upsert(request_id, job)
+        batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
+        asyncio.create_task(
+            _dispatch_video_repair_job_async(
+                request_id,
+                batch,
+                temp_dirs=temp_dirs or None,
+                output_persistent=output_persistent,
+            )
+        )
+        return VideoResponse(**job)
+    except Exception:
+        _VIDEOEDIT_SEMAPHORE.release()
+        for td in temp_dirs:
+            shutil.rmtree(td, ignore_errors=True)
+        raise
 
 
 # TODO: support image to video generation
@@ -390,6 +570,21 @@ async def retrieve_video(video_id: str = Path(...)):
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
     return VideoResponse(**job)
+
+
+@router.get("/{video_id}/progress")
+async def retrieve_video_progress(video_id: str = Path(...)):
+    job = await VIDEO_STORE.get(video_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {
+        "id": video_id,
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "file_path": job.get("file_path"),
+        "url": job.get("url"),
+        "error": job.get("error"),
+    }
 
 
 # TODO: support aborting a job.

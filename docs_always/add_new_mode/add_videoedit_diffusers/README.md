@@ -89,7 +89,7 @@ wan_eraser 只作为服务行为参考，不复用其协议：
 
 - FastAPI 提交后后台执行。
 - 单任务 admission，运行中请求直接拒绝。
-- `/healthz` 返回进程可用性。
+- `/health` 返回进程可用性。
 - 任务完成后回调 / 状态更新。
 
 它的 `/generate` 绑定 MinIO key、RLE mask JSON、bbox CSV 和 Ray actor，不适合作为 SGLang VideoEdit 的最终 API。
@@ -833,7 +833,7 @@ GET    /v1/videos/{video_id}
 GET    /v1/videos/{video_id}/progress
 GET    /v1/videos/{video_id}/content
 DELETE /v1/videos/{video_id}
-GET    /healthz
+GET    /health
 ```
 
 `VideoRepairRequest` 新增在 `protocol.py`：
@@ -1139,7 +1139,7 @@ CI / nightly 建议：
 7. 新增 `videoedit_wan.py` stages，所有中间结果只写 `WanVideoEditSamplingParams`。
 8. 新增 `WanVideoEditPipeline.forward`，外层处理窗口，内层循环 stage，每个 stage 固定 81 帧。
 9. 新增本地 CLI `repair`，跑通第一条端到端。
-10. 新增 serve `/v1/videos/repairs`，实现单任务 admission、后台执行、查询、下载和 `/healthz`。
+10. 新增 serve `/v1/videos/repairs`，实现单任务 admission、后台执行、查询、下载和 `/health`。
 11. 跑 reference baseline、SGLang CLI、SGLang serve 三条端到端验收。
 12. 运行 `runtime/videoedit/compare.py` 生成逐帧对齐 JSON report，只有 SSIM/MSE/MAE 阈值全部通过才算集成完成。
 

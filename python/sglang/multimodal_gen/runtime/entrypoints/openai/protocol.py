@@ -117,6 +117,60 @@ class VideoGenerationsRequest(BaseModel):
     perf_dump_path: Optional[str] = None
 
 
+class VideoRepairRequest(BaseModel):
+    task_id: Optional[str] = None
+    prompt: str
+    negative_prompt: Optional[str] = None
+    model: Optional[str] = None
+
+    video_input_path: Optional[str] = None
+    mask_input_path: Optional[str] = None
+    video_url: Optional[str] = None
+    mask_url: Optional[str] = None
+
+    callback_url: Optional[str] = None
+    output_storage: str = "local"
+    output_path: Optional[str] = None
+    output_bucket: Optional[str] = None
+    output_object_key: Optional[str] = None
+
+    num_frames: int = 81
+    infer_len: int = 81
+    overlap: int = 0
+    strength: float = 1.0
+    num_inference_steps: int = 20
+    guidance_scale: float = 5.0
+    seed: int = 42
+    generator_device: Optional[str] = None
+    dtype: str = "bf16"
+    dynamic_cfg: bool = True
+    dynamic_cfg_max_step: int = 15
+    dynamic_cfg_min: float = 1.0
+
+    bbox_padding: int = 0
+    dilate_px: int = 15
+    mask_scale: float = 1.2
+    feather_px: int = 12
+    adain_boundary_dilate: int = 15
+    enable_paste_back: bool = True
+    save_crop_only: bool = False
+    drop_reference_frame: bool = True
+    keep_intermediate_windows: bool = False
+    use_repaired_context: bool = True
+    vary_seed_by_window: bool = False
+    enable_teacache: bool = False
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1
+    frame_interpolation_scale: float = 1.0
+    frame_interpolation_model_path: Optional[str] = None
+    enable_upscaling: bool = False
+    upscaling_model_path: Optional[str] = None
+    upscaling_scale: int = 4
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
+    perf_dump_path: Optional[str] = None
+
+
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"

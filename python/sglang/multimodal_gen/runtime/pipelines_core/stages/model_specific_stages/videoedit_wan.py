@@ -1,0 +1,508 @@
+# SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
+import math
+import weakref
+from typing import Any
+
+import numpy as np
+import torch
+
+from sglang.multimodal_gen.configs.sample.videoedit_wan import (
+    WanVideoEditSamplingParams,
+)
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    V,
+    VerificationResult,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.videoedit.preprocess import prepare_window_inputs
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+
+def _videoedit_params(batch: Req) -> WanVideoEditSamplingParams:
+    params = batch.sampling_params
+    if not isinstance(params, WanVideoEditSamplingParams):
+        raise TypeError(
+            "VideoEdit stages require WanVideoEditSamplingParams, "
+            f"got {type(params).__name__}"
+        )
+    return params
+
+
+def _module_dtype(module: torch.nn.Module, default: torch.dtype) -> torch.dtype:
+    try:
+        return next(module.parameters()).dtype
+    except StopIteration:
+        return default
+
+
+def _retrieve_latents(encoder_output: Any) -> torch.Tensor:
+    if hasattr(encoder_output, "latent_dist"):
+        encoder_output = encoder_output.latent_dist
+    if hasattr(encoder_output, "mode"):
+        return encoder_output.mode()
+    if hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    if isinstance(encoder_output, torch.Tensor):
+        return encoder_output
+    raise AttributeError("Could not access latents of VAE encoder output")
+
+
+def _vae_latent_mean_std(
+    vae: torch.nn.Module, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    z_dim = int(getattr(vae.config, "z_dim", getattr(vae, "z_dim", 16)))
+    mean = torch.tensor(
+        getattr(vae.config, "latents_mean", getattr(vae, "latents_mean")),
+        device=device,
+        dtype=dtype,
+    ).view(1, z_dim, 1, 1, 1)
+    std = torch.tensor(
+        getattr(vae.config, "latents_std", getattr(vae, "latents_std")),
+        device=device,
+        dtype=dtype,
+    ).view(1, z_dim, 1, 1, 1)
+    return mean, std
+
+
+def _normalize_vae_latents(latents: torch.Tensor, vae: torch.nn.Module) -> torch.Tensor:
+    mean, std = _vae_latent_mean_std(vae, latents.device, latents.dtype)
+    return (latents - mean) / std
+
+
+def _denormalize_vae_latents(
+    latents: torch.Tensor, vae: torch.nn.Module
+) -> torch.Tensor:
+    mean, std = _vae_latent_mean_std(vae, latents.device, latents.dtype)
+    return latents * std + mean
+
+
+def _ensure_tensor_decode_output(decode_output: Any) -> torch.Tensor:
+    if isinstance(decode_output, tuple):
+        return decode_output[0]
+    if hasattr(decode_output, "sample"):
+        return decode_output.sample
+    return decode_output
+
+
+def calc_current_cfg(
+    max_cfg: float,
+    current_step: int,
+    max_step: int = 15,
+    min_cfg: float = 1.0,
+    dynamic_cfg: bool = True,
+) -> tuple[float, bool]:
+    if dynamic_cfg:
+        if current_step < max_step:
+            add_cfg = max(
+                (max_cfg - min_cfg)
+                / (math.pow((max_cfg - min_cfg), 1.0 / max_step) ** current_step),
+                0,
+            )
+        else:
+            add_cfg = 0.0
+        current_cfg = min_cfg + add_cfg
+        return current_cfg, current_cfg > 1.0
+    return max_cfg, max_cfg != 1.0
+
+
+class VideoEditWindowValidationStage(PipelineStage):
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _videoedit_params(batch)
+        frames = params.runtime_window_frames
+        masks = params.runtime_window_masks
+        if frames is None or masks is None:
+            raise ValueError("VideoEdit window frames and masks must be materialized")
+        if len(frames) != params.infer_len:
+            raise ValueError(
+                f"VideoEdit window must contain {params.infer_len} frames, "
+                f"got {len(frames)}"
+            )
+        if len(masks) != params.infer_len:
+            raise ValueError(
+                f"VideoEdit window must contain {params.infer_len} masks, got {len(masks)}"
+            )
+        if params.infer_len != 81 or (params.infer_len - 1) % 4 != 0:
+            raise ValueError("VideoEdit stages require infer_len=81 and (infer_len-1)%4=0")
+
+        width, height = frames[0].size
+        if height % 16 != 0 or width % 16 != 0:
+            raise ValueError(
+                f"VideoEdit window size must be divisible by 16, got {width}x{height}"
+            )
+
+        params.runtime_height = height
+        params.runtime_width = width
+        params.runtime_num_frames = len(frames)
+        params.runtime_window_validated = True
+        batch.height = height
+        batch.width = width
+        batch.num_frames = len(frames)
+        return batch
+
+
+class VideoEditTextEncodingStage(PipelineStage):
+    def __init__(self, text_encoder: torch.nn.Module, tokenizer: Any, transformer: torch.nn.Module):
+        super().__init__()
+        self.text_stage = TextEncodingStage([text_encoder], [tokenizer])
+        self.transformer = transformer
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        target_dtype = _module_dtype(
+            self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        )
+        prompt_embeds, _, _ = self.text_stage.encode_text(
+            params.prompt or " ",
+            server_args,
+            encoder_index=[0],
+            return_attention_mask=True,
+            dtype=target_dtype,
+        )
+        params.runtime_prompt_embeds = prompt_embeds[0]
+
+        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+        if params.runtime_do_cfg:
+            neg_embeds, _, _ = self.text_stage.encode_text(
+                params.negative_prompt or "",
+                server_args,
+                encoder_index=[0],
+                return_attention_mask=True,
+                dtype=target_dtype,
+            )
+            params.runtime_negative_prompt_embeds = neg_embeds[0]
+        else:
+            params.runtime_negative_prompt_embeds = None
+        return batch
+
+
+class VideoEditConditionEncodingStage(PipelineStage):
+    def __init__(self, vae: torch.nn.Module):
+        super().__init__()
+        self.vae = vae
+
+    @torch.no_grad()
+    def _encode_video_latents(
+        self,
+        video_tensor: torch.Tensor,
+        *,
+        vae_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        device = get_local_torch_device()
+        self.vae = self.vae.to(device=device, dtype=vae_dtype)
+        video_tensor = video_tensor.to(device=device, dtype=vae_dtype)
+        encoded = self.vae.encode(video_tensor)
+        latents = _retrieve_latents(encoded)
+        latents = _normalize_vae_latents(latents, self.vae)
+        return latents.to(device=device, dtype=output_dtype)
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        if not params.runtime_window_validated:
+            raise ValueError("VideoEdit window must be validated before condition encoding")
+
+        device = get_local_torch_device()
+        tensor_dtype = PRECISION_TO_TYPE[params.dtype]
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        prepared = prepare_window_inputs(
+            params.runtime_window_frames,
+            params.runtime_window_masks,
+            device=device,
+            dtype=tensor_dtype,
+        )
+        params.runtime_masked_video_tensor = prepared["masked_video_tensor"]
+        params.runtime_raw_video_tensor = prepared["video_tensor"]
+        params.runtime_mask_video_tensor = prepared["mask_video_tensor"]
+        params.runtime_cond_masks = prepared["cond_masks"]
+
+        masked_video = params.runtime_masked_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
+        raw_video = params.runtime_raw_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
+
+        params.runtime_cond_latents = self._encode_video_latents(
+            masked_video,
+            vae_dtype=vae_dtype,
+            output_dtype=tensor_dtype,
+        )
+        params.runtime_video_latents = self._encode_video_latents(
+            raw_video,
+            vae_dtype=vae_dtype,
+            output_dtype=tensor_dtype,
+        )
+        params.runtime_condition_latent = torch.cat(
+            [params.runtime_cond_masks, params.runtime_cond_latents], dim=1
+        )
+        return batch
+
+
+class VideoEditLatentPreparationStage(PipelineStage):
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _videoedit_params(batch)
+        if params.runtime_video_latents is None:
+            raise ValueError("VideoEdit video latents must be prepared before noise")
+        device = params.runtime_video_latents.device
+        seed = int(params.seed)
+        if params.vary_seed_by_window and params.runtime_window_index is not None:
+            seed += int(params.runtime_window_index)
+        generator_device = params.generator_device or device.type
+        generator = torch.Generator(device=generator_device).manual_seed(seed)
+        params.runtime_generator = generator
+        params.runtime_noise = torch.randn(
+            params.runtime_video_latents.shape,
+            generator=generator,
+            device=device,
+            dtype=torch.float32,
+        )
+        params.runtime_latents = params.runtime_noise
+        batch.generator = generator
+        batch.latents = params.runtime_latents
+        batch.raw_latent_shape = tuple(params.runtime_latents.shape)
+        return batch
+
+
+class VideoEditTimestepPreparationStage(PipelineStage):
+    def __init__(self, scheduler: Any):
+        super().__init__()
+        self.scheduler = scheduler
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        device = get_local_torch_device()
+        self.scheduler.set_timesteps(
+            params.num_inference_steps,
+            shift=server_args.pipeline_config.flow_shift or 5.0,
+            device=device,
+        )
+        if params.strength < 1.0:
+            timesteps, effective_steps = self.scheduler.get_timesteps(
+                params.num_inference_steps, self.scheduler.timesteps, params.strength
+            )
+        else:
+            timesteps = self.scheduler.timesteps
+            effective_steps = params.num_inference_steps
+
+        params.runtime_timesteps = timesteps.to(device)
+        params.runtime_effective_num_inference_steps = int(effective_steps)
+        params.runtime_num_warmup_steps = len(timesteps) - int(effective_steps)
+        batch.timesteps = params.runtime_timesteps
+        return batch
+
+
+class VideoEditLatentInitStage(PipelineStage):
+    def __init__(self, scheduler: Any):
+        super().__init__()
+        self.scheduler = scheduler
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _videoedit_params(batch)
+        if params.runtime_timesteps is None:
+            raise ValueError("VideoEdit timesteps must be prepared before latent init")
+        params.runtime_initial_timestep = params.runtime_timesteps[:1]
+        params.runtime_latents = self.scheduler.add_noise(
+            params.runtime_video_latents.to(dtype=torch.float32),
+            params.runtime_noise,
+            params.runtime_initial_timestep,
+        )
+        batch.latents = params.runtime_latents
+        batch.raw_latent_shape = tuple(params.runtime_latents.shape)
+        return batch
+
+
+class VideoEditDenoisingStage(DenoisingStage):
+    def __init__(self, transformer: torch.nn.Module, scheduler: Any, pipeline=None):
+        super().__init__(transformer=transformer, scheduler=scheduler, pipeline=pipeline)
+        self.pipeline = weakref.ref(pipeline) if pipeline else None
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        del server_args
+        params = _videoedit_params(batch)
+        result = VerificationResult()
+        result.add_check("runtime_timesteps", params.runtime_timesteps, V.is_tensor)
+        result.add_check(
+            "runtime_effective_num_inference_steps",
+            params.runtime_effective_num_inference_steps,
+            V.positive_int,
+        )
+        result.add_check(
+            "runtime_latents", params.runtime_latents, [V.is_tensor, V.with_dims(5)]
+        )
+        result.add_check(
+            "runtime_cond_masks",
+            params.runtime_cond_masks,
+            [V.is_tensor, V.with_dims(5)],
+        )
+        result.add_check(
+            "runtime_cond_latents",
+            params.runtime_cond_latents,
+            [V.is_tensor, V.with_dims(5)],
+        )
+        result.add_check("runtime_prompt_embeds", params.runtime_prompt_embeds, V.is_tensor)
+        result.add_check("runtime_generator", params.runtime_generator, V.generator_or_list_generators)
+        result.add_check("runtime_do_cfg", params.runtime_do_cfg, V.bool_value)
+        result.add_check(
+            "runtime_negative_prompt_embeds",
+            params.runtime_negative_prompt_embeds,
+            lambda value: not params.runtime_do_cfg or V.is_tensor(value),
+        )
+        return result
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if server_args.enable_cfg_parallel:
+            raise NotImplementedError("VideoEdit MVP does not support CFG parallel yet")
+
+        params = _videoedit_params(batch)
+        if params.runtime_latents is None or params.runtime_timesteps is None:
+            raise ValueError("VideoEdit latents and timesteps must be prepared")
+        if params.runtime_prompt_embeds is None:
+            raise ValueError("VideoEdit prompt embeds must be prepared")
+
+        target_dtype = _module_dtype(
+            self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        )
+        autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+        timesteps = params.runtime_timesteps
+        timesteps_cpu = timesteps.detach().cpu()
+        latents = params.runtime_latents
+
+        self._manage_device_placement(self.transformer, None, server_args)
+        self._maybe_enable_cache_dit(params.runtime_effective_num_inference_steps, batch)
+
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=target_dtype,
+            enabled=autocast_enabled,
+        ):
+            with self.progress_bar(
+                total=params.runtime_effective_num_inference_steps
+            ) as progress_bar:
+                for i, t_host in enumerate(timesteps_cpu):
+                    t_device = timesteps[i]
+                    current_cfg, do_cfg = calc_current_cfg(
+                        max_cfg=float(params.guidance_scale),
+                        current_step=i,
+                        max_step=int(params.dynamic_cfg_max_step),
+                        min_cfg=float(params.dynamic_cfg_min),
+                        dynamic_cfg=bool(params.dynamic_cfg),
+                    )
+                    params.runtime_current_step = i
+                    params.runtime_current_timestep = t_device
+                    params.runtime_current_cfg = float(current_cfg)
+
+                    latent_model_input = torch.cat(
+                        [latents, params.runtime_cond_masks, params.runtime_cond_latents],
+                        dim=1,
+                    ).to(target_dtype)
+                    timestep = t_device.to(dtype=target_dtype).expand(latents.shape[0])
+                    attn_metadata = self._build_attn_metadata(
+                        i,
+                        batch,
+                        server_args,
+                        timestep_value=int(t_host.item()),
+                        timesteps=timesteps_cpu,
+                    )
+                    with set_forward_context(
+                        current_timestep=i,
+                        attn_metadata=attn_metadata,
+                        forward_batch=batch,
+                    ):
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=params.runtime_prompt_embeds,
+                        )
+
+                    if do_cfg:
+                        if params.runtime_negative_prompt_embeds is None:
+                            raise ValueError("Negative prompt embeds are required for CFG")
+                        with set_forward_context(
+                            current_timestep=i,
+                            attn_metadata=attn_metadata,
+                            forward_batch=batch,
+                        ):
+                            noise_uncond = self.transformer(
+                                hidden_states=latent_model_input,
+                                timestep=timestep,
+                                encoder_hidden_states=params.runtime_negative_prompt_embeds,
+                            )
+                        noise_pred = noise_uncond + current_cfg * (
+                            noise_pred - noise_uncond
+                        )
+
+                    latents = self.scheduler.step(noise_pred, t_device, latents)
+                    params.runtime_latents = latents
+                    batch.latents = latents
+                    params.runtime_progress = float(i + 1) / float(len(timesteps))
+                    if progress_bar is not None:
+                        progress_bar.update()
+
+        return batch
+
+
+class VideoEditDecodingStage(PipelineStage):
+    def __init__(self, vae: torch.nn.Module):
+        super().__init__()
+        self.vae = vae
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        if params.runtime_latents is None:
+            raise ValueError("VideoEdit denoised latents must be prepared")
+        device = get_local_torch_device()
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(device=device, dtype=vae_dtype)
+        if server_args.pipeline_config.vae_tiling:
+            self.vae.enable_tiling()
+        latents = params.runtime_latents.to(device=device, dtype=vae_dtype)
+        latents = _denormalize_vae_latents(latents, self.vae)
+        decoded = self.vae.decode(latents)
+        decoded = _ensure_tensor_decode_output(decoded)
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+        params.runtime_decoded_video_tensor = decoded
+
+        video = decoded[0].detach().float().cpu()
+        frames = []
+        for frame in video.permute(1, 2, 3, 0):
+            arr = (frame.clamp(0, 1).numpy() * 255.0).round().astype("uint8")
+            from PIL import Image
+
+            frames.append(Image.fromarray(arr))
+        params.runtime_window_output_frames = frames
+        return batch
+
+
+class VideoEditWindowPostprocessStage(PipelineStage):
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _videoedit_params(batch)
+        frames = params.runtime_window_output_frames
+        if frames is None:
+            raise ValueError("VideoEdit window output frames are missing")
+        if len(frames) != params.infer_len:
+            raise ValueError(
+                f"VideoEdit decoded window must contain {params.infer_len} frames, "
+                f"got {len(frames)}"
+            )
+        params.runtime_window_metadata = {
+            "window_index": params.runtime_window_index,
+            "num_frames": len(frames),
+            "height": frames[0].height if frames else None,
+            "width": frames[0].width if frames else None,
+        }
+        return batch

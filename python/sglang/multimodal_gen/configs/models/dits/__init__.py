@@ -6,11 +6,15 @@ from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import HunyuanVideoC
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits.wan_videoedit import (
+    WanVideoEditConfig,
+)
 
 __all__ = [
     "HeliosConfig",
     "HunyuanVideoConfig",
     "WanVideoConfig",
+    "WanVideoEditConfig",
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
     "MOVAVideoConfig",
