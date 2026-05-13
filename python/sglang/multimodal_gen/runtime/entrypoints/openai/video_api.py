@@ -49,6 +49,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+    resolve_videoedit_num_frames,
+)
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -272,6 +275,12 @@ async def create_video_repair(req: VideoRepairRequest):
         if not mask_input_path:
             raise HTTPException(status_code=400, detail="mask_input_path or mask_url is required")
 
+        resolved_num_frames = resolve_videoedit_num_frames(
+            req.num_frames,
+            video_input_path,
+            mask_input_path,
+        )
+
         output_dir, output_file_name = _split_output_path(
             req.output_path, request_id, server_args.output_path
         )
@@ -290,7 +299,7 @@ async def create_video_repair(req: VideoRepairRequest):
             mask_input_path=mask_input_path,
             output_path=output_dir,
             output_file_name=output_file_name,
-            num_frames=req.num_frames,
+            num_frames=resolved_num_frames,
             infer_len=req.infer_len,
             overlap=req.overlap,
             strength=req.strength,

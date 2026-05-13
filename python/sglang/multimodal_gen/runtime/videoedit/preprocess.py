@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import logging
 import os
 
 import cv2
@@ -8,6 +9,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 def load_video_frames(
@@ -27,6 +30,52 @@ def load_video_frames(
         frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
     cap.release()
     return frames, fps
+
+
+def probe_video_frame_count(video_path: str) -> int:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video file: {video_path}")
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if count <= 0:
+            count = 0
+            while True:
+                ok, _ = cap.read()
+                if not ok:
+                    break
+                count += 1
+    finally:
+        cap.release()
+    if count <= 0:
+        raise RuntimeError(f"No frames found in video file: {video_path}")
+    return count
+
+
+def resolve_videoedit_num_frames(
+    requested_num_frames: int,
+    video_input_path: str,
+    mask_input_path: str,
+) -> int:
+    if requested_num_frames != -1:
+        return requested_num_frames
+
+    video_frames = probe_video_frame_count(video_input_path)
+    mask_frames = probe_video_frame_count(mask_input_path)
+    resolved = min(video_frames, mask_frames)
+    if resolved <= 0:
+        raise RuntimeError(
+            "Could not resolve full-video frame count: "
+            f"video={video_frames}, mask={mask_frames}"
+        )
+    if video_frames != mask_frames:
+        logger.warning(
+            "VideoEdit num_frames=-1 resolved to %s using min(video=%s, mask=%s)",
+            resolved,
+            video_frames,
+            mask_frames,
+        )
+    return resolved
 
 
 def get_aligned_size(h: int, w: int, align: int = 16) -> tuple[int, int]:
@@ -279,4 +328,3 @@ def prepare_window_inputs(
         "video_tensor": frames_to_tensor(window_video, normalize=True).to(device=device, dtype=dtype),
         "num_frames": len(window_video),
     }
-

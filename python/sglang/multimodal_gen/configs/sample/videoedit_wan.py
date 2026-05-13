@@ -101,6 +101,11 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_metadata_path: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.num_frames is not None and self.num_frames <= 0:
+            raise ValueError(
+                "VideoEdit num_frames must be positive after request normalization. "
+                "Use num_frames=-1 only at API/CLI entrypoints to mean all frames."
+            )
         super().__post_init__()
         self._validate_videoedit()
 
@@ -110,7 +115,10 @@ class WanVideoEditSamplingParams(SamplingParams):
         if (self.infer_len - 1) % 4 != 0:
             raise ValueError("VideoEdit infer_len must satisfy (infer_len - 1) % 4 == 0")
         if self.num_frames is not None and self.num_frames <= 0:
-            raise ValueError(f"num_frames must be positive, got {self.num_frames!r}")
+            raise ValueError(
+                "VideoEdit num_frames must be positive after request normalization. "
+                "Use num_frames=-1 only at API/CLI entrypoints to mean all frames."
+            )
         if not (0 <= self.overlap < self.infer_len):
             raise ValueError(
                 f"overlap must be in [0, {self.infer_len}), got {self.overlap}"

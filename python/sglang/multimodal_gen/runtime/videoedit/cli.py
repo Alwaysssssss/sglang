@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
 )
 from sglang.multimodal_gen.runtime.server_args import Backend, ServerArgs
+from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+    resolve_videoedit_num_frames,
+)
 
 
 def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
@@ -187,6 +190,11 @@ def repair_cmd(args: argparse.Namespace) -> int:
         component_paths["transformer"] = args.transformer_path
 
     server_args = ServerArgs.from_kwargs(**_server_args_kwargs(args, component_paths))
+    resolved_num_frames = resolve_videoedit_num_frames(
+        args.num_frames,
+        args.video_input_path,
+        args.mask_input_path,
+    )
     sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
         server_args,
         request_id=generate_request_id(),
@@ -196,7 +204,7 @@ def repair_cmd(args: argparse.Namespace) -> int:
         mask_input_path=args.mask_input_path,
         output_path=args.output_path,
         output_file_name=args.output_file_name,
-        num_frames=args.num_frames,
+        num_frames=resolved_num_frames,
         infer_len=args.infer_len,
         overlap=args.overlap,
         strength=args.strength,
