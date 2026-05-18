@@ -28,14 +28,14 @@
 
 ```bash
 conda deactivate
-source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
-cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
+cd /home/tyx/workspace/zhouhao6/sglang
+source .venv/bin/activate
 
-export MODEL_PATH=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model
-export TRANSFORMER_PATH=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
-export INPUT_VIDEO=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4
-export INPUT_MASK=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4
-export OUT_DIR=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs
+export MODEL_PATH=/home/tyx/workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model
+export TRANSFORMER_PATH=/home/tyx/workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+export INPUT_VIDEO=/home/tyx/workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4
+export INPUT_MASK=/home/tyx/workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4
+export OUT_DIR=/home/tyx/workspace/zhouhao6/sglang/outputs
 export PROMPT="A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video."
 ```
 
@@ -166,10 +166,10 @@ curl -s -X POST http://127.0.0.1:30000/v1/videos/repairs \
   -d '{
     "task_id": "sp1_offload",
     "prompt": "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.",
-    "video_input_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4",
-    "mask_input_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4",
+    "video_input_path": "/home/tyx/workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4",
+    "mask_input_path": "/home/tyx/workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4",
     "output_storage": "local",
-    "output_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps_api_sp1_offload.mp4",
+    "output_path": "/home/tyx/workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps_api_sp1_offload.mp4",
     "num_frames": 81,
     "infer_len": 81,
     "overlap": 0,
@@ -181,7 +181,7 @@ curl -s -X POST http://127.0.0.1:30000/v1/videos/repairs \
     "dtype": "bf16",
     "enable_paste_back": true,
     "drop_reference_frame": true,
-    "perf_dump_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/videoedit_perf_api_sp1_offload.json"
+    "perf_dump_path": "/home/tyx/workspace/zhouhao6/sglang/outputs/videoedit_perf_api_sp1_offload.json"
   }'
 ```
 
@@ -255,8 +255,8 @@ sglang serve \
 ```json
 {
   "task_id": "sp1_no_offload",
-  "output_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps_api_sp1_no_offload.mp4",
-  "perf_dump_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/videoedit_perf_api_sp1_no_offload.json"
+  "output_path": "/home/tyx/workspace/zhouhao6/sglang/outputs/15108907_3840_2160_50fps_api_sp1_no_offload.mp4",
+  "perf_dump_path": "/home/tyx/workspace/zhouhao6/sglang/outputs/videoedit_perf_api_sp1_no_offload.json"
 }
 ```
 
@@ -350,7 +350,7 @@ sglang serve \
 A100 建议安装 SageAttention 2.x：
 
 ```bash
-source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
+source .venv/bin/activate
 pip install ninja packaging
 pip install sageattention==2.2.0 --no-build-isolation
 
@@ -363,7 +363,7 @@ PY
 如果 pip wheel / build 不匹配当前 CUDA，可从源码编译：
 
 ```bash
-source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
+source .venv/bin/activate
 git clone https://github.com/thu-ml/SageAttention /tmp/SageAttention
 cd /tmp/SageAttention
 pip install -v . --no-build-isolation
@@ -372,7 +372,7 @@ pip install -v . --no-build-isolation
 SageAttention3 只建议在 Blackwell + CUDA 12.8+ + PyTorch 2.8+ 环境尝试：
 
 ```bash
-source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
+source .venv/bin/activate
 git clone https://github.com/thu-ml/SageAttention /tmp/SageAttention
 cd /tmp/SageAttention/sageattention3_blackwell
 python setup.py install
@@ -802,7 +802,7 @@ sglang serve \
 python - <<'PY'
 import cv2
 
-path = "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/reference/15108907_3840_2160_50fps.mp4"
+path = "/home/tyx/workspace/zhouhao6/sglang/outputs/reference/15108907_3840_2160_50fps.mp4"
 cap = cv2.VideoCapture(path)
 frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))

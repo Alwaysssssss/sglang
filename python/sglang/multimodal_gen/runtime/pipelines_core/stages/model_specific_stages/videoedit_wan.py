@@ -479,7 +479,7 @@ class VideoEditDecodingStage(PipelineStage):
         video = decoded[0].detach().float().cpu()
         frames = []
         for frame in video.permute(1, 2, 3, 0):
-            arr = (frame.clamp(0, 1).numpy() * 255.0).round().astype("uint8")
+            arr = (frame.clamp(0, 1).numpy() * 255.0).astype("uint8")
             from PIL import Image
 
             frames.append(Image.fromarray(arr))

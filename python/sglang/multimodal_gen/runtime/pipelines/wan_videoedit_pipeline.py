@@ -171,6 +171,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         params.runtime_window_frames = frames
         params.runtime_window_masks = masks
 
+    # overlap权重，越靠近窗口边缘权重越小，中心区域权重为1.0，边缘区域权重线性衰减到0.0，最小不低于1e-6
     def _commit_weight(
         self,
         params: WanVideoEditSamplingParams,

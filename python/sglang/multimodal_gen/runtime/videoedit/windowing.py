@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from sglang.multimodal_gen.runtime.videoedit.contracts import VideoEditWindowSpec
 
-
+# 反射补帧，返回对应帧的索引
 def _reflect_index(index: int, num_frames: int) -> int:
     if num_frames <= 1:
         return 0
@@ -25,6 +25,7 @@ def build_videoedit_window_specs(
         raise ValueError(f"overlap must be in [0, {infer_len}), got {overlap}")
 
     stride = infer_len - overlap
+    # 创建窗口的起始索引列表
     starts: list[int] = [0]
     while starts[-1] + infer_len < num_frames:
         starts.append(starts[-1] + stride)
