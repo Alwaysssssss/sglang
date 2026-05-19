@@ -134,12 +134,87 @@ async def _save_first_input_image(
     return await save_image_to_path(image, target_path)
 
 
+def _build_video_callback_payload(
+    video_id: str, job: Dict[str, Any]
+) -> Dict[str, Any]:
+    payload = {
+        "id": video_id,
+        "object": job.get("object", "video"),
+        "model": job.get("model"),
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "created_at": job.get("created_at"),
+        "completed_at": job.get("completed_at"),
+        "file_path": job.get("file_path"),
+        "url": job.get("url"),
+        "error": job.get("error"),
+    }
+    for key in ("peak_memory_mb", "inference_time_s"):
+        if key in job:
+            payload[key] = job[key]
+    return payload
+
+
+async def _post_video_callback(
+    job_id: str,
+    callback_url: str | None,
+    payload: Dict[str, Any],
+    *,
+    timeout: float = 10.0,
+    max_retries: int = 3,
+) -> None:
+    if not callback_url:
+        return
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=timeout
+            ) as client:
+                response = await client.post(callback_url, json=payload)
+                response.raise_for_status()
+            await VIDEO_STORE.update_fields(
+                job_id,
+                {
+                    "callback_status": "succeeded",
+                    "callback_error": None,
+                    "callback_attempts": attempt,
+                    "callback_completed_at": int(time.time()),
+                },
+            )
+            return
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(
+                "Video callback failed for job=%s attempt=%s/%s url=%s: %s",
+                job_id,
+                attempt,
+                max_retries,
+                callback_url,
+                last_error,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(min(2 ** (attempt - 1), 5))
+
+    await VIDEO_STORE.update_fields(
+        job_id,
+        {
+            "callback_status": "failed",
+            "callback_error": last_error,
+            "callback_attempts": max_retries,
+            "callback_completed_at": int(time.time()),
+        },
+    )
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
     *,
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
+    callback_url: str | None = None,
 ) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
@@ -165,11 +240,29 @@ async def _dispatch_job_async(
             update_fields, request_id=job_id, result=result
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
+        job = await VIDEO_STORE.get(job_id)
+        if job and callback_url:
+            asyncio.create_task(
+                _post_video_callback(
+                    job_id,
+                    callback_url,
+                    _build_video_callback_payload(job_id, job),
+                )
+            )
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
+        job = await VIDEO_STORE.get(job_id)
+        if job and callback_url:
+            asyncio.create_task(
+                _post_video_callback(
+                    job_id,
+                    callback_url,
+                    _build_video_callback_payload(job_id, job),
+                )
+            )
     finally:
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
@@ -219,6 +312,9 @@ def _video_repair_job_from_sampling(
         "seconds": "",
         "quality": "standard",
         "file_path": os.path.abspath(sampling.output_file_path()),
+        "callback_url": req.callback_url,
+        "callback_status": None,
+        "callback_error": None,
     }
 
 
@@ -228,6 +324,7 @@ async def _dispatch_video_repair_job_async(
     *,
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
+    callback_url: str | None = None,
 ) -> None:
     try:
         await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
@@ -236,6 +333,7 @@ async def _dispatch_video_repair_job_async(
             batch,
             temp_dirs=None,
             output_persistent=output_persistent,
+            callback_url=callback_url,
         )
     finally:
         _VIDEOEDIT_SEMAPHORE.release()
@@ -343,6 +441,7 @@ async def create_video_repair(req: VideoRepairRequest):
                 batch,
                 temp_dirs=temp_dirs or None,
                 output_persistent=output_persistent,
+                callback_url=req.callback_url,
             )
         )
         return VideoResponse(**job)
@@ -593,6 +692,9 @@ async def retrieve_video_progress(video_id: str = Path(...)):
         "file_path": job.get("file_path"),
         "url": job.get("url"),
         "error": job.get("error"),
+        "callback_status": job.get("callback_status"),
+        "callback_error": job.get("callback_error"),
+        "callback_attempts": job.get("callback_attempts"),
     }
 
 
