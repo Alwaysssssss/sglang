@@ -61,6 +61,11 @@ class Req:
 
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
+    condition_video: torch.Tensor | list[torch.Tensor] | None = None
+    original_condition_video_size: tuple[int, int] | None = None
+    original_condition_video_fps: float | None = None
+    condition_video_indices: list[int] | None = None
+    condition_video_num_frames: int | None = None
     vae_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
@@ -185,7 +190,20 @@ class Req:
         for name, value in kwargs.items():
             setattr(self, name, value)
 
+        self._hydrate_overlapping_sampling_fields()
         self.validate()
+
+    def _hydrate_overlapping_sampling_fields(self) -> None:
+        """Copy sampling-param values into overlapping Req fields when needed."""
+        sampling_params = object.__getattribute__(self, "sampling_params")
+        if sampling_params is None:
+            return
+
+        for name in self.__class__.__dataclass_fields__:
+            if name == "sampling_params" or not hasattr(sampling_params, name):
+                continue
+            if object.__getattribute__(self, name) is None:
+                object.__setattr__(self, name, getattr(sampling_params, name))
 
     def __getattr__(self, name: str) -> Any:
         """

@@ -4,5 +4,12 @@ from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.star_cogvideox_sr import (
+    StarCogVideoXSRSamplingParams,
+)
 
-__all__ = ["SamplingParams", "DiffusersGenericSamplingParams"]
+__all__ = [
+    "SamplingParams",
+    "DiffusersGenericSamplingParams",
+    "StarCogVideoXSRSamplingParams",
+]

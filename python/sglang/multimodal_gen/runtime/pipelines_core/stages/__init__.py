@@ -74,6 +74,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.upsampling import (
     LTX2LoRASwitchStage,
     LTX2UpsampleStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.video_condition_loading import (
+    STARConditionVideoLoadingStage,
+)
 
 __all__ = [
     "PipelineStage",
@@ -109,4 +112,5 @@ __all__ = [
     "LTX2HalveResolutionStage",
     "LTX2LoRASwitchStage",
     "LTX2UpsampleStage",
+    "STARConditionVideoLoadingStage",
 ]
