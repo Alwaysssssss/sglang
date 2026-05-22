@@ -3,45 +3,61 @@
     "build": {
         "dockerfile": "Dockerfile",
         "args": {
-            "HTTP_PROXY": "${localEnv:http_proxy}",
-            "HTTPS_PROXY": "${localEnv:https_proxy}"
+            "HTTP_PROXY": "http://172.28.100.100:10808",
+            "HTTPS_PROXY": "http://172.28.100.100:10808",
+            "ALL_PROXY": "http://172.28.100.100:10808",
+            "NO_PROXY": "localhost,127.0.0.1,::1,host.docker.internal,172.28.100.100",
+            "http_proxy": "http://172.28.100.100:10808",
+            "https_proxy": "http://172.28.100.100:10808",
+            "all_proxy": "http://172.28.100.100:10808",
+            "no_proxy": "localhost,127.0.0.1,::1,host.docker.internal,172.28.100.100"
         }
     },
     "remoteUser": "devuser",
-    "updateRemoteUserUID": true,
+    "containerEnv": {
+        "CONTAINER_PROXY": "http://127.0.0.1:10808"
+    },
+    "remoteEnv": {
+        "HTTP_PROXY": "${containerEnv:CONTAINER_PROXY}",
+        "HTTPS_PROXY": "${containerEnv:CONTAINER_PROXY}",
+        "ALL_PROXY": "${containerEnv:CONTAINER_PROXY}",
+        "http_proxy": "${containerEnv:CONTAINER_PROXY}",
+        "https_proxy": "${containerEnv:CONTAINER_PROXY}",
+        "all_proxy": "${containerEnv:CONTAINER_PROXY}",
+        "NO_PROXY": "localhost,127.0.0.1,::1,host.docker.internal",
+        "no_proxy": "localhost,127.0.0.1,::1,host.docker.internal"
+    },
     "customizations": {
         "vscode": {
             "extensions": [
+                // Python development
                 "ms-python.python",
                 "charliermarsh.ruff",
+                // Rust development
                 "rust-lang.rust-analyzer",
                 "tamasfe.even-better-toml"
             ]
         }
     },
     "forwardPorts": [],
-    "initializeCommand": "mkdir -p ~/.codex ~/.claude ~/.ssh && [ -f ~/.gitconfig ] || touch ~/.gitconfig",
-    "mounts": [
-        "source=${localEnv:HOME}/.codex,target=/home/devuser/.codex,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.claude,target=/home/devuser/.claude,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.gitconfig,target=/home/devuser/.gitconfig,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.ssh,target=/home/devuser/.ssh,type=bind,consistency=cached"
-    ],
     "runArgs": [
-        "--gpus", "all",
-        "--shm-size", "32g",
-        "--add-host", "host.docker.internal:host-gateway",
-        "-v", "/data/shared_models:/models"
+        "--gpus",
+        "all",
+        "--network",
+        "host"
     ],
-    "containerEnv": {
-        "HTTP_PROXY": "${localEnv:CONTAINER_PROXY}",
-        "HTTPS_PROXY": "${localEnv:CONTAINER_PROXY}",
-        "NO_PROXY": "localhost,127.0.0.1",
-        "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
-        "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
-        "HF_HOME": "/models/huggingface_cache"
-    },
+    "mounts": [
+        "source=/home/model/models,target=/sgl-workspace/sglang/models,type=bind,readonly",
+        "source=${localEnv:HOME}/.codex,target=/home/devuser/.codex,type=bind",
+        "source=${localEnv:HOME}/.claude,target=/home/devuser/.claude,type=bind",
+        "source=/usr/lib/node_modules/@openai/codex,target=/usr/lib/node_modules/@openai/codex,type=bind,readonly",
+        "source=${localEnv:HOME}/.npm-global/lib/node_modules/@anthropic-ai/claude-code,target=/usr/lib/node_modules/@anthropic-ai/claude-code,type=bind,readonly"
+    ],
+    // The two lines below ensures that your local changes in the sglang
+    // repo is automatically synced to the sglang pip package installed
+    // in the dev docker container. You can remove / comment out these
+    // two lines if you prefer to sync code changes manually.
     "workspaceMount": "source=${localWorkspaceFolder},target=/sgl-workspace/sglang,type=bind",
     "workspaceFolder": "/sgl-workspace/sglang",
-    "postCreateCommand": "/bin/bash .devcontainer/post-create.sh"
+    "postStartCommand": "sudo mkdir -p /usr/lib/node_modules/@anthropic-ai /usr/local/bin; sudo ln -sf /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex /usr/local/bin/codex; sudo ln -sf /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/path/rg /usr/local/bin/rg; sudo ln -sf /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude; if [ ! -f /home/devuser/.claude.json ]; then latest_claude_config=$(ls -t /home/devuser/.claude/backups/.claude.json.backup.* 2>/dev/null | head -n 1); if [ -n \"$latest_claude_config\" ]; then cp \"$latest_claude_config\" /home/devuser/.claude.json; fi; fi"
 }
