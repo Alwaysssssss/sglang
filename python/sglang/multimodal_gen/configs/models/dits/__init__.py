@@ -5,6 +5,9 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConf
 from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import HunyuanVideoConfig
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
+from sglang.multimodal_gen.configs.models.dits.star_cogvideox_sr import (
+    StarCogVideoXSRDiTConfig,
+)
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
     StableDiffusion3TransformerConfig,
 )
@@ -17,5 +20,6 @@ __all__ = [
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
     "MOVAVideoConfig",
+    "StarCogVideoXSRDiTConfig",
     "StableDiffusion3TransformerConfig",
 ]

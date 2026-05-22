@@ -289,3 +289,51 @@ MVP 推荐：
 4. 无法判断问题来自 scheduler、DiT 还是 decode
 
 这个阶段的重点不是“勉强能出视频”，而是“知道结果为什么对/为什么不对”。
+
+
+## 11.Reference 逐帧对齐验收
+1. STAR的原项目，使用/sgl-workspace/STAR_mg/input/cogvideox_test里面的内容作为输入，输出结果在/sgl-workspace/STAR_mg/cogvideox-based/sat/output/results/0_A_serene_scene_of_a_panda_bear_playing_a_guitar_at_sunset_unfolds_by_a_tranquil_lake._The_panda,_with_its_black-and-whit下面，注意，推理的时候不能使用 gt 的内容，在推理阶段已经显示关闭了# samples = adain_color_fix(samples, gt) # samples,lq: (b, t, c, h, w)。推理命令如下:
+```
+cd /workspace/STAR/cogvideox-based/sat
+export STAR_COG_OUTPUT_DIR=/sgl-workspace/STAR/cogvideox-based/sat/output/results
+CUDA_VISIBLE_DEVICES=1 bash inference_sr.sh
+```
+STAR集成到 sglang 后的输出必须与原STAR 项目的输出做自动化逐帧对齐。只检查视频能打开、帧数正确还不够；必须验证视觉效果和数值尺度没有大范围偏移。
+比较口径：
+
+- 逐帧读取 reference mp4 和 SGLang candidate mp4。
+- 对每一帧计算 `SSIM`、`MSE`、`MAE`、`PSNR`、`max_abs_diff`。
+- 输出全局统计：`ssim_mean`、`ssim_min`、`mse_mean`、`mse_max`、`mae_mean`、`mae_max`、`failed_frames`。
+- 任一帧低于阈值即记录到 `failed_frames`；默认允许少量失败帧，用于兼容 H.264/HEVC 编码器以及不同 attention backend / GPU kernel 引入的微小漂移。
+
+默认阈值建议（宽松基线，用于发现「质性偏差」而不是 bit-exact 一致性）：
+
+```text
+min_ssim = 0.90
+max_mse = 150.0
+max_mae = 8.0
+allow_frame_count_delta = 1
+max_failed_frame_ratio = 0.05
+```
+
+这些阈值用于发现整帧错误、通道顺序错误、尺度错误、mask packing 错误、窗口提交错位和解码后处理错误，而不要求逐像素一致。视频编码器（H.264/HEVC）的有损压缩、不同 attention backend（FA2/FA3/torch SDPA）、不同 GPU 数值精度、VAE/dtype 差异都可能带来 SSIM 0.93-0.98 量级的小波动，按 0.985 这种严格阈值会大量误报。
+
+如果只关心是否完全跑通，不关心微小漂移，可以使用更宽松的「smoke」阈值：
+
+```text
+min_ssim = 0.80
+max_mse = 400.0
+max_mae = 15.0
+max_failed_frame_ratio = 0.10
+```
+
+如果是非常稳定的对照（同一台机、同一个 backend、同一个视频编码器），可以收紧成「strict」阈值用于 release gate：
+
+```text
+min_ssim = 0.95
+max_mse = 60.0
+max_mae = 5.0
+max_failed_frame_ratio = 0.0
+```
+
+无论选择哪一档，都必须保留 `ssim_min` 和 `mse_max` 的上报，便于事后定位回归。

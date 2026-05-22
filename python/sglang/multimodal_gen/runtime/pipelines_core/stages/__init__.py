@@ -77,6 +77,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.upsampling import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.video_condition_loading import (
     STARConditionVideoLoadingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.video_condition_vae_encoding import (
+    STARConditionVideoVAEEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.star_cogvideox_sr_decoding import (
+    STARCogVideoXSRDecodingStage,
+)
 
 __all__ = [
     "PipelineStage",
@@ -98,6 +104,8 @@ __all__ = [
     "LTX2ImageEncodingStage",
     "TextEncodingStage",
     "LTX2TextConnectorStage",
+    "STARConditionVideoVAEEncodingStage",
+    "STARCogVideoXSRDecodingStage",
     # Hunyuan3D shape stages
     "Hunyuan3DShapeBeforeDenoisingStage",
     "Hunyuan3DShapeDenoisingStage",

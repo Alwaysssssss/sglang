@@ -68,6 +68,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.star_cogvideox_sr import (
+    StarCogVideoXSRPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -113,6 +116,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.star_cogvideox_sr import (
+    StarCogVideoXSRSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -959,6 +965,17 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "ernie-image" in hf_id.lower(),
+        ],
+    )
+
+    # STAR CogVideoX video super-resolution
+    register_configs(
+        sampling_param_cls=StarCogVideoXSRSamplingParams,
+        pipeline_config_cls=StarCogVideoXSRPipelineConfig,
+        model_detectors=[
+            lambda value: "starcogvideoxsrpipeline" in value.lower(),
+            lambda value: "star-cogvideox" in value.lower(),
+            lambda value: "star_cogvideox" in value.lower(),
         ],
     )
 
