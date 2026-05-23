@@ -37,6 +37,48 @@ class TestStarCogVideoXKeymap(unittest.TestCase):
         )
         self.assertEqual(extracted.dropped_key_count, 1)
 
+    def test_extract_transformer_state_dict_merges_lora_into_original_weight(self):
+        checkpoint = {
+            "module": OrderedDict(
+                {
+                    "model.diffusion_model.transformer.layers.0.attention.dense.original.weight": torch.zeros(
+                        2, 2
+                    ),
+                    "model.diffusion_model.transformer.layers.0.attention.dense.original.bias": torch.zeros(
+                        2
+                    ),
+                    "model.diffusion_model.transformer.layers.0.attention.dense.matrix_A.0": torch.ones(
+                        2, 2
+                    ),
+                    "model.diffusion_model.transformer.layers.0.attention.dense.matrix_B.0": torch.ones(
+                        2, 2
+                    ),
+                }
+            )
+        }
+        extracted = extract_transformer_state_dict(checkpoint)
+
+        self.assertIn(
+            "transformer.layers.0.attention.dense.original.weight",
+            extracted.state_dict,
+        )
+        self.assertNotIn(
+            "transformer.layers.0.attention.dense.matrix_A.0",
+            extracted.state_dict,
+        )
+        self.assertNotIn(
+            "transformer.layers.0.attention.dense.matrix_B.0",
+            extracted.state_dict,
+        )
+        self.assertTrue(
+            torch.equal(
+                extracted.state_dict[
+                    "transformer.layers.0.attention.dense.original.weight"
+                ],
+                torch.ones(2, 2),
+            )
+        )
+
     def test_extract_vae_state_dict_drops_loss_keys(self):
         checkpoint = {
             "state_dict": {
@@ -206,6 +248,9 @@ class TestStarCogVideoXConversion(unittest.TestCase):
             with open(out / "model_index.json", encoding="utf-8") as f:
                 model_index = json.load(f)
             self.assertEqual(model_index["_class_name"], "StarCogVideoXSRPipeline")
+            self.assertEqual(model_index["transformer"][0], "diffusers")
+            self.assertEqual(model_index["vae"][0], "diffusers")
+            self.assertEqual(model_index["scheduler"][0], "diffusers")
 
             with open(out / "vae" / "config.json", encoding="utf-8") as f:
                 vae_cfg = json.load(f)

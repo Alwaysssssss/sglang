@@ -100,6 +100,27 @@ class TestStarConditionVideoVaeEncodingStage(unittest.TestCase):
         self.assertIsNotNone(result.image_latent)
         self.assertEqual(tuple(result.image_latent.shape), (1, 4, 3, 2, 2))
 
+    def test_expected_latent_num_frames_uses_condition_video_frame_count(self):
+        pipeline_config = StarCogVideoXSRPipelineConfig()
+        pipeline_config.vae_config.use_temporal_scaling_frames = True
+        pipeline_config.vae_config.arch_config.temporal_compression_ratio = 4
+
+        batch = Req(
+            sampling_params=StarCogVideoXSRSamplingParams(
+                prompt="test",
+                condition_video_path="/tmp/unused.mp4",
+                condition_video_num_frames=25,
+            )
+        )
+        batch.num_frames = 7
+        batch.condition_video_num_frames = 25
+
+        expected = STARConditionVideoVAEEncodingStage._expected_latent_num_frames(
+            batch,
+            SimpleNamespace(pipeline_config=pipeline_config),
+        )
+        self.assertEqual(expected, 7)
+
 
 if __name__ == "__main__":
     unittest.main()

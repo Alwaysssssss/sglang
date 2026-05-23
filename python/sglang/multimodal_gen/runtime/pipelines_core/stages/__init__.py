@@ -54,6 +54,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.star_latent_preparation import (
+    STARLatentPreparationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
     LTX2AVLatentPreparationStage,
 )
@@ -89,6 +92,7 @@ __all__ = [
     "InputValidationStage",
     "TimestepPreparationStage",
     "LatentPreparationStage",
+    "STARLatentPreparationStage",
     "ComfyUILatentPreparationStage",
     "LTX2AVLatentPreparationStage",
     "DenoisingStage",

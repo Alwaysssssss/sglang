@@ -50,12 +50,15 @@ class TestSTARConditionVideoLoadingStage(unittest.TestCase):
         )
 
     @staticmethod
-    def _make_server_args(width=None, height=None, num_frames=None):
+    def _make_server_args(
+        width=None, height=None, num_frames=None, condition_video_num_frames=None
+    ):
         return SimpleNamespace(
             pipeline_config=SimpleNamespace(
                 width=width,
                 height=height,
                 num_frames=num_frames,
+                condition_video_num_frames=condition_video_num_frames,
             )
         )
 
@@ -79,14 +82,19 @@ class TestSTARConditionVideoLoadingStage(unittest.TestCase):
 
     def test_stage_uses_pipeline_defaults_when_size_and_frames_are_implicit(self):
         batch = self._make_batch(condition_video_path=self.video_path)
-        server_args = self._make_server_args(width=40, height=24, num_frames=4)
+        server_args = self._make_server_args(
+            width=40,
+            height=24,
+            num_frames=4,
+            condition_video_num_frames=4,
+        )
 
         result = self.stage.forward(batch, server_args)
 
         self.assertEqual(result.condition_video.shape, (1, 4, 3, 24, 40))
         self.assertEqual(result.original_condition_video_size, (64, 48))
         self.assertAlmostEqual(result.original_condition_video_fps, 10.0)
-        self.assertEqual(result.condition_video_indices, [0, 1, 3, 4])
+        self.assertEqual(result.condition_video_indices, [0, 1, 2, 3])
         self.assertEqual(result.condition_video_num_frames, 4)
         self.assertEqual((result.width, result.height), (40, 24))
 
@@ -97,14 +105,30 @@ class TestSTARConditionVideoLoadingStage(unittest.TestCase):
             width=32,
             height=32,
             num_frames=3,
+            condition_video_num_frames=3,
         )
         server_args = self._make_server_args(width=40, height=24, num_frames=4)
 
         result = self.stage.forward(batch, server_args)
 
         self.assertEqual(result.condition_video.shape, (1, 3, 3, 32, 32))
-        self.assertEqual(result.condition_video_indices, [0, 2, 4])
+        self.assertEqual(result.condition_video_indices, [0, 1, 2])
         self.assertEqual((result.width, result.height), (32, 32))
+
+    def test_stage_uses_condition_video_default_not_output_num_frames(self):
+        batch = self._make_batch(condition_video_path=self.video_path, num_frames=3)
+        server_args = self._make_server_args(
+            width=64,
+            height=48,
+            num_frames=3,
+            condition_video_num_frames=5,
+        )
+
+        result = self.stage.forward(batch, server_args)
+
+        self.assertEqual(result.condition_video.shape, (1, 5, 3, 48, 64))
+        self.assertEqual(result.condition_video_indices, [0, 1, 2, 3, 4])
+        self.assertEqual(result.condition_video_num_frames, 5)
 
     def test_stage_supports_start_frame_and_stride(self):
         batch = self._make_batch(

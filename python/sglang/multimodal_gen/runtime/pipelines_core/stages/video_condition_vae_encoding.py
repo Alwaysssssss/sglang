@@ -28,12 +28,17 @@ class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
 
     @staticmethod
     def _expected_latent_num_frames(batch: Req, server_args: ServerArgs) -> int:
+        source_num_frames = batch.condition_video_num_frames or (
+            batch.condition_video.shape[1]
+            if isinstance(batch.condition_video, torch.Tensor)
+            else batch.num_frames
+        )
         temporal_ratio = (
             server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
         )
         if server_args.pipeline_config.vae_config.use_temporal_scaling_frames:
-            return int((batch.num_frames - 1) // temporal_ratio + 1)
-        return int(batch.num_frames)
+            return int((source_num_frames - 1) // temporal_ratio + 1)
+        return int(source_num_frames)
 
     def forward(
         self,

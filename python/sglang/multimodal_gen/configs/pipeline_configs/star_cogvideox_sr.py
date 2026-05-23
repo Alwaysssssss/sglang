@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -61,11 +62,15 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
     width: int = 720
     height: int = 480
     num_frames: int = 7
+    condition_video_num_frames: int = 25
     latent_channels: int = 16
 
     condition_video_resize_mode: str = "crop"
     enable_color_fix: bool = False
     color_fix_mode: str | None = None
+    dynamic_cfg_enabled: bool = True
+    dynamic_cfg_exp: float = 5.0
+    use_step_index_timestep: bool = False
 
     integration_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -96,6 +101,10 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
         latent_scale_factor = payload.get("latent_scale_factor")
         if latent_scale_factor not in (None, 0):
             self.vae_config.arch_config.scaling_factor = latent_scale_factor
+
+        dynamic_cfg_exp = payload.get("dynamic_cfg_exp")
+        if isinstance(dynamic_cfg_exp, (int, float)):
+            self.dynamic_cfg_exp = float(dynamic_cfg_exp)
 
         transformer_summary = payload.get("transformer_summary") or {}
         latent_width = transformer_summary.get("latent_width")
@@ -154,3 +163,49 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
                 device=device
             )
         return kwargs
+
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        del text_inputs, encoder_index
+        # STAR's FrozenT5Embedder calls T5EncoderModel with input_ids only.
+        return None
+
+    def should_force_zero_unconditional_text_embeddings(self) -> bool:
+        return True
+
+    def get_classifier_free_guidance_scale_for_step(
+        self,
+        batch,
+        guidance_scale: float,
+        timestep_index: int,
+        scheduler_timestep: int | None = None,
+    ) -> float:
+        if not self.dynamic_cfg_enabled:
+            return guidance_scale
+        num_steps = max(int(batch.num_inference_steps), 1)
+        if scheduler_timestep is None:
+            scheduler_timestep = int(timestep_index)
+        progress = (num_steps - int(scheduler_timestep)) / num_steps
+        return 1.0 + guidance_scale * (
+            1.0 - math.cos(math.pi * (progress**self.dynamic_cfg_exp))
+        ) / 2.0
+
+    def expand_timestep_before_forward_for_step(
+        self,
+        batch,
+        t_device,
+        target_dtype,
+        seq_len,
+        reserved_frames_mask,
+        batch_size: int,
+        timestep_index: int,
+    ):
+        if not self.use_step_index_timestep:
+            return None
+        del target_dtype, seq_len, reserved_frames_mask
+        remaining_steps = max(int(batch.num_inference_steps) - int(timestep_index), 1)
+        return torch.full(
+            (batch_size,),
+            remaining_steps,
+            dtype=t_device.dtype,
+            device=t_device.device,
+        )

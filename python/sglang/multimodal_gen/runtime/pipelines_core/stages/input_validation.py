@@ -94,6 +94,19 @@ class InputValidationStage(PipelineStage):
             torch.Generator(device_str).manual_seed(seed) for seed in seeds
         ]
 
+        # STAR's reference sampler draws the initial latent noise on CPU before
+        # moving it to CUDA, while VAE/scheduler noise stays on the runtime
+        # generator device. Preserve a separate CPU generator so later STAR
+        # stages can mirror that split RNG path without affecting the default
+        # generator contract used by other pipelines.
+        if (
+            getattr(server_args, "pipeline_class_name", None)
+            == "StarCogVideoXSRPipeline"
+        ):
+            batch.extra["star_initial_noise_generator"] = [
+                torch.Generator("cpu").manual_seed(seed) for seed in seeds
+            ]
+
     def preprocess_condition_image(
         self,
         batch: Req,

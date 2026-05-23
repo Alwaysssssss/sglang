@@ -29,3 +29,8 @@ class StarCogVideoXSRVAEConfig(VAEConfig):
     arch_config: StarCogVideoXSRVAEArchConfig = field(
         default_factory=StarCogVideoXSRVAEArchConfig
     )
+
+    def encode_sample_mode(self):
+        # STAR's reference pipeline samples from the VAE posterior during
+        # condition-video encoding via DiagonalGaussianRegularizer(sample=True).
+        return "sample"

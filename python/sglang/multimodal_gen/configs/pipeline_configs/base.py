@@ -241,6 +241,40 @@ class PipelineConfig:
     def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
         return guidance_scale
 
+    def get_classifier_free_guidance_scale_for_step(
+        self,
+        batch,
+        guidance_scale: float,
+        timestep_index: int,
+        scheduler_timestep: int | None = None,
+    ) -> float:
+        del timestep_index, scheduler_timestep
+        return self.get_classifier_free_guidance_scale(batch, guidance_scale)
+
+    def should_force_zero_unconditional_text_embeddings(self) -> bool:
+        return False
+
+    def expand_timestep_before_forward_for_step(
+        self,
+        batch,
+        t_device,
+        target_dtype,
+        seq_len,
+        reserved_frames_mask,
+        batch_size: int,
+        timestep_index: int,
+    ):
+        del (
+            batch,
+            t_device,
+            target_dtype,
+            seq_len,
+            reserved_frames_mask,
+            batch_size,
+            timestep_index,
+        )
+        return None
+
     def postprocess_cfg_noise(
         self,
         batch,

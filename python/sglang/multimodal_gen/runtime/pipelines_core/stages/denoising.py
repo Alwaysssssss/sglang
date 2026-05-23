@@ -776,6 +776,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ctx.target_dtype,
             ctx.seq_len,
             ctx.reserved_frames_mask,
+            step.step_index,
         )
 
         # 3. Apply scheduler-side input scaling before the model forward.
@@ -1060,8 +1061,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         target_dtype,
         seq_len: int | None,
         reserved_frames_mask,
+        timestep_index: int,
     ):
         bsz = batch.raw_latent_shape[0]
+        pipeline_timestep = (
+            server_args.pipeline_config.expand_timestep_before_forward_for_step(
+                batch=batch,
+                t_device=t_device,
+                target_dtype=target_dtype,
+                seq_len=seq_len,
+                reserved_frames_mask=reserved_frames_mask,
+                batch_size=bsz,
+                timestep_index=timestep_index,
+            )
+        )
+        if pipeline_timestep is not None:
+            return pipeline_timestep
         should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
 
         # expand timestep
@@ -1640,8 +1655,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_uncond, latents
                 )
-        cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
-            batch, current_guidance_scale
+        cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale_for_step(
+            batch,
+            current_guidance_scale,
+            timestep_index,
+            scheduler_timestep=int(timestep.reshape(-1)[0].item()),
         )
 
         if server_args.enable_cfg_parallel:

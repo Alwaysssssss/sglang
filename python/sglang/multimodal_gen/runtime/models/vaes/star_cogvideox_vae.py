@@ -2,8 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import math
+import os
+from pathlib import Path
+import sys
+import tempfile
+import warnings
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
@@ -12,6 +20,64 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.vaes.star_cogvideox_vae import (
     StarCogVideoXSRVAEConfig,
 )
+
+_STAR_LOCAL_DIST_INIT_PATH: str | None = None
+
+
+def _resolve_star_sat_root() -> Path | None:
+    candidates: list[Path] = []
+    for env_name in ("SGLANG_STAR_SAT_ROOT", "STAR_COGVIDEOX_SAT_ROOT"):
+        raw = os.environ.get(env_name)
+        if raw:
+            candidates.append(Path(raw).expanduser().resolve())
+
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidates.append(parent / "STAR_mg" / "cogvideox-based" / "sat")
+        candidates.append(parent.parent / "STAR_mg" / "cogvideox-based" / "sat")
+
+    for candidate in candidates:
+        if (candidate / "vae_modules" / "autoencoder.py").is_file():
+            return candidate
+    return None
+
+
+def _load_original_star_modules():
+    sat_root = _resolve_star_sat_root()
+    if sat_root is None:
+        raise FileNotFoundError(
+            "Unable to locate STAR SAT source root. Set `SGLANG_STAR_SAT_ROOT` "
+            "or place `STAR_mg/cogvideox-based/sat` alongside the `sglang` repo."
+        )
+
+    sat_root_str = str(sat_root)
+    if sat_root_str not in sys.path:
+        sys.path.insert(0, sat_root_str)
+
+    autoencoder_mod = importlib.import_module("vae_modules.autoencoder")
+    util_mod = importlib.import_module("sgm.util")
+    return autoencoder_mod.VideoAutoencoderInferenceWrapper, util_mod
+
+
+def _ensure_star_context_parallel(util_mod) -> None:
+    global _STAR_LOCAL_DIST_INIT_PATH
+
+    if not dist.is_initialized():
+        if _STAR_LOCAL_DIST_INIT_PATH is None:
+            fd, init_path = tempfile.mkstemp(
+                prefix="sglang-star-cp-", suffix=".dist"
+            )
+            os.close(fd)
+            _STAR_LOCAL_DIST_INIT_PATH = init_path
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{_STAR_LOCAL_DIST_INIT_PATH}",
+            rank=0,
+            world_size=1,
+        )
+
+    if not util_mod.is_context_parallel_initialized():
+        util_mod.initialize_context_parallel(1)
 
 
 def _group_norm(num_channels: int) -> nn.GroupNorm:
@@ -290,6 +356,24 @@ class _StarVideoDecoder(nn.Module):
         target_num_frames: int | None,
     ) -> torch.Tensor:
         if target_num_frames is None:
+            if self.temporal_compression_ratio <= 1 or latents.shape[2] <= 1:
+                return latents
+
+            ratio = int(self.temporal_compression_ratio)
+            if ratio > 0 and ratio & (ratio - 1) == 0:
+                expanded = latents
+                num_temporal_upsamples = int(math.log2(ratio))
+                for _ in range(num_temporal_upsamples):
+                    if expanded.shape[2] <= 1:
+                        break
+                    if expanded.shape[2] % 2 == 1:
+                        first_frame = expanded[:, :, :1]
+                        rest_frames = expanded[:, :, 1:].repeat_interleave(2, dim=2)
+                        expanded = torch.cat([first_frame, rest_frames], dim=2)
+                    else:
+                        expanded = expanded.repeat_interleave(2, dim=2)
+                return expanded
+
             target_num_frames = max(
                 1,
                 (latents.shape[2] - 1) * self.temporal_compression_ratio + 1,
@@ -327,9 +411,66 @@ class StarCogVideoXSRVAE(nn.Module):
         self.config = config
         self.scaling_factor = config.arch_config.scaling_factor
         self.shift_factor = getattr(config.arch_config, "shift_factor", None)
-        self.encoder = _StarVideoEncoder(config)
-        self.decoder = _StarVideoDecoder(config)
         self.use_tiling = False
+        self._star_util_mod = None
+        self._use_original_impl = False
+
+        try:
+            wrapper_cls, util_mod = _load_original_star_modules()
+            _ensure_star_context_parallel(util_mod)
+            self._star_util_mod = util_mod
+            self.impl = wrapper_cls(
+                cp_size=0,
+                loss_config={"target": "torch.nn.Identity"},
+                regularizer_config={
+                    "target": "vae_modules.regularizers.DiagonalGaussianRegularizer"
+                },
+                encoder_config={
+                    "target": "vae_modules.cp_enc_dec.ContextParallelEncoder3D",
+                    "params": {
+                        "double_z": True,
+                        "z_channels": config.arch_config.z_channels,
+                        "resolution": config.arch_config.resolution,
+                        "in_channels": config.arch_config.in_channels,
+                        "out_ch": config.arch_config.out_channels,
+                        "ch": config.arch_config.ch,
+                        "ch_mult": config.arch_config.ch_mult,
+                        "attn_resolutions": [],
+                        "num_res_blocks": config.arch_config.num_res_blocks,
+                        "dropout": config.arch_config.dropout,
+                        "gather_norm": True,
+                    },
+                },
+                decoder_config={
+                    "target": "vae_modules.cp_enc_dec.ContextParallelDecoder3D",
+                    "params": {
+                        "double_z": True,
+                        "z_channels": config.arch_config.z_channels,
+                        "resolution": config.arch_config.resolution,
+                        "in_channels": config.arch_config.in_channels,
+                        "out_ch": config.arch_config.out_channels,
+                        "ch": config.arch_config.ch,
+                        "ch_mult": config.arch_config.ch_mult,
+                        "attn_resolutions": [],
+                        "num_res_blocks": config.arch_config.num_res_blocks,
+                        "dropout": config.arch_config.dropout,
+                        "gather_norm": False,
+                    },
+                },
+            )
+            self._use_original_impl = True
+        except Exception as exc:
+            warnings.warn(
+                "Falling back to the approximate STAR VAE implementation because "
+                f"the original SAT VAE could not be initialized: {exc}",
+                stacklevel=2,
+            )
+            self.encoder = _StarVideoEncoder(config)
+            self.decoder = _StarVideoDecoder(config)
+
+    def _ensure_original_runtime(self) -> None:
+        if self._use_original_impl and self._star_util_mod is not None:
+            _ensure_star_context_parallel(self._star_util_mod)
 
     def enable_tiling(self, use_tiling: bool = True) -> None:
         self.use_tiling = use_tiling
@@ -343,7 +484,11 @@ class StarCogVideoXSRVAE(nn.Module):
                 "STAR VAE encode expects [B, C, T, H, W], "
                 f"got {tuple(x.shape)}"
             )
-        moments = self.encoder(x)
+        if self._use_original_impl:
+            self._ensure_original_runtime()
+            moments = self.impl.encoder(x)
+        else:
+            moments = self.encoder(x)
         latent_dist = DiagonalGaussianDistribution(moments)
         if not return_dict:
             return (latent_dist,)
@@ -354,6 +499,7 @@ class StarCogVideoXSRVAE(nn.Module):
         latents: torch.Tensor,
         return_dict: bool = True,
         target_num_frames: int | None = None,
+        clear_fake_cp_cache: bool = False,
         **kwargs,
     ):
         del kwargs
@@ -362,7 +508,23 @@ class StarCogVideoXSRVAE(nn.Module):
                 "STAR VAE decode expects [B, C, T, H, W], "
                 f"got {tuple(latents.shape)}"
             )
-        sample = self.decoder(latents, target_num_frames=target_num_frames)
+        if self._use_original_impl:
+            self._ensure_original_runtime()
+            if target_num_frames is not None:
+                expected_frames = latents.shape[2] * 4 - 3
+                if target_num_frames != expected_frames:
+                    warnings.warn(
+                        "STAR original VAE decode ignores `target_num_frames`; "
+                        f"requested {target_num_frames}, implied {expected_frames}.",
+                        stacklevel=2,
+                    )
+            sample = self.impl.decode(
+                latents,
+                clear_fake_cp_cache=clear_fake_cp_cache,
+            )
+        else:
+            del clear_fake_cp_cache
+            sample = self.decoder(latents, target_num_frames=target_num_frames)
         if not return_dict:
             return (sample,)
         return DecoderOutput(sample=sample)
@@ -371,6 +533,16 @@ class StarCogVideoXSRVAE(nn.Module):
         posterior = self.encode(x).latent_dist
         latents = posterior.sample() if sample_posterior else posterior.mode()
         return self.decode(latents)
+
+    def state_dict(self, *args, **kwargs):
+        if self._use_original_impl:
+            return self.impl.state_dict(*args, **kwargs)
+        return super().state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        if self._use_original_impl:
+            return self.impl.load_state_dict(state_dict, strict=strict)
+        return super().load_state_dict(state_dict, strict=strict)
 
 
 EntryClass = StarCogVideoXSRVAE

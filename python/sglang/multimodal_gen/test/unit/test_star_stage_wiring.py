@@ -85,7 +85,7 @@ class TestStarPipelineWiring(unittest.TestCase):
                 "STARConditionVideoLoadingStage",
                 "TextEncodingStage",
                 "STARConditionVideoVAEEncodingStage",
-                "LatentPreparationStage",
+                "STARLatentPreparationStage",
                 "TimestepPreparationStage",
                 "DenoisingStage",
                 "STARCogVideoXSRDecodingStage",

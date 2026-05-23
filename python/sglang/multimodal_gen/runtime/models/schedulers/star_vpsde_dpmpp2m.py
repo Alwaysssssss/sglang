@@ -128,17 +128,30 @@ class StarVPSDEDPMPP2MScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         self._num_inference_steps: int | None = None
         self._step_index: int | None = None
+        self._begin_index: int | None = None
         self._old_denoised: torch.Tensor | None = None
 
         BaseScheduler.__init__(self)
+
+    @property
+    def step_index(self) -> int | None:
+        return self._step_index
+
+    @property
+    def begin_index(self) -> int | None:
+        return self._begin_index
 
     def set_shift(self, shift: float) -> None:
         self.shift_scale = float(shift)
         if self._num_inference_steps is not None:
             self.set_timesteps(self._num_inference_steps, device=self.timesteps.device)
 
+    def set_begin_index(self, begin_index: int = 0) -> None:
+        self._begin_index = int(begin_index)
+
     def _reset_step_state(self) -> None:
         self._step_index = None
+        self._begin_index = None
         self._old_denoised = None
 
     def set_timesteps(
@@ -205,15 +218,27 @@ class StarVPSDEDPMPP2MScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         del timestep
         return sample
 
-    def _init_step_index(self, timestep: torch.Tensor | int) -> None:
+    def index_for_timestep(
+        self,
+        timestep: torch.Tensor | int,
+        schedule_timesteps: torch.Tensor | None = None,
+    ) -> int:
+        if schedule_timesteps is None:
+            schedule_timesteps = self.timesteps
         if isinstance(timestep, torch.Tensor):
-            timestep_value = int(timestep.flatten()[0].item())
+            timestep = timestep.to(schedule_timesteps.device)
+        indices = (schedule_timesteps == timestep).nonzero(as_tuple=False)
+        if indices.numel() == 0:
+            raise ValueError(f"Unknown STAR scheduler timestep: {timestep}")
+        return int(indices[0].item())
+
+    def _init_step_index(self, timestep: torch.Tensor | int) -> None:
+        if self.begin_index is None:
+            if isinstance(timestep, torch.Tensor):
+                timestep = timestep.to(self.timesteps.device)
+            self._step_index = self.index_for_timestep(timestep)
         else:
-            timestep_value = int(timestep)
-        matches = (self.timesteps == timestep_value).nonzero(as_tuple=False)
-        if matches.numel() == 0:
-            raise ValueError(f"Unknown STAR scheduler timestep: {timestep_value}")
-        self._step_index = int(matches[0].item())
+            self._step_index = self.begin_index
 
     def _epsilon_to_denoised(
         self,
@@ -263,6 +288,28 @@ class StarVPSDEDPMPP2MScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             value = value.unsqueeze(-1)
         return value
 
+    @staticmethod
+    def _sample_star_noise_like(
+        sample: torch.Tensor,
+        generator: torch.Generator | list[torch.Generator] | None,
+    ) -> torch.Tensor:
+        if sample.ndim != 5:
+            return randn_tensor(
+                sample.shape,
+                generator=generator,
+                device=sample.device,
+                dtype=torch.float32,
+            )
+
+        batch_size, channels, num_frames, height, width = sample.shape
+        noise_btchw = randn_tensor(
+            (batch_size, num_frames, channels, height, width),
+            generator=generator,
+            device=sample.device,
+            dtype=torch.float32,
+        )
+        return noise_btchw.permute(0, 2, 1, 3, 4).contiguous()
+
     def step(
         self,
         model_output: torch.Tensor,
@@ -306,16 +353,13 @@ class StarVPSDEDPMPP2MScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             )
 
             sample_f = sample.to(torch.float32)
-            noise = randn_tensor(
-                sample.shape,
-                generator=generator,
-                device=sample.device,
-                dtype=torch.float32,
-            )
             mult1 = self._append_dims(mult1, sample.ndim)
             mult2 = self._append_dims(mult2, sample.ndim)
             mult_noise = self._append_dims(mult_noise, sample.ndim)
-            x_standard = mult1 * sample_f - mult2 * denoised + mult_noise * noise
+            noise_standard = self._sample_star_noise_like(sample, generator)
+            x_standard = (
+                mult1 * sample_f - mult2 * denoised + mult_noise * noise_standard
+            )
 
             if self._old_denoised is None or r is None or torch.sum(next_alpha) < 1e-14:
                 prev_sample = x_standard
@@ -323,11 +367,13 @@ class StarVPSDEDPMPP2MScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 mult3 = self._append_dims(1.0 + 1.0 / (2.0 * r), sample.ndim)
                 mult4 = self._append_dims(1.0 / (2.0 * r), sample.ndim)
                 denoised_d = mult3 * denoised - mult4 * self._old_denoised
-                prev_sample = mult1 * sample_f - mult2 * denoised_d + mult_noise * noise
+                noise_advanced = self._sample_star_noise_like(sample, generator)
+                prev_sample = (
+                    mult1 * sample_f - mult2 * denoised_d + mult_noise * noise_advanced
+                )
 
         self._old_denoised = denoised
         self._step_index += 1
-        prev_sample = prev_sample.to(model_output.dtype)
 
         if not return_dict:
             return (prev_sample,)

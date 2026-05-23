@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from sat.ops.layernorm import LayerNorm as SATLayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.star_cogvideox_sr import (
     StarCogVideoXSRDiTConfig,
@@ -83,13 +84,13 @@ class _SpatialLocalEnhancer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         pooled = torch.cat(
             [
-                x.mean(dim=1, keepdim=True),
                 x.amax(dim=1, keepdim=True),
+                x.mean(dim=1, keepdim=True),
             ],
             dim=1,
         )
         gate = torch.sigmoid(self.conv1(pooled))
-        return x + x * gate
+        return x * gate
 
 
 class _TemporalLocalEnhancer(nn.Module):
@@ -98,9 +99,9 @@ class _TemporalLocalEnhancer(nn.Module):
         self.conv1 = nn.Linear(2, 1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pooled = torch.stack([x.mean(dim=-1), x.amax(dim=-1)], dim=-1)
+        pooled = torch.stack([x.amax(dim=-1), x.mean(dim=-1)], dim=-1)
         gate = torch.sigmoid(self.conv1(pooled))
-        return x + x * gate
+        return x * gate
 
 
 class _StarPatchEmbedMixin(nn.Module):
@@ -229,7 +230,7 @@ class _StarAdaLNMixin(nn.Module):
         if qk_ln:
             self.query_layernorm_list = nn.ModuleList(
                 [
-                    nn.LayerNorm(
+                    SATLayerNorm(
                         head_dim,
                         eps=1e-6,
                         elementwise_affine=elementwise_affine,
@@ -239,7 +240,7 @@ class _StarAdaLNMixin(nn.Module):
             )
             self.key_layernorm_list = nn.ModuleList(
                 [
-                    nn.LayerNorm(
+                    SATLayerNorm(
                         head_dim,
                         eps=1e-6,
                         elementwise_affine=elementwise_affine,
@@ -431,13 +432,13 @@ class _StarTransformerLayer(nn.Module):
         local_spatial_kernel_size: int,
     ) -> None:
         super().__init__()
-        self.input_layernorm = nn.LayerNorm(
+        self.input_layernorm = SATLayerNorm(
             hidden_size,
             eps=1e-6,
             elementwise_affine=elementwise_affine,
         )
         self.attention = _StarAttention(hidden_size, num_attention_heads)
-        self.post_attention_layernorm = nn.LayerNorm(
+        self.post_attention_layernorm = SATLayerNorm(
             hidden_size,
             eps=1e-6,
             elementwise_affine=elementwise_affine,
@@ -448,9 +449,20 @@ class _StarTransformerLayer(nn.Module):
 
 
 class _StarTransformerStack(nn.Module):
-    def __init__(self, layers: nn.ModuleList) -> None:
+    def __init__(
+        self,
+        layers: nn.ModuleList,
+        *,
+        hidden_size: int,
+        elementwise_affine: bool,
+    ) -> None:
         super().__init__()
         self.layers = layers
+        self.final_layernorm = SATLayerNorm(
+            hidden_size,
+            eps=1e-6,
+            elementwise_affine=elementwise_affine,
+        )
 
 
 class _StarMixins(nn.Module):
@@ -551,7 +563,9 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
                     )
                     for _ in range(arch.num_layers)
                 ]
-            )
+            ),
+            hidden_size=arch.hidden_size,
+            elementwise_affine=arch.elementwise_affine,
         )
         self.__post_init__()
 
@@ -736,6 +750,8 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
             text_hidden = text_hidden + text_gate_mlp.unsqueeze(1) * mlp_output[:, :text_length, :]
             img_hidden = img_hidden + gate_mlp.unsqueeze(1) * mlp_output[:, text_length:, :]
             hidden_states = torch.cat([text_hidden, img_hidden], dim=1)
+
+        hidden_states = self.transformer.final_layernorm(hidden_states)
 
         return self.mixins.final_layer(
             hidden_states,

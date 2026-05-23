@@ -93,6 +93,16 @@ class TextEncodingStage(PipelineStage):
                 return_attention_mask=True,
             )
 
+            if server_args.pipeline_config.should_force_zero_unconditional_text_embeddings():
+                neg_embeds_list = [
+                    torch.zeros_like(prompt_embeds)
+                    for prompt_embeds in prompt_embeds_list
+                ]
+                neg_pooler_embeds_list = [
+                    torch.zeros_like(pooler_embeds)
+                    for pooler_embeds in pooler_embeds_list
+                ]
+
             assert batch.negative_prompt_embeds is not None
 
             for ne in neg_embeds_list:
@@ -114,7 +124,7 @@ class TextEncodingStage(PipelineStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+            lambda x: not batch.do_classifier_free_guidance or isinstance(x, str),
         )
         result.add_check(
             "do_classifier_free_guidance",

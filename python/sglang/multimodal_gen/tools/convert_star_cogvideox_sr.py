@@ -141,11 +141,11 @@ def _build_model_index(tokenizer_class_name: str) -> dict[str, Any]:
     return {
         "_class_name": PIPELINE_CLASS_NAME,
         "_diffusers_version": "0.0.0",
-        "transformer": ["sglang", TRANSFORMER_CLASS_NAME],
-        "vae": ["sglang", VAE_CLASS_NAME],
+        "transformer": ["diffusers", TRANSFORMER_CLASS_NAME],
+        "vae": ["diffusers", VAE_CLASS_NAME],
         "text_encoder": ["transformers", "T5EncoderModel"],
         "tokenizer": ["transformers", tokenizer_class_name],
-        "scheduler": ["sglang", SCHEDULER_CLASS_NAME],
+        "scheduler": ["diffusers", SCHEDULER_CLASS_NAME],
     }
 
 
@@ -171,6 +171,21 @@ def _build_transformer_component_config(source_cfg: dict[str, Any]) -> dict[str,
     params["_source_target"] = network.get("target")
     params["source_key_prefix"] = "model.diffusion_model."
     return params
+
+
+def _get_transformer_lora_alpha(source_cfg: dict[str, Any]) -> float | None:
+    params = (
+        source_cfg.get("model", {})
+        .get("network_config", {})
+        .get("params", {})
+        .get("modules", {})
+        .get("lora_config", {})
+        .get("params", {})
+    )
+    value = params.get("lora_alpha", params.get("alpha"))
+    if value is None:
+        return None
+    return float(value)
 
 
 def _build_vae_component_config(source_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -200,6 +215,13 @@ def _build_integration_config(source_cfg: dict[str, Any]) -> dict[str, Any]:
     args_cfg = source_cfg.get("args", {})
     model_cfg = source_cfg.get("model", {})
     network_params = model_cfg.get("network_config", {}).get("params", {}) or {}
+    guider_params = (
+        model_cfg.get("sampler_config", {})
+        .get("params", {})
+        .get("guider_config", {})
+        .get("params", {})
+        or {}
+    )
     return {
         "pipeline_class_name": PIPELINE_CLASS_NAME,
         "pipeline_config_class_name": "StarCogVideoXSRPipelineConfig",
@@ -213,6 +235,7 @@ def _build_integration_config(source_cfg: dict[str, Any]) -> dict[str, Any]:
         "default_num_inference_steps": model_cfg.get("sampler_config", {})
         .get("params", {})
         .get("num_steps"),
+        "dynamic_cfg_exp": guider_params.get("exp"),
         "latent_channels": args_cfg.get("latent_channels"),
         "transformer_summary": {
             "hidden_size": network_params.get("hidden_size"),
@@ -313,7 +336,10 @@ def run_conversion(args: argparse.Namespace) -> ConversionReport:
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     transformer_ckpt = _load_torch_checkpoint(source_paths["transformer_path"])
-    transformer_extracted = extract_transformer_state_dict(transformer_ckpt)
+    transformer_extracted = extract_transformer_state_dict(
+        transformer_ckpt,
+        lora_alpha=_get_transformer_lora_alpha(source_cfg),
+    )
     transformer_dir = output_root / "transformer"
     transformer_dir.mkdir(parents=True, exist_ok=True)
     transformer_tensors, transformer_params = _save_safetensors(

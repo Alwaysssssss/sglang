@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 class StarCogVideoXSRSamplingParams(SamplingParams):
     """Sampling parameters for STAR CogVideoX video super-resolution."""
 
+    negative_prompt: str = ""
     condition_video_path: str | None = None
     condition_video_start_frame: int | None = None
     condition_video_num_frames: int | None = None

@@ -5,18 +5,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import imageio
+import decord
 import numpy as np
 import PIL.Image
-import PIL.ImageOps
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as TT
 
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    PIL_INTERPOLATION,
-    load_video,
-    normalize,
-    numpy_to_pt,
-    pil_to_numpy,
-)
+from sglang.multimodal_gen.runtime.models.vision_utils import normalize
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -50,29 +46,73 @@ class STARConditionVideoLoadingStage(PipelineStage):
         return value
 
     @staticmethod
-    def _inspect_video_metadata(
-        path: str, frames: list[PIL.Image.Image]
-    ) -> ConditionVideoMetadata:
-        first_frame = frames[0]
-        fps = None
+    def _paired_dataset_preprocess(
+        frames: torch.Tensor,
+        target_height: int,
+        target_width: int,
+    ) -> torch.Tensor:
+        if frames.shape[-1] > target_width:
+            scale_factor = target_width / frames.shape[-1]
+            frames = F.interpolate(
+                frames,
+                scale_factor=scale_factor,
+                mode="bilinear",
+            )
+            frames = TT.functional.center_crop(frames, (target_height, target_width))
+        elif frames.shape[-1] < target_width:
+            scale_factor = target_width / frames.shape[-1]
+            frames = F.interpolate(
+                frames,
+                scale_factor=scale_factor,
+                mode="bicubic",
+            )
+        return frames
 
+    @staticmethod
+    def _load_gif_frames(path: str) -> tuple[torch.Tensor, float | None]:
+        pil_frames: list[torch.Tensor] = []
+        with PIL.Image.open(path) as gif:
+            duration_ms = gif.info.get("duration")
+            fps = 1000.0 / float(duration_ms) if duration_ms and duration_ms > 0 else None
+            try:
+                while True:
+                    pil_frames.append(
+                        torch.from_numpy(np.array(gif.convert("RGB"), copy=True))
+                    )
+                    gif.seek(gif.tell() + 1)
+            except EOFError:
+                pass
+
+        if not pil_frames:
+            raise ValueError(f"No frames could be loaded from {path!r}")
+        return torch.stack(pil_frames, dim=0), fps
+
+    @staticmethod
+    def _load_video_tensor(path: str) -> tuple[torch.Tensor, ConditionVideoMetadata]:
         if path.lower().endswith(".gif"):
-            with PIL.Image.open(path) as gif:
-                duration_ms = gif.info.get("duration")
-            if duration_ms and duration_ms > 0:
-                fps = 1000.0 / float(duration_ms)
-        else:
-            with imageio.get_reader(path) as reader:
-                metadata = reader.get_meta_data()
-            raw_fps = metadata.get("fps")
-            if raw_fps is not None:
-                fps = float(raw_fps)
+            frames, fps = STARConditionVideoLoadingStage._load_gif_frames(path)
+            return frames, ConditionVideoMetadata(
+                width=int(frames.shape[2]),
+                height=int(frames.shape[1]),
+                fps=fps,
+                num_frames=int(frames.shape[0]),
+            )
 
-        return ConditionVideoMetadata(
-            width=first_frame.width,
-            height=first_frame.height,
+        decord.bridge.set_bridge("torch")
+        reader = decord.VideoReader(uri=path, height=-1, width=-1)
+        if len(reader) == 0:
+            raise ValueError(f"No frames could be loaded from {path!r}")
+        indices = np.arange(len(reader))
+        frames = reader.get_batch(indices)
+        if not isinstance(frames, torch.Tensor):
+            frames = torch.from_numpy(frames)
+
+        fps = float(reader.get_avg_fps()) if hasattr(reader, "get_avg_fps") else None
+        return frames, ConditionVideoMetadata(
+            width=int(frames.shape[2]),
+            height=int(frames.shape[1]),
             fps=fps,
-            num_frames=len(frames),
+            num_frames=int(frames.shape[0]),
         )
 
     @staticmethod
@@ -120,13 +160,20 @@ class STARConditionVideoLoadingStage(PipelineStage):
         if requested_condition_frames is not None:
             return requested_condition_frames
 
-        explicit_fields = set(batch.extra.get("explicit_fields", []))
-        if "num_frames" in explicit_fields:
-            return cls._validate_positive_int("num_frames", batch.num_frames)
+        default_condition_frames = getattr(
+            pipeline_config, "condition_video_num_frames", None
+        )
+        if default_condition_frames is not None:
+            return cls._validate_positive_int(
+                "pipeline_config.condition_video_num_frames",
+                default_condition_frames,
+            )
 
         default_num_frames = getattr(pipeline_config, "num_frames", None)
         if default_num_frames is not None:
-            return cls._validate_positive_int("pipeline_config.num_frames", default_num_frames)
+            return cls._validate_positive_int(
+                "pipeline_config.num_frames", default_num_frames
+            )
 
         return metadata.num_frames
 
@@ -178,25 +225,22 @@ class STARConditionVideoLoadingStage(PipelineStage):
         if target_num_frames is None or target_num_frames == len(indices):
             return indices
 
+        # Match STAR reference inference semantics: without an explicit stride/FPS
+        # override, the condition clip is the leading contiguous window rather than
+        # a uniformly resampled subset of the full source video.
+        if (
+            frame_stride is None
+            and sample_fps is None
+            and target_num_frames < len(indices)
+        ):
+            return indices[:target_num_frames]
+
         sample_positions = np.linspace(
             0,
             len(indices) - 1,
             num=target_num_frames,
         )
         return [indices[int(round(position))] for position in sample_positions]
-
-    @staticmethod
-    def _resize_and_crop_frame(
-        frame: PIL.Image.Image,
-        width: int,
-        height: int,
-    ) -> PIL.Image.Image:
-        return PIL.ImageOps.fit(
-            frame.convert("RGB"),
-            (width, height),
-            method=PIL_INTERPOLATION["lanczos"],
-            centering=(0.5, 0.5),
-        )
 
     def forward(
         self,
@@ -205,13 +249,11 @@ class STARConditionVideoLoadingStage(PipelineStage):
     ) -> Req:
         condition_video_path = batch.condition_video_path
         if not condition_video_path:
-            raise ValueError("condition_video_path is required for STAR condition video loading")
+            raise ValueError(
+                "condition_video_path is required for STAR condition video loading"
+            )
 
-        frames = load_video(condition_video_path)
-        if not frames:
-            raise ValueError(f"No frames could be loaded from {condition_video_path!r}")
-
-        metadata = self._inspect_video_metadata(condition_video_path, frames)
+        frames, metadata = self._load_video_tensor(condition_video_path)
         target_width, target_height = self._resolve_target_size(
             batch=batch,
             pipeline_config=server_args.pipeline_config,
@@ -224,13 +266,20 @@ class STARConditionVideoLoadingStage(PipelineStage):
             pipeline_config=server_args.pipeline_config,
         )
 
-        selected_frames = [
-            self._resize_and_crop_frame(frames[index], target_width, target_height)
-            for index in frame_indices
-        ]
-        condition_video = normalize(numpy_to_pt(pil_to_numpy(selected_frames))).unsqueeze(0)
+        selected_frames = frames.index_select(
+            0, torch.tensor(frame_indices, dtype=torch.long)
+        )
+        condition_video = selected_frames.permute(0, 3, 1, 2).contiguous()
+        condition_video = self._paired_dataset_preprocess(
+            condition_video,
+            target_height=target_height,
+            target_width=target_width,
+        )
+        condition_video = normalize(condition_video.to(torch.float32) / 255.0).unsqueeze(0)
         if batch.num_outputs_per_prompt > 1:
-            condition_video = condition_video.repeat(batch.num_outputs_per_prompt, 1, 1, 1, 1)
+            condition_video = condition_video.repeat(
+                batch.num_outputs_per_prompt, 1, 1, 1, 1
+            )
 
         batch.condition_video = condition_video
         batch.original_condition_video_size = (metadata.width, metadata.height)

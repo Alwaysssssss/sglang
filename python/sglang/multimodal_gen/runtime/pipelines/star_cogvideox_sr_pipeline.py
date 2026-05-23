@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
     STARConditionVideoLoadingStage,
+    STARLatentPreparationStage,
     STARConditionVideoVAEEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.star_cogvideox_sr_decoding import (
@@ -75,7 +76,12 @@ class StarCogVideoXSRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             STARConditionVideoVAEEncodingStage(vae=self.get_module("vae"))
         )
-        self.add_standard_latent_preparation_stage()
+        self.add_stage(
+            STARLatentPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
+            )
+        )
         self.add_standard_timestep_preparation_stage()
         self.add_standard_denoising_stage()
         self.add_stage(
