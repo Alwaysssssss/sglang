@@ -355,6 +355,8 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
+            if self.server_args.enable_torch_compile:
+                self._reclaim_dit_gpu_residency_after_request()
             # torch.compile on large video models can keep allocator reservations
             # from the previous request large enough to trigger the next request's
             # VAE encode OOM before denoising begins. Clearing the CUDA allocator
@@ -364,6 +366,38 @@ class GPUWorker:
                 gc.collect()
                 torch.cuda.empty_cache()
         return output_batch
+
+    def _reclaim_dit_gpu_residency_after_request(self) -> None:
+        """
+        When CPU offload is enabled, torch.compile can leave the active DiT
+        resident on GPU after a request completes. Reclaiming that residency at
+        request boundaries prevents the next request's condition-video VAE
+        encode from inheriting the previous request's peak transformer memory.
+        """
+        if (
+            not self.server_args.dit_cpu_offload
+            or self.server_args.use_fsdp_inference
+            or self.pipeline is None
+        ):
+            return
+        if bool(
+            getattr(
+                self.server_args.pipeline_config,
+                "keep_transformer_gpu_resident_between_requests",
+                False,
+            )
+        ):
+            return
+
+        for module_name in ("transformer", "transformer_2"):
+            dit = self.pipeline.get_module(module_name, None)
+            if dit is None or not hasattr(dit, "to"):
+                continue
+            try:
+                if next(dit.parameters()).device.type == "cuda":
+                    dit.to("cpu")
+            except StopIteration:
+                continue
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float

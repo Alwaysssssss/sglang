@@ -155,6 +155,61 @@ def _parse_args() -> argparse.Namespace:
         help="Enable torch.compile for the DiT runtime.",
     )
     parser.add_argument(
+        "--use-flashinfer-rope",
+        dest="use_flashinfer_rope",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--disable-flashinfer-rope",
+        dest="use_flashinfer_rope",
+        action="store_false",
+    )
+    parser.set_defaults(use_flashinfer_rope=None)
+    parser.add_argument(
+        "--local-enhancer-mode",
+        choices=["legacy", "fused_5d"],
+        default=None,
+    )
+    parser.add_argument(
+        "--condition-video-vae-peak-memory-mode",
+        choices=[
+            "legacy",
+            "off",
+            "text_encoder_only",
+            "transformer_only",
+            "text_encoder_and_transformer",
+            "auto",
+        ],
+        default=None,
+    )
+    parser.add_argument(
+        "--condition-video-vae-target-headroom-gb",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--release-text-encoder-after-prompt-encode",
+        dest="release_text_encoder_after_prompt_encode",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--keep-text-encoder-after-prompt-encode",
+        dest="release_text_encoder_after_prompt_encode",
+        action="store_false",
+    )
+    parser.set_defaults(release_text_encoder_after_prompt_encode=None)
+    parser.add_argument(
+        "--keep-transformer-gpu-resident-between-requests",
+        dest="keep_transformer_gpu_resident_between_requests",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--disable-keep-transformer-gpu-resident-between-requests",
+        dest="keep_transformer_gpu_resident_between_requests",
+        action="store_false",
+    )
+    parser.set_defaults(keep_transformer_gpu_resident_between_requests=None)
+    parser.add_argument(
         "--dit-cpu-offload",
         action="store_true",
         help="Enable DiT CPU offload.",
@@ -349,6 +404,31 @@ def _build_nunchaku_config(args: argparse.Namespace) -> NunchakuSVDQuantArgs | N
     )
 
 
+def _build_pipeline_config_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if args.use_flashinfer_rope is not None:
+        overrides["use_flashinfer_rope"] = args.use_flashinfer_rope
+    if args.local_enhancer_mode is not None:
+        overrides["local_enhancer_mode"] = args.local_enhancer_mode
+    if args.condition_video_vae_peak_memory_mode is not None:
+        overrides["condition_video_vae_peak_memory_mode"] = (
+            args.condition_video_vae_peak_memory_mode
+        )
+    if args.condition_video_vae_target_headroom_gb is not None:
+        overrides["condition_video_vae_target_headroom_gb"] = (
+            args.condition_video_vae_target_headroom_gb
+        )
+    if args.release_text_encoder_after_prompt_encode is not None:
+        overrides["release_text_encoder_after_prompt_encode"] = (
+            args.release_text_encoder_after_prompt_encode
+        )
+    if args.keep_transformer_gpu_resident_between_requests is not None:
+        overrides["keep_transformer_gpu_resident_between_requests"] = (
+            args.keep_transformer_gpu_resident_between_requests
+        )
+    return overrides
+
+
 def main() -> int:
     args = _parse_args()
     if args.enable_stage_logging:
@@ -367,6 +447,7 @@ def main() -> int:
         else output_dir / "star_smoke_summary.json"
     )
 
+    pipeline_config_overrides = _build_pipeline_config_overrides(args)
     server_kwargs = {
         "model_path": args.model_path,
         "pipeline_class_name": args.pipeline_class_name,
@@ -386,6 +467,8 @@ def main() -> int:
         "vae_cpu_offload": args.vae_cpu_offload,
         "transformer_weights_path": args.transformer_weights_path,
     }
+    if pipeline_config_overrides:
+        server_kwargs["pipeline_config"] = pipeline_config_overrides
     nunchaku_config = _build_nunchaku_config(args)
     if nunchaku_config is not None:
         server_kwargs["nunchaku_config"] = nunchaku_config
@@ -516,6 +599,7 @@ def main() -> int:
             "dit_cpu_offload": args.dit_cpu_offload,
             "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
             "vae_cpu_offload": args.vae_cpu_offload,
+            "pipeline_config_overrides": server_kwargs.get("pipeline_config"),
             "cache_dit_env": cache_dit_env,
             "component_paths": server_kwargs["component_paths"],
         },

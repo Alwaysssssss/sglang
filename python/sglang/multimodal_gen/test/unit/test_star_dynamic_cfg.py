@@ -84,6 +84,26 @@ class TestStarDynamicCFG(unittest.TestCase):
             )
         )
 
+    def test_phase7_pipeline_overrides_update_resident_strategy_flags(self):
+        config = StarCogVideoXSRPipelineConfig()
+
+        config.apply_integration_config(
+            {
+                "release_text_encoder_after_prompt_encode": False,
+                "temporarily_offload_transformer_during_condition_vae_encode": True,
+                "condition_video_vae_peak_memory_mode": "transformer_only",
+            }
+        )
+
+        self.assertFalse(config.release_text_encoder_after_prompt_encode)
+        self.assertTrue(
+            config.temporarily_offload_transformer_during_condition_vae_encode
+        )
+        self.assertEqual(
+            config.resolve_condition_video_vae_peak_memory_mode(),
+            "transformer_only",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

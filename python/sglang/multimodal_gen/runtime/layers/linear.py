@@ -276,6 +276,18 @@ class ReplicatedLinear(LinearBase):
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
+        elif (
+            isinstance(param, BlockQuantScaleParameter)
+            and param.ndim == 2
+            and loaded_weight.ndim == 1
+        ):
+            # Some serialized block-FP8 checkpoints squeeze a singleton block row
+            # for small output projections, while the runtime always materializes
+            # the block-scale tensor as 2D [num_block_rows, num_block_cols].
+            if param.shape[0] == 1 and loaded_weight.shape[0] == param.shape[1]:
+                loaded_weight = loaded_weight.unsqueeze(0)
+            elif param.shape[1] == 1 and loaded_weight.shape[0] == param.shape[0]:
+                loaded_weight = loaded_weight.unsqueeze(1)
 
         assert param.size() == loaded_weight.size(), (
             f"Tried to load weights of size {loaded_weight.size()}"

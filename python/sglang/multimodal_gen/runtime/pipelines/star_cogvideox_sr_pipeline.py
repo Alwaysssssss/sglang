@@ -74,7 +74,11 @@ class StarCogVideoXSRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(STARConditionVideoLoadingStage())
         self.add_standard_text_encoding_stage()
         self.add_stage(
-            STARConditionVideoVAEEncodingStage(vae=self.get_module("vae"))
+            STARConditionVideoVAEEncodingStage(
+                vae=self.get_module("vae"),
+                transformer=self.get_module("transformer"),
+                text_encoders=[self.get_module("text_encoder")],
+            )
         )
         self.add_stage(
             STARLatentPreparationStage(

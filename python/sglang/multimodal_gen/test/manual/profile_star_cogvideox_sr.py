@@ -66,6 +66,61 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--text-encoder-cpu-offload", action="store_true")
     parser.add_argument("--vae-cpu-offload", action="store_true")
     parser.add_argument(
+        "--use-flashinfer-rope",
+        dest="use_flashinfer_rope",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--disable-flashinfer-rope",
+        dest="use_flashinfer_rope",
+        action="store_false",
+    )
+    parser.set_defaults(use_flashinfer_rope=None)
+    parser.add_argument(
+        "--local-enhancer-mode",
+        choices=["legacy", "fused_5d"],
+        default=None,
+    )
+    parser.add_argument(
+        "--condition-video-vae-peak-memory-mode",
+        choices=[
+            "legacy",
+            "off",
+            "text_encoder_only",
+            "transformer_only",
+            "text_encoder_and_transformer",
+            "auto",
+        ],
+        default=None,
+    )
+    parser.add_argument(
+        "--condition-video-vae-target-headroom-gb",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--release-text-encoder-after-prompt-encode",
+        dest="release_text_encoder_after_prompt_encode",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--keep-text-encoder-after-prompt-encode",
+        dest="release_text_encoder_after_prompt_encode",
+        action="store_false",
+    )
+    parser.set_defaults(release_text_encoder_after_prompt_encode=None)
+    parser.add_argument(
+        "--keep-transformer-gpu-resident-between-requests",
+        dest="keep_transformer_gpu_resident_between_requests",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--disable-keep-transformer-gpu-resident-between-requests",
+        dest="keep_transformer_gpu_resident_between_requests",
+        action="store_false",
+    )
+    parser.set_defaults(keep_transformer_gpu_resident_between_requests=None)
+    parser.add_argument(
         "--enable-batched-cfg",
         dest="enable_batched_cfg",
         action="store_true",
@@ -133,6 +188,28 @@ def _run_compare(reference: str, candidate: str, mode: str, output_json: Path) -
 
 
 def _build_server_kwargs(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    pipeline_config_overrides: dict[str, Any] = {}
+    if args.use_flashinfer_rope is not None:
+        pipeline_config_overrides["use_flashinfer_rope"] = args.use_flashinfer_rope
+    if args.local_enhancer_mode is not None:
+        pipeline_config_overrides["local_enhancer_mode"] = args.local_enhancer_mode
+    if args.condition_video_vae_peak_memory_mode is not None:
+        pipeline_config_overrides["condition_video_vae_peak_memory_mode"] = (
+            args.condition_video_vae_peak_memory_mode
+        )
+    if args.condition_video_vae_target_headroom_gb is not None:
+        pipeline_config_overrides["condition_video_vae_target_headroom_gb"] = (
+            args.condition_video_vae_target_headroom_gb
+        )
+    if args.release_text_encoder_after_prompt_encode is not None:
+        pipeline_config_overrides["release_text_encoder_after_prompt_encode"] = (
+            args.release_text_encoder_after_prompt_encode
+        )
+    if args.keep_transformer_gpu_resident_between_requests is not None:
+        pipeline_config_overrides["keep_transformer_gpu_resident_between_requests"] = (
+            args.keep_transformer_gpu_resident_between_requests
+        )
+
     kwargs: dict[str, Any] = {
         "model_path": args.model_path,
         "pipeline_class_name": args.pipeline_class_name,
@@ -152,6 +229,8 @@ def _build_server_kwargs(args: argparse.Namespace, output_dir: Path) -> dict[str
         "vae_cpu_offload": args.vae_cpu_offload,
         "transformer_weights_path": args.transformer_weights_path,
     }
+    if pipeline_config_overrides:
+        kwargs["pipeline_config"] = pipeline_config_overrides
     if (
         args.enable_svdquant
         or args.quantization_precision is not None
@@ -176,8 +255,18 @@ def _build_capability_summary(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "attention_backend": {
             "runtime_request_backend": args.attention_backend or "auto",
-            "star_transformer_backend": "fa_sdpa_sage",
-            "non_torch_sdpa_supported": True,
+            "star_supported_backends": [
+                "torch_sdpa",
+                "fa",
+                "aiter",
+                "sage_attn",
+                "sage_attn_3",
+            ],
+            "flashinfer_rope": (
+                args.use_flashinfer_rope
+                if args.use_flashinfer_rope is not None
+                else "integrated_default_off"
+            ),
         },
         "parallel": {
             "cfg_parallel": "supported" if args.enable_cfg_parallel else "available_but_disabled",
@@ -191,6 +280,23 @@ def _build_capability_summary(args: argparse.Namespace) -> dict[str, Any]:
         "cache": {
             "teacache": "enabled" if args.enable_teacache else "integrated",
             "cache_dit": "enabled" if args.enable_cache_dit else "integrated",
+        },
+        "local_enhancer": {
+            "mode": args.local_enhancer_mode or "legacy",
+        },
+        "resident_strategy": {
+            "condition_video_vae_peak_memory_mode": (
+                args.condition_video_vae_peak_memory_mode or "legacy"
+            ),
+            "condition_video_vae_target_headroom_gb": (
+                args.condition_video_vae_target_headroom_gb
+            ),
+            "release_text_encoder_after_prompt_encode": (
+                args.release_text_encoder_after_prompt_encode
+            ),
+            "keep_transformer_gpu_resident_between_requests": (
+                args.keep_transformer_gpu_resident_between_requests
+            ),
         },
         "quantization": {
             "status": (
@@ -388,6 +494,7 @@ def main() -> int:
             "dit_cpu_offload": args.dit_cpu_offload,
             "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
             "vae_cpu_offload": args.vae_cpu_offload,
+            "pipeline_config_overrides": server_kwargs.get("pipeline_config"),
             "component_paths": server_kwargs["component_paths"],
         },
         "capabilities": _build_capability_summary(args),

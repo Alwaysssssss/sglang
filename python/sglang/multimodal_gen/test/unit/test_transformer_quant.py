@@ -43,7 +43,10 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
-from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -51,15 +54,20 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     _prepare_nvfp4_weight_bytes,
 )
+from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import _maybe_dequantize_fp8
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
+)
+from sglang.multimodal_gen.tools.build_modelopt_fp8_transformer import (
+    get_default_keep_bf16_patterns,
 )
 
 
@@ -277,6 +285,48 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             updated["quantization_config"]["ignore"],
             ["single_transformer_blocks.*.proj_mlp*"],
         )
+
+    def test_modelopt_fp8_builder_recognizes_star_fallback_profile(self):
+        patterns = get_default_keep_bf16_patterns(
+            model_type="auto",
+            class_name="StarCogVideoXSRTransformer3DModel",
+        )
+
+        self.assertIn(r"^mixins\.final_layer\.linear$", patterns)
+        self.assertIn(r"^transformer\.layers\.\d+\.(spa_local|temp_local)\.conv1$", patterns)
+
+    def test_replicated_linear_loader_accepts_squeezed_block_fp8_scale(self):
+        param = BlockQuantScaleParameter(
+            data=torch.zeros(1, 24, dtype=torch.float32),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=lambda *_args, **_kwargs: None,
+        )
+        loaded_weight = torch.arange(24, dtype=torch.float32)
+
+        ReplicatedLinear.weight_loader(ReplicatedLinear.__new__(ReplicatedLinear), param, loaded_weight)
+
+        self.assertTrue(torch.equal(param.data, loaded_weight.unsqueeze(0)))
+
+    def test_maybe_dequantize_fp8_uses_scalar_weight_scale_inv_for_bf16_fallback(self):
+        full_tensor = torch.tensor([[-160.0, -448.0]], dtype=torch.float8_e4m3fn)
+        param_sd = {
+            "transformer.layers.0.temp_local.conv1.weight_scale_inv": torch.tensor(
+                0.0021, dtype=torch.float32
+            )
+        }
+
+        dequantized = _maybe_dequantize_fp8(
+            full_tensor=full_tensor,
+            target_dtype=torch.bfloat16,
+            target_param_name="transformer.layers.0.temp_local.conv1.weight",
+            param_sd=param_sd,
+        )
+
+        expected = full_tensor.to(torch.float32) * param_sd[
+            "transformer.layers.0.temp_local.conv1.weight_scale_inv"
+        ].float()
+        self.assertTrue(torch.allclose(dequantized, expected))
 
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)

@@ -56,6 +56,8 @@
    目标：完成时序分块 decode、端到端结果对齐、功能验收。
 6. [phase_6_performance_hardening_and_upstream_sync.md](/sgl-workspace/sglang/docs_xzh/add_STAR/detail_plan/phase_6_performance_hardening_and_upstream_sync.md:1)
    目标：补并行/显存/性能收尾，沉淀后续同步 upstream 的维护规则。
+7. [phase_7_full_sglang_acceleration_completion.md](/sgl-workspace/sglang/docs_xzh/add_STAR/detail_plan/phase_7_full_sglang_acceleration_completion.md:1)
+   目标：把 STAR 还未吃到的 SGLang 底层加速能力一次补齐，重点完成 fused kernel、量化、单卡常驻和并行策略的最终接入。
 
 ---
 
@@ -84,6 +86,8 @@
    因为 parity 验证必须在组件可运行后进行。
 5. 阶段 6 依赖阶段 5
    因为性能优化必须以“结果已对齐”为前提。
+6. 阶段 7 依赖阶段 6
+   因为 phase 7 的目标不是重新做一轮泛化优化，而是在 phase 6 已有 benchmark、代码挂接和已知瓶颈基础上，把剩余底层加速能力补完整。
 
 ### 5.2 允许并行准备的内容
 

@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import gc
+
+from torch import nn
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
@@ -26,6 +29,154 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
     """Encode a full condition video into STAR-compatible conditioning latents."""
 
+    _AUTO_OFFLOAD_WORKSPACE_MULTIPLIER = 32.0
+
+    def __init__(
+        self,
+        vae,
+        transformer: nn.Module | None = None,
+        text_encoders: list[nn.Module] | None = None,
+    ) -> None:
+        super().__init__(vae=vae)
+        self.transformer = transformer
+        self.text_encoders = list(text_encoders or [])
+
+    @staticmethod
+    def _module_device(module: nn.Module | None) -> str | None:
+        if module is None:
+            return None
+        try:
+            return next(module.parameters()).device.type
+        except StopIteration:
+            return None
+
+    @staticmethod
+    def _move_module(module: nn.Module | None, device: str | torch.device) -> bool:
+        if module is None or not hasattr(module, "to"):
+            return False
+        current_device = STARConditionVideoVAEEncodingStage._module_device(module)
+        if current_device == torch.device(device).type:
+            return False
+        module.to(device)
+        return True
+
+    @staticmethod
+    def _resolve_peak_memory_mode(server_args: ServerArgs) -> str:
+        pipeline_config = server_args.pipeline_config
+        resolver = getattr(
+            pipeline_config, "resolve_condition_video_vae_peak_memory_mode", None
+        )
+        if callable(resolver):
+            return str(resolver())
+        if getattr(
+            pipeline_config,
+            "temporarily_offload_transformer_during_condition_vae_encode",
+            False,
+        ):
+            return "text_encoder_and_transformer"
+        if getattr(pipeline_config, "release_text_encoder_after_prompt_encode", False):
+            return "text_encoder_only"
+        return "off"
+
+    @staticmethod
+    def _get_free_gpu_memory_bytes() -> int | None:
+        if not torch.cuda.is_available():
+            return None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+        except Exception:
+            return None
+        return int(free_bytes)
+
+    @staticmethod
+    def _estimate_condition_video_encode_bytes(
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> int:
+        condition_video = batch.condition_video
+        if isinstance(condition_video, torch.Tensor):
+            numel = int(condition_video.numel())
+        elif isinstance(condition_video, list) and condition_video:
+            numel = sum(int(frame.numel()) for frame in condition_video)
+        else:
+            numel = int(
+                batch.batch_size
+                * (batch.condition_video_num_frames or batch.num_frames)
+                * 3
+                * batch.height
+                * batch.width
+            )
+
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        element_size = torch.empty((), dtype=vae_dtype).element_size()
+        return int(
+            numel
+            * element_size
+            * STARConditionVideoVAEEncodingStage._AUTO_OFFLOAD_WORKSPACE_MULTIPLIER
+        )
+
+    def _should_auto_offload_transformer(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> bool:
+        free_bytes = self._get_free_gpu_memory_bytes()
+        if free_bytes is None:
+            return False
+
+        target_headroom_gb = float(
+            getattr(
+                server_args.pipeline_config,
+                "condition_video_vae_target_headroom_gb",
+                6.0,
+            )
+        )
+        target_headroom_bytes = int(target_headroom_gb * (1024**3))
+        estimated_encode_bytes = self._estimate_condition_video_encode_bytes(
+            batch, server_args
+        )
+        decision = free_bytes < (target_headroom_bytes + estimated_encode_bytes)
+        batch.extra["star_condition_vae_peak_memory"] = {
+            "mode": "auto",
+            "free_bytes": free_bytes,
+            "estimated_encode_bytes": estimated_encode_bytes,
+            "target_headroom_bytes": target_headroom_bytes,
+            "offloaded_transformer": decision,
+        }
+        return decision
+
+    def _prepare_peak_memory(self, batch: Req, server_args: ServerArgs) -> None:
+        released_any = False
+
+        mode = self._resolve_peak_memory_mode(server_args)
+
+        if mode in (
+            "text_encoder_only",
+            "text_encoder_and_transformer",
+            "auto",
+        ):
+            for text_encoder in self.text_encoders:
+                released_any = self._move_module(text_encoder, "cpu") or released_any
+
+        should_temporarily_offload_transformer = mode in (
+            "transformer_only",
+            "text_encoder_and_transformer",
+        )
+        if mode == "auto":
+            should_temporarily_offload_transformer = (
+                self._should_auto_offload_transformer(batch, server_args)
+            )
+        if should_temporarily_offload_transformer and self._move_module(
+            self.transformer, "cpu"
+        ):
+            if not bool(getattr(server_args, "dit_cpu_offload", False)):
+                batch.extra["star_reload_transformer_before_denoise"] = True
+            released_any = True
+
+        if released_any and torch.cuda.is_initialized():
+            gc.collect()
+            torch.cuda.empty_cache()
+
     @staticmethod
     def _expected_latent_num_frames(batch: Req, server_args: ServerArgs) -> int:
         source_num_frames = batch.condition_video_num_frames or (
@@ -48,6 +199,7 @@ class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
         if batch.condition_video is None:
             return batch
 
+        self._prepare_peak_memory(batch, server_args)
         self.load_model()
 
         condition_video = batch.condition_video
@@ -161,8 +313,12 @@ class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
             latent_condition,
             batch,
         )
+        batch.condition_video = None
 
         self.offload_model()
+        if torch.cuda.is_initialized():
+            gc.collect()
+            torch.cuda.empty_cache()
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

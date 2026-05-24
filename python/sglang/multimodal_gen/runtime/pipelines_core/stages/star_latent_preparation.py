@@ -30,6 +30,15 @@ class STARLatentPreparationStage(LatentPreparationStage):
         batch_size = batch.batch_size
         dtype = self._get_latent_dtype(batch, server_args)
         device = get_local_torch_device()
+
+        if batch.extra.pop("star_reload_transformer_before_denoise", False):
+            try:
+                transformer_device = next(self.transformer.parameters()).device.type
+            except StopIteration:
+                transformer_device = None
+            if transformer_device == "cpu" and hasattr(self.transformer, "to"):
+                self.transformer.to(device)
+
         generator = batch.generator
         initial_noise_generator = batch.extra.get("star_initial_noise_generator")
         latents = batch.latents

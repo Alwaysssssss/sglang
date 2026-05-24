@@ -51,6 +51,10 @@ class TestStarPhase6Integrations(unittest.TestCase):
             StarCogVideoXSRTransformer3DModel._supported_attention_backends,
         )
         self.assertIn(
+            AttentionBackendEnum.AITER,
+            StarCogVideoXSRTransformer3DModel._supported_attention_backends,
+        )
+        self.assertIn(
             AttentionBackendEnum.TORCH_SDPA,
             StarCogVideoXSRTransformer3DModel._supported_attention_backends,
         )

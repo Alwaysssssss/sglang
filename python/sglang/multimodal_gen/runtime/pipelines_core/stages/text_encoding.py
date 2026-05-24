@@ -45,6 +45,24 @@ class TextEncodingStage(PipelineStage):
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
 
+    @staticmethod
+    def _module_device_type(module) -> str | None:
+        try:
+            return next(module.parameters()).device.type
+        except (AttributeError, StopIteration, TypeError):
+            return None
+
+    def _ensure_text_encoders_loaded(self, device: torch.device) -> None:
+        target_device_type = device.type
+        for text_encoder in self.text_encoders:
+            current_device_type = self._module_device_type(text_encoder)
+            if (
+                current_device_type is not None
+                and current_device_type != target_device_type
+                and hasattr(text_encoder, "to")
+            ):
+                text_encoder.to(device)
+
     @torch.no_grad()
     def forward(
         self,
@@ -58,6 +76,7 @@ class TextEncodingStage(PipelineStage):
         assert len(self.text_encoders) == len(
             server_args.pipeline_config.text_encoder_configs
         )
+        self._ensure_text_encoders_loaded(get_local_torch_device())
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None

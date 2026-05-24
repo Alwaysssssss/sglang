@@ -24,6 +24,16 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 
+STAR_LOCAL_ENHANCER_MODES = ("legacy", "fused_5d")
+STAR_CONDITION_VAE_PEAK_MEMORY_MODES = (
+    "legacy",
+    "off",
+    "text_encoder_only",
+    "transformer_only",
+    "text_encoder_and_transformer",
+    "auto",
+)
+
 
 def star_t5_postprocess_text(
     outputs: BaseEncoderOutput,
@@ -72,6 +82,13 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
     dynamic_cfg_exp: float = 5.0
     use_step_index_timestep: bool = False
     enable_batched_cfg: bool = True
+    use_flashinfer_rope: bool = False
+    local_enhancer_mode: str = "legacy"
+    release_text_encoder_after_prompt_encode: bool = True
+    temporarily_offload_transformer_during_condition_vae_encode: bool = False
+    condition_video_vae_peak_memory_mode: str = "legacy"
+    condition_video_vae_target_headroom_gb: float = 6.0
+    keep_transformer_gpu_resident_between_requests: bool = False
 
     integration_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -79,6 +96,7 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
         self._sync_latent_channel_defaults()
+        self._validate_phase7_overrides()
 
     def _sync_latent_channel_defaults(self) -> None:
         if getattr(self.dit_config.arch_config, "num_channels_latents", 0) in (0, None):
@@ -107,6 +125,45 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
         if isinstance(dynamic_cfg_exp, (int, float)):
             self.dynamic_cfg_exp = float(dynamic_cfg_exp)
 
+        local_enhancer_mode = payload.get("local_enhancer_mode")
+        if isinstance(local_enhancer_mode, str) and local_enhancer_mode:
+            self.local_enhancer_mode = local_enhancer_mode
+
+        release_text_encoder = payload.get("release_text_encoder_after_prompt_encode")
+        if isinstance(release_text_encoder, bool):
+            self.release_text_encoder_after_prompt_encode = release_text_encoder
+
+        offload_transformer = payload.get(
+            "temporarily_offload_transformer_during_condition_vae_encode"
+        )
+        if isinstance(offload_transformer, bool):
+            self.temporarily_offload_transformer_during_condition_vae_encode = (
+                offload_transformer
+            )
+
+        condition_video_vae_peak_memory_mode = payload.get(
+            "condition_video_vae_peak_memory_mode"
+        )
+        if (
+            isinstance(condition_video_vae_peak_memory_mode, str)
+            and condition_video_vae_peak_memory_mode
+        ):
+            self.condition_video_vae_peak_memory_mode = (
+                condition_video_vae_peak_memory_mode
+            )
+
+        target_headroom_gb = payload.get("condition_video_vae_target_headroom_gb")
+        if isinstance(target_headroom_gb, (int, float)):
+            self.condition_video_vae_target_headroom_gb = float(target_headroom_gb)
+
+        keep_transformer_resident = payload.get(
+            "keep_transformer_gpu_resident_between_requests"
+        )
+        if isinstance(keep_transformer_resident, bool):
+            self.keep_transformer_gpu_resident_between_requests = (
+                keep_transformer_resident
+            )
+
         transformer_summary = payload.get("transformer_summary") or {}
         latent_width = transformer_summary.get("latent_width")
         latent_height = transformer_summary.get("latent_height")
@@ -118,6 +175,51 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
             self.width = latent_width * spatial_ratio
         if isinstance(latent_height, int) and latent_height > 0:
             self.height = latent_height * spatial_ratio
+
+        self._validate_phase7_overrides()
+
+    def _validate_phase7_overrides(self) -> None:
+        if self.local_enhancer_mode not in STAR_LOCAL_ENHANCER_MODES:
+            raise ValueError(
+                "local_enhancer_mode must be one of "
+                f"{STAR_LOCAL_ENHANCER_MODES}, got {self.local_enhancer_mode!r}."
+            )
+        if (
+            self.condition_video_vae_peak_memory_mode
+            not in STAR_CONDITION_VAE_PEAK_MEMORY_MODES
+        ):
+            raise ValueError(
+                "condition_video_vae_peak_memory_mode must be one of "
+                f"{STAR_CONDITION_VAE_PEAK_MEMORY_MODES}, "
+                f"got {self.condition_video_vae_peak_memory_mode!r}."
+            )
+        if self.condition_video_vae_target_headroom_gb < 0:
+            raise ValueError(
+                "condition_video_vae_target_headroom_gb must be >= 0, "
+                f"got {self.condition_video_vae_target_headroom_gb}."
+            )
+
+    def resolve_local_enhancer_mode(self) -> str:
+        self._validate_phase7_overrides()
+        return self.local_enhancer_mode
+
+    def resolve_condition_video_vae_peak_memory_mode(self) -> str:
+        self._validate_phase7_overrides()
+        mode = self.condition_video_vae_peak_memory_mode
+        if mode != "legacy":
+            return mode
+
+        release_text = bool(self.release_text_encoder_after_prompt_encode)
+        offload_transformer = bool(
+            self.temporarily_offload_transformer_during_condition_vae_encode
+        )
+        if release_text and offload_transformer:
+            return "text_encoder_and_transformer"
+        if release_text:
+            return "text_encoder_only"
+        if offload_transformer:
+            return "transformer_only"
+        return "off"
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio

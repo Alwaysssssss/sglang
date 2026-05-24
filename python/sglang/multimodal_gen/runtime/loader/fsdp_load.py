@@ -97,10 +97,30 @@ def _maybe_dequantize_fp8(
     ):
         return full_tensor
 
-    scale_key = target_param_name.rsplit(".", 1)[0] + ".weight_scale"
+    module_prefix = target_param_name.rsplit(".", 1)[0]
+    scale_key = module_prefix + ".weight_scale"
     scale_tensor = param_sd.get(scale_key)
+    if scale_tensor is None:
+        scale_key = module_prefix + ".weight_scale_inv"
+        scale_tensor = param_sd.get(scale_key)
     if scale_tensor is not None:
-        full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+        if scale_tensor.ndim == 0:
+            full_tensor = full_tensor.to(torch.float32) * scale_tensor.float()
+        elif full_tensor.ndim == 2 and scale_tensor.ndim in (1, 2):
+            block_scale = scale_tensor.float()
+            if block_scale.ndim == 1:
+                block_scale = block_scale.unsqueeze(0)
+            block_rows, block_cols = block_scale.shape
+            row_repeat = max((full_tensor.shape[0] + block_rows - 1) // block_rows, 1)
+            col_repeat = max((full_tensor.shape[1] + block_cols - 1) // block_cols, 1)
+            expanded_scale = (
+                block_scale.repeat_interleave(row_repeat, dim=0)
+                .repeat_interleave(col_repeat, dim=1)[: full_tensor.shape[0], : full_tensor.shape[1]]
+                .contiguous()
+            )
+            full_tensor = full_tensor.to(torch.float32) * expanded_scale
+        else:
+            return full_tensor
         logger.debug(
             "Auto-dequantized FP8 weight %s using %s",
             target_param_name,

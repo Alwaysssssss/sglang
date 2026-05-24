@@ -76,6 +76,17 @@ DEFAULT_LTX2_KEEP_BF16_PATTERNS = [
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_out\.0$",
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(ff|audio_ff)\.proj_(in|out)$",
 ]
+DEFAULT_STAR_KEEP_BF16_PATTERNS = [
+    r"^time_embed\.(0|2)$",
+    r"^mixins\.patch_embed\.text_proj$",
+    r"^mixins\.adaln_layer\.adaLN_modulations\.\d+\.1$",
+    r"^mixins\.adaln_layer\.(query_layernorm_list|key_layernorm_list)\.\d+$",
+    r"^mixins\.final_layer\.adaLN_modulation\.1$",
+    r"^mixins\.final_layer\.linear$",
+    r"^transformer\.final_layernorm$",
+    r"^transformer\.layers\.\d+\.(input_layernorm|post_attention_layernorm)$",
+    r"^transformer\.layers\.\d+\.(spa_local|temp_local)\.conv1$",
+]
 
 
 def _resolve_transformer_dir(path: str) -> str:
@@ -255,6 +266,8 @@ def get_default_keep_bf16_patterns(
 ) -> list[str]:
     if model_type == "ltx2":
         return list(DEFAULT_LTX2_KEEP_BF16_PATTERNS)
+    if model_type == "star":
+        return list(DEFAULT_STAR_KEEP_BF16_PATTERNS)
     if model_type == "flux1":
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if model_type == "flux2":
@@ -265,6 +278,8 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if class_name == "Flux2Transformer2DModel":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
+    if class_name == "StarCogVideoXSRTransformer3DModel":
+        return list(DEFAULT_STAR_KEEP_BF16_PATTERNS)
     return []
 
 
@@ -645,12 +660,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        choices=["auto", "flux1", "flux2", "ltx2", "none"],
+        choices=["auto", "flux1", "flux2", "ltx2", "star", "none"],
         default="auto",
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
-            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 "
-            "fallback set when the export config matches those transformer classes."
+            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 / "
+            "STAR fallback set when the export config matches those transformer classes."
         ),
     )
     parser.add_argument(

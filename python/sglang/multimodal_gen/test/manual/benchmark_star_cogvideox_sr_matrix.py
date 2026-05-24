@@ -197,6 +197,36 @@ def _run_profile(args: argparse.Namespace, config: dict, run_dir: Path) -> dict:
         command.append("--enable-torch-compile")
     if config["enable_cfg_parallel"]:
         command.append("--enable-cfg-parallel")
+    if config.get("use_flashinfer_rope") is True:
+        command.append("--use-flashinfer-rope")
+    elif config.get("use_flashinfer_rope") is False:
+        command.append("--disable-flashinfer-rope")
+    if config.get("local_enhancer_mode"):
+        command.extend(
+            ["--local-enhancer-mode", str(config["local_enhancer_mode"])]
+        )
+    if config.get("condition_video_vae_peak_memory_mode"):
+        command.extend(
+            [
+                "--condition-video-vae-peak-memory-mode",
+                str(config["condition_video_vae_peak_memory_mode"]),
+            ]
+        )
+    if config.get("condition_video_vae_target_headroom_gb") is not None:
+        command.extend(
+            [
+                "--condition-video-vae-target-headroom-gb",
+                str(config["condition_video_vae_target_headroom_gb"]),
+            ]
+        )
+    if config.get("release_text_encoder_after_prompt_encode") is True:
+        command.append("--release-text-encoder-after-prompt-encode")
+    elif config.get("release_text_encoder_after_prompt_encode") is False:
+        command.append("--keep-text-encoder-after-prompt-encode")
+    if config.get("keep_transformer_gpu_resident_between_requests") is True:
+        command.append("--keep-transformer-gpu-resident-between-requests")
+    elif config.get("keep_transformer_gpu_resident_between_requests") is False:
+        command.append("--disable-keep-transformer-gpu-resident-between-requests")
     if config["enable_batched_cfg"]:
         command.append("--enable-batched-cfg")
     else:
