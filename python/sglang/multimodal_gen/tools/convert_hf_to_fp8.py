@@ -139,6 +139,7 @@ def process_file(
     for key in weights.keys():
         if (
             "weight" in key
+            and weights[key].ndim == 2
             and "layernorm" not in key
             and "embed" not in key
             and "router" not in key

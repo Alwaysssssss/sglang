@@ -8,44 +8,97 @@ from pathlib import Path
 
 DEFAULT_MATRIX = (
     {
-        "name": "baseline_offload",
+        "name": "baseline_offload_sdpa",
         "dit_cpu_offload": True,
         "text_encoder_cpu_offload": True,
         "vae_cpu_offload": False,
         "enable_torch_compile": False,
         "enable_batched_cfg": False,
-        "num_gpus": 1,
         "enable_cfg_parallel": False,
     },
     {
-        "name": "offload_batched_cfg",
+        "name": "offload_fa",
+        "dit_cpu_offload": True,
+        "text_encoder_cpu_offload": True,
+        "vae_cpu_offload": False,
+        "enable_torch_compile": False,
+        "enable_batched_cfg": False,
+        "enable_cfg_parallel": False,
+        "attention_backend": "fa",
+    },
+    {
+        "name": "offload_fa_batched_cfg",
         "dit_cpu_offload": True,
         "text_encoder_cpu_offload": True,
         "vae_cpu_offload": False,
         "enable_torch_compile": False,
         "enable_batched_cfg": True,
-        "num_gpus": 1,
         "enable_cfg_parallel": False,
+        "attention_backend": "fa",
     },
     {
-        "name": "offload_compile_batched_cfg",
+        "name": "offload_fa_compile_batched_cfg",
         "dit_cpu_offload": True,
         "text_encoder_cpu_offload": True,
         "vae_cpu_offload": False,
         "enable_torch_compile": True,
         "enable_batched_cfg": True,
-        "num_gpus": 1,
         "enable_cfg_parallel": False,
+        "attention_backend": "fa",
     },
     {
-        "name": "offload_cfg_parallel",
+        "name": "offload_fa_teacache_batched_cfg",
         "dit_cpu_offload": True,
         "text_encoder_cpu_offload": True,
         "vae_cpu_offload": False,
         "enable_torch_compile": False,
-        "enable_batched_cfg": False,
-        "num_gpus": 2,
-        "enable_cfg_parallel": True,
+        "enable_batched_cfg": True,
+        "enable_cfg_parallel": False,
+        "attention_backend": "fa",
+        "enable_teacache": True,
+        "teacache_thresh": 0.15,
+        "teacache_start_skipping": 5.0,
+        "teacache_end_skipping": -1.0,
+        "teacache_coefficients": "1,0",
+    },
+    {
+        "name": "offload_fa_cache_dit_batched_cfg",
+        "dit_cpu_offload": True,
+        "text_encoder_cpu_offload": True,
+        "vae_cpu_offload": False,
+        "enable_torch_compile": False,
+        "enable_batched_cfg": True,
+        "enable_cfg_parallel": False,
+        "attention_backend": "fa",
+        "enable_cache_dit": True,
+        "cache_dit_fn": 1,
+        "cache_dit_bn": 0,
+        "cache_dit_warmup": 4,
+        "cache_dit_rdt": 0.24,
+        "cache_dit_mc": 3,
+        "cache_dit_scm_preset": "none",
+    },
+    {
+        "name": "offload_fa_teacache_cache_dit_compile_batched_cfg",
+        "dit_cpu_offload": True,
+        "text_encoder_cpu_offload": True,
+        "vae_cpu_offload": False,
+        "enable_torch_compile": True,
+        "enable_batched_cfg": True,
+        "enable_cfg_parallel": False,
+        "attention_backend": "fa",
+        "enable_teacache": True,
+        "teacache_thresh": 0.15,
+        "teacache_start_skipping": 5.0,
+        "teacache_end_skipping": -1.0,
+        "teacache_coefficients": "1,0",
+        "enable_cache_dit": True,
+        "cache_dit_fn": 1,
+        "cache_dit_bn": 0,
+        "cache_dit_warmup": 4,
+        "cache_dit_rdt": 0.24,
+        "cache_dit_mc": 3,
+        "cache_dit_scm_preset": "none",
     },
 )
 
@@ -60,6 +113,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-video", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument("--num-frames", type=int, default=7)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=720)
@@ -72,7 +126,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--original-star-cold-e2e-s", type=float, default=None)
     parser.add_argument("--original-star-warm-e2e-s", type=float, default=None)
     parser.add_argument("--original-star-denoise-s", type=float, default=None)
-    parser.add_argument("--attention-backend", default=None)
     parser.add_argument("--pipeline-class-name", default="StarCogVideoXSRPipeline")
     return parser.parse_args()
 
@@ -117,10 +170,11 @@ def _run_profile(args: argparse.Namespace, config: dict, run_dir: Path) -> dict:
         "--pipeline-class-name",
         args.pipeline_class_name,
         "--num-gpus",
-        str(config["num_gpus"]),
+        str(config.get("num_gpus", args.num_gpus)),
     ]
-    if args.attention_backend:
-        command.extend(["--attention-backend", args.attention_backend])
+    attention_backend = config.get("attention_backend")
+    if attention_backend:
+        command.extend(["--attention-backend", str(attention_backend)])
     if args.original_star_cold_e2e_s is not None:
         command.extend(
             ["--original-star-cold-e2e-s", str(args.original_star_cold_e2e_s)]
@@ -147,6 +201,64 @@ def _run_profile(args: argparse.Namespace, config: dict, run_dir: Path) -> dict:
         command.append("--enable-batched-cfg")
     else:
         command.append("--disable-batched-cfg")
+    if config.get("enable_teacache"):
+        command.append("--enable-teacache")
+        command.extend(["--teacache-thresh", str(config.get("teacache_thresh", 0.0))])
+        command.extend(
+            [
+                "--teacache-start-skipping",
+                str(config.get("teacache_start_skipping", 5.0)),
+            ]
+        )
+        command.extend(
+            [
+                "--teacache-end-skipping",
+                str(config.get("teacache_end_skipping", -1.0)),
+            ]
+        )
+        command.extend(
+            [
+                "--teacache-coefficients",
+                str(config.get("teacache_coefficients", "1,0")),
+            ]
+        )
+    if config.get("enable_cache_dit"):
+        command.append("--enable-cache-dit")
+        command.extend(["--cache-dit-fn", str(config.get("cache_dit_fn", 1))])
+        command.extend(["--cache-dit-bn", str(config.get("cache_dit_bn", 0))])
+        command.extend(
+            ["--cache-dit-warmup", str(config.get("cache_dit_warmup", 4))]
+        )
+        command.extend(["--cache-dit-rdt", str(config.get("cache_dit_rdt", 0.24))])
+        command.extend(["--cache-dit-mc", str(config.get("cache_dit_mc", 3))])
+        command.extend(
+            [
+                "--cache-dit-scm-preset",
+                str(config.get("cache_dit_scm_preset", "none")),
+            ]
+        )
+    if config.get("transformer_weights_path"):
+        command.extend(
+            [
+                "--transformer-weights-path",
+                str(config["transformer_weights_path"]),
+            ]
+        )
+    if config.get("enable_svdquant"):
+        command.append("--enable-svdquant")
+    if config.get("quantization_precision"):
+        command.extend(
+            [
+                "--quantization-precision",
+                str(config["quantization_precision"]),
+            ]
+        )
+    if config.get("quantization_rank") is not None:
+        command.extend(
+            ["--quantization-rank", str(config["quantization_rank"])]
+        )
+    if config.get("quantization_act_unsigned"):
+        command.append("--quantization-act-unsigned")
 
     subprocess.run(command, check=True)
     summary_path = run_dir / "summary.json"
@@ -168,6 +280,7 @@ def main() -> int:
             {
                 "name": config["name"],
                 "config": config,
+                "num_gpus": config.get("num_gpus", args.num_gpus),
                 "summary_path": str((run_dir / "summary.json").resolve()),
                 "candidate_path": summary.get("profile", {}).get("last_candidate_path"),
                 "avg_generation_time_s": summary.get("profile", {}).get(
@@ -196,6 +309,10 @@ def main() -> int:
         best_result = ranked[0]
 
     matrix_summary = {
+        "comparison_policy": {
+            "same_gpu_count_required": True,
+            "target_num_gpus": args.num_gpus,
+        },
         "results": results,
         "best_result": best_result,
     }

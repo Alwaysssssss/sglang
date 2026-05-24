@@ -12,8 +12,37 @@ from sat.ops.layernorm import LayerNorm as SATLayerNorm
 from sglang.multimodal_gen.configs.models.dits.star_cogvideox_sr import (
     StarCogVideoXSRDiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_tp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_sp_world_size,
+    get_ulysses_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+
+try:
+    from cache_dit import ForwardPattern
+    from cache_dit.caching.block_adapters import BlockAdapter, BlockAdapterRegister
+except Exception:
+    ForwardPattern = None
+    BlockAdapter = None
+    BlockAdapterRegister = None
 
 
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -60,10 +89,60 @@ def _build_rotary_cache(
     return freqs.sin().contiguous(), freqs.cos().contiguous()
 
 
+def _reset_linear_parameters(module: nn.Module, fan_in: int) -> None:
+    weight = getattr(module, "weight", None)
+    if weight is not None:
+        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+    bias = getattr(module, "bias", None)
+    if bias is not None:
+        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+        nn.init.uniform_(bias, -bound, bound)
+
+
+class _TensorOnlyReplicatedLinear(ReplicatedLinear):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _reset_linear_parameters(self, self.input_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = super().forward(x)
+        return output
+
+
+class _TensorOnlyColumnParallelLinear(ColumnParallelLinear):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _reset_linear_parameters(self, self.input_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = super().forward(x)
+        return output
+
+
+class _TensorOnlyMergedColumnParallelLinear(MergedColumnParallelLinear):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _reset_linear_parameters(self, self.input_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = super().forward(x)
+        return output
+
+
+class _TensorOnlyRowParallelLinear(RowParallelLinear):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _reset_linear_parameters(self, self.input_size_per_partition)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output, _ = super().forward(x)
+        return output
+
+
 class _WrappedLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+    def __init__(self, original: nn.Module) -> None:
         super().__init__()
-        self.original = nn.Linear(in_features, out_features, bias=bias)
+        self.original = original
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.original(x)
@@ -122,7 +201,12 @@ class _StarPatchEmbedMixin(nn.Module):
             stride=patch_size,
             bias=True,
         )
-        self.text_proj = nn.Linear(text_hidden_size, hidden_size, bias=True)
+        self.text_proj = _TensorOnlyReplicatedLinear(
+            text_hidden_size,
+            hidden_size,
+            bias=True,
+            prefix="mixins.patch_embed.text_proj",
+        )
 
     def forward(
         self,
@@ -149,14 +233,14 @@ class _StarPatchEmbedMixin(nn.Module):
         if encoder_hidden_states is None:
             return video_tokens, num_frames, grid_h, grid_w
 
-        if encoder_hidden_states.shape[-1] == self.text_proj.in_features:
+        if encoder_hidden_states.shape[-1] == self.text_proj.input_size:
             text_tokens = self.text_proj(encoder_hidden_states)
-        elif encoder_hidden_states.shape[-1] == self.text_proj.out_features:
+        elif encoder_hidden_states.shape[-1] == self.text_proj.output_size:
             text_tokens = encoder_hidden_states
         else:
             raise ValueError(
                 "encoder_hidden_states last dimension must match either "
-                f"text_hidden_size={self.text_proj.in_features} or hidden_size={self.text_proj.out_features}, "
+                f"text_hidden_size={self.text_proj.input_size} or hidden_size={self.text_proj.output_size}, "
                 f"got {encoder_hidden_states.shape[-1]}"
             )
         return torch.cat([text_tokens, video_tokens], dim=1), num_frames, grid_h, grid_w
@@ -222,9 +306,14 @@ class _StarAdaLNMixin(nn.Module):
             [
                 nn.Sequential(
                     nn.SiLU(),
-                    nn.Linear(time_embed_dim, 12 * hidden_size, bias=True),
+                    _TensorOnlyReplicatedLinear(
+                        time_embed_dim,
+                        12 * hidden_size,
+                        bias=True,
+                        prefix=f"mixins.adaln_layer.adaLN_modulations.{layer_idx}.1",
+                    ),
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
         if qk_ln:
@@ -271,14 +360,20 @@ class _StarFinalLayerMixin(nn.Module):
             eps=1e-6,
             elementwise_affine=elementwise_affine,
         )
-        self.linear = nn.Linear(
+        self.linear = _TensorOnlyReplicatedLinear(
             hidden_size,
             patch_size * patch_size * out_channels,
             bias=True,
+            prefix="mixins.final_layer.linear",
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_embed_dim, 2 * hidden_size, bias=True),
+            _TensorOnlyReplicatedLinear(
+                time_embed_dim,
+                2 * hidden_size,
+                bias=True,
+                prefix="mixins.final_layer.adaLN_modulation.1",
+            ),
         )
 
     def forward(
@@ -291,13 +386,14 @@ class _StarFinalLayerMixin(nn.Module):
         grid_h: int,
         grid_w: int,
     ) -> torch.Tensor:
+        orig_dtype = hidden_states.dtype
         img_hidden_states = hidden_states[:, text_length:, :]
         shift, scale = self.adaLN_modulation(emb).chunk(2, dim=1)
         img_hidden_states = _modulate(
             self.norm_final(img_hidden_states),
             shift,
             scale,
-        )
+        ).to(orig_dtype)
         img_hidden_states = self.linear(img_hidden_states)
 
         batch_size = img_hidden_states.shape[0]
@@ -323,13 +419,90 @@ class _StarFinalLayerMixin(nn.Module):
 
 
 class _StarAttention(nn.Module):
-    def __init__(self, hidden_size: int, num_attention_heads: int) -> None:
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_attention_heads: int,
+        quant_config: QuantizationConfig | None,
+        supported_attention_backends: set[AttentionBackendEnum],
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.runtime_parallel_initialized = model_parallel_is_initialized()
+        self.tp_size = (
+            get_tp_world_size() if self.runtime_parallel_initialized else 1
+        )
+        self.sp_size = (
+            get_sp_world_size() if self.runtime_parallel_initialized else 1
+        )
+        self.ulysses_size = (
+            get_ulysses_parallel_world_size()
+            if self.runtime_parallel_initialized
+            else 1
+        )
+        self.ring_size = (
+            get_ring_parallel_world_size() if self.runtime_parallel_initialized else 1
+        )
+        self.parallelized = self.runtime_parallel_initialized and max(
+            self.tp_size,
+            self.sp_size,
+            self.ulysses_size,
+            self.ring_size,
+        ) > 1
+        self.local_num_heads = divide(num_attention_heads, self.tp_size)
         self.head_dim = hidden_size // num_attention_heads
-        self.query_key_value = _WrappedLinear(hidden_size, hidden_size * 3, bias=True)
-        self.dense = _WrappedLinear(hidden_size, hidden_size, bias=True)
+        if self.parallelized:
+            query_key_value = _TensorOnlyMergedColumnParallelLinear(
+                hidden_size,
+                [hidden_size, hidden_size, hidden_size],
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.query_key_value.original",
+            )
+            dense = _TensorOnlyRowParallelLinear(
+                hidden_size,
+                hidden_size,
+                bias=True,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.dense.original",
+            )
+            self.attn = USPAttention(
+                num_heads=self.local_num_heads,
+                head_size=self.head_dim,
+                causal=False,
+                dropout_rate=0.0,
+                supported_attention_backends=supported_attention_backends,
+                prefix=f"{prefix}.usp_attn",
+            )
+        else:
+            query_key_value = _TensorOnlyReplicatedLinear(
+                hidden_size,
+                hidden_size * 3,
+                bias=True,
+                prefix=f"{prefix}.query_key_value.original",
+            )
+            dense = _TensorOnlyReplicatedLinear(
+                hidden_size,
+                hidden_size,
+                bias=True,
+                prefix=f"{prefix}.dense.original",
+            )
+            # Even on a single GPU, use the SGLang attention abstraction so the
+            # runtime can honor backend selection such as FlashAttention.
+            self.attn = LocalAttention(
+                num_heads=self.local_num_heads,
+                head_size=self.head_dim,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+                prefix=f"{prefix}.local_attn",
+            )
+        self.query_key_value = _WrappedLinear(query_key_value)
+        self.dense = _WrappedLinear(dense)
 
     def _apply_rotary(
         self,
@@ -339,19 +512,19 @@ class _StarAttention(nn.Module):
         freqs_sin: torch.Tensor | None,
         freqs_cos: torch.Tensor | None,
     ) -> torch.Tensor:
-        if freqs_sin is None or freqs_cos is None or tensor.shape[2] <= text_length:
+        if freqs_sin is None or freqs_cos is None or tensor.shape[1] <= text_length:
             return tensor
-        image_tokens = tensor[:, :, text_length:, :]
-        sin = freqs_sin[: image_tokens.shape[2]].to(
+        image_tokens = tensor[:, text_length:, :, :]
+        sin = freqs_sin[: image_tokens.shape[1]].to(
             device=image_tokens.device,
             dtype=image_tokens.dtype,
-        )[None, None, :, :]
-        cos = freqs_cos[: image_tokens.shape[2]].to(
+        )[None, :, None, :]
+        cos = freqs_cos[: image_tokens.shape[1]].to(
             device=image_tokens.device,
             dtype=image_tokens.dtype,
-        )[None, None, :, :]
+        )[None, :, None, :]
         rotated = image_tokens * cos + _rotate_half(image_tokens) * sin
-        return torch.cat([tensor[:, :, :text_length, :], rotated], dim=2)
+        return torch.cat([tensor[:, :text_length, :, :], rotated], dim=1)
 
     def forward(
         self,
@@ -368,12 +541,12 @@ class _StarAttention(nn.Module):
             batch_size,
             seq_len,
             3,
-            self.num_attention_heads,
+            self.local_num_heads,
             self.head_dim,
         )
-        query = qkv[:, :, 0].transpose(1, 2)
-        key = qkv[:, :, 1].transpose(1, 2)
-        value = qkv[:, :, 2].transpose(1, 2)
+        query = qkv[:, :, 0]
+        key = qkv[:, :, 1]
+        value = qkv[:, :, 2]
 
         if query_layernorm is not None:
             query = query_layernorm(query)
@@ -392,33 +565,63 @@ class _StarAttention(nn.Module):
             freqs_sin=freqs_sin,
             freqs_cos=freqs_cos,
         )
+        target_dtype = hidden_states.dtype
+        query = query.to(dtype=target_dtype)
+        key = key.to(dtype=target_dtype)
+        value = value.to(dtype=target_dtype)
 
-        attn_output = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        attn_output = attn_output.transpose(1, 2).reshape(
-            batch_size,
-            seq_len,
-            self.hidden_size,
-        )
+        attn_output = self.attn(query, key, value)
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
         return self.dense(attn_output)
 
 
 class _StarMLP(nn.Module):
-    def __init__(self, hidden_size: int, mlp_ratio: float) -> None:
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        mlp_ratio: float,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
         super().__init__()
         inner_dim = int(hidden_size * mlp_ratio)
-        self.dense_h_to_4h = nn.Linear(hidden_size, inner_dim, bias=True)
+        if model_parallel_is_initialized():
+            self.dense_h_to_4h = _TensorOnlyColumnParallelLinear(
+                hidden_size,
+                inner_dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.dense_h_to_4h",
+            )
+            self.dense_4h_to_h = _TensorOnlyRowParallelLinear(
+                inner_dim,
+                hidden_size,
+                bias=True,
+                input_is_parallel=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.dense_4h_to_h",
+            )
+        else:
+            self.dense_h_to_4h = _TensorOnlyReplicatedLinear(
+                hidden_size,
+                inner_dim,
+                bias=True,
+                prefix=f"{prefix}.dense_h_to_4h",
+            )
+            self.dense_4h_to_h = _TensorOnlyReplicatedLinear(
+                inner_dim,
+                hidden_size,
+                bias=True,
+                prefix=f"{prefix}.dense_4h_to_h",
+            )
         self.activation = nn.GELU(approximate="tanh")
-        self.dense_4h_to_h = nn.Linear(inner_dim, hidden_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.dense_4h_to_h(self.activation(self.dense_h_to_4h(hidden_states)))
+        hidden_states = self.dense_h_to_4h(hidden_states)
+        hidden_states = self.activation(hidden_states)
+        return self.dense_4h_to_h(hidden_states)
 
 
 class _StarTransformerLayer(nn.Module):
@@ -430,6 +633,9 @@ class _StarTransformerLayer(nn.Module):
         mlp_ratio: float,
         elementwise_affine: bool,
         local_spatial_kernel_size: int,
+        quant_config: QuantizationConfig | None,
+        supported_attention_backends: set[AttentionBackendEnum],
+        prefix: str,
     ) -> None:
         super().__init__()
         self.input_layernorm = SATLayerNorm(
@@ -437,15 +643,138 @@ class _StarTransformerLayer(nn.Module):
             eps=1e-6,
             elementwise_affine=elementwise_affine,
         )
-        self.attention = _StarAttention(hidden_size, num_attention_heads)
+        self.attention = _StarAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            quant_config=quant_config,
+            supported_attention_backends=supported_attention_backends,
+            prefix=f"{prefix}.attention",
+        )
         self.post_attention_layernorm = SATLayerNorm(
             hidden_size,
             eps=1e-6,
             elementwise_affine=elementwise_affine,
         )
-        self.mlp = _StarMLP(hidden_size, mlp_ratio)
+        self.mlp = _StarMLP(
+            hidden_size=hidden_size,
+            mlp_ratio=mlp_ratio,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
         self.spa_local = _SpatialLocalEnhancer(local_spatial_kernel_size)
         self.temp_local = _TemporalLocalEnhancer()
+
+    @staticmethod
+    def _apply_local_enhancers(
+        img_hidden_states: torch.Tensor,
+        layer: "_StarTransformerLayer",
+        *,
+        num_frames: int,
+        grid_h: int,
+        grid_w: int,
+    ) -> torch.Tensor:
+        batch_size, token_count, hidden_size = img_hidden_states.shape
+        if token_count != num_frames * grid_h * grid_w:
+            return img_hidden_states
+        spatial = img_hidden_states.view(batch_size, num_frames, grid_h, grid_w, hidden_size)
+        spatial = spatial.permute(0, 1, 4, 2, 3).reshape(
+            batch_size * num_frames,
+            hidden_size,
+            grid_h,
+            grid_w,
+        )
+        spatial = layer.spa_local(spatial)
+        temporal = spatial.view(batch_size, num_frames, hidden_size, grid_h, grid_w)
+        temporal = temporal.permute(0, 3, 4, 1, 2).reshape(
+            batch_size * grid_h * grid_w,
+            num_frames,
+            hidden_size,
+        )
+        temporal = layer.temp_local(temporal)
+        temporal = temporal.view(batch_size, grid_h, grid_w, num_frames, hidden_size)
+        return temporal.permute(0, 3, 1, 2, 4).reshape(batch_size, token_count, hidden_size)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        emb: torch.Tensor,
+        text_length: int,
+        modulation: torch.Tensor,
+        query_layernorm: nn.Module | None,
+        key_layernorm: nn.Module | None,
+        freqs_sin: torch.Tensor | None,
+        freqs_cos: torch.Tensor | None,
+        num_frames: int,
+        grid_h: int,
+        grid_w: int,
+    ) -> torch.Tensor:
+        orig_dtype = hidden_states.dtype
+        text_hidden = hidden_states[:, :text_length, :]
+        img_hidden = hidden_states[:, text_length:, :]
+
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            text_shift_msa,
+            text_scale_msa,
+            text_gate_msa,
+            text_shift_mlp,
+            text_scale_mlp,
+            text_gate_mlp,
+        ) = modulation.chunk(12, dim=1)
+
+        img_attn_input = _modulate(
+            self.input_layernorm(img_hidden),
+            shift_msa,
+            scale_msa,
+        ).to(orig_dtype)
+        text_attn_input = _modulate(
+            self.input_layernorm(text_hidden),
+            text_shift_msa,
+            text_scale_msa,
+        ).to(orig_dtype)
+        img_attn_input = self._apply_local_enhancers(
+            img_attn_input,
+            self,
+            num_frames=num_frames,
+            grid_h=grid_h,
+            grid_w=grid_w,
+        ).to(orig_dtype)
+
+        attn_input = torch.cat([text_attn_input, img_attn_input], dim=1)
+        attn_output = self.attention(
+            attn_input,
+            text_length=text_length,
+            query_layernorm=query_layernorm,
+            key_layernorm=key_layernorm,
+            freqs_sin=freqs_sin,
+            freqs_cos=freqs_cos,
+        ).to(orig_dtype)
+
+        text_hidden = text_hidden + text_gate_msa.unsqueeze(1) * attn_output[:, :text_length, :]
+        img_hidden = img_hidden + gate_msa.unsqueeze(1) * attn_output[:, text_length:, :]
+
+        img_mlp_input = _modulate(
+            self.post_attention_layernorm(img_hidden),
+            shift_mlp,
+            scale_mlp,
+        ).to(orig_dtype)
+        text_mlp_input = _modulate(
+            self.post_attention_layernorm(text_hidden),
+            text_shift_mlp,
+            text_scale_mlp,
+        ).to(orig_dtype)
+        mlp_output = self.mlp(torch.cat([text_mlp_input, img_mlp_input], dim=1)).to(
+            orig_dtype
+        )
+        text_hidden = text_hidden + text_gate_mlp.unsqueeze(1) * mlp_output[:, :text_length, :]
+        img_hidden = img_hidden + gate_mlp.unsqueeze(1) * mlp_output[:, text_length:, :]
+        return torch.cat([text_hidden, img_hidden], dim=1)
 
 
 class _StarTransformerStack(nn.Module):
@@ -481,24 +810,54 @@ class _StarMixins(nn.Module):
         self.final_layer = final_layer
 
 
-class StarCogVideoXSRTransformer3DModel(CachableDiT):
+class StarCogVideoXSRTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     _aliases = ["StarCogVideoXSRTransformer3DModel"]
     _fsdp_shard_conditions = StarCogVideoXSRDiTConfig().arch_config._fsdp_shard_conditions
     _compile_conditions = StarCogVideoXSRDiTConfig().arch_config._compile_conditions
     param_names_mapping: dict[str, str] = {}
     reverse_param_names_mapping: dict[str, str] = {}
     lora_param_names_mapping: dict[str, str] = {}
-    _supported_attention_backends: set[AttentionBackendEnum] = {
-        AttentionBackendEnum.TORCH_SDPA
+    layer_names = ["layers"]
+    _CFG_SUPPORTED_PREFIXES = set(CachableDiT._CFG_SUPPORTED_PREFIXES) | {
+        "star_cogvideox_sr"
     }
+    _supported_attention_backends: set[AttentionBackendEnum] = {
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SAGE_ATTN_3,
+    }
+
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "pos_embed",
+                "proj_sr",
+                "spa_local",
+                "temp_local",
+            ],
+            "svdq_w4a4": [
+                "attention.query_key_value.original",
+                "attention.dense.original",
+                "mlp.dense_h_to_4h",
+                "mlp.dense_4h_to_h",
+            ],
+            "awq_w4a16": [
+                "time_embed",
+                "adaLN_modulations",
+                "text_proj",
+                "final_layer.linear",
+            ],
+        }
 
     def __init__(
         self,
         config: StarCogVideoXSRDiTConfig,
         hf_config: dict[str, Any],
-        quant_config: Any | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
-        del quant_config
         super().__init__(config=config, hf_config=hf_config)
         arch = config.arch_config
 
@@ -513,9 +872,19 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
         self.head_dim = arch.hidden_size // arch.num_attention_heads
 
         self.time_embed = nn.Sequential(
-            nn.Linear(arch.hidden_size, arch.time_embed_dim, bias=True),
+            _TensorOnlyReplicatedLinear(
+                arch.hidden_size,
+                arch.time_embed_dim,
+                bias=True,
+                prefix="time_embed.0",
+            ),
             nn.SiLU(),
-            nn.Linear(arch.time_embed_dim, arch.time_embed_dim, bias=True),
+            _TensorOnlyReplicatedLinear(
+                arch.time_embed_dim,
+                arch.time_embed_dim,
+                bias=True,
+                prefix="time_embed.2",
+            ),
         )
 
         patch_embed = _StarPatchEmbedMixin(
@@ -560,14 +929,21 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
                         mlp_ratio=arch.mlp_ratio,
                         elementwise_affine=arch.elementwise_affine,
                         local_spatial_kernel_size=arch.local_spatial_kernel_size,
+                        quant_config=quant_config,
+                        supported_attention_backends=self._supported_attention_backends,
+                        prefix=f"transformer.layers.{layer_idx}",
                     )
-                    for _ in range(arch.num_layers)
+                    for layer_idx in range(arch.num_layers)
                 ]
             ),
             hidden_size=arch.hidden_size,
             elementwise_affine=arch.elementwise_affine,
         )
         self.__post_init__()
+
+    @property
+    def layers(self) -> nn.ModuleList:
+        return self.transformer.layers
 
     def _timestep_embedding(
         self,
@@ -600,35 +976,48 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
             encoder_hidden_states = encoder_hidden_states[0]
         return encoder_hidden_states
 
-    def _apply_local_enhancers(
-        self,
-        img_hidden_states: torch.Tensor,
-        layer: _StarTransformerLayer,
-        *,
-        num_frames: int,
-        grid_h: int,
-        grid_w: int,
-    ) -> torch.Tensor:
-        batch_size, token_count, hidden_size = img_hidden_states.shape
-        if token_count != num_frames * grid_h * grid_w:
-            return img_hidden_states
-        spatial = img_hidden_states.view(batch_size, num_frames, grid_h, grid_w, hidden_size)
-        spatial = spatial.permute(0, 1, 4, 2, 3).reshape(
-            batch_size * num_frames,
-            hidden_size,
-            grid_h,
-            grid_w,
+    def _get_model_dtype(self) -> torch.dtype:
+        return self.time_embed[0].weight.dtype
+
+    def should_skip_forward_for_cached_states(self, *, emb: torch.Tensor) -> bool:
+        try:
+            ctx = self._get_teacache_context()
+        except AssertionError:
+            return False
+        if ctx is None:
+            return False
+        self.is_cfg_negative = ctx.is_cfg_negative
+        start_skipping, end_skipping = ctx.teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps,
+            ctx.do_cfg,
         )
-        spatial = layer.spa_local(spatial)
-        temporal = spatial.view(batch_size, num_frames, hidden_size, grid_h, grid_w)
-        temporal = temporal.permute(0, 3, 4, 1, 2).reshape(
-            batch_size * grid_h * grid_w,
-            num_frames,
-            hidden_size,
+        is_boundary_step = (
+            ctx.current_timestep < start_skipping or ctx.current_timestep >= end_skipping
         )
-        temporal = layer.temp_local(temporal)
-        temporal = temporal.view(batch_size, grid_h, grid_w, num_frames, hidden_size)
-        return temporal.permute(0, 3, 1, 2, 4).reshape(batch_size, token_count, hidden_size)
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=emb,
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+        return not should_calc
+
+    def maybe_cache_states(
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+    ) -> None:
+        del original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = hidden_states
+        elif self._supports_cfg_cache:
+            self.previous_residual_negative = hidden_states
+
+    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        del hidden_states
+        if self.is_cfg_negative and self._supports_cfg_cache:
+            assert self.previous_residual_negative is not None
+            return self.previous_residual_negative
+        assert self.previous_residual is not None
+        return self.previous_residual
 
     def forward(
         self,
@@ -654,13 +1043,22 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
         if timestep is None:
             raise ValueError("timestep is required for STAR transformer forward")
 
+        original_hidden_states = hidden_states
         text_hidden_states = self._coerce_text_tensor(encoder_hidden_states)
+        model_dtype = self._get_model_dtype()
+        if hidden_states.dtype != model_dtype:
+            hidden_states = hidden_states.to(dtype=model_dtype)
+        if text_hidden_states is not None and text_hidden_states.dtype != model_dtype:
+            text_hidden_states = text_hidden_states.to(dtype=model_dtype)
         batch_size = hidden_states.shape[0]
         timestep = timestep.reshape(-1)
         if timestep.shape[0] == 1 and batch_size > 1:
             timestep = timestep.expand(batch_size)
         time_emb = self._timestep_embedding(timestep, self.hidden_size)
         emb = self.time_embed(time_emb.to(hidden_states.device, dtype=hidden_states.dtype))
+
+        if self.should_skip_forward_for_cached_states(emb=emb):
+            return self.retrieve_cached_states(original_hidden_states)
 
         hidden_states, num_frames, grid_h, grid_w = self.mixins.patch_embed(
             hidden_states,
@@ -678,47 +1076,11 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
         )
 
         for layer_id, layer in enumerate(self.transformer.layers):
-            text_hidden = hidden_states[:, :text_length, :]
-            img_hidden = hidden_states[:, text_length:, :]
-
-            modulation = self.mixins.adaln_layer.adaLN_modulations[layer_id](emb)
-            (
-                shift_msa,
-                scale_msa,
-                gate_msa,
-                shift_mlp,
-                scale_mlp,
-                gate_mlp,
-                text_shift_msa,
-                text_scale_msa,
-                text_gate_msa,
-                text_shift_mlp,
-                text_scale_mlp,
-                text_gate_mlp,
-            ) = modulation.chunk(12, dim=1)
-
-            img_attn_input = _modulate(
-                layer.input_layernorm(img_hidden),
-                shift_msa,
-                scale_msa,
-            )
-            text_attn_input = _modulate(
-                layer.input_layernorm(text_hidden),
-                text_shift_msa,
-                text_scale_msa,
-            )
-            img_attn_input = self._apply_local_enhancers(
-                img_attn_input,
-                layer,
-                num_frames=num_frames,
-                grid_h=grid_h,
-                grid_w=grid_w,
-            )
-
-            attn_input = torch.cat([text_attn_input, img_attn_input], dim=1)
-            attn_output = layer.attention(
-                attn_input,
+            hidden_states = layer(
+                hidden_states,
+                emb=emb,
                 text_length=text_length,
+                modulation=self.mixins.adaln_layer.adaLN_modulations[layer_id](emb),
                 query_layernorm=(
                     self.mixins.adaln_layer.query_layernorm_list[layer_id]
                     if self.mixins.adaln_layer.qk_ln
@@ -731,35 +1093,41 @@ class StarCogVideoXSRTransformer3DModel(CachableDiT):
                 ),
                 freqs_sin=freqs_sin,
                 freqs_cos=freqs_cos,
+                num_frames=num_frames,
+                grid_h=grid_h,
+                grid_w=grid_w,
             )
 
-            text_hidden = text_hidden + text_gate_msa.unsqueeze(1) * attn_output[:, :text_length, :]
-            img_hidden = img_hidden + gate_msa.unsqueeze(1) * attn_output[:, text_length:, :]
-
-            img_mlp_input = _modulate(
-                layer.post_attention_layernorm(img_hidden),
-                shift_mlp,
-                scale_mlp,
-            )
-            text_mlp_input = _modulate(
-                layer.post_attention_layernorm(text_hidden),
-                text_shift_mlp,
-                text_scale_mlp,
-            )
-            mlp_output = layer.mlp(torch.cat([text_mlp_input, img_mlp_input], dim=1))
-            text_hidden = text_hidden + text_gate_mlp.unsqueeze(1) * mlp_output[:, :text_length, :]
-            img_hidden = img_hidden + gate_mlp.unsqueeze(1) * mlp_output[:, text_length:, :]
-            hidden_states = torch.cat([text_hidden, img_hidden], dim=1)
-
-        hidden_states = self.transformer.final_layernorm(hidden_states)
-
-        return self.mixins.final_layer(
+        hidden_states = self.transformer.final_layernorm(hidden_states).to(model_dtype)
+        output = self.mixins.final_layer(
             hidden_states,
             emb,
             text_length=text_length,
             num_frames=num_frames,
             grid_h=grid_h,
             grid_w=grid_w,
+        )
+        self.maybe_cache_states(output, original_hidden_states)
+        return output
+
+
+if (
+    BlockAdapterRegister is not None
+    and BlockAdapter is not None
+    and ForwardPattern is not None
+):
+
+    @BlockAdapterRegister.register("StarCogVideoXSR")
+    def star_cogvideox_sr_adapter(pipe, **kwargs) -> BlockAdapter:
+        transformer = pipe.transformer
+        return BlockAdapter(
+            pipe=pipe,
+            transformer=transformer,
+            blocks=transformer.transformer.layers,
+            forward_pattern=ForwardPattern.Pattern_2,
+            check_forward_pattern=False,
+            has_separate_cfg=True,
+            **kwargs,
         )
 
 

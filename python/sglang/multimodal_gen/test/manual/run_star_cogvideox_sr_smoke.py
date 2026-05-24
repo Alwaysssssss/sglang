@@ -11,6 +11,11 @@ import imageio
 import imageio.v3 as iio
 import numpy as np
 
+from sglang.multimodal_gen.configs.quantization.nunchaku import (
+    NunchakuSVDQuantArgs,
+)
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
 
 def parse_component_overrides(entries: list[str] | None) -> dict[str, str]:
     overrides: dict[str, str] = {}
@@ -110,11 +115,24 @@ def _parse_args() -> argparse.Namespace:
         help="Optional attention backend override.",
     )
     parser.add_argument(
+        "--transformer-weights-path",
+        default=None,
+        help="Optional alternate transformer weights path, including quantized exports.",
+    )
+    parser.add_argument("--enable-svdquant", action="store_true")
+    parser.add_argument("--quantization-precision", default=None)
+    parser.add_argument("--quantization-rank", type=int, default=None)
+    parser.add_argument("--quantization-act-unsigned", action="store_true")
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=1,
         help="Number of GPUs to launch with.",
     )
+    parser.add_argument("--tp-size", type=int, default=None)
+    parser.add_argument("--sp-degree", type=int, default=None)
+    parser.add_argument("--ulysses-degree", type=int, default=None)
+    parser.add_argument("--ring-degree", type=int, default=None)
     parser.add_argument(
         "--enable-cfg-parallel",
         action="store_true",
@@ -189,6 +207,22 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional color-fix mode label for bookkeeping.",
     )
+    parser.add_argument("--enable-teacache", action="store_true")
+    parser.add_argument("--teacache-thresh", type=float, default=0.0)
+    parser.add_argument("--teacache-start-skipping", type=float, default=5.0)
+    parser.add_argument("--teacache-end-skipping", type=float, default=-1.0)
+    parser.add_argument(
+        "--teacache-coefficients",
+        default="1,0",
+        help="Comma-separated polynomial coefficients for TeaCache scaling.",
+    )
+    parser.add_argument("--enable-cache-dit", action="store_true")
+    parser.add_argument("--cache-dit-fn", type=int, default=1)
+    parser.add_argument("--cache-dit-bn", type=int, default=0)
+    parser.add_argument("--cache-dit-warmup", type=int, default=4)
+    parser.add_argument("--cache-dit-rdt", type=float, default=0.24)
+    parser.add_argument("--cache-dit-mc", type=int, default=3)
+    parser.add_argument("--cache-dit-scm-preset", default="none")
     return parser.parse_args()
 
 
@@ -261,12 +295,67 @@ def _summarize_internal_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parse_teacache_coefficients(raw: str) -> list[float]:
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise ValueError("TeaCache coefficients cannot be empty.")
+    return [float(part) for part in parts]
+
+
+def _build_teacache_params(args: argparse.Namespace) -> TeaCacheParams | None:
+    if not args.enable_teacache:
+        return None
+    return TeaCacheParams(
+        teacache_thresh=args.teacache_thresh,
+        start_skipping=args.teacache_start_skipping,
+        end_skipping=args.teacache_end_skipping,
+        coefficients=_parse_teacache_coefficients(args.teacache_coefficients),
+    )
+
+
+def _configure_cache_dit_env(args: argparse.Namespace) -> dict[str, str]:
+    if not args.enable_cache_dit:
+        return {}
+    env_updates = {
+        "SGLANG_CACHE_DIT_ENABLED": "true",
+        "SGLANG_CACHE_DIT_FN": str(args.cache_dit_fn),
+        "SGLANG_CACHE_DIT_BN": str(args.cache_dit_bn),
+        "SGLANG_CACHE_DIT_WARMUP": str(args.cache_dit_warmup),
+        "SGLANG_CACHE_DIT_RDT": str(args.cache_dit_rdt),
+        "SGLANG_CACHE_DIT_MC": str(args.cache_dit_mc),
+        "SGLANG_CACHE_DIT_SCM_PRESET": str(args.cache_dit_scm_preset),
+    }
+    for key, value in env_updates.items():
+        os.environ[key] = value
+    return env_updates
+
+
+def _build_nunchaku_config(args: argparse.Namespace) -> NunchakuSVDQuantArgs | None:
+    if not (
+        args.enable_svdquant
+        or args.quantization_precision is not None
+        or args.quantization_rank is not None
+        or args.quantization_act_unsigned
+    ):
+        return None
+    return NunchakuSVDQuantArgs.from_dict(
+        {
+            "enable_svdquant": args.enable_svdquant,
+            "transformer_weights_path": args.transformer_weights_path,
+            "quantization_precision": args.quantization_precision,
+            "quantization_rank": args.quantization_rank,
+            "quantization_act_unsigned": args.quantization_act_unsigned,
+        }
+    )
+
+
 def main() -> int:
     args = _parse_args()
     if args.enable_stage_logging:
         os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
     if args.sync_stage_profiling:
         os.environ["SGLANG_DIFFUSION_SYNC_STAGE_PROFILING"] = "1"
+    cache_dit_env = _configure_cache_dit_env(args)
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
@@ -284,6 +373,10 @@ def main() -> int:
         "backend": args.backend,
         "output_path": str(output_dir),
         "num_gpus": args.num_gpus,
+        "tp_size": args.tp_size,
+        "sp_degree": args.sp_degree,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
         "enable_cfg_parallel": args.enable_cfg_parallel,
         "component_paths": parse_component_overrides(args.component_path),
         "disable_autocast": args.disable_autocast,
@@ -291,7 +384,11 @@ def main() -> int:
         "dit_cpu_offload": args.dit_cpu_offload,
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
+        "transformer_weights_path": args.transformer_weights_path,
     }
+    nunchaku_config = _build_nunchaku_config(args)
+    if nunchaku_config is not None:
+        server_kwargs["nunchaku_config"] = nunchaku_config
     if args.attention_backend:
         server_kwargs["attention_backend"] = args.attention_backend
 
@@ -312,6 +409,10 @@ def main() -> int:
         "enable_color_fix": args.enable_color_fix,
         "color_fix_mode": args.color_fix_mode,
     }
+    teacache_params = _build_teacache_params(args)
+    if teacache_params is not None:
+        sampling_params_kwargs["enable_teacache"] = True
+        sampling_params_kwargs["teacache_params"] = teacache_params
     if args.enable_batched_cfg is not None:
         sampling_params_kwargs["enable_batched_cfg"] = args.enable_batched_cfg
     if args.negative_prompt is not None:
@@ -385,16 +486,37 @@ def main() -> int:
             "enable_batched_cfg": args.enable_batched_cfg,
             "enable_color_fix": args.enable_color_fix,
             "color_fix_mode": args.color_fix_mode,
+            "enable_teacache": args.enable_teacache,
+            "teacache_params": (
+                {
+                    "teacache_thresh": teacache_params.teacache_thresh,
+                    "start_skipping": teacache_params.start_skipping,
+                    "end_skipping": teacache_params.end_skipping,
+                    "coefficients": teacache_params.coefficients,
+                }
+                if teacache_params is not None
+                else None
+            ),
         },
         "server": {
             "attention_backend": args.attention_backend,
+            "transformer_weights_path": args.transformer_weights_path,
+            "enable_svdquant": args.enable_svdquant,
+            "quantization_precision": args.quantization_precision,
+            "quantization_rank": args.quantization_rank,
+            "quantization_act_unsigned": args.quantization_act_unsigned,
             "num_gpus": args.num_gpus,
+            "tp_size": args.tp_size,
+            "sp_degree": args.sp_degree,
+            "ulysses_degree": args.ulysses_degree,
+            "ring_degree": args.ring_degree,
             "enable_cfg_parallel": args.enable_cfg_parallel,
             "disable_autocast": args.disable_autocast,
             "enable_torch_compile": args.enable_torch_compile,
             "dit_cpu_offload": args.dit_cpu_offload,
             "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
             "vae_cpu_offload": args.vae_cpu_offload,
+            "cache_dit_env": cache_dit_env,
             "component_paths": server_kwargs["component_paths"],
         },
         "timing": {

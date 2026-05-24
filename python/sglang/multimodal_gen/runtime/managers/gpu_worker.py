@@ -354,6 +354,15 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            # torch.compile on large video models can keep allocator reservations
+            # from the previous request large enough to trigger the next request's
+            # VAE encode OOM before denoising begins. Clearing the CUDA allocator
+            # cache between requests preserves the compiled module while improving
+            # multi-request stability.
+            if self.server_args.enable_torch_compile and torch.cuda.is_initialized():
+                gc.collect()
+                torch.cuda.empty_cache()
         return output_batch
 
     def get_can_stay_resident_components(

@@ -11,8 +11,13 @@ from typing import Any
 import imageio.v3 as iio
 import numpy as np
 
+from sglang.multimodal_gen.configs.quantization.nunchaku import (
+    NunchakuSVDQuantArgs,
+)
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke import (
+    _build_teacache_params,
+    _configure_cache_dit_env,
     _read_video_metadata,
     _save_frame_pngs,
     _summarize_frames,
@@ -43,7 +48,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pipeline-class-name", default="StarCogVideoXSRPipeline")
     parser.add_argument("--backend", default="sglang", choices=["sglang", "diffusers", "auto"])
     parser.add_argument("--attention-backend", default=None)
+    parser.add_argument("--transformer-weights-path", default=None)
+    parser.add_argument("--enable-svdquant", action="store_true")
+    parser.add_argument("--quantization-precision", default=None)
+    parser.add_argument("--quantization-rank", type=int, default=None)
+    parser.add_argument("--quantization-act-unsigned", action="store_true")
     parser.add_argument("--num-gpus", type=int, default=1)
+    parser.add_argument("--tp-size", type=int, default=None)
+    parser.add_argument("--sp-degree", type=int, default=None)
+    parser.add_argument("--ulysses-degree", type=int, default=None)
+    parser.add_argument("--ring-degree", type=int, default=None)
     parser.add_argument("--enable-cfg-parallel", action="store_true")
     parser.add_argument("--component-path", action="append", default=[])
     parser.add_argument("--enable-torch-compile", action="store_true")
@@ -62,6 +76,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
     )
     parser.set_defaults(enable_batched_cfg=None)
+    parser.add_argument("--enable-teacache", action="store_true")
+    parser.add_argument("--teacache-thresh", type=float, default=0.0)
+    parser.add_argument("--teacache-start-skipping", type=float, default=5.0)
+    parser.add_argument("--teacache-end-skipping", type=float, default=-1.0)
+    parser.add_argument("--teacache-coefficients", default="1,0")
+    parser.add_argument("--enable-cache-dit", action="store_true")
+    parser.add_argument("--cache-dit-fn", type=int, default=1)
+    parser.add_argument("--cache-dit-bn", type=int, default=0)
+    parser.add_argument("--cache-dit-warmup", type=int, default=4)
+    parser.add_argument("--cache-dit-rdt", type=float, default=0.24)
+    parser.add_argument("--cache-dit-mc", type=int, default=3)
+    parser.add_argument("--cache-dit-scm-preset", default="none")
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--measured-runs", type=int, default=1)
     parser.add_argument("--save-frame-pngs", action="store_true")
@@ -113,6 +139,10 @@ def _build_server_kwargs(args: argparse.Namespace, output_dir: Path) -> dict[str
         "backend": args.backend,
         "output_path": str(output_dir),
         "num_gpus": args.num_gpus,
+        "tp_size": args.tp_size,
+        "sp_degree": args.sp_degree,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
         "enable_cfg_parallel": args.enable_cfg_parallel,
         "component_paths": parse_component_overrides(args.component_path),
         "disable_autocast": args.disable_autocast,
@@ -120,7 +150,23 @@ def _build_server_kwargs(args: argparse.Namespace, output_dir: Path) -> dict[str
         "dit_cpu_offload": args.dit_cpu_offload,
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
+        "transformer_weights_path": args.transformer_weights_path,
     }
+    if (
+        args.enable_svdquant
+        or args.quantization_precision is not None
+        or args.quantization_rank is not None
+        or args.quantization_act_unsigned
+    ):
+        kwargs["nunchaku_config"] = NunchakuSVDQuantArgs.from_dict(
+            {
+                "enable_svdquant": args.enable_svdquant,
+                "transformer_weights_path": args.transformer_weights_path,
+                "quantization_precision": args.quantization_precision,
+                "quantization_rank": args.quantization_rank,
+                "quantization_act_unsigned": args.quantization_act_unsigned,
+            }
+        )
     if args.attention_backend:
         kwargs["attention_backend"] = args.attention_backend
     return kwargs
@@ -130,20 +176,33 @@ def _build_capability_summary(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "attention_backend": {
             "runtime_request_backend": args.attention_backend or "auto",
-            "star_transformer_backend": "torch_sdpa_only",
-            "non_torch_sdpa_supported": False,
+            "star_transformer_backend": "fa_sdpa_sage",
+            "non_torch_sdpa_supported": True,
         },
         "parallel": {
             "cfg_parallel": "supported" if args.enable_cfg_parallel else "available_but_disabled",
-            "tp": "not_integrated",
-            "sp_ulysses_ring": "not_integrated",
+            "tp": "enabled" if args.tp_size not in (None, 1) else "integrated",
+            "sp_ulysses_ring": (
+                "enabled"
+                if (args.sp_degree not in (None, 1) or args.ulysses_degree not in (None, 1) or args.ring_degree not in (None, 1))
+                else "integrated"
+            ),
         },
         "cache": {
-            "teacache": "not_integrated_for_star",
-            "cache_dit": "not_integrated_for_star",
+            "teacache": "enabled" if args.enable_teacache else "integrated",
+            "cache_dit": "enabled" if args.enable_cache_dit else "integrated",
         },
         "quantization": {
-            "status": "not_integrated_for_star",
+            "status": (
+                "enabled"
+                if (args.transformer_weights_path or args.enable_svdquant)
+                else "runtime_integrated_requires_quantized_weights"
+            ),
+            "transformer_weights_path": args.transformer_weights_path,
+            "enable_svdquant": args.enable_svdquant,
+            "quantization_precision": args.quantization_precision,
+            "quantization_rank": args.quantization_rank,
+            "quantization_act_unsigned": args.quantization_act_unsigned,
         },
     }
 
@@ -175,6 +234,10 @@ def _build_sampling_kwargs(
     }
     if args.enable_batched_cfg is not None:
         kwargs["enable_batched_cfg"] = args.enable_batched_cfg
+    teacache_params = _build_teacache_params(args)
+    if teacache_params is not None:
+        kwargs["enable_teacache"] = True
+        kwargs["teacache_params"] = teacache_params
     return kwargs
 
 
@@ -184,6 +247,7 @@ def main() -> int:
         os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
     if args.sync_stage_profiling:
         os.environ["SGLANG_DIFFUSION_SYNC_STAGE_PROFILING"] = "1"
+    _configure_cache_dit_env(args)
 
     prompt = _load_prompt(args)
     output_dir = Path(args.output_dir).expanduser().resolve()

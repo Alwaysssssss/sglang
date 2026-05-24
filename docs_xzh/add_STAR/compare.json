@@ -1,0 +1,349 @@
+{
+  "schema_version": 1,
+  "project": "STAR on SGLang phase6",
+  "reference_case": {
+    "prompt_path": "/sgl-workspace/STAR_mg/input/cogvideox_test/text/023_klingai_reedit.txt",
+    "condition_video_path": "/sgl-workspace/STAR_mg/input/cogvideox_test/lq/023_klingai_reedit.mp4",
+    "reference_video_path": "/sgl-workspace/STAR_mg/cogvideox-based/sat/output/ref_seed1234/0_A_serene_scene_of_a_panda_bear_playing_a_guitar_at_sunset_unfolds_by_a_tranquil_lake._The_panda,_with_its_black-and-whit/000000.mp4",
+    "seed": 1234,
+    "height": 480,
+    "width": 720,
+    "num_frames": 7,
+    "condition_video_num_frames": 25,
+    "num_inference_steps": 50,
+    "guidance_scale": 6.0
+  },
+  "original_star_baseline": {
+    "cold_e2e_s": 302.334,
+    "warm_e2e_s": 228.0,
+    "notes": "Current phase6 speedup calculations use these baseline numbers."
+  },
+  "phase6_state": {
+    "implemented_code_paths": [
+      "STAR transformer now always uses SGLang LocalAttention on the single-GPU path, so requested attention backends such as FlashAttention are actually honored.",
+      "STAR transformer already exposes SGLang backend capability metadata for FA/SAGE and distributed USPAttention on parallel paths.",
+      "STAR cache-dit adapter registration exists in runtime/models/dits/star_cogvideox_sr.py.",
+      "STAR Nunchaku/SVDQuant quantization rules exist in runtime/models/dits/star_cogvideox_sr.py.",
+      "GPU worker now clears CUDA allocator cache between requests when torch.compile is enabled, which stabilized STAR repeated-request compile benchmarking.",
+      "Manual benchmark/profile scripts exist for STAR phase6 profiling and matrix experiments."
+    ],
+    "current_best_exact_single_gpu": {
+      "label": "single_compile_cache_combo_v2",
+      "warm_e2e_speedup": 1.418551809472978,
+      "baseline_passed": true
+    },
+    "current_best_quality_passing_speedup": {
+      "label": "dual_cfg_parallel",
+      "warm_e2e_speedup": 1.8627655297195325,
+      "baseline_passed": true
+    },
+    "current_gaps": [
+      "Single-card exact path has not reached the target 1.6x/1.8x speedup band.",
+      "The FP8 transformer probe is faster than exact single-card but currently breaks baseline parity badly.",
+      "Batched CFG did not produce a meaningful single-card gain on this STAR workload.",
+      "Single-card no-offload and transformer-resident variants currently OOM during condition-video VAE encoding."
+    ]
+  },
+  "runs": [
+    {
+      "label": "dual_cfg_parallel",
+      "status": "success",
+      "scope": "2gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_bench/cfg_parallel_profile/summary.json",
+      "config": {
+        "attention_backend": null,
+        "num_gpus": 2,
+        "enable_cfg_parallel": true,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": null
+      },
+      "metrics": {
+        "avg_wall_clock_s": 122.39865745976567,
+        "avg_denoise_s": 102.02800385281444,
+        "warm_e2e_speedup": 1.8627655297195325,
+        "baseline_passed": true,
+        "ssim_mean": 0.9291644543599226,
+        "mse_mean": 33.32240982055664,
+        "mae_mean": 3.138689489364624
+      },
+      "notes": [
+        "Current best quality-passing speedup result.",
+        "This already exceeds the 1.8x warm speedup threshold, but it is a 2-GPU result."
+      ]
+    },
+    {
+      "label": "single_fa_old_probe",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_fa_offload_single_gpu_retry/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": false
+      },
+      "metrics": {
+        "avg_wall_clock_s": 211.0538500957191,
+        "avg_denoise_s": 190.67033729702234,
+        "baseline_passed": true,
+        "ssim_mean": 0.9294072172460112,
+        "mse_mean": 33.24436981201172,
+        "mae_mean": 3.1365245151519776
+      },
+      "notes": [
+        "Historical single-card FA probe before the latest explicit single-GPU LocalAttention fix."
+      ]
+    },
+    {
+      "label": "single_fa_exact",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_single_gpu_fa_real/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": null
+      },
+      "metrics": {
+        "avg_wall_clock_s": 212.44081996381283,
+        "denoise_s_log": 192.1733,
+        "warm_e2e_speedup": 1.0732400676990304,
+        "baseline_passed": true,
+        "ssim_mean": 0.9294375139051735,
+        "mse_mean": 33.39339622497559,
+        "mae_mean": 3.134185037612915
+      },
+      "notes": [
+        "This run verified that single-GPU STAR now really uses SGLang FlashAttention.",
+        "Quality stayed aligned, but speedup remained far below the single-card target band."
+      ]
+    },
+    {
+      "label": "single_fa_batched_cfg",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_single_gpu_fa_batched_cfg/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": true
+      },
+      "metrics": {
+        "avg_wall_clock_s": 213.5895126312971,
+        "denoise_s_log": 193.2819,
+        "warm_e2e_speedup": 1.067468141067294,
+        "baseline_passed": true,
+        "ssim_mean": 0.9294375139051735,
+        "mse_mean": 33.39339622497559,
+        "mae_mean": 3.134185037612915
+      },
+      "notes": [
+        "Batched CFG produced no meaningful single-card speedup on this STAR workload.",
+        "This path is currently lower priority than quantization and cache work."
+      ]
+    },
+    {
+      "label": "single_fa_compile_warm_v1",
+      "status": "warmup_success_then_oom",
+      "scope": "1gpu",
+      "summary_path": null,
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": true,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": false
+      },
+      "metrics": {
+        "warmup_wall_clock_s": 177.83,
+        "warmup_denoise_s_log": 157.9813,
+        "warmup_step_avg_s_log": 3.1596
+      },
+      "notes": [
+        "First compile benchmark attempt.",
+        "The warmup request succeeded and was already much faster than the exact non-compile path.",
+        "The second request OOMed before VAE encode, which motivated the worker-side empty_cache stabilization change."
+      ]
+    },
+    {
+      "label": "single_fa_compile_warm_v2",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_single_gpu_fa_compile_warm_v2/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": true,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": false
+      },
+      "metrics": {
+        "avg_wall_clock_s": 161.09524952992797,
+        "warm_e2e_speedup": 1.415311752924425,
+        "warmup_wall_clock_s": 171.30820614099503,
+        "measured_denoise_s_log": 139.7063,
+        "measured_step_avg_s_log": 2.7941,
+        "baseline_passed": true,
+        "ssim_mean": 0.9297965605024433,
+        "mse_mean": 33.19365478515625,
+        "mae_mean": 3.121154842376709
+      },
+      "notes": [
+        "Current best exact single-card result.",
+        "Quality still passes baseline parity and improved slightly over the non-compile exact path.",
+        "Single-card exact speedup is now meaningfully better, but still below the 1.6x / 1.8x phase6 target band."
+      ]
+    },
+    {
+      "label": "single_compile_cache_combo_v2",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_single_gpu_compile_cache_combo_v2/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": true,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_teacache": true,
+        "enable_cache_dit": true,
+        "cache_dit_fn": 1,
+        "cache_dit_bn": 0,
+        "cache_dit_warmup": 4,
+        "cache_dit_rdt": 0.24,
+        "cache_dit_mc": 3
+      },
+      "metrics": {
+        "avg_wall_clock_s": 160.7272984161973,
+        "warm_e2e_speedup": 1.418551809472978,
+        "measured_denoise_s_log": 139.8103,
+        "measured_step_avg_s_log": 2.7961,
+        "baseline_passed": true,
+        "ssim_mean": 0.9293969010084184,
+        "mse_mean": 33.282499084472654,
+        "mae_mean": 3.1277795696258544
+      },
+      "notes": [
+        "Current best single-card exact result, but only marginally better than pure compile.",
+        "TeaCache plus cache-dit did not unlock an additional step-function speedup under the current parameter set."
+      ]
+    },
+    {
+      "label": "single_teacache_cache_compile_probe",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_fa_teacache_cache_dit_compile_batched_cfg_probe/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": true,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": true,
+        "enable_teacache": true,
+        "enable_cache_dit": true
+      },
+      "metrics": {
+        "avg_wall_clock_s": 213.5894573368132,
+        "avg_denoise_s": 193.21924225240946,
+        "baseline_passed": true,
+        "ssim_mean": 0.9291808485184176,
+        "mse_mean": 33.38565544128418,
+        "mae_mean": 3.135905313491821
+      },
+      "notes": [
+        "This probe did not show a compelling gain.",
+        "It was measured without compile warmup averaging, so it is not the final word on torch.compile."
+      ]
+    },
+    {
+      "label": "single_fp8_probe",
+      "status": "quality_failed",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase6_fp8_probe/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": true,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": true,
+        "transformer_weights_path": "/sgl-workspace/STAR_mg/pretrained_weight/sglang_star_cogvideox_sr/transformer-fp8-block128"
+      },
+      "metrics": {
+        "avg_wall_clock_s": 196.63472471758723,
+        "avg_denoise_s": 176.79134774580598,
+        "baseline_passed": false,
+        "ssim_mean": 0.11159388894210145,
+        "mse_mean": 22134.4865625,
+        "mae_mean": 130.22901580810546
+      },
+      "notes": [
+        "FP8 is the most promising single-card speed path tested so far, but parity is badly broken.",
+        "This is now one of the highest-priority remaining phase6 gaps."
+      ]
+    },
+    {
+      "label": "single_fa_no_offload",
+      "status": "oom",
+      "scope": "1gpu",
+      "summary_path": null,
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": false,
+        "text_encoder_cpu_offload": false,
+        "enable_batched_cfg": false
+      },
+      "metrics": {
+        "failure_stage": "STARConditionVideoVAEEncodingStage"
+      },
+      "notes": [
+        "OOM during condition-video VAE encode after loading both text encoder and transformer on GPU."
+      ]
+    },
+    {
+      "label": "single_fa_transformer_on_gpu",
+      "status": "oom",
+      "scope": "1gpu",
+      "summary_path": null,
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": false,
+        "dit_cpu_offload": false,
+        "text_encoder_cpu_offload": true,
+        "enable_batched_cfg": false
+      },
+      "metrics": {
+        "failure_stage": "STARConditionVideoVAEEncodingStage"
+      },
+      "notes": [
+        "Keeping the transformer resident on GPU still OOMs before denoising begins, so exact single-card speedups are memory-bound."
+      ]
+    }
+  ]
+}
