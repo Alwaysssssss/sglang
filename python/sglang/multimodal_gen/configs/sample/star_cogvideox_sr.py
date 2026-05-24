@@ -11,6 +11,8 @@ class StarCogVideoXSRSamplingParams(SamplingParams):
     """Sampling parameters for STAR CogVideoX video super-resolution."""
 
     negative_prompt: str = ""
+    # STAR reference outputs are 25 frames at 8 FPS (about 3.1 seconds).
+    fps: int = 8
     condition_video_path: str | None = None
     condition_video_start_frame: int | None = None
     condition_video_num_frames: int | None = None

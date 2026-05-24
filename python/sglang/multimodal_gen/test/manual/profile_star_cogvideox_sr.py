@@ -19,6 +19,7 @@ from sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke import (
     _build_teacache_params,
     _configure_cache_dit_env,
     _read_video_metadata,
+    _resolve_request_fps,
     _save_frame_pngs,
     _summarize_frames,
     _summarize_internal_metrics,
@@ -41,7 +42,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=7)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--condition-video-num-frames", type=int, default=25)
@@ -318,6 +319,7 @@ def _build_sampling_kwargs(
     prompt: str,
     run_output_dir: Path,
     output_file_name: str,
+    resolved_fps: int,
     *,
     save_output: bool,
 ) -> dict[str, Any]:
@@ -329,7 +331,7 @@ def _build_sampling_kwargs(
         "num_frames": args.num_frames,
         "height": args.height,
         "width": args.width,
-        "fps": args.fps,
+        "fps": resolved_fps,
         "num_inference_steps": args.num_inference_steps,
         "guidance_scale": args.guidance_scale,
         "condition_video_num_frames": args.condition_video_num_frames,
@@ -360,6 +362,11 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     runs_dir = output_dir / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
+    resolved_fps, fps_source = _resolve_request_fps(
+        args.fps,
+        reference_video=args.reference_video,
+        condition_video_path=args.condition_video_path,
+    )
 
     server_kwargs = _build_server_kwargs(args, output_dir)
     run_records: list[dict[str, Any]] = []
@@ -384,6 +391,7 @@ def main() -> int:
                 prompt,
                 run_dir,
                 run_output_name,
+                resolved_fps,
                 save_output=not is_warmup,
             )
             run_start = time.perf_counter()
@@ -478,7 +486,9 @@ def main() -> int:
             "num_frames": args.num_frames,
             "height": args.height,
             "width": args.width,
-            "fps": args.fps,
+            "fps": resolved_fps,
+            "fps_source": fps_source,
+            "requested_fps": args.fps,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "condition_video_num_frames": args.condition_video_num_frames,

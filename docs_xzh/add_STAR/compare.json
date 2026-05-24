@@ -32,6 +32,7 @@
       "STAR includes an optional FlashInfer RoPE path, but phase7 benchmark evidence shows it should remain disabled for the mainline STAR exact configuration.",
       "STAR single-GPU quantization now threads quant_config through time_embed, qkv/out, MLP, AdaLN, final layer, and text projection, so ReplicatedLinear hot paths can really use FP8/AWQ/SVDQuant hooks.",
       "STAR manual smoke/profile/matrix scripts now expose phase7 controls for FlashInfer RoPE, local enhancer mode, resident strategy, and text-encoder release policy.",
+      "STAR sampling defaults and manual acceptance scripts now resolve STAR output playback to 8 FPS by default, or inherit the reference/condition clip FPS when available, which fixes the accelerated 1-second single-card mp4 artifacts.",
       "TextEncodingStage now reloads text encoders automatically on the next request after VAE-stage peak-memory eviction, fixing the resident fast-path device mismatch on repeated requests.",
       "STAR ModelOpt FP8 loading now accepts squeezed singleton block scales and auto-dequantizes BF16 fallback modules from weight_scale_inv tensors, which makes the STAR FP8 checkpoint load and pass baseline parity.",
       "Manual benchmark/profile scripts exist for STAR phase6/7 profiling and matrix experiments."
@@ -47,8 +48,8 @@
       "baseline_passed": true
     },
     "current_best_quantized_single_gpu": {
-      "label": "single_fp8_full_v1",
-      "warm_e2e_speedup": 1.4321557950752737,
+      "label": "single_fp8_full_v2_fps_fix",
+      "warm_e2e_speedup": 1.3919261129425886,
       "baseline_passed": true,
       "strict_passed": false
     },
@@ -66,6 +67,7 @@
       "FlashInfer RoPE was integrated and benchmarked, but it regressed STAR single-card exact speed and should remain disabled.",
       "Keeping the text encoder resident between requests still OOMs during condition-video VAE encoding, even when the transformer is quantized to FP8.",
       "The current FP8 + TeaCache + cache-dit probe showed no measurable per-step gain over plain FP8 compile on this STAR workload.",
+      "Historical single-card benchmark videos produced before the STAR FPS fix were written at 24 FPS instead of the reference 8 FPS, so those older mp4 artifacts should not be used for subjective playback comparison.",
       "SAGE, SAGE_ATTN_3, and AITER cannot be recommended in the current environment because sageattention and aiter are not installed on this L20 host.",
       "Nunchaku SVDQuant is not currently usable in this environment because the nunchaku package is absent and L20 (SM89) is outside the supported architecture set."
     ]
@@ -702,7 +704,42 @@
       "notes": [
         "This run uses the repaired STAR FP8 loading path: singleton block scales now load correctly, and BF16 fallback modules such as temp_local.conv1 are auto-dequantized from weight_scale_inv tensors.",
         "Baseline parity passed and the result is marginally faster than the best exact single-card run, so phase7 now has a baseline-passing quantized STAR configuration.",
-        "Strict parity still fails and the speedup remains far below the 1.6x/1.8x single-card phase7 target band."
+        "Strict parity still fails and the speedup remains far below the 1.6x/1.8x single-card phase7 target band.",
+        "This artifact was written before the STAR FPS fix and saves the 25-frame output at 24 FPS, so it should not be used for subjective playback comparison against the original 8 FPS STAR video."
+      ]
+    },
+    {
+      "label": "single_fp8_full_v2_fps_fix",
+      "status": "success",
+      "scope": "1gpu",
+      "summary_path": "/sgl-workspace/sglang/outputs/star_phase7_fp8_full_v2_fps_fix/summary.json",
+      "config": {
+        "attention_backend": "fa",
+        "num_gpus": 1,
+        "enable_cfg_parallel": false,
+        "enable_torch_compile": true,
+        "dit_cpu_offload": false,
+        "text_encoder_cpu_offload": false,
+        "enable_batched_cfg": false,
+        "transformer_weights_path": "/sgl-workspace/STAR_mg/pretrained_weight/sglang_star_cogvideox_sr/transformer-fp8-block128",
+        "condition_video_vae_peak_memory_mode": "text_encoder_and_transformer",
+        "release_text_encoder_after_prompt_encode": true,
+        "keep_transformer_gpu_resident_between_requests": true,
+        "resolved_output_fps": 8
+      },
+      "metrics": {
+        "avg_wall_clock_s": 163.8017980121076,
+        "warm_e2e_speedup": 1.3919261129425886,
+        "baseline_passed": true,
+        "strict_passed": false,
+        "ssim_mean": 0.9353243278662879,
+        "mse_mean": 32.40367370605469,
+        "mae_mean": 3.0599112129211425
+      },
+      "notes": [
+        "This rerun verifies the STAR FPS fix: the candidate mp4 is now written at 8 FPS, matching the 25-frame, ~3.1-second playback semantics of the original STAR reference video.",
+        "Baseline parity passed again and visual metrics improved over single_fp8_full_v1, but strict parity still fails.",
+        "Warm speedup measured 1.3919x on this rerun, so the single-card phase7 target band is still not met."
       ]
     }
   ]

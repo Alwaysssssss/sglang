@@ -117,7 +117,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=7)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--condition-video-num-frames", type=int, default=25)
@@ -153,8 +153,6 @@ def _run_profile(args: argparse.Namespace, config: dict, run_dir: Path) -> dict:
         str(args.height),
         "--width",
         str(args.width),
-        "--fps",
-        str(args.fps),
         "--num-inference-steps",
         str(args.num_inference_steps),
         "--guidance-scale",
@@ -175,6 +173,8 @@ def _run_profile(args: argparse.Namespace, config: dict, run_dir: Path) -> dict:
     attention_backend = config.get("attention_backend")
     if attention_backend:
         command.extend(["--attention-backend", str(attention_backend)])
+    if args.fps is not None:
+        command.extend(["--fps", str(args.fps)])
     if args.original_star_cold_e2e_s is not None:
         command.extend(
             ["--original-star-cold-e2e-s", str(args.original_star_cold_e2e_s)]

@@ -7,6 +7,10 @@ from sglang.multimodal_gen.configs.sample import (
     StarCogVideoXSRSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke import (
+    STAR_DEFAULT_OUTPUT_FPS,
+    _resolve_request_fps,
+)
 
 
 class TestStarCogVideoXSamplingParams(unittest.TestCase):
@@ -69,6 +73,44 @@ class TestStarCogVideoXSamplingParams(unittest.TestCase):
     def test_star_specific_fields_do_not_pollute_base_sampling_params(self):
         self.assertFalse(hasattr(SamplingParams(), "condition_video_path"))
         self.assertTrue(hasattr(StarCogVideoXSRSamplingParams(), "condition_video_path"))
+
+    def test_star_sampling_defaults_to_reference_fps(self):
+        self.assertEqual(StarCogVideoXSRSamplingParams().fps, STAR_DEFAULT_OUTPUT_FPS)
+
+    def test_resolve_request_fps_prefers_explicit_value(self):
+        fps, source = _resolve_request_fps(
+            12,
+            reference_video=None,
+            condition_video_path=None,
+        )
+        self.assertEqual(fps, 12)
+        self.assertEqual(source, "explicit_request")
+
+    def test_resolve_request_fps_falls_back_to_star_default(self):
+        with patch(
+            "sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke._read_video_fps",
+            return_value=None,
+        ):
+            fps, source = _resolve_request_fps(
+                None,
+                reference_video="/tmp/ref.mp4",
+                condition_video_path="/tmp/cond.mp4",
+            )
+        self.assertEqual(fps, STAR_DEFAULT_OUTPUT_FPS)
+        self.assertEqual(source, "star_default")
+
+    def test_resolve_request_fps_prefers_reference_video_metadata(self):
+        with patch(
+            "sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke._read_video_fps",
+            side_effect=[8.0, None],
+        ):
+            fps, source = _resolve_request_fps(
+                None,
+                reference_video="/tmp/ref.mp4",
+                condition_video_path="/tmp/cond.mp4",
+            )
+        self.assertEqual(fps, 8)
+        self.assertEqual(source, "reference_video")
 
 
 if __name__ == "__main__":

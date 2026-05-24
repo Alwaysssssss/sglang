@@ -16,6 +16,8 @@ from sglang.multimodal_gen.configs.quantization.nunchaku import (
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
+STAR_DEFAULT_OUTPUT_FPS = 8
+
 
 def parse_component_overrides(entries: list[str] | None) -> dict[str, str]:
     overrides: dict[str, str] = {}
@@ -71,7 +73,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=7)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument(
@@ -307,6 +309,46 @@ def _read_video_metadata(path: str | Path | None) -> dict[str, Any] | None:
     }
 
 
+def _read_video_fps(path: str | Path | None) -> float | None:
+    if not path:
+        return None
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        return None
+    try:
+        with imageio.get_reader(resolved) as reader:
+            fps = reader.get_meta_data().get("fps")
+    except Exception:
+        return None
+    try:
+        fps_value = float(fps)
+    except (TypeError, ValueError):
+        return None
+    return fps_value if fps_value > 0 else None
+
+
+def _resolve_request_fps(
+    explicit_fps: int | None,
+    *,
+    reference_video: str | Path | None,
+    condition_video_path: str | Path | None,
+) -> tuple[int, str]:
+    if explicit_fps is not None:
+        if explicit_fps <= 0:
+            raise ValueError(f"fps must be positive, got {explicit_fps}")
+        return int(explicit_fps), "explicit_request"
+
+    reference_fps = _read_video_fps(reference_video)
+    if reference_fps is not None:
+        return max(int(round(reference_fps)), 1), "reference_video"
+
+    condition_fps = _read_video_fps(condition_video_path)
+    if condition_fps is not None:
+        return max(int(round(condition_fps)), 1), "condition_video"
+
+    return STAR_DEFAULT_OUTPUT_FPS, "star_default"
+
+
 def _summarize_frames(frames: list[np.ndarray]) -> dict[str, Any]:
     frame_stack = np.stack([np.asarray(frame) for frame in frames], axis=0)
     return {
@@ -446,6 +488,11 @@ def main() -> int:
         if args.summary_json
         else output_dir / "star_smoke_summary.json"
     )
+    resolved_fps, fps_source = _resolve_request_fps(
+        args.fps,
+        reference_video=args.reference_video,
+        condition_video_path=args.condition_video_path,
+    )
 
     pipeline_config_overrides = _build_pipeline_config_overrides(args)
     server_kwargs = {
@@ -482,7 +529,7 @@ def main() -> int:
         "num_frames": args.num_frames,
         "height": args.height,
         "width": args.width,
-        "fps": args.fps,
+        "fps": resolved_fps,
         "num_inference_steps": args.num_inference_steps,
         "guidance_scale": args.guidance_scale,
         "output_path": str(output_dir),
@@ -559,7 +606,9 @@ def main() -> int:
             "num_frames": args.num_frames,
             "height": args.height,
             "width": args.width,
-            "fps": args.fps,
+            "fps": resolved_fps,
+            "fps_source": fps_source,
+            "requested_fps": args.fps,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
             "condition_video_start_frame": args.condition_video_start_frame,
