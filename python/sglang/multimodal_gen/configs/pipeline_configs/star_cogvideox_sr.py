@@ -71,6 +71,7 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
     dynamic_cfg_enabled: bool = True
     dynamic_cfg_exp: float = 5.0
     use_step_index_timestep: bool = False
+    enable_batched_cfg: bool = True
 
     integration_metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -209,3 +210,10 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
             dtype=t_device.dtype,
             device=t_device.device,
         )
+
+    def should_use_batched_cfg(self, batch, server_args) -> bool:
+        del server_args
+        request_override = getattr(batch, "enable_batched_cfg", None)
+        if request_override is not None:
+            return bool(request_override)
+        return bool(self.enable_batched_cfg)

@@ -1572,6 +1572,206 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             **kwargs,
         )
 
+    @staticmethod
+    def _concat_cfg_branch_values(
+        pos_value: Any,
+        neg_value: Any,
+    ) -> tuple[Any, bool]:
+        if pos_value is None and neg_value is None:
+            return None, True
+        if pos_value is None or neg_value is None:
+            return None, False
+        if torch.is_tensor(pos_value) and torch.is_tensor(neg_value):
+            if pos_value.shape[1:] != neg_value.shape[1:]:
+                return None, False
+            return torch.cat([pos_value, neg_value], dim=0), True
+        if isinstance(pos_value, list) and isinstance(neg_value, list):
+            if len(pos_value) != len(neg_value):
+                return None, False
+            merged_items = []
+            for pos_item, neg_item in zip(pos_value, neg_value, strict=True):
+                merged_item, ok = DenoisingStage._concat_cfg_branch_values(
+                    pos_item, neg_item
+                )
+                if not ok:
+                    return None, False
+                merged_items.append(merged_item)
+            return merged_items, True
+        if isinstance(pos_value, tuple) and isinstance(neg_value, tuple):
+            if len(pos_value) != len(neg_value):
+                return None, False
+            merged_items = []
+            for pos_item, neg_item in zip(pos_value, neg_value, strict=True):
+                merged_item, ok = DenoisingStage._concat_cfg_branch_values(
+                    pos_item, neg_item
+                )
+                if not ok:
+                    return None, False
+                merged_items.append(merged_item)
+            return tuple(merged_items), True
+        if isinstance(pos_value, dict) and isinstance(neg_value, dict):
+            if pos_value.keys() != neg_value.keys():
+                return None, False
+            merged_dict: dict[str, Any] = {}
+            for key in pos_value:
+                merged_item, ok = DenoisingStage._concat_cfg_branch_values(
+                    pos_value[key], neg_value[key]
+                )
+                if not ok:
+                    return None, False
+                merged_dict[key] = merged_item
+            return merged_dict, True
+        if pos_value == neg_value:
+            return pos_value, True
+        return None, False
+
+    @staticmethod
+    def _repeat_cfg_branch_value(value: Any) -> tuple[Any, bool]:
+        if value is None:
+            return None, True
+        if torch.is_tensor(value):
+            return torch.cat([value, value], dim=0), True
+        if isinstance(value, list):
+            repeated_items = []
+            for item in value:
+                repeated_item, ok = DenoisingStage._repeat_cfg_branch_value(item)
+                if not ok:
+                    return None, False
+                repeated_items.append(repeated_item)
+            return repeated_items, True
+        if isinstance(value, tuple):
+            repeated_items = []
+            for item in value:
+                repeated_item, ok = DenoisingStage._repeat_cfg_branch_value(item)
+                if not ok:
+                    return None, False
+                repeated_items.append(repeated_item)
+            return tuple(repeated_items), True
+        if isinstance(value, dict):
+            repeated_dict: dict[str, Any] = {}
+            for key, item in value.items():
+                repeated_item, ok = DenoisingStage._repeat_cfg_branch_value(item)
+                if not ok:
+                    return None, False
+                repeated_dict[key] = repeated_item
+            return repeated_dict, True
+        return value, True
+
+    @staticmethod
+    def _split_batched_cfg_value(value: Any) -> tuple[Any, Any]:
+        if value is None:
+            return None, None
+        if torch.is_tensor(value):
+            return torch.chunk(value, 2, dim=0)
+        if isinstance(value, list):
+            pos_items, neg_items = [], []
+            for item in value:
+                pos_item, neg_item = DenoisingStage._split_batched_cfg_value(item)
+                pos_items.append(pos_item)
+                neg_items.append(neg_item)
+            return pos_items, neg_items
+        if isinstance(value, tuple):
+            pos_items, neg_items = [], []
+            for item in value:
+                pos_item, neg_item = DenoisingStage._split_batched_cfg_value(item)
+                pos_items.append(pos_item)
+                neg_items.append(neg_item)
+            return tuple(pos_items), tuple(neg_items)
+        if isinstance(value, dict):
+            pos_dict: dict[str, Any] = {}
+            neg_dict: dict[str, Any] = {}
+            for key, item in value.items():
+                pos_item, neg_item = DenoisingStage._split_batched_cfg_value(item)
+                pos_dict[key] = pos_item
+                neg_dict[key] = neg_item
+            return pos_dict, neg_dict
+        return value, value
+
+    def _build_batched_cfg_inputs(
+        self,
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor | float | int,
+        guidance: torch.Tensor,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        merged_kwargs: dict[str, Any] = {}
+        for key in sorted(pos_cond_kwargs.keys() | neg_cond_kwargs.keys()):
+            merged_value, ok = self._concat_cfg_branch_values(
+                pos_cond_kwargs.get(key),
+                neg_cond_kwargs.get(key),
+            )
+            if not ok:
+                return {}, False
+            merged_kwargs[key] = merged_value
+        for key, value in image_kwargs.items():
+            repeated_value, ok = self._repeat_cfg_branch_value(value)
+            if not ok:
+                return {}, False
+            merged_kwargs[key] = repeated_value
+        if torch.is_tensor(timestep):
+            merged_timestep = torch.cat([timestep, timestep], dim=0)
+        else:
+            merged_timestep = timestep
+        merged_guidance = guidance
+        if torch.is_tensor(guidance):
+            merged_guidance = torch.cat([guidance, guidance], dim=0)
+        return {
+            "latent_model_input": torch.cat([latent_model_input, latent_model_input], dim=0),
+            "timestep": merged_timestep,
+            "guidance": merged_guidance,
+            "kwargs": merged_kwargs,
+        }, True
+
+    def _predict_noise_with_batched_cfg(
+        self,
+        current_model: nn.Module,
+        latent_model_input: torch.Tensor,
+        timestep,
+        batch: Req,
+        timestep_index: int,
+        attn_metadata,
+        target_dtype,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
+        guidance: torch.Tensor,
+        latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        merged_inputs, ok = self._build_batched_cfg_inputs(
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            guidance=guidance,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs,
+        )
+        if not ok:
+            return None
+        batch.is_cfg_negative = False
+        with set_forward_context(
+            current_timestep=timestep_index,
+            attn_metadata=attn_metadata,
+            forward_batch=batch,
+        ):
+            merged_noise_pred = self._predict_noise(
+                current_model=current_model,
+                latent_model_input=merged_inputs["latent_model_input"],
+                timestep=merged_inputs["timestep"],
+                target_dtype=target_dtype,
+                guidance=merged_inputs["guidance"],
+                **merged_inputs["kwargs"],
+            )
+        noise_pred_cond, noise_pred_uncond = torch.chunk(merged_noise_pred, 2, dim=0)
+        noise_pred_cond = self.server_args.pipeline_config.slice_noise_pred(
+            noise_pred_cond, latents
+        )
+        noise_pred_uncond = self.server_args.pipeline_config.slice_noise_pred(
+            noise_pred_uncond, latents
+        )
+        return noise_pred_cond, noise_pred_uncond
+
     def _predict_noise_with_cfg(
         self,
         current_model: nn.Module,
@@ -1611,8 +1811,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         noise_pred_cond: torch.Tensor | None = None
         noise_pred_uncond: torch.Tensor | None = None
         cfg_rank = get_classifier_free_guidance_rank()
+        should_try_batched_cfg = (
+            batch.do_classifier_free_guidance
+            and not server_args.enable_cfg_parallel
+            and server_args.pipeline_config.should_use_batched_cfg(batch, server_args)
+        )
+        if should_try_batched_cfg:
+            batched_cfg_result = self._predict_noise_with_batched_cfg(
+                current_model=current_model,
+                latent_model_input=latent_model_input,
+                timestep=timestep,
+                batch=batch,
+                timestep_index=timestep_index,
+                attn_metadata=attn_metadata,
+                target_dtype=target_dtype,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                neg_cond_kwargs=neg_cond_kwargs,
+                guidance=guidance,
+                latents=latents,
+            )
+            if batched_cfg_result is not None:
+                noise_pred_cond, noise_pred_uncond = batched_cfg_result
         # positive pass
-        if not (server_args.enable_cfg_parallel and cfg_rank != 0):
+        if noise_pred_cond is None and not (
+            server_args.enable_cfg_parallel and cfg_rank != 0
+        ):
             batch.is_cfg_negative = False
             with set_forward_context(
                 current_timestep=timestep_index,
@@ -1636,7 +1860,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return noise_pred_cond
 
         # negative pass
-        if not server_args.enable_cfg_parallel or cfg_rank != 0:
+        if noise_pred_uncond is None and (
+            not server_args.enable_cfg_parallel or cfg_rank != 0
+        ):
             batch.is_cfg_negative = True
             with set_forward_context(
                 current_timestep=timestep_index,

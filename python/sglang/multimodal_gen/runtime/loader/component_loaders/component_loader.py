@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.startup_debug import (
+    write_startup_debug_event,
+)
 
 logger = init_logger(__name__)
 
@@ -93,9 +96,18 @@ class ComponentLoader(ABC):
             component_model_path,
             gpu_mem_before_loading,
         )
+        write_startup_debug_event(
+            f"ComponentLoader.load start component={component_name} path={component_model_path}"
+        )
         try:
+            write_startup_debug_event(
+                f"ComponentLoader.load_customized start component={component_name}"
+            )
             component = self.load_customized(
                 component_model_path, server_args, component_name
+            )
+            write_startup_debug_event(
+                f"ComponentLoader.load_customized done component={component_name}"
             )
             source = "sgl-diffusion"
         except Exception as e:
@@ -111,6 +123,9 @@ class ComponentLoader(ABC):
             # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
+            )
+            write_startup_debug_event(
+                f"ComponentLoader.load_native done component={component_name}"
             )
             should_offload = self.should_offload(server_args)
             target_device = self.target_device(should_offload)
@@ -139,6 +154,9 @@ class ComponentLoader(ABC):
                 consumed,
                 current_gpu_mem,
             )
+        write_startup_debug_event(
+            f"ComponentLoader.load done component={component_name}"
+        )
         return component, consumed
 
     def load_native(

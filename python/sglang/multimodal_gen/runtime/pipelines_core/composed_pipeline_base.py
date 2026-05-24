@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.startup_debug import (
+    write_startup_debug_event,
+)
 
 logger = init_logger(__name__)
 
@@ -117,7 +120,11 @@ class ComposedPipelineBase(ABC):
         self.memory_usages: dict[str, float] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
+        write_startup_debug_event(
+            f"{self.__class__.__name__} load_modules start required={self._required_config_modules}"
+        )
         self.modules = self.load_modules(server_args, loaded_modules)
+        write_startup_debug_event(f"{self.__class__.__name__} load_modules done")
 
         self.__post_init__()
 
@@ -135,7 +142,9 @@ class ComposedPipelineBase(ABC):
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
+        write_startup_debug_event(f"{self.__class__.__name__} create_pipeline_stages start")
         self.create_pipeline_stages(self.server_args)
+        write_startup_debug_event(f"{self.__class__.__name__} create_pipeline_stages done")
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -404,12 +413,18 @@ class ComposedPipelineBase(ABC):
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
+            write_startup_debug_event(
+                f"{self.__class__.__name__} loading module={module_name} load_name={load_module_name}"
+            )
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
                 component_architecture=architecture,
+            )
+            write_startup_debug_event(
+                f"{self.__class__.__name__} loaded module={module_name} load_name={load_module_name}"
             )
 
             self.memory_usages[load_module_name] = memory_usage

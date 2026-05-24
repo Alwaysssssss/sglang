@@ -64,6 +64,26 @@ class TestStarDynamicCFG(unittest.TestCase):
         self.assertTrue(torch.equal(timestep, torch.tensor([50, 50])))
         self.assertTrue(torch.equal(last_timestep, torch.tensor([1, 1])))
 
+    def test_batched_cfg_prefers_request_override(self):
+        config = StarCogVideoXSRPipelineConfig()
+        server_args = SimpleNamespace()
+
+        self.assertTrue(
+            config.should_use_batched_cfg(
+                SimpleNamespace(enable_batched_cfg=None), server_args
+            )
+        )
+        self.assertFalse(
+            config.should_use_batched_cfg(
+                SimpleNamespace(enable_batched_cfg=False), server_args
+            )
+        )
+        self.assertTrue(
+            config.should_use_batched_cfg(
+                SimpleNamespace(enable_batched_cfg=True), server_args
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

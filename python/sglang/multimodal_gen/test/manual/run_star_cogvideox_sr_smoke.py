@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +110,17 @@ def _parse_args() -> argparse.Namespace:
         help="Optional attention backend override.",
     )
     parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs to launch with.",
+    )
+    parser.add_argument(
+        "--enable-cfg-parallel",
+        action="store_true",
+        help="Enable classifier-free guidance parallelism across two GPU ranks.",
+    )
+    parser.add_argument(
         "--component-path",
         action="append",
         default=[],
@@ -117,6 +130,11 @@ def _parse_args() -> argparse.Namespace:
         "--disable-autocast",
         action="store_true",
         help="Disable autocast for the generator run.",
+    )
+    parser.add_argument(
+        "--enable-torch-compile",
+        action="store_true",
+        help="Enable torch.compile for the DiT runtime.",
     )
     parser.add_argument(
         "--dit-cpu-offload",
@@ -138,6 +156,29 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also write candidate frames as PNGs.",
     )
+    parser.add_argument(
+        "--enable-stage-logging",
+        action="store_true",
+        help="Enable internal stage timing collection through SGLANG_DIFFUSION_STAGE_LOGGING.",
+    )
+    parser.add_argument(
+        "--sync-stage-profiling",
+        action="store_true",
+        help="Synchronize step timing around stage profiling for more stable denoise timings.",
+    )
+    parser.add_argument(
+        "--enable-batched-cfg",
+        dest="enable_batched_cfg",
+        action="store_true",
+        help="Force STAR batched CFG on for this request.",
+    )
+    parser.add_argument(
+        "--disable-batched-cfg",
+        dest="enable_batched_cfg",
+        action="store_false",
+        help="Force STAR batched CFG off for this request.",
+    )
+    parser.set_defaults(enable_batched_cfg=None)
     parser.add_argument(
         "--enable-color-fix",
         action="store_true",
@@ -202,8 +243,30 @@ def _save_frame_pngs(frames: list[np.ndarray], output_dir: Path) -> list[str]:
     return saved_paths
 
 
+def _summarize_internal_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    stages = metrics.get("stages") or {}
+    step_durations = metrics.get("steps") or []
+    internal_total_ms = float(metrics.get("total_duration_ms") or 0.0)
+    denoise_total_ms = float(sum(step_durations))
+    return {
+        "internal_total_duration_ms": internal_total_ms,
+        "internal_total_duration_s": internal_total_ms / 1000.0,
+        "denoise_total_duration_ms": denoise_total_ms,
+        "denoise_total_duration_s": denoise_total_ms / 1000.0,
+        "denoise_step_count": len(step_durations),
+        "denoise_step_avg_ms": (
+            denoise_total_ms / len(step_durations) if step_durations else None
+        ),
+        "stage_durations_ms": stages,
+    }
+
+
 def main() -> int:
     args = _parse_args()
+    if args.enable_stage_logging:
+        os.environ["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
+    if args.sync_stage_profiling:
+        os.environ["SGLANG_DIFFUSION_SYNC_STAGE_PROFILING"] = "1"
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
@@ -220,8 +283,11 @@ def main() -> int:
         "pipeline_class_name": args.pipeline_class_name,
         "backend": args.backend,
         "output_path": str(output_dir),
+        "num_gpus": args.num_gpus,
+        "enable_cfg_parallel": args.enable_cfg_parallel,
         "component_paths": parse_component_overrides(args.component_path),
         "disable_autocast": args.disable_autocast,
+        "enable_torch_compile": args.enable_torch_compile,
         "dit_cpu_offload": args.dit_cpu_offload,
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
@@ -246,6 +312,8 @@ def main() -> int:
         "enable_color_fix": args.enable_color_fix,
         "color_fix_mode": args.color_fix_mode,
     }
+    if args.enable_batched_cfg is not None:
+        sampling_params_kwargs["enable_batched_cfg"] = args.enable_batched_cfg
     if args.negative_prompt is not None:
         sampling_params_kwargs["negative_prompt"] = args.negative_prompt
     if args.condition_video_start_frame is not None:
@@ -265,8 +333,14 @@ def main() -> int:
             args.condition_video_frame_stride
         )
 
+    total_start = time.perf_counter()
+    load_start = time.perf_counter()
     with DiffGenerator.from_pretrained(local_mode=True, **server_kwargs) as generator:
+        load_duration_s = time.perf_counter() - load_start
+        generate_start = time.perf_counter()
         result = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        generate_duration_s = time.perf_counter() - generate_start
+    total_duration_s = time.perf_counter() - total_start
 
     if result is None:
         raise RuntimeError("Smoke generation returned no result.")
@@ -286,6 +360,7 @@ def main() -> int:
             "Smoke generation did not return frames or an output file path."
         )
 
+    metrics_summary = _summarize_internal_metrics(result.metrics or {})
     summary = {
         "model_path": str(Path(args.model_path).expanduser().resolve()),
         "pipeline_class_name": args.pipeline_class_name,
@@ -307,16 +382,26 @@ def main() -> int:
             "condition_video_num_frames": args.condition_video_num_frames,
             "condition_video_sample_fps": args.condition_video_sample_fps,
             "condition_video_frame_stride": args.condition_video_frame_stride,
+            "enable_batched_cfg": args.enable_batched_cfg,
             "enable_color_fix": args.enable_color_fix,
             "color_fix_mode": args.color_fix_mode,
         },
         "server": {
             "attention_backend": args.attention_backend,
+            "num_gpus": args.num_gpus,
+            "enable_cfg_parallel": args.enable_cfg_parallel,
             "disable_autocast": args.disable_autocast,
+            "enable_torch_compile": args.enable_torch_compile,
             "dit_cpu_offload": args.dit_cpu_offload,
             "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
             "vae_cpu_offload": args.vae_cpu_offload,
             "component_paths": server_kwargs["component_paths"],
+        },
+        "timing": {
+            "load_duration_s": load_duration_s,
+            "generate_wall_clock_s": generate_duration_s,
+            "total_wall_clock_s": total_duration_s,
+            **metrics_summary,
         },
         "result": {
             "output_file_path": result.output_file_path,

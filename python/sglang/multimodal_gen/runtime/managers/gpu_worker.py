@@ -58,6 +58,9 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.startup_debug import (
+    write_startup_debug_event,
+)
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils.network import NetworkAddress
@@ -95,6 +98,9 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
+        write_startup_debug_event(
+            f"worker_init start local_rank={self.local_rank} rank={self.rank}"
+        )
         torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
@@ -103,6 +109,7 @@ class GPUWorker:
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
         # initialize the distributed environment
+        write_startup_debug_event("before maybe_init_distributed_environment")
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
             enable_cfg_parallel=self.server_args.enable_cfg_parallel,
@@ -115,6 +122,7 @@ class GPUWorker:
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+        write_startup_debug_event("after maybe_init_distributed_environment")
 
         # set proc title
         if model_parallel_is_initialized():
@@ -135,7 +143,9 @@ class GPUWorker:
         else:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
+        write_startup_debug_event("before build_pipeline")
         self.pipeline = build_pipeline(self.server_args)
+        write_startup_debug_event("after build_pipeline")
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
@@ -160,6 +170,7 @@ class GPUWorker:
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
+        write_startup_debug_event("worker_init done")
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         final_snapshot = capture_memory_snapshot()
@@ -538,13 +549,18 @@ def run_scheduler_process(
         trace_set_thread_info(f"DiffWorker_rank{rank}")
 
     port_args = PortArgs.from_server_args(server_args)
+    write_startup_debug_event(
+        f"run_scheduler_process start local_rank={local_rank} rank={rank}"
+    )
 
     # start the scheduler event loop
     assert task_pipes_to_slaves is not None
     assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
+    signaled_ready = False
     try:
+        write_startup_debug_event("before Scheduler()")
         scheduler = Scheduler(
             server_args,
             gpu_id=rank,
@@ -553,15 +569,31 @@ def run_scheduler_process(
             result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
+        write_startup_debug_event("after Scheduler()")
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {
                 "status": "ready",
             }
         )
+        signaled_ready = True
+        write_startup_debug_event("ready sent")
         scheduler.event_loop()
     except _oom_exceptions() as _e:
+        if not signaled_ready:
+            try:
+                pipe_writer.send({"status": "error", "error": str(_e)})
+            except Exception:
+                pass
         logger.warning(OOM_MSG)
+        raise
+    except Exception as e:
+        if not signaled_ready:
+            try:
+                pipe_writer.send({"status": "error", "error": str(e)})
+            except Exception:
+                pass
+        logger.exception("Worker %s failed during scheduler startup or execution", rank)
         raise
     finally:
         # Clean up resources to speed up shutdown
@@ -572,4 +604,8 @@ def run_scheduler_process(
             torch.cuda.empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
+        try:
+            pipe_writer.close()
+        except Exception:
+            pass
         logger.info(f"Worker {rank}: Shutdown complete.")

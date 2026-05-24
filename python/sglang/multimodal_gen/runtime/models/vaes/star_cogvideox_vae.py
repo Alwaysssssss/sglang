@@ -20,6 +20,15 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.vaes.star_cogvideox_vae import (
     StarCogVideoXSRVAEConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    get_dp_group,
+    get_sp_group,
+    get_tp_group,
+    get_world_group,
+)
+from sglang.multimodal_gen.runtime.utils.startup_debug import (
+    write_startup_debug_event,
+)
 
 _STAR_LOCAL_DIST_INIT_PATH: str | None = None
 
@@ -59,10 +68,44 @@ def _load_original_star_modules():
     return autoencoder_mod.VideoAutoencoderInferenceWrapper, util_mod
 
 
-def _ensure_star_context_parallel(util_mod) -> None:
+def _ensure_star_context_parallel(
+    util_mod,
+    *,
+    context_parallel_size: int,
+) -> None:
     global _STAR_LOCAL_DIST_INIT_PATH
 
+    # The original STAR VAE implementation still dereferences a context-parallel
+    # group inside fake-CP convolution helpers even when the wrapper is used in
+    # cp_size=0 mode. We therefore need a valid singleton process group, but we
+    # must not ask SAT to create new groups on top of SGLang's existing
+    # distributed topology because that can deadlock multi-rank startup.
+    if context_parallel_size <= 1:
+        if util_mod.is_context_parallel_initialized():
+            return
+
+        singleton_group = None
+        for candidate in (get_tp_group(), get_sp_group(), get_dp_group()):
+            if candidate.world_size == 1:
+                singleton_group = candidate.device_group
+                break
+        if singleton_group is None:
+            world_group = get_world_group()
+            if world_group.world_size == 1:
+                singleton_group = world_group.device_group
+
+        if singleton_group is None:
+            raise RuntimeError(
+                "Unable to find an existing singleton process group for STAR VAE "
+                "fake context-parallel operations."
+            )
+
+        write_startup_debug_event("STAR VAE set_context_parallel_group singleton")
+        util_mod.set_context_parallel_group(1, singleton_group)
+        return
+
     if not dist.is_initialized():
+        write_startup_debug_event("STAR VAE local dist.init_process_group start")
         if _STAR_LOCAL_DIST_INIT_PATH is None:
             fd, init_path = tempfile.mkstemp(
                 prefix="sglang-star-cp-", suffix=".dist"
@@ -75,9 +118,12 @@ def _ensure_star_context_parallel(util_mod) -> None:
             rank=0,
             world_size=1,
         )
+        write_startup_debug_event("STAR VAE local dist.init_process_group done")
 
     if not util_mod.is_context_parallel_initialized():
+        write_startup_debug_event("STAR VAE initialize_context_parallel start")
         util_mod.initialize_context_parallel(1)
+        write_startup_debug_event("STAR VAE initialize_context_parallel done")
 
 
 def _group_norm(num_channels: int) -> nn.GroupNorm:
@@ -416,9 +462,12 @@ class StarCogVideoXSRVAE(nn.Module):
         self._use_original_impl = False
 
         try:
+            write_startup_debug_event("STAR VAE original_impl load_modules start")
             wrapper_cls, util_mod = _load_original_star_modules()
-            _ensure_star_context_parallel(util_mod)
+            write_startup_debug_event("STAR VAE original_impl load_modules done")
+            _ensure_star_context_parallel(util_mod, context_parallel_size=0)
             self._star_util_mod = util_mod
+            write_startup_debug_event("STAR VAE original_impl wrapper init start")
             self.impl = wrapper_cls(
                 cp_size=0,
                 loss_config={"target": "torch.nn.Identity"},
@@ -458,6 +507,7 @@ class StarCogVideoXSRVAE(nn.Module):
                     },
                 },
             )
+            write_startup_debug_event("STAR VAE original_impl wrapper init done")
             self._use_original_impl = True
         except Exception as exc:
             warnings.warn(
@@ -470,7 +520,7 @@ class StarCogVideoXSRVAE(nn.Module):
 
     def _ensure_original_runtime(self) -> None:
         if self._use_original_impl and self._star_util_mod is not None:
-            _ensure_star_context_parallel(self._star_util_mod)
+            _ensure_star_context_parallel(self._star_util_mod, context_parallel_size=0)
 
     def enable_tiling(self, use_tiling: bool = True) -> None:
         self.use_tiling = use_tiling

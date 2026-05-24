@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import psutil
 import uvicorn
@@ -173,18 +174,38 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     for p in result_pipes_from_slaves_r:
         p.close()
 
+    startup_timeout_s = min(max(server_args.dist_timeout or 600, 30), 600)
     for i, reader in enumerate(scheduler_pipe_readers):
-        try:
-            data = reader.recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+        deadline = time.time() + startup_timeout_s
+        data = None
+        while time.time() < deadline:
+            if reader.poll(1.0):
+                try:
+                    data = reader.recv()
+                    break
+                except EOFError:
+                    logger.error(
+                        f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+                    )
+                    processes[i].join(timeout=1)
+                    logger.error(f"Exit code: {processes[i].exitcode}")
+                    raise
+            if not processes[i].is_alive():
+                logger.error("Rank %s scheduler exited before signaling ready.", i)
+                processes[i].join(timeout=1)
+                logger.error(f"Exit code: {processes[i].exitcode}")
+                raise RuntimeError(
+                    f"Rank {i} scheduler exited during startup with code {processes[i].exitcode}."
+                )
+        if data is None:
+            raise TimeoutError(
+                f"Timed out waiting for rank {i} to become ready after {startup_timeout_s} seconds."
             )
-            processes[i].join()
-            logger.error(f"Exit code: {processes[i].exitcode}")
-            raise
 
         if data["status"] != "ready":
+            error_message = data.get("error")
+            if error_message:
+                logger.error("Rank %s initialization error: %s", i, error_message)
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
             )

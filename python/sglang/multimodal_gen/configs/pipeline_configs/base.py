@@ -539,6 +539,10 @@ class PipelineConfig:
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
+    def should_use_batched_cfg(self, batch, server_args) -> bool:
+        del batch, server_args
+        return False
+
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
 

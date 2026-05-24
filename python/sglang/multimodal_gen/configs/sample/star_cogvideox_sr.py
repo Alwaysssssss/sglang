@@ -19,6 +19,7 @@ class StarCogVideoXSRSamplingParams(SamplingParams):
 
     enable_color_fix: bool = False
     color_fix_mode: str | None = None
+    enable_batched_cfg: bool | None = None
 
     guidance_scale: float = 6.0
     num_inference_steps: int = 50

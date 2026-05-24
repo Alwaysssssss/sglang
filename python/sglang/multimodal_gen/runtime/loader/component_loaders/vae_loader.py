@@ -22,6 +22,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.startup_debug import (
+    write_startup_debug_event,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -134,12 +137,18 @@ class VAELoader(ComponentLoader):
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
+        write_startup_debug_event(
+            f"VAELoader instantiate start component={component_name} class={class_name}"
+        )
         with (
             set_default_torch_dtype(PRECISION_TO_TYPE[vae_precision]),
             skip_init_modules(),
         ):
             vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
             vae = vae_cls(vae_config).to(target_device)
+        write_startup_debug_event(
+            f"VAELoader instantiate done component={component_name} class={class_name}"
+        )
 
         safetensors_list = _list_safetensors_files(component_model_path)
         safetensors_list = server_args.pipeline_config.select_vae_weight_files(
@@ -152,11 +161,23 @@ class VAELoader(ComponentLoader):
         assert (
             len(safetensors_list) >= 1
         ), f"Found no safetensors files in {component_model_path}"
+        write_startup_debug_event(
+            f"VAELoader read_safetensors start component={component_name} files={len(safetensors_list)}"
+        )
         loaded = {}
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
+        write_startup_debug_event(
+            f"VAELoader read_safetensors done component={component_name} keys={len(loaded)}"
+        )
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
+        write_startup_debug_event(
+            f"VAELoader load_state_dict start component={component_name}"
+        )
         vae.load_state_dict(loaded, strict=False)
+        write_startup_debug_event(
+            f"VAELoader load_state_dict done component={component_name}"
+        )
 
         state_keys = set(vae.state_dict().keys())
         loaded_keys = set(loaded.keys())
@@ -176,5 +197,11 @@ class VAELoader(ComponentLoader):
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
+        write_startup_debug_event(
+            f"VAELoader optimize_vae start component={component_name}"
+        )
         vae = current_platform.optimize_vae(vae)
+        write_startup_debug_event(
+            f"VAELoader optimize_vae done component={component_name}"
+        )
         return vae
