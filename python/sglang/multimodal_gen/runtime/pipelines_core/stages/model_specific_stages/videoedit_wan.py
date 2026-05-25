@@ -382,6 +382,8 @@ class VideoEditDenoisingStage(DenoisingStage):
 
         self._manage_device_placement(self.transformer, None, server_args)
         self._maybe_enable_cache_dit(params.runtime_effective_num_inference_steps, batch)
+        batch.do_classifier_free_guidance = bool(params.runtime_do_cfg)
+        batch.is_cfg_negative = False
 
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -416,6 +418,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                         timestep_value=int(t_host.item()),
                         timesteps=timesteps_cpu,
                     )
+                    batch.is_cfg_negative = False
                     with set_forward_context(
                         current_timestep=i,
                         attn_metadata=attn_metadata,
@@ -430,6 +433,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                     if do_cfg:
                         if params.runtime_negative_prompt_embeds is None:
                             raise ValueError("Negative prompt embeds are required for CFG")
+                        batch.is_cfg_negative = True
                         with set_forward_context(
                             current_timestep=i,
                             attn_metadata=attn_metadata,
@@ -443,6 +447,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                         noise_pred = noise_uncond + current_cfg * (
                             noise_pred - noise_uncond
                         )
+                        batch.is_cfg_negative = False
 
                     latents = self.scheduler.step(noise_pred, t_device, latents)
                     params.runtime_latents = latents

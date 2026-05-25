@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_1_3b_coefficients
 
 
 DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT = (
@@ -43,6 +45,15 @@ class WanVideoEditSamplingParams(SamplingParams):
     guidance_scale: float = 5.0
     num_inference_steps: int = 20
     negative_prompt: str | None = DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
+            teacache_thresh=0.08,
+            use_ret_steps=True,
+            coefficients_callback=_wan_1_3b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
+        )
+    )
 
     # Global runtime fields
     runtime_original_frames: list[Any] | None = field(default=None, init=False, repr=False)

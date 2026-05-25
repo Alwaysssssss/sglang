@@ -135,8 +135,10 @@ class TeaCacheMixin:
         self.cnt = 0
         self.enable_teacache = True
         # Flag indicating if this model supports CFG cache separation
-        self._supports_cfg_cache = (
-            self.config.prefix.lower() in self._CFG_SUPPORTED_PREFIXES
+        prefix = self.config.prefix.lower()
+        self._supports_cfg_cache = any(
+            prefix.startswith(supported)
+            for supported in self._CFG_SUPPORTED_PREFIXES
         )
 
         # Always initialize positive cache fields (used in all modes)
@@ -288,7 +290,7 @@ class TeaCacheMixin:
         is_cfg_negative = forward_batch.is_cfg_negative
 
         # Reset at first timestep
-        if current_timestep == 0 and not self.is_cfg_negative:
+        if current_timestep == 0 and not is_cfg_negative:
             self.reset_teacache_state()
 
         return TeaCacheContext(

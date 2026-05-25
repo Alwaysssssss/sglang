@@ -1197,10 +1197,16 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Retrieve cached residual with CFG positive/negative separation."""
-        if not self.is_cfg_negative:
-            return hidden_states + self.previous_residual
-        else:
-            return hidden_states + self.previous_residual_negative
+        residual = (
+            self.previous_residual_negative
+            if self.is_cfg_negative
+            else self.previous_residual
+        )
+        if residual is None:
+            return hidden_states
+        return hidden_states + residual.to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
 
 
 EntryClass = WanTransformer3DModel
