@@ -1,0 +1,99 @@
+{
+  "components": [
+    {
+      "component_name": "transformer",
+      "notes": [],
+      "output_dir": "/sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr/transformer",
+      "output_files": [
+        "config.json",
+        "model.safetensors"
+      ],
+      "parameter_count": 5572926888,
+      "tensor_count": 859
+    },
+    {
+      "component_name": "vae",
+      "notes": [
+        "VAE exported from dedicated VAE checkpoint."
+      ],
+      "output_dir": "/sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr/vae",
+      "output_files": [
+        "config.json",
+        "model.safetensors"
+      ],
+      "parameter_count": 215583907,
+      "tensor_count": 436
+    },
+    {
+      "component_name": "text_encoder",
+      "notes": [
+        "Copied from source HuggingFace-style text encoder directory."
+      ],
+      "output_dir": "/sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr/text_encoder",
+      "output_files": [
+        "added_tokens.json",
+        "config.json",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model.safetensors.index.json",
+        "special_tokens_map.json",
+        "spiece.model",
+        "tokenizer_config.json"
+      ],
+      "parameter_count": null,
+      "tensor_count": null
+    },
+    {
+      "component_name": "tokenizer",
+      "notes": [],
+      "output_dir": "/sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr/tokenizer",
+      "output_files": [
+        "added_tokens.json",
+        "special_tokens_map.json",
+        "spiece.model",
+        "tokenizer_config.json"
+      ],
+      "parameter_count": null,
+      "tensor_count": null
+    },
+    {
+      "component_name": "scheduler",
+      "notes": [],
+      "output_dir": "/sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr/scheduler",
+      "output_files": [
+        "scheduler_config.json"
+      ],
+      "parameter_count": null,
+      "tensor_count": null
+    }
+  ],
+  "key_mapping": [
+    {
+      "component_name": "transformer",
+      "dropped_key_count": 656,
+      "dropped_key_prefixes": [
+        "first_stage_model.",
+        "conditioner."
+      ],
+      "exported_key_count": 859,
+      "source_key_count": 1851,
+      "stripped_prefixes": [
+        "model.diffusion_model."
+      ]
+    },
+    {
+      "component_name": "vae",
+      "dropped_key_count": 119,
+      "dropped_key_prefixes": [
+        "loss."
+      ],
+      "exported_key_count": 436,
+      "source_key_count": 555,
+      "stripped_prefixes": []
+    }
+  ],
+  "notes": [],
+  "output_dir": "/sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr",
+  "pipeline_class_name": "StarCogVideoXSRPipeline",
+  "source_format": "star-cogvideox-sat"
+}

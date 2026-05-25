@@ -1,0 +1,103 @@
+{
+  "config_path": {
+    "path": "/sgl-workspace/STAR_mg/cogvideox-based/sat/configs/cogvideox_5b/cogvideox_5b_infer_sr.yaml",
+    "sha256": "a888e2198766ab2b6ca0c3e95133c7cf29c7446613d4f76c457464eee16b7eea",
+    "size_bytes": 5185
+  },
+  "text_encoder_dir": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl",
+  "text_encoder_files": [
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/added_tokens.json",
+      "sha256": "ea5a91a3234f66ea642c8e672d67f0f493759a9bee6910ae304ea9b9492118b5",
+      "size_bytes": 2593
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/config.json",
+      "sha256": "82e6880a8f78a2ad50832d82ebe0f3046f33527d9c444acc82caa0592920baf6",
+      "size_bytes": 783
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/model-00001-of-00002.safetensors",
+      "sha256": "4f2751ceeb2a96edd693e539dc5d6bba0b8d3814f49a9b3798403a0cec4b2e3d",
+      "size_bytes": 4994582104
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/model-00002-of-00002.safetensors",
+      "sha256": "f63154532130422309532ff56f11945fbea8266c958e3133e8e5aef85c6293c7",
+      "size_bytes": 4530066248
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/model.safetensors.index.json",
+      "sha256": "3bacec0f0cf392399d4a385908f67dd73df99c9e9cfee669f148858ba9fbdb0a",
+      "size_bytes": 19885
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/special_tokens_map.json",
+      "sha256": "7a1985a994c41886db38c719d2a3d2f40606663cc19d7c5d6a85d349320e06d2",
+      "size_bytes": 2543
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/spiece.model",
+      "sha256": "d60acb128cf7b7f2536e8f38a5b18a05535c9e14c7a355904270e15b0945ea86",
+      "size_bytes": 791656
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/tokenizer_config.json",
+      "sha256": "9c4f8a92630f7c6cc082831b291d6f46f18455d69d1a2a52c9b5f5303ab01469",
+      "size_bytes": 20617
+    }
+  ],
+  "tokenizer_dir": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl",
+  "tokenizer_files": [
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/added_tokens.json",
+      "sha256": "ea5a91a3234f66ea642c8e672d67f0f493759a9bee6910ae304ea9b9492118b5",
+      "size_bytes": 2593
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/config.json",
+      "sha256": "82e6880a8f78a2ad50832d82ebe0f3046f33527d9c444acc82caa0592920baf6",
+      "size_bytes": 783
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/model-00001-of-00002.safetensors",
+      "sha256": "4f2751ceeb2a96edd693e539dc5d6bba0b8d3814f49a9b3798403a0cec4b2e3d",
+      "size_bytes": 4994582104
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/model-00002-of-00002.safetensors",
+      "sha256": "f63154532130422309532ff56f11945fbea8266c958e3133e8e5aef85c6293c7",
+      "size_bytes": 4530066248
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/model.safetensors.index.json",
+      "sha256": "3bacec0f0cf392399d4a385908f67dd73df99c9e9cfee669f148858ba9fbdb0a",
+      "size_bytes": 19885
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/special_tokens_map.json",
+      "sha256": "7a1985a994c41886db38c719d2a3d2f40606663cc19d7c5d6a85d349320e06d2",
+      "size_bytes": 2543
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/spiece.model",
+      "sha256": "d60acb128cf7b7f2536e8f38a5b18a05535c9e14c7a355904270e15b0945ea86",
+      "size_bytes": 791656
+    },
+    {
+      "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/t5-v1_1-xxl/tokenizer_config.json",
+      "sha256": "9c4f8a92630f7c6cc082831b291d6f46f18455d69d1a2a52c9b5f5303ab01469",
+      "size_bytes": 20617
+    }
+  ],
+  "transformer_checkpoint": {
+    "path": "/sgl-workspace/STAR_mg/pretrained_weight/CogVideoX-5B-based/1/mp_rank_00_model_states.pt",
+    "sha256": "80cb89d736cc8e67642f35fbc80678a42370d8c3c27b190ddce3296531253d22",
+    "size_bytes": 43249690700
+  },
+  "vae_checkpoint": {
+    "path": "/sgl-workspace/STAR_mg/pretrained_weight/cogvideox/vae/3d-vae.pt",
+    "sha256": "cdf2683a98192fc35ebb1f86ff0bfd620eb0f8905efa4e8eb818af759e2bc418",
+    "size_bytes": 1176149148
+  }
+}

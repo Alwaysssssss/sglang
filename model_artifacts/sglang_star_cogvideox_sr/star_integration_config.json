@@ -1,0 +1,23 @@
+{
+  "default_num_inference_steps": 50,
+  "default_sampling_num_frames": 7,
+  "dynamic_cfg_exp": 5,
+  "latent_channels": 16,
+  "latent_scale_factor": 0.7,
+  "pipeline_class_name": "StarCogVideoXSRPipeline",
+  "pipeline_config_class_name": "StarCogVideoXSRPipelineConfig",
+  "sampling_params_class_name": "StarCogVideoXSRSamplingParams",
+  "scheduler_class_name": "StarVPSDEDPMPP2MScheduler",
+  "source_format": "star-cogvideox-sat",
+  "transformer_class_name": "StarCogVideoXSRTransformer3DModel",
+  "transformer_summary": {
+    "hidden_size": 3072,
+    "latent_height": 60,
+    "latent_width": 90,
+    "num_attention_heads": 48,
+    "num_layers": 42,
+    "patch_size": 2,
+    "time_compressed_rate": 4
+  },
+  "vae_class_name": "StarCogVideoXSRVAE"
+}

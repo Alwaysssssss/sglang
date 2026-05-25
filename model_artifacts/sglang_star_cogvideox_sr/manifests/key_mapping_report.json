@@ -1,0 +1,27 @@
+{
+  "items": [
+    {
+      "component_name": "transformer",
+      "dropped_key_count": 656,
+      "dropped_key_prefixes": [
+        "first_stage_model.",
+        "conditioner."
+      ],
+      "exported_key_count": 859,
+      "source_key_count": 1851,
+      "stripped_prefixes": [
+        "model.diffusion_model."
+      ]
+    },
+    {
+      "component_name": "vae",
+      "dropped_key_count": 119,
+      "dropped_key_prefixes": [
+        "loss."
+      ],
+      "exported_key_count": 436,
+      "source_key_count": 555,
+      "stripped_prefixes": []
+    }
+  ]
+}

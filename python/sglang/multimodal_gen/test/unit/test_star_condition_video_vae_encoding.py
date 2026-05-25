@@ -35,8 +35,8 @@ class TestStarConditionVideoVaeEncodingStage(unittest.TestCase):
     def test_stage_encodes_condition_video_to_image_latent(self):
         vae_config = StarCogVideoXSRVAEConfig(
             arch_config=StarCogVideoXSRVAEArchConfig(
-                ch=8,
-                ch_mult=[1, 2, 2, 4],
+                ch=32,
+                ch_mult=[1, 1, 1, 1],
                 num_res_blocks=1,
                 z_channels=4,
                 latent_channels=4,

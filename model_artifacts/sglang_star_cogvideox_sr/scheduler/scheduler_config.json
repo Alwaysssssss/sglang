@@ -1,0 +1,21 @@
+{
+  "_class_name": "StarVPSDEDPMPP2MScheduler",
+  "_source_format": "star-cogvideox-sat",
+  "_source_target": "sgm.modules.diffusionmodules.sampling.VPSDEDPMPP2MSampler",
+  "discretization_config": {
+    "params": {
+      "shift_scale": 1.0
+    },
+    "target": "sgm.modules.diffusionmodules.discretizer.ZeroSNRDDPMDiscretization"
+  },
+  "guider_config": {
+    "params": {
+      "exp": 5,
+      "num_steps": 50,
+      "scale": 6
+    },
+    "target": "sgm.modules.diffusionmodules.guiders.DynamicCFG"
+  },
+  "num_steps": 50,
+  "verbose": true
+}

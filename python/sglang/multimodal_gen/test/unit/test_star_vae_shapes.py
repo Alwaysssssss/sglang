@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import torch
 
@@ -8,15 +9,23 @@ from sglang.multimodal_gen.configs.models.vaes.star_cogvideox_vae import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.star_cogvideox_vae import (
     StarCogVideoXSRVAE,
+    _resolve_star_sat_root,
 )
 
 
 class TestStarVaeShapes(unittest.TestCase):
+    def test_vendored_star_sat_root_lives_inside_sglang_repo(self):
+        sat_root = _resolve_star_sat_root()
+        self.assertIsNotNone(sat_root)
+        resolved = Path(sat_root).resolve()
+        self.assertIn("star_sat_vendor", resolved.parts)
+        self.assertNotIn("STAR_mg", resolved.parts)
+
     def test_encode_and_decode_keep_expected_video_shape_contract(self):
         config = StarCogVideoXSRVAEConfig(
             arch_config=StarCogVideoXSRVAEArchConfig(
-                ch=8,
-                ch_mult=[1, 2, 2, 4],
+                ch=32,
+                ch_mult=[1, 1, 1, 1],
                 num_res_blocks=1,
                 z_channels=4,
                 latent_channels=4,

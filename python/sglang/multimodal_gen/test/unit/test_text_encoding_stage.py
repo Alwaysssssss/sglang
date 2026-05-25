@@ -26,6 +26,9 @@ class TestTextEncodingStage(unittest.TestCase):
             self.to_calls.append(str(device))
             return self
 
+    class FSDPDummyEncoder(_DummyEncoder):
+        pass
+
     def test_verify_input_allows_empty_negative_prompt_for_cfg(self):
         with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock(comfyui_mode=False)):
             stage = TextEncodingStage(text_encoders=[], tokenizers=[])
@@ -44,6 +47,15 @@ class TestTextEncodingStage(unittest.TestCase):
         stage._ensure_text_encoders_loaded(torch.device("cuda:0"))
 
         self.assertEqual(encoder.to_calls, ["cuda:0"])
+
+    def test_ensure_text_encoders_loaded_skips_fsdp_cpu_offload_encoder(self):
+        encoder = self.FSDPDummyEncoder()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock(comfyui_mode=False)):
+            stage = TextEncodingStage(text_encoders=[encoder], tokenizers=[MagicMock()])
+
+        stage._ensure_text_encoders_loaded(torch.device("cuda:0"))
+
+        self.assertEqual(encoder.to_calls, [])
 
 
 if __name__ == "__main__":

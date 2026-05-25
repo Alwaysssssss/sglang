@@ -1,0 +1,24 @@
+{
+  "_class_name": "StarCogVideoXSRPipeline",
+  "_diffusers_version": "0.0.0",
+  "scheduler": [
+    "diffusers",
+    "StarVPSDEDPMPP2MScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "T5EncoderModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "T5Tokenizer"
+  ],
+  "transformer": [
+    "diffusers",
+    "StarCogVideoXSRTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "StarCogVideoXSRVAE"
+  ]
+}

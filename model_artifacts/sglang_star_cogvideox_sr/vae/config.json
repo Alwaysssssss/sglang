@@ -1,0 +1,59 @@
+{
+  "_class_name": "StarCogVideoXSRVAE",
+  "_source_format": "star-cogvideox-sat",
+  "_source_target": "vae_modules.autoencoder.VideoAutoencoderInferenceWrapper",
+  "cp_size": 1,
+  "decoder_config": {
+    "params": {
+      "attn_resolutions": [],
+      "ch": 128,
+      "ch_mult": [
+        1,
+        2,
+        2,
+        4
+      ],
+      "double_z": true,
+      "dropout": 0.0,
+      "gather_norm": false,
+      "in_channels": 3,
+      "num_res_blocks": 3,
+      "out_ch": 3,
+      "resolution": 256,
+      "z_channels": 16
+    },
+    "target": "vae_modules.cp_enc_dec.ContextParallelDecoder3D"
+  },
+  "encoder_config": {
+    "params": {
+      "attn_resolutions": [],
+      "ch": 128,
+      "ch_mult": [
+        1,
+        2,
+        2,
+        4
+      ],
+      "double_z": true,
+      "dropout": 0.0,
+      "gather_norm": true,
+      "in_channels": 3,
+      "num_res_blocks": 3,
+      "out_ch": 3,
+      "resolution": 256,
+      "z_channels": 16
+    },
+    "target": "vae_modules.cp_enc_dec.ContextParallelEncoder3D"
+  },
+  "ignore_keys": [
+    "loss"
+  ],
+  "latent_scale_factor": 0.7,
+  "loss_config": {
+    "target": "torch.nn.Identity"
+  },
+  "regularizer_config": {
+    "target": "vae_modules.regularizers.DiagonalGaussianRegularizer"
+  },
+  "source_key_prefix": "first_stage_model."
+}

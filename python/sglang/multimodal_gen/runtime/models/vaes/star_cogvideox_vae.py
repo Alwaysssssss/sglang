@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-import warnings
 
 import torch
 import torch.distributed as dist
@@ -34,20 +33,9 @@ _STAR_LOCAL_DIST_INIT_PATH: str | None = None
 
 
 def _resolve_star_sat_root() -> Path | None:
-    candidates: list[Path] = []
-    for env_name in ("SGLANG_STAR_SAT_ROOT", "STAR_COGVIDEOX_SAT_ROOT"):
-        raw = os.environ.get(env_name)
-        if raw:
-            candidates.append(Path(raw).expanduser().resolve())
-
-    current = Path(__file__).resolve()
-    for parent in current.parents:
-        candidates.append(parent / "STAR_mg" / "cogvideox-based" / "sat")
-        candidates.append(parent.parent / "STAR_mg" / "cogvideox-based" / "sat")
-
-    for candidate in candidates:
-        if (candidate / "vae_modules" / "autoencoder.py").is_file():
-            return candidate
+    vendored_root = Path(__file__).resolve().parent / "star_sat_vendor"
+    if (vendored_root / "vae_modules" / "autoencoder.py").is_file():
+        return vendored_root
     return None
 
 
@@ -55,8 +43,8 @@ def _load_original_star_modules():
     sat_root = _resolve_star_sat_root()
     if sat_root is None:
         raise FileNotFoundError(
-            "Unable to locate STAR SAT source root. Set `SGLANG_STAR_SAT_ROOT` "
-            "or place `STAR_mg/cogvideox-based/sat` alongside the `sglang` repo."
+            "Unable to locate the vendored STAR SAT source root under "
+            "`runtime/models/vaes/star_sat_vendor`."
         )
 
     sat_root_str = str(sat_root)
@@ -75,36 +63,10 @@ def _ensure_star_context_parallel(
 ) -> None:
     global _STAR_LOCAL_DIST_INIT_PATH
 
-    # The original STAR VAE implementation still dereferences a context-parallel
-    # group inside fake-CP convolution helpers even when the wrapper is used in
-    # cp_size=0 mode. We therefore need a valid singleton process group, but we
-    # must not ask SAT to create new groups on top of SGLang's existing
-    # distributed topology because that can deadlock multi-rank startup.
-    if context_parallel_size <= 1:
-        if util_mod.is_context_parallel_initialized():
+    def _ensure_local_singleton_dist() -> None:
+        global _STAR_LOCAL_DIST_INIT_PATH
+        if dist.is_initialized():
             return
-
-        singleton_group = None
-        for candidate in (get_tp_group(), get_sp_group(), get_dp_group()):
-            if candidate.world_size == 1:
-                singleton_group = candidate.device_group
-                break
-        if singleton_group is None:
-            world_group = get_world_group()
-            if world_group.world_size == 1:
-                singleton_group = world_group.device_group
-
-        if singleton_group is None:
-            raise RuntimeError(
-                "Unable to find an existing singleton process group for STAR VAE "
-                "fake context-parallel operations."
-            )
-
-        write_startup_debug_event("STAR VAE set_context_parallel_group singleton")
-        util_mod.set_context_parallel_group(1, singleton_group)
-        return
-
-    if not dist.is_initialized():
         write_startup_debug_event("STAR VAE local dist.init_process_group start")
         if _STAR_LOCAL_DIST_INIT_PATH is None:
             fd, init_path = tempfile.mkstemp(
@@ -119,6 +81,42 @@ def _ensure_star_context_parallel(
             world_size=1,
         )
         write_startup_debug_event("STAR VAE local dist.init_process_group done")
+
+    # The original STAR VAE implementation still dereferences a context-parallel
+    # group inside fake-CP convolution helpers even when the wrapper is used in
+    # cp_size=0 mode. We therefore need a valid singleton process group, but we
+    # must not ask SAT to create new groups on top of SGLang's existing
+    # distributed topology because that can deadlock multi-rank startup.
+    if context_parallel_size <= 1:
+        if util_mod.is_context_parallel_initialized():
+            return
+
+        singleton_group = None
+        for getter in (get_tp_group, get_sp_group, get_dp_group):
+            try:
+                candidate = getter()
+            except AssertionError:
+                continue
+            if candidate.world_size == 1:
+                singleton_group = candidate.device_group
+                break
+        if singleton_group is None:
+            try:
+                world_group = get_world_group()
+            except AssertionError:
+                world_group = None
+            if world_group is not None and world_group.world_size == 1:
+                singleton_group = world_group.device_group
+
+        if singleton_group is None:
+            _ensure_local_singleton_dist()
+            singleton_group = dist.group.WORLD
+
+        write_startup_debug_event("STAR VAE set_context_parallel_group singleton")
+        util_mod.set_context_parallel_group(1, singleton_group)
+        return
+
+    _ensure_local_singleton_dist()
 
     if not util_mod.is_context_parallel_initialized():
         write_startup_debug_event("STAR VAE initialize_context_parallel start")
@@ -459,64 +457,56 @@ class StarCogVideoXSRVAE(nn.Module):
         self.shift_factor = getattr(config.arch_config, "shift_factor", None)
         self.use_tiling = False
         self._star_util_mod = None
-        self._use_original_impl = False
+        self._use_original_impl = True
 
-        try:
-            write_startup_debug_event("STAR VAE original_impl load_modules start")
-            wrapper_cls, util_mod = _load_original_star_modules()
-            write_startup_debug_event("STAR VAE original_impl load_modules done")
-            _ensure_star_context_parallel(util_mod, context_parallel_size=0)
-            self._star_util_mod = util_mod
-            write_startup_debug_event("STAR VAE original_impl wrapper init start")
-            self.impl = wrapper_cls(
-                cp_size=0,
-                loss_config={"target": "torch.nn.Identity"},
-                regularizer_config={
-                    "target": "vae_modules.regularizers.DiagonalGaussianRegularizer"
+        write_startup_debug_event("STAR VAE original_impl load_modules start")
+        wrapper_cls, util_mod = _load_original_star_modules()
+        write_startup_debug_event("STAR VAE original_impl load_modules done")
+        _ensure_star_context_parallel(util_mod, context_parallel_size=0)
+        self._star_util_mod = util_mod
+        write_startup_debug_event("STAR VAE original_impl wrapper init start")
+        self.impl = wrapper_cls(
+            cp_size=0,
+            loss_config={"target": "torch.nn.Identity"},
+            regularizer_config={
+                "target": "vae_modules.regularizers.DiagonalGaussianRegularizer"
+            },
+            encoder_config={
+                "target": "vae_modules.cp_enc_dec.ContextParallelEncoder3D",
+                "params": {
+                    "double_z": True,
+                    "z_channels": config.arch_config.z_channels,
+                    "resolution": config.arch_config.resolution,
+                    "in_channels": config.arch_config.in_channels,
+                    "out_ch": config.arch_config.out_channels,
+                    "ch": config.arch_config.ch,
+                    "ch_mult": config.arch_config.ch_mult,
+                    "attn_resolutions": [],
+                    "num_res_blocks": config.arch_config.num_res_blocks,
+                    "dropout": config.arch_config.dropout,
+                    "temporal_compress_times": config.arch_config.temporal_compression_ratio,
+                    "gather_norm": True,
                 },
-                encoder_config={
-                    "target": "vae_modules.cp_enc_dec.ContextParallelEncoder3D",
-                    "params": {
-                        "double_z": True,
-                        "z_channels": config.arch_config.z_channels,
-                        "resolution": config.arch_config.resolution,
-                        "in_channels": config.arch_config.in_channels,
-                        "out_ch": config.arch_config.out_channels,
-                        "ch": config.arch_config.ch,
-                        "ch_mult": config.arch_config.ch_mult,
-                        "attn_resolutions": [],
-                        "num_res_blocks": config.arch_config.num_res_blocks,
-                        "dropout": config.arch_config.dropout,
-                        "gather_norm": True,
-                    },
+            },
+            decoder_config={
+                "target": "vae_modules.cp_enc_dec.ContextParallelDecoder3D",
+                "params": {
+                    "double_z": True,
+                    "z_channels": config.arch_config.z_channels,
+                    "resolution": config.arch_config.resolution,
+                    "in_channels": config.arch_config.in_channels,
+                    "out_ch": config.arch_config.out_channels,
+                    "ch": config.arch_config.ch,
+                    "ch_mult": config.arch_config.ch_mult,
+                    "attn_resolutions": [],
+                    "num_res_blocks": config.arch_config.num_res_blocks,
+                    "dropout": config.arch_config.dropout,
+                    "temporal_compress_times": config.arch_config.temporal_compression_ratio,
+                    "gather_norm": False,
                 },
-                decoder_config={
-                    "target": "vae_modules.cp_enc_dec.ContextParallelDecoder3D",
-                    "params": {
-                        "double_z": True,
-                        "z_channels": config.arch_config.z_channels,
-                        "resolution": config.arch_config.resolution,
-                        "in_channels": config.arch_config.in_channels,
-                        "out_ch": config.arch_config.out_channels,
-                        "ch": config.arch_config.ch,
-                        "ch_mult": config.arch_config.ch_mult,
-                        "attn_resolutions": [],
-                        "num_res_blocks": config.arch_config.num_res_blocks,
-                        "dropout": config.arch_config.dropout,
-                        "gather_norm": False,
-                    },
-                },
-            )
-            write_startup_debug_event("STAR VAE original_impl wrapper init done")
-            self._use_original_impl = True
-        except Exception as exc:
-            warnings.warn(
-                "Falling back to the approximate STAR VAE implementation because "
-                f"the original SAT VAE could not be initialized: {exc}",
-                stacklevel=2,
-            )
-            self.encoder = _StarVideoEncoder(config)
-            self.decoder = _StarVideoDecoder(config)
+            },
+        )
+        write_startup_debug_event("STAR VAE original_impl wrapper init done")
 
     def _ensure_original_runtime(self) -> None:
         if self._use_original_impl and self._star_util_mod is not None:

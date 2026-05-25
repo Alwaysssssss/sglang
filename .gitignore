@@ -179,6 +179,7 @@ benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
 /tmp/
+model_artifacts/**/*.safetensors
 
 # Torch Compile logs
 tl_out/

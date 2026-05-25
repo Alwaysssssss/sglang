@@ -52,6 +52,11 @@ class TextEncodingStage(PipelineStage):
         except (AttributeError, StopIteration, TypeError):
             return None
 
+    @staticmethod
+    def _uses_fsdp_cpu_offload(module) -> bool:
+        module_name = type(module).__name__
+        return module_name.startswith("FSDP")
+
     def _ensure_text_encoders_loaded(self, device: torch.device) -> None:
         target_device_type = device.type
         for text_encoder in self.text_encoders:
@@ -61,6 +66,11 @@ class TextEncodingStage(PipelineStage):
                 and current_device_type != target_device_type
                 and hasattr(text_encoder, "to")
             ):
+                if self._uses_fsdp_cpu_offload(text_encoder):
+                    # FSDP CPU-offloaded text encoders keep parameters on CPU and
+                    # materialize shards during forward. Forcing a plain `.to(cuda)`
+                    # breaks sharded parameter storage.
+                    continue
                 text_encoder.to(device)
 
     @torch.no_grad()
