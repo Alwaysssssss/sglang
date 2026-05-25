@@ -23,6 +23,7 @@ from sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke import (
     _save_frame_pngs,
     _summarize_frames,
     _summarize_internal_metrics,
+    _write_trace_artifacts,
     parse_component_overrides,
 )
 
@@ -37,6 +38,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-path", default=None)
     parser.add_argument("--negative-prompt", default=None)
     parser.add_argument("--reference-video", default=None)
+    parser.add_argument("--reference-frame-dir", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--num-frames", type=int, default=7)
@@ -46,6 +48,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--condition-video-num-frames", type=int, default=25)
+    parser.add_argument(
+        "--output-quality",
+        default="default",
+        choices=["default", "maximum", "high", "medium", "low"],
+    )
+    parser.add_argument("--output-compression", type=int, default=None)
     parser.add_argument("--pipeline-class-name", default="StarCogVideoXSRPipeline")
     parser.add_argument("--backend", default="sglang", choices=["sglang", "diffusers", "auto"])
     parser.add_argument("--attention-backend", default=None)
@@ -147,6 +155,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--measured-runs", type=int, default=1)
     parser.add_argument("--save-frame-pngs", action="store_true")
+    parser.add_argument("--save-trace", action="store_true")
     parser.add_argument("--enable-stage-logging", action="store_true")
     parser.add_argument("--sync-stage-profiling", action="store_true")
     parser.add_argument("--original-star-cold-e2e-s", type=float, default=None)
@@ -337,8 +346,11 @@ def _build_sampling_kwargs(
         "condition_video_num_frames": args.condition_video_num_frames,
         "output_path": str(run_output_dir),
         "output_file_name": output_file_name,
+        "output_quality": args.output_quality,
+        "output_compression": args.output_compression,
         "save_output": save_output,
         "return_file_paths_only": False,
+        "return_trajectory_latents": args.save_trace,
     }
     if args.enable_batched_cfg is not None:
         kwargs["enable_batched_cfg"] = args.enable_batched_cfg
@@ -461,6 +473,27 @@ def main() -> int:
             output_dir / "compare_strict.json",
         )
 
+    saved_frame_paths = None
+    if args.save_frame_pngs:
+        saved_frame_paths = _save_frame_pngs(last_frames, output_dir)
+
+    raw_baseline_report = None
+    raw_strict_report = None
+    if args.reference_frame_dir and saved_frame_paths:
+        candidate_frame_dir = output_dir / "frames"
+        raw_baseline_report = _run_compare(
+            args.reference_frame_dir,
+            str(candidate_frame_dir),
+            "baseline",
+            output_dir / "compare_raw_baseline.json",
+        )
+        raw_strict_report = _run_compare(
+            args.reference_frame_dir,
+            str(candidate_frame_dir),
+            "strict",
+            output_dir / "compare_raw_strict.json",
+        )
+
     speedup = {}
     if args.original_star_cold_e2e_s:
         speedup["cold_e2e_speedup"] = (
@@ -493,6 +526,8 @@ def main() -> int:
             "guidance_scale": args.guidance_scale,
             "condition_video_num_frames": args.condition_video_num_frames,
             "enable_batched_cfg": args.enable_batched_cfg,
+            "output_quality": args.output_quality,
+            "output_compression": args.output_compression,
         },
         "server": {
             "backend": args.backend,
@@ -524,11 +559,24 @@ def main() -> int:
         "parity": {
             "baseline": baseline_report,
             "strict": strict_report,
+            "raw_baseline": raw_baseline_report,
+            "raw_strict": raw_strict_report,
         },
     }
 
-    if args.save_frame_pngs:
-        summary["saved_frame_paths"] = _save_frame_pngs(last_frames, output_dir)
+    if saved_frame_paths is not None:
+        summary["saved_frame_paths"] = saved_frame_paths
+    if args.save_trace:
+        summary["trace_artifacts"] = _write_trace_artifacts(
+            output_dir,
+            request=summary["request"],
+            condition_video=summary["condition_video"],
+            reference_video=summary["reference_video"],
+            trajectory_latents=last_result.trajectory_latents,
+            trajectory_timesteps=last_result.trajectory_timesteps,
+            frame_summary=measured_records[-1]["frame_summary"],
+            output_file_path=last_result.output_file_path,
+        )
 
     summary_path = output_dir / "summary.json"
     profile_path = output_dir / "profile.json"

@@ -10,6 +10,7 @@ from typing import Any
 import imageio
 import imageio.v3 as iio
 import numpy as np
+import torch
 
 from sglang.multimodal_gen.configs.quantization.nunchaku import (
     NunchakuSVDQuantArgs,
@@ -58,6 +59,18 @@ def _parse_args() -> argparse.Namespace:
         "--output-file-name",
         default="star_sglang_candidate.mp4",
         help="Saved candidate file name.",
+    )
+    parser.add_argument(
+        "--output-quality",
+        default="default",
+        choices=["default", "maximum", "high", "medium", "low"],
+        help="SamplingParams output_quality passed to the video writer.",
+    )
+    parser.add_argument(
+        "--output-compression",
+        type=int,
+        default=None,
+        help="Optional SamplingParams output_compression override.",
     )
     parser.add_argument(
         "--summary-json",
@@ -232,6 +245,11 @@ def _parse_args() -> argparse.Namespace:
         help="Also write candidate frames as PNGs.",
     )
     parser.add_argument(
+        "--save-trace",
+        action="store_true",
+        help="Save minimal latent/timestep trace artifacts for alignment debugging.",
+    )
+    parser.add_argument(
         "--enable-stage-logging",
         action="store_true",
         help="Enable internal stage timing collection through SGLANG_DIFFUSION_STAGE_LOGGING.",
@@ -363,6 +381,54 @@ def _summarize_frames(frames: list[np.ndarray]) -> dict[str, Any]:
     }
 
 
+def _summarize_tensor(tensor: Any) -> dict[str, Any] | None:
+    if tensor is None:
+        return None
+    tensor_f = torch.as_tensor(tensor).detach().cpu().float()
+    return {
+        "shape": list(tensor_f.shape),
+        "mean": float(tensor_f.mean()),
+        "std": float(tensor_f.std()),
+        "min": float(tensor_f.min()),
+        "max": float(tensor_f.max()),
+    }
+
+
+def _summarize_trajectory(
+    trajectory_latents: Any,
+    trajectory_timesteps: Any,
+) -> dict[str, Any] | None:
+    if trajectory_latents is None:
+        return None
+
+    latents = torch.as_tensor(trajectory_latents).detach().cpu().float()
+    timesteps = (
+        torch.as_tensor(trajectory_timesteps).detach().cpu()
+        if trajectory_timesteps is not None
+        else None
+    )
+    num_steps = int(latents.shape[1]) if latents.ndim >= 2 else 0
+    selected_indices = sorted({0, max(num_steps // 2, 0), max(num_steps - 1, 0)})
+
+    selected_steps: list[dict[str, Any]] = []
+    for step_index in selected_indices:
+        if step_index >= num_steps:
+            continue
+        entry = {
+            "step_index": step_index,
+            "latent_summary": _summarize_tensor(latents[:, step_index]),
+        }
+        if timesteps is not None and timesteps.numel() > step_index:
+            entry["timestep"] = float(timesteps.reshape(-1)[step_index].item())
+        selected_steps.append(entry)
+
+    return {
+        "trajectory_summary": _summarize_tensor(latents),
+        "num_steps": num_steps,
+        "selected_steps": selected_steps,
+    }
+
+
 def _save_frame_pngs(frames: list[np.ndarray], output_dir: Path) -> list[str]:
     frame_dir = output_dir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
@@ -390,6 +456,51 @@ def _summarize_internal_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         ),
         "stage_durations_ms": stages,
     }
+
+
+def _write_trace_artifacts(
+    output_dir: Path,
+    *,
+    request: dict[str, Any],
+    condition_video: dict[str, Any] | None,
+    reference_video: dict[str, Any] | None,
+    trajectory_latents: Any,
+    trajectory_timesteps: Any,
+    frame_summary: dict[str, Any],
+    output_file_path: str | None,
+) -> dict[str, str]:
+    trace_dir = output_dir / "trace"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    trace_manifest = {
+        "request": request,
+        "condition_video": condition_video,
+        "reference_video": reference_video,
+        "output_file_path": output_file_path,
+        "frame_summary": frame_summary,
+        "trajectory": _summarize_trajectory(
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+        ),
+    }
+    manifest_path = trace_dir / "trace_manifest.json"
+    manifest_path.write_text(
+        json.dumps(trace_manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    saved = {
+        "trace_manifest": str(manifest_path),
+    }
+    if trajectory_latents is not None:
+        latents_path = trace_dir / "trajectory_latents.pt"
+        torch.save(torch.as_tensor(trajectory_latents).detach().cpu(), latents_path)
+        saved["trajectory_latents"] = str(latents_path)
+    if trajectory_timesteps is not None:
+        timesteps_path = trace_dir / "trajectory_timesteps.pt"
+        torch.save(torch.as_tensor(trajectory_timesteps).detach().cpu(), timesteps_path)
+        saved["trajectory_timesteps"] = str(timesteps_path)
+    return saved
 
 
 def _parse_teacache_coefficients(raw: str) -> list[float]:
@@ -534,10 +645,13 @@ def main() -> int:
         "guidance_scale": args.guidance_scale,
         "output_path": str(output_dir),
         "output_file_name": args.output_file_name,
+        "output_quality": args.output_quality,
+        "output_compression": args.output_compression,
         "save_output": True,
         "return_file_paths_only": False,
         "enable_color_fix": args.enable_color_fix,
         "color_fix_mode": args.color_fix_mode,
+        "return_trajectory_latents": args.save_trace,
     }
     teacache_params = _build_teacache_params(args)
     if teacache_params is not None:
@@ -611,6 +725,8 @@ def main() -> int:
             "requested_fps": args.fps,
             "num_inference_steps": args.num_inference_steps,
             "guidance_scale": args.guidance_scale,
+            "output_quality": args.output_quality,
+            "output_compression": args.output_compression,
             "condition_video_start_frame": args.condition_video_start_frame,
             "condition_video_num_frames": args.condition_video_num_frames,
             "condition_video_sample_fps": args.condition_video_sample_fps,
@@ -672,6 +788,17 @@ def main() -> int:
 
     if args.save_frame_pngs:
         summary["result"]["saved_frame_paths"] = _save_frame_pngs(frames, output_dir)
+    if args.save_trace:
+        summary["result"]["trace_artifacts"] = _write_trace_artifacts(
+            output_dir,
+            request=summary["request"],
+            condition_video=summary["condition_video"],
+            reference_video=summary["reference_video"],
+            trajectory_latents=result.trajectory_latents,
+            trajectory_timesteps=result.trajectory_timesteps,
+            frame_summary=summary["result"]["frame_summary"],
+            output_file_path=result.output_file_path,
+        )
 
     summary_json_path.parent.mkdir(parents=True, exist_ok=True)
     summary_json_path.write_text(
