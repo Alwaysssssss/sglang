@@ -1,0 +1,63 @@
+{
+  "timestamp": "2026-05-18T05:28:46.193883+00:00",
+  "request_id": "cloud_sp1_offload_81f",
+  "commit_hash": "ccc9080808a1f7170e821218eaff37d2822fd429",
+  "tag": "server_perf_dump",
+  "total_duration_ms": 316006.00679405034,
+  "steps": [
+    {
+      "name": "VideoEditWindowValidationStage",
+      "duration_ms": 0.018162652850151062
+    },
+    {
+      "name": "VideoEditTextEncodingStage",
+      "duration_ms": 1035.596949979663
+    },
+    {
+      "name": "VideoEditConditionEncodingStage",
+      "duration_ms": 12582.050830125809
+    },
+    {
+      "name": "VideoEditLatentPreparationStage",
+      "duration_ms": 0.11743605136871338
+    },
+    {
+      "name": "VideoEditTimestepPreparationStage",
+      "duration_ms": 0.27124956250190735
+    },
+    {
+      "name": "VideoEditLatentInitStage",
+      "duration_ms": 0.32041966915130615
+    },
+    {
+      "name": "VideoEditDenoisingStage",
+      "duration_ms": 284495.54074555635
+    },
+    {
+      "name": "VideoEditDecodingStage",
+      "duration_ms": 8835.740469396114
+    },
+    {
+      "name": "VideoEditWindowPostprocessStage",
+      "duration_ms": 0.01961737871170044
+    }
+  ],
+  "denoise_steps_ms": [],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 1498.6,
+      "reserved_mb": 15978.0,
+      "peak_allocated_mb": 1498.6,
+      "peak_reserved_mb": 15978.0
+    },
+    "after_forward": {
+      "allocated_mb": 2380.29,
+      "reserved_mb": 16100.0,
+      "peak_allocated_mb": 14223.45,
+      "peak_reserved_mb": 16100.0
+    }
+  },
+  "meta": {
+    "model": "/home/tyx/workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model"
+  }
+}

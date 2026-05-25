@@ -280,6 +280,7 @@ class GPUWorker:
                         enable_upscaling=req.enable_upscaling,
                         upscaling_model_path=req.upscaling_model_path,
                         upscaling_scale=req.upscaling_scale,
+                        video_reference_path=getattr(req, "video_input_path", None),
                     )
                     output_batch.output_file_paths = output_paths
 

@@ -289,6 +289,7 @@ async def process_generation_batch(
                 enable_upscaling=batch.enable_upscaling,
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=batch.upscaling_scale,
+                video_reference_path=getattr(batch, "video_input_path", None),
             )
 
     total_time = time.perf_counter() - total_start_time

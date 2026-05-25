@@ -10,6 +10,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.videoedit.mask_io import (
+    load_mask_frames,
+    probe_mask_frame_count,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,7 +66,7 @@ def resolve_videoedit_num_frames(
         return requested_num_frames
 
     video_frames = probe_video_frame_count(video_input_path)
-    mask_frames = probe_video_frame_count(mask_input_path)
+    mask_frames = probe_mask_frame_count(mask_input_path)
     resolved = min(video_frames, mask_frames)
     if resolved <= 0:
         raise RuntimeError(
@@ -259,7 +264,13 @@ def prepare_global_inputs(
     debug_dir: str | None = None,
 ) -> dict:
     original_frames, fps = load_video_frames(input_video, num_frames)
-    raw_mask_frames, _ = load_video_frames(mask_video, num_frames)
+    if not original_frames:
+        raise RuntimeError("No frames loaded from input video")
+    raw_mask_frames = load_mask_frames(
+        mask_video,
+        num_frames=num_frames,
+        target_size=original_frames[0].size,
+    )
     n = min(len(original_frames), len(raw_mask_frames))
     if n == 0:
         raise RuntimeError("No frames loaded from input or mask video")

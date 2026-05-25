@@ -206,6 +206,7 @@ async def forward_to_scheduler(
                 enable_upscaling=sp.enable_upscaling,
                 upscaling_model_path=sp.upscaling_model_path,
                 upscaling_scale=sp.upscaling_scale,
+                video_reference_path=getattr(sp, "video_input_path", None),
             )
 
         if hasattr(response, "model_dump"):

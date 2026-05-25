@@ -350,6 +350,7 @@ def save_outputs(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    video_reference_path: Optional[str] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -374,6 +375,7 @@ def save_outputs(
             enable_upscaling=enable_upscaling,
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
+            video_reference_path=video_reference_path,
         )
 
         if samples_out is not None:
@@ -409,6 +411,7 @@ def post_process_sample(
     enable_upscaling: bool = False,
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
+    video_reference_path: Optional[str] = None,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
@@ -479,17 +482,45 @@ def post_process_sample(
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
-                quality = (
+                imageio_quality = (
                     output_compression / 10 if output_compression is not None else 5
                 )
-                imageio.mimsave(
-                    save_file_path,
-                    frames,
-                    fps=fps,
-                    format=data_type.get_default_extension(),
-                    codec="libx264",
-                    quality=quality,
-                )
+                saved_with_reference = False
+                if video_reference_path:
+                    try:
+                        from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import (
+                            save_video_frames_like_reference,
+                        )
+
+                        save_video_frames_like_reference(
+                            frames,
+                            save_file_path,
+                            refer_file=video_reference_path,
+                            fps=fps,
+                            quality=(
+                                imageio_quality
+                                if output_compression is not None
+                                else None
+                            ),
+                        )
+                        saved_with_reference = True
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to save video with reference profile %s: %s. "
+                            "Falling back to default imageio writer.",
+                            video_reference_path,
+                            e,
+                        )
+
+                if not saved_with_reference:
+                    imageio.mimsave(
+                        save_file_path,
+                        frames,
+                        fps=fps,
+                        format=data_type.get_default_extension(),
+                        codec="libx264",
+                        quality=imageio_quality,
+                    )
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,

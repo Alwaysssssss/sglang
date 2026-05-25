@@ -1,0 +1,27 @@
+{
+  "video_input_path": "/tmp/sglang-videoedit-cloud-inputs/cloud_sp1_offload_81f_video.mp4",
+  "mask_input_path": "/tmp/sglang-videoedit-cloud-inputs/cloud_sp1_offload_81f_mask.mp4",
+  "bbox": [
+    789,
+    232,
+    1458,
+    854
+  ],
+  "crop_h": 622,
+  "crop_w": 669,
+  "aligned_h": 624,
+  "aligned_w": 672,
+  "fps": 25.0,
+  "num_input_frames": 81,
+  "num_output_frames": null,
+  "drop_reference_frame": true,
+  "enable_paste_back": true,
+  "window_specs": [
+    {
+      "window_index": 0,
+      "start_index": 0,
+      "end_index": 81,
+      "reflected_count": 0
+    }
+  ]
+}
