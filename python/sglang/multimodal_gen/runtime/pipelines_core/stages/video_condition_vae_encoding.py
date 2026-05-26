@@ -31,6 +31,33 @@ class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
 
     _AUTO_OFFLOAD_WORKSPACE_MULTIPLIER = 32.0
 
+    @staticmethod
+    def _tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
+        tensor_f = tensor.detach().cpu().float()
+        return {
+            "shape": list(tensor_f.shape),
+            "mean": float(tensor_f.mean()),
+            "std": float(tensor_f.std()),
+            "min": float(tensor_f.min()),
+            "max": float(tensor_f.max()),
+        }
+
+    @staticmethod
+    def _resolve_sample_rng_mode(server_args: ServerArgs) -> str:
+        pipeline_config = server_args.pipeline_config
+        resolver = getattr(
+            pipeline_config, "resolve_condition_video_vae_sample_rng_mode", None
+        )
+        if callable(resolver):
+            return str(resolver())
+        return str(
+            getattr(
+                pipeline_config,
+                "condition_video_vae_sample_rng_mode",
+                "generator",
+            )
+        )
+
     def __init__(
         self,
         vae,
@@ -238,9 +265,14 @@ class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
                 latent_dist = latent_dist.latent_dist
 
         sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+        sample_rng_mode = self._resolve_sample_rng_mode(server_args)
+        latent_generator = batch.generator
+        if sample_mode == "sample" and sample_rng_mode == "global_seed":
+            torch.manual_seed(int(batch.seed))
+            latent_generator = None
         latent_condition = self.retrieve_latents(
             latent_dist,
-            batch.generator,
+            latent_generator,
             sample_mode=sample_mode,
         )
         latent_condition = server_args.pipeline_config.postprocess_vae_encode(
@@ -313,6 +345,15 @@ class STARConditionVideoVAEEncodingStage(ImageVAEEncodingStage):
             latent_condition,
             batch,
         )
+        if batch.return_trajectory_latents and batch.metrics is not None:
+            batch.metrics.record_annotation(
+                "condition_video_vae_summary",
+                {
+                    "sample_mode": sample_mode,
+                    "sample_rng_mode": sample_rng_mode,
+                    "image_latent_summary": self._tensor_summary(batch.image_latent),
+                },
+            )
         batch.condition_video = None
 
         self.offload_model()

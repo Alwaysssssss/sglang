@@ -11,13 +11,20 @@
 3. 先做哪些工作，后做哪些工作
 4. 哪些方向当前不要继续投入
 
+本轮后续工作的硬约束：
+
+1. **不改动、不回退当前已经完成的 `sglang` STAR 加速工作**
+2. **后续修改只允许围绕推理语义本身做对齐**
+3. **`sglang` 自己的 compile / FlashAttention / fused / runtime 加速实现，当前视为固定前提，而不是待回退对象**
+
 ---
 
 ## 2. 当前基线与关键结论
 
 ### 2.1 当前最重要的现状
 
-当前 `sglang` 侧已经可以在本地模型目录下稳定跑通 STAR exact 和 FP8 路线，但主观质量与原版 STAR 仍未对齐到 strict。
+当前 `sglang` 侧已经可以在本地模型目录下稳定跑通 STAR exact 和 FP8 路线。  
+其中，当前 exact compile 主线已经通过 `strict 0.95` release gate，但距离 `raw 0.97 / 0.98` 的高标准对齐目标仍有差距。
 
 当前最应该围绕的 exact 基线为：
 
@@ -27,6 +34,12 @@
 4. `fps = 8`
 5. 固定 reference case
 6. 不引入 quantization / cache / 多卡 / 新 backend 变量
+
+这里需要明确：
+
+1. 当前主线基线不是“最接近原版代码结构的慢路径”
+2. 当前主线基线是“**已经通过 strict release gate 的 `sglang` exact compile 路径**”
+3. 后续要继续对齐的是这条固定加速路径上的**推理语义**
 
 ### 2.2 当前 exact 本地模型目录结果
 
@@ -50,7 +63,37 @@
 2. `MSE / MAE` 已经明显落在 strict 阈值之内
 3. 这更像是**轻微但系统性的结构偏差**，而不是尺度错、帧数错、通道错这种粗错误
 
-### 2.3 当前 FP8 结果的定位
+### 2.3 当前已通过的对齐验收结果
+
+在统一 `mp4` 编码质量并补齐 `raw frame` 对比后，当前 exact compile 主线已经通过 release gate。
+
+当前推荐参考这组最新产物：
+
+1. 输出目录：`/sgl-workspace/sglang/outputs/star_align/sglang_exact_compile_case023_q10`
+2. reference 目录：`/sgl-workspace/sglang/outputs/star_align/reference_case023_q10_raw`
+
+关键结果：
+
+1. `reference raw` vs `candidate raw`
+   - `ssim_mean = 0.9601536133`
+   - `ssim_min = 0.9575826519`
+   - `num_failed_frames = 0`
+2. `reference mp4` vs `candidate mp4`
+   - `ssim_mean = 0.9529690934`
+   - `ssim_min = 0.9507997807`
+   - `num_failed_frames = 0`
+3. `reference raw -> reference mp4` 编码损失
+   - `ssim_mean = 0.9885351781`
+4. `candidate raw -> candidate mp4` 编码损失
+   - `ssim_mean = 0.9877945149`
+
+重要结论：
+
+1. 当前 `strict 0.95` release gate 已完成
+2. 编码器质量差异已被验证为此前 strict 失败的重要来源之一
+3. 但 `raw` 还只有 `0.960 / 0.958` 左右，因此距离 `0.97 / 0.98` 的高标准目标仍有实质差距
+
+### 2.4 当前 FP8 结果的定位
 
 现有 FP8 本地模型目录结果同样 baseline 通过、strict 失败，但当前不是主线。
 
@@ -61,11 +104,63 @@ FP8 当前只保留为：
 
 当前不要继续围绕 FP8 做主攻排查。
 
+### 2.5 当前新增语义实验结论
+
+在固定 compile + FA 主线下，已经额外完成两组高价值语义 A/B：
+
+1. `condition_video_vae_sample_rng_mode = global_seed`
+2. `vae_tiling = false`
+
+结果：
+
+1. `global_seed` 路线显著劣化
+   - `raw_ssim_mean` 下降到约 `0.8827`
+   - 连 baseline 都无法通过
+   - 说明这条路径不是原版 STAR 的正确参考语义
+2. `no_vae_tiling` 与当前主线结果几乎完全一致
+   - `raw_ssim_mean` 仍约为 `0.9602`
+   - `mp4 strict` 指标也与当前主线一致
+   - 说明 `vae_tiling` 不是当前 `0.960x` 差距的主要来源
+
+额外 trace 对比结论：
+
+1. `condition_video preprocess` 已与 reference 完全一致
+2. `condition latent` 的统计量与 reference 非常接近
+3. `decode 前 final latents` 与 `decode 输入 latents` 的统计量也都已非常接近
+
+当前最重要的含义是：
+
+1. 低层次的 `condition preprocess / VAE encode 粗统计 / decode scale-shift` 已不是主要矛盾
+2. 剩余差距更像是 **denoise 过程内部的 tensor 级语义差异**
+3. 下一步不应继续围绕 `global_seed` 或 `vae_tiling` 反复试验
+
 ---
 
-## 3. strict 验收口径
+## 3. 验收口径与术语
 
-以 `phase_5_decoding_parity_and_acceptance.md` 为准，当前目标口径为：
+### 3.1 `raw` 和 `mp4` 分别是什么
+
+后续讨论里，`raw` 和 `mp4` 需要严格区分：
+
+1. `raw`
+   - 指 VAE decode 和后处理完成后、进入视频编码器之前的逐帧原始图像
+   - 当前通常以 `frames/frame_XXXX.png` 的形式落盘
+   - 这个口径最接近“模型本身到底有没有对齐”
+   - 如果要把 SSIM 继续抬到 `0.97 / 0.98`，主要应该看这个口径
+2. `mp4`
+   - 指经过 `imageio/ffmpeg` 等视频编码器压缩后的最终交付文件
+   - 这个口径更接近用户实际看到的成品
+   - 但它会混入 `codec`、`quality`、像素格式等编码器变量
+   - 因此它适合做 release gate，不适合单独拿来判断“模型是否已经完全复刻”
+
+简化理解：
+
+1. `raw` 主要回答：模型本身是否对齐
+2. `mp4` 主要回答：最终交付视频是否对齐
+
+### 3.2 当前 release gate
+
+以 `phase_5_decoding_parity_and_acceptance.md` 为准，当前 release gate 仍保留为：
 
 ```text
 min_ssim = 0.95
@@ -77,8 +172,56 @@ max_failed_frame_ratio = 0.0
 
 这里必须注意两点：
 
-1. `strict` 适用于同一台机器、同一 backend、同一视频编码器、同一 dtype 配置
-2. 当前 `mp4` 比较里混入了视频编码器差异，因此**不能直接把 strict 失败全部解释为模型本身失败**
+1. 这条 `strict 0.95` 口径仍然有效，适合作为当前主线 release gate
+2. 这条口径可以同时用于 `raw` 和 `mp4`，但对 `mp4` 的解释必须考虑编码器差异
+
+### 3.3 新的高标准对齐目标
+
+由于当前项目目标是尽可能完整复刻原版 STAR，因此在 `strict 0.95` 之上，再引入一层更高标准的对齐目标：
+
+#### High-Bar 对齐目标
+
+优先使用 `raw vs raw` 比较，目标建议定为：
+
+```text
+raw_ssim_mean >= 0.97
+raw_ssim_min  >= 0.97
+raw_mse_max   <= 60.0
+raw_mae_mean  <= 5.0
+raw_failed_frame_ratio = 0.0
+```
+
+含义：
+
+1. `0.97` 级别的目标主要用来判断“模型级对齐是否已经足够完善”
+2. 这条目标比当前 `strict 0.95` 明显更严格
+3. 这条目标应优先建立在 `raw` 上，而不是优先建立在 `mp4` 上
+
+#### Stretch Goal
+
+`0.98` 可以保留为 stretch goal，但当前不建议直接定义成主验收线：
+
+```text
+raw_ssim_mean >= 0.98
+raw_ssim_min  >= 0.98
+```
+
+原因：
+
+1. `0.98` 更适合作为“接近 reference implementation 无明显残差”的长期目标
+2. 对当前阶段而言，`0.98` 不应替代 `0.95` release gate
+3. 在没有多 case、没有更完整逐步 trace 的前提下，不建议把 `0.98` 直接写成必须满足的交付门槛
+
+### 3.4 为什么高标准优先看 `raw`
+
+如果把目标抬到 `0.97 / 0.98`，优先看 `raw` 而不是 `mp4` 的原因很直接：
+
+1. `raw` 更接近模型本体，不会混入视频编码器变量
+2. `mp4` 结果天然会受到编码质量和 codec 路径影响
+3. 如果 `raw` 还没到 `0.97`，就不应要求 `mp4` 先到 `0.97 / 0.98`
+4. 正确顺序应是：
+   - 先把 `raw` 推到更高 SSIM
+   - 再验证 `mp4` 交付结果是否同步稳定提升
 
 ---
 
@@ -166,6 +309,12 @@ max_failed_frame_ratio = 0.0
 2. 这种差异会直接影响 condition latent，全程影响 denoise 结果
 3. 这种差异非常符合“所有帧都略偏一点，但不是粗错”的当前表现
 
+当前状态更新：
+
+1. 已完成 `global_seed` A/B
+2. 结果显著劣化，因此这条分支当前应视为**已排除方向**
+3. 当前默认 `generator` 模式保留
+
 ### 5.4 VAE tiling 行为
 
 当前 `sglang` STAR pipeline config 默认 `vae_tiling = true`。
@@ -174,6 +323,12 @@ max_failed_frame_ratio = 0.0
 
 1. 原版 reference 路径是否在 encode / decode 上使用相同 tiling 语义
 2. 如果原版是 full-frame，而 `sglang` 使用 tiling，可能带来轻微但稳定的结构差异
+
+当前状态更新：
+
+1. 已完成 `vae_tiling on/off` A/B
+2. 结果与当前主线几乎完全一致
+3. 因此 `vae_tiling` 当前不再视为高优先级差异源
 
 ### 5.5 condition video 预处理细节
 
@@ -194,6 +349,15 @@ max_failed_frame_ratio = 0.0
 3. qk layernorm / fused layernorm / modulation 热路径
 4. rope / local enhancer / attention backend 的细微数值漂移
 
+当前状态更新：
+
+1. 在 `condition preprocess`、`condition latent`、`decode 前后粗统计` 都已经接近 reference 的情况下
+2. 剩余的主要矛盾已收敛到 **denoise 过程内部的 tensor 级差异**
+3. 下一步优先顺序应调整为：
+   - 初始噪声与 scheduler 噪声 RNG 轨迹
+   - batched CFG combine 的 tensor 级差异
+   - selected denoise steps 的 latent / noise_pred 对照
+
 ---
 
 ## 6. 实施原则
@@ -206,6 +370,17 @@ max_failed_frame_ratio = 0.0
 2. 再补 reference trace
 3. 再做中间量二分
 4. 最后才动数值实现
+
+这里的“动数值实现”只指：
+
+1. 修正与 reference 不一致的推理语义
+2. 修正 condition latent / scheduler / decode / CFG 这些流程级偏差
+
+不包括：
+
+1. 回退 `sglang` 现有 compile 路径
+2. 回退 `sglang` attention / fused / runtime 加速实现
+3. 为了更像原版而改回逐算子执行
 
 ### 6.2 单变量实验
 
@@ -220,14 +395,27 @@ max_failed_frame_ratio = 0.0
 5. cache / teacache / cache-dit
 6. 新的 fused 热路径
 
-### 6.3 先 no-compile exact，再 compile exact
+### 6.3 固定加速主线，不把“关加速”当成方案
 
-质量对齐时建议先建立一个**最少变量**的 exact debug 基线，再回归 compile 路径。
+后续语义对齐的主线必须固定在当前已经通过验收的加速配置上：
+
+1. `enable_torch_compile = true`
+2. `attention_backend = fa`
+3. 保留当前 `sglang` fused / runtime 路径
+4. 不改回原版逐算子实现
 
 原因：
 
-1. compile 是性能变量，不应在第一轮就和质量变量绑死
-2. 如果 no-compile exact 已 strict 通过，而 compile exact 失败，问题范围会立即缩小
+1. 用户当前要求是“不要对原有加速工作做任何变动”
+2. 因此“先关 compile 看会不会更像原版”不再是主线方案
+3. 后续所有对齐都应该回答：
+   - 在**保持当前 `sglang` 加速后端不变**时，推理语义还有哪里与原版 STAR 不一致
+
+允许存在的唯一例外：
+
+1. 个别临时 A/B 可以把关某个选项作为定位手段
+2. 但这种 A/B 只能作为证据采集
+3. 不能作为最终修复方案合入主线
 
 ### 6.4 不要凭“看起来更合理”修改参考语义
 
@@ -254,6 +442,8 @@ max_failed_frame_ratio = 0.0
 6. `guidance_scale = 6.0`
 7. `condition_video_num_frames = 25`
 8. `enable_color_fix = false`
+9. `enable_torch_compile = true`
+10. 保留当前 `sglang` fused / runtime 加速路径
 
 建议固定两条运行入口：
 
@@ -287,8 +477,9 @@ max_failed_frame_ratio = 0.0
 
 这一阶段的判定规则：
 
-1. 如果 `raw vs raw` 已经 strict 通过，而 `mp4 vs mp4` 不通过，优先修输出编码一致性，不要先动模型
-2. 如果 `raw vs raw` 本身也不通过，再进入模型侧排查
+1. 如果 `raw vs raw` 已经达到 `strict 0.95`，而 `mp4 vs mp4` 不通过，优先修输出编码一致性，不要先动模型
+2. 如果 `raw vs raw` 连 `strict 0.95` 都不过，再进入模型侧排查
+3. 如果 `raw vs raw` 已过 `0.95`，但还没有到 `0.97`，说明 release gate 已满足，但“高标准对齐目标”还没有完成
 
 ## 7.3 Phase C：补齐 reference / candidate trace
 
@@ -329,7 +520,14 @@ max_failed_frame_ratio = 0.0
 1. `python/sglang/multimodal_gen/test/manual/run_star_cogvideox_sr_smoke.py`
 2. `python/sglang/multimodal_gen/test/manual/profile_star_cogvideox_sr.py`
 
-## 7.4 Phase D：按阶段做二分定位
+## 7.4 Phase D：在固定加速后端下做语义二分定位
+
+这一阶段的根约束：
+
+1. 固定当前 `sglang` compile exact 主线
+2. 固定 `attention_backend = fa`
+3. 固定现有 fused / runtime 实现
+4. 只检查“推理语义是否与原版 STAR 一致”
 
 阶段顺序必须固定，不要跳步。
 
@@ -377,7 +575,7 @@ max_failed_frame_ratio = 0.0
 4. encode 时是否存在 tiling 差异
 5. `image_latent` 数值分布是否与原版对齐
 
-如果 `image_latent` 还没有对齐，不要继续查 attention。
+如果 `image_latent` 还没有对齐，不要继续查 attention，也不要试图通过关闭 `sglang` 加速路径来规避问题。
 
 主要代码位置：
 
@@ -401,6 +599,7 @@ max_failed_frame_ratio = 0.0
 1. `sglang` 当前 scheduler 不是纯 deterministic ODE
 2. 不要把 scheduler 的 stochastic path 误认为已经被删掉
 3. dynamic CFG 语义应先以 trace 为准，不要凭主观修改
+4. 这一层要做的是确认“当前 `sglang` scheduler 语义是否与原版一致”，而不是把 scheduler 改写成原版逐行实现
 
 主要代码位置：
 
@@ -419,12 +618,14 @@ max_failed_frame_ratio = 0.0
 2. `latent_model_input` 与 `image_latent` 的 concat 顺序
 3. 第 `0 / N/2 / N-1` 步 `noise_pred`
 4. 第 `0 / N/2 / N-1` 步 latent
-5. compile / no-compile 是否引入额外漂移
+5. compile 主线下的语义结果是否与 reference 一致
 
 这里要特别注意：
 
 1. 原版本身就是 cond/uncond batched forward，不要先入为主地把 `enable_batched_cfg` 当成错误
-2. 若怀疑 compile 引入漂移，先做 `sglang vs sglang` 的 no-compile / compile 对照，而不是直接改 reference 对比脚本
+2. 当前主线不是“关闭 compile 看会不会更像原版”
+3. 如果怀疑 compile 下存在语义偏差，应优先查输入语义、CFG scale、latent concat、condition latent 是否一致
+4. 只有在证据非常明确时，才允许把 compile/no-compile A/B 当成一次性定位工具，而不是最终方案
 
 建议复用工具：
 
@@ -454,13 +655,15 @@ max_failed_frame_ratio = 0.0
 2. `python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/star_cogvideox_sr_decoding.py`
 3. `python/sglang/multimodal_gen/configs/pipeline_configs/star_cogvideox_sr.py`
 
-## 7.5 Phase E：回归 compile exact acceptance
+## 7.5 Phase E：固定加速主线下的高标准语义对齐收口
 
-当 no-compile exact 已经通过 raw strict 与 mp4 strict 后，再回归当前 compile exact 主线：
+由于当前 compile exact 主线已经通过 `strict 0.95`，后续阶段不再围绕“是否回到 compile 主线”展开，而是直接在 compile exact 主线上继续提高 `raw` 对齐度。
 
-1. 使用 `infer_STAR.md` 中的 exact profile 命令复验
-2. 对比 no-compile exact 与 compile exact 的 raw frame parity
-3. 若 compile 退化，再用 `compare_diffusion_trajectory_similarity.py` 做 `sglang vs sglang` 轨迹对照
+后续收口目标：
+
+1. 在当前 compile exact 主线上稳定保持 `strict 0.95`
+2. 在不改动现有加速工作前提下，把 `raw` 对齐继续从 `0.960 / 0.958` 往 `0.97+` 推进
+3. 所有修正都必须证明自己是在修复推理语义，而不是在牺牲加速实现
 
 ---
 
@@ -482,17 +685,20 @@ max_failed_frame_ratio = 0.0
 ### P2
 
 1. 先做 `reference_raw` vs `candidate_raw` strict
-2. 如果 raw strict 已过，停止模型侧调参，优先统一视频写盘路径
+2. 如果 raw strict 已过，先完成编码器口径统一
+3. 如果 raw strict 已过但仍只有 `0.96x`，则进入“高标准语义对齐”阶段，而不是继续改输出编码器
 
 ### P3
 
-1. 如果 raw strict 未过，优先查 condition-video VAE posterior RNG
+1. 如果目标是把 `raw` 从 `0.96x` 继续提高，优先查 condition-video VAE posterior RNG 语义
 2. 然后查 `vae_tiling`
 3. 再查 condition-video preprocess
+4. 以上修改必须保持当前 compile / FA / fused 路径不变
 
 ### P4
 
-1. 只有在上面都排掉之后，再去查 fused norm / rope / attention / local enhancer
+1. 只有在上面都排掉之后，再去查 latent concat、CFG combine、decode scale/shift 这类推理语义问题
+2. 不把 fused norm / rope / attention / local enhancer 改回原版算子当成方案
 
 ---
 
@@ -517,6 +723,7 @@ max_failed_frame_ratio = 0.0
 1. 停在 VAE encode 层
 2. 优先查 RNG、sample_mode、tiling、preprocess
 3. 不要先查 denoise
+4. 不要通过关 compile、换 backend、回退 fused 路径来绕过问题
 
 ### 情况 C
 
@@ -527,6 +734,7 @@ max_failed_frame_ratio = 0.0
 1. 查 initial noise
 2. 查 scheduler timesteps / per-step noise
 3. 查 CFG combine 路径
+4. 保持当前 `sglang` 加速后端不变，只修正语义
 
 ### 情况 D
 
@@ -537,31 +745,54 @@ max_failed_frame_ratio = 0.0
 1. 查 decode scale / shift
 2. 查 temporal windows
 3. 查 VAE tiling
+4. 不把“回退到原版逐算子 decode 路径”作为默认解法
 
 ---
 
 ## 10. 完成标准
 
-这一轮质量对齐工作建议按三层 gate 收口：
+这一轮质量对齐工作建议按分层 gate 收口：
 
-### Gate 1：raw frame strict
+### Gate 1：Release Gate
 
-在 reference raw frame 与 `sglang` raw frame 上达到：
+这层 gate 代表“当前版本可以作为 release 候选”。
 
-1. `ssim_min >= 0.95`
-2. `mse_max <= 60.0`
-3. `mae_mean <= 5.0`
-4. `failed_frame_ratio = 0.0`
+要求：
 
-### Gate 2：mp4 strict
+1. `reference raw` vs `candidate raw` 达到 `strict 0.95`
+2. `reference mp4` vs `candidate mp4` 达到 `strict 0.95`
+3. 当前主线 exact acceptance path 复验通过
+4. 上述通过建立在**不改动当前加速主线**的前提下
 
-在统一编码参数后，reference `mp4` 与 candidate `mp4` 达到同样 strict 阈值。
+### Gate 2：High-Bar 对齐目标
 
-### Gate 3：current exact acceptance path strict
+这层 gate 代表“模型级对齐已经比较完善”。
 
-在当前主线 exact 命令上复验 strict 通过。
+要求：
 
-只有 Gate 1、Gate 2、Gate 3 都通过，才算当前质量对齐主目标完成。
+1. `reference raw` vs `candidate raw`
+2. `raw_ssim_mean >= 0.97`
+3. `raw_ssim_min >= 0.97`
+4. `raw_failed_frame_ratio = 0.0`
+5. 其余 `MSE / MAE / frame_count` 仍满足 `strict 0.95` 的限制
+6. 保持当前 compile / FA / fused 加速实现不变
+
+### Gate 3：Stretch Goal
+
+这层 gate 不作为当前硬性 release 条件，但可作为长期追求目标。
+
+要求：
+
+1. `reference raw` vs `candidate raw`
+2. `raw_ssim_mean >= 0.98`
+3. `raw_ssim_min >= 0.98`
+4. `raw_failed_frame_ratio = 0.0`
+
+建议解释方式：
+
+1. Gate 1 通过：可以说“当前主线验收通过”
+2. Gate 2 通过：可以说“在不回退加速实现的前提下，高标准语义对齐完成度较高”
+3. Gate 3 通过：可以说“非常接近 reference implementation”
 
 ---
 
@@ -575,6 +806,8 @@ max_failed_frame_ratio = 0.0
 4. 双卡 cfg-parallel
 5. cache / teacache / cache-dit 继续提速
 6. FlashInfer RoPE
+7. 为了贴近原版而回退 `sglang` 现有 compile / FA / fused 加速路径
+8. 把运行时改成原版逐算子实现
 
 这些方向都应等 strict 质量主线完成后再回头处理。
 
@@ -582,8 +815,8 @@ max_failed_frame_ratio = 0.0
 
 ## 12. 最后一条执行建议
 
-后续所有 strict 对齐工作，建议都遵循一句话：
+后续所有高标准语义对齐工作，建议都遵循一句话：
 
-**先证明差异来自模型，再去改模型。**
+**先证明差异来自推理语义，再去修语义；不要为了更像原版而撤掉 `sglang` 的加速实现。**
 
 如果 raw frame、trace、encoder 参数还没有拆清楚，就不要急着改 denoise 热路径，也不要急着追求更高速度。

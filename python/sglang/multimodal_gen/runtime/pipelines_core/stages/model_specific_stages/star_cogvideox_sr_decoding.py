@@ -20,6 +20,17 @@ class STARCogVideoXSRDecodingStage(DecodingStage):
     """STAR-specific decoding stage with temporal windowed VAE decode."""
 
     @staticmethod
+    def _tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
+        tensor_f = tensor.detach().cpu().float()
+        return {
+            "shape": list(tensor_f.shape),
+            "mean": float(tensor_f.mean()),
+            "std": float(tensor_f.std()),
+            "min": float(tensor_f.min()),
+            "max": float(tensor_f.max()),
+        }
+
+    @staticmethod
     def build_decode_windows(num_frames: int) -> list[tuple[int, int, bool]]:
         """Build STAR temporal decode windows.
 
@@ -131,7 +142,17 @@ class STARCogVideoXSRDecodingStage(DecodingStage):
     ) -> torch.Tensor:
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        if batch is not None and batch.return_trajectory_latents and batch.metrics is not None:
+            batch.metrics.record_annotation(
+                "final_latents_before_decode_summary",
+                self._tensor_summary(latents),
+            )
         latents = self.prepare_latents_for_decode(latents, server_args)
+        if batch is not None and batch.return_trajectory_latents and batch.metrics is not None:
+            batch.metrics.record_annotation(
+                "decode_input_latents_summary",
+                self._tensor_summary(latents),
+            )
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast

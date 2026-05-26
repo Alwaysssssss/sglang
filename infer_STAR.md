@@ -108,7 +108,54 @@ cp -a /sgl-workspace/STAR_mg/pretrained_weight/sglang_star_cogvideox_sr/transfor
   /sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr/transformer-fp8-block128/
 ```
 
-### 3.2 Exact 对齐推理命令
+### 3.2 当前最快的单卡非量化命令
+
+如果你的约束是“**单卡** + **不使用量化**”，那当前已验证的**最快单卡非量化命令**是：
+
+- run label: `single_fa_compile_fusedln_v2`
+- `warm_e2e_speedup = 1.4314x`
+- `avg_wall_clock_s = 159.2888`
+- 台账位置：[compare.json](/sgl-workspace/sglang/docs_xzh/add_STAR/compare.json:402)
+- 结果 summary：[single_fa_compile_fusedln_v2 summary](/sgl-workspace/sglang/outputs/star_phase7_single_gpu_fa_compile_fusedln_v2/summary.json:1)
+
+对应命令如下：
+
+```bash
+python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
+  --model-path /sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr \
+  --condition-video-path /sgl-workspace/STAR_mg/input/cogvideox_test/lq/023_klingai_reedit.mp4 \
+  --prompt-path /sgl-workspace/STAR_mg/input/cogvideox_test/text/023_klingai_reedit.txt \
+  --reference-video /sgl-workspace/STAR_mg/cogvideox-based/sat/output/ref_seed1234/0_A_serene_scene_of_a_panda_bear_playing_a_guitar_at_sunset_unfolds_by_a_tranquil_lake._The_panda,_with_its_black-and-whit/000000.mp4 \
+  --output-dir /sgl-workspace/sglang/outputs/star_repro_single_fa_compile_fusedln_v2_fps8 \
+  --seed 1234 \
+  --num-frames 7 \
+  --height 480 \
+  --width 720 \
+  --fps 8 \
+  --num-inference-steps 50 \
+  --guidance-scale 6.0 \
+  --condition-video-num-frames 25 \
+  --attention-backend fa \
+  --num-gpus 1 \
+  --enable-torch-compile \
+  --dit-cpu-offload \
+  --text-encoder-cpu-offload \
+  --output-quality maximum \
+  --warmup-runs 1 \
+  --measured-runs 1 \
+  --original-star-cold-e2e-s 302.334 \
+  --original-star-warm-e2e-s 228.0
+```
+
+补充说明：
+
+- 这是**当前最快的单卡非量化命令**。
+- 如果你要复现我们后来通过 `strict 0.95` 的视频对比口径，这里必须显式加 `--output-quality maximum`。
+  原因：脚本默认 `output_quality=default`，会落到较低的视频编码质量；这会把 `mp4` 级别的 `SSIM` 从 `0.95x` 拉回到 `0.93x` 左右。
+- 如果你不限制必须单卡，而只看“整体最快的非量化命令”，那仍然是双卡 `dual_cfg_parallel`，`warm_e2e_speedup = 1.8628x`，见 [compare.json](/sgl-workspace/sglang/docs_xzh/add_STAR/compare.json:77)。
+- 这条命令和后面 [3.6.2 `single_fa_compile_fusedln_v2` 复现命令](#362-single_fa_compile_fusedln_v2-复现命令) 是同一条主线命令，这里只是提前明确标注出来。
+
+### 3.3 Exact 对齐推理命令
 
 如果你要和原版 STAR 做“同标准”的主观/算法对齐，优先用 exact 路线，不要先上 FP8。  
 这条命令优先保证稳定可跑，不强调速度：
@@ -132,7 +179,8 @@ python -m sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke \
   --attention-backend fa \
   --num-gpus 1 \
   --dit-cpu-offload \
-  --text-encoder-cpu-offload
+  --text-encoder-cpu-offload \
+  --output-quality maximum
 ```
 
 这个命令的输出主要看：
@@ -140,7 +188,7 @@ python -m sglang.multimodal_gen.test.manual.run_star_cogvideox_sr_smoke \
 - candidate: `/sgl-workspace/sglang/outputs/star_sglang_exact_case023/candidate.mp4`
 - summary: `/sgl-workspace/sglang/outputs/star_sglang_exact_case023/star_smoke_summary.json`
 
-### 3.3 Exact 验收命令
+### 3.4 Exact 验收命令
 
 如果你希望同时拿到分 stage 统计和 parity 报告，用下面这条 exact profile 命令。  
 这是当前仓库下已经实际跑通过的一条单卡 exact compile 命令：
@@ -165,11 +213,12 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
   --enable-torch-compile \
   --dit-cpu-offload \
   --text-encoder-cpu-offload \
+  --output-quality maximum \
   --warmup-runs 0 \
   --measured-runs 1
 ```
 
-### 3.4 Phase7 FP8 验收命令
+### 3.5 Phase7 FP8 验收命令
 
 如果你要复现当前 phase7 的单卡量化验收口径，再额外跑一遍 FP8。  
 这条命令依赖上面已经把 `transformer-fp8-block128` 复制到本地模型目录：
@@ -199,7 +248,7 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
   --measured-runs 1
 ```
 
-### 3.5 历史 `1.4x` Exact Compile 复现实验
+### 3.6 历史 `1.4x` Exact Compile 复现实验
 
 下面两条命令对应的是历史上“未量化、仅靠 `torch.compile` 就到 `1.4x` 左右”的两条 exact 路线。
 
@@ -208,7 +257,7 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
 1. 现在统一显式写 `--fps 8`，不再沿用旧脚本时期错误的 `24 fps` 输出。
 2. 现在建议把模型目录放在 `sglang` 仓库内，例如 `${SGLANG_STAR_MODEL_DIR}`，从而直接在当前仓库下复现。
 
-#### 3.5.1 `single_fa_compile_warm_v2` 复现命令
+#### 3.6.1 `single_fa_compile_warm_v2` 复现命令
 
 这是 phase6 时期的单卡 exact compile 路线，历史台账约为 `1.4153x`。
 
@@ -232,6 +281,7 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
   --enable-torch-compile \
   --dit-cpu-offload \
   --text-encoder-cpu-offload \
+  --output-quality maximum \
   --warmup-runs 1 \
   --measured-runs 1 \
   --original-star-cold-e2e-s 302.334 \
@@ -244,7 +294,7 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
 - 历史速度：`warm_e2e_speedup = 1.4153x`
 - 台账位置：[compare.json](/sgl-workspace/sglang/docs_xzh/add_STAR/compare.json:212)
 
-#### 3.5.2 `single_fa_compile_fusedln_v2` 复现命令
+#### 3.6.2 `single_fa_compile_fusedln_v2` 复现命令
 
 这是 phase7 时期更好的单卡 exact compile 路线，历史台账约为 `1.4314x`。
 
@@ -270,6 +320,7 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
   --enable-torch-compile \
   --dit-cpu-offload \
   --text-encoder-cpu-offload \
+  --output-quality maximum \
   --warmup-runs 1 \
   --measured-runs 1 \
   --original-star-cold-e2e-s 302.334 \

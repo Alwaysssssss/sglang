@@ -75,6 +75,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--text-encoder-cpu-offload", action="store_true")
     parser.add_argument("--vae-cpu-offload", action="store_true")
     parser.add_argument(
+        "--vae-tiling",
+        dest="vae_tiling",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no-vae-tiling",
+        dest="vae_tiling",
+        action="store_false",
+    )
+    parser.set_defaults(vae_tiling=None)
+    parser.add_argument(
         "--use-flashinfer-rope",
         dest="use_flashinfer_rope",
         action="store_true",
@@ -105,6 +116,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--condition-video-vae-target-headroom-gb",
         type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--condition-video-vae-rng-mode",
+        choices=["generator", "global_seed"],
         default=None,
     )
     parser.add_argument(
@@ -199,6 +215,8 @@ def _run_compare(reference: str, candidate: str, mode: str, output_json: Path) -
 
 def _build_server_kwargs(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     pipeline_config_overrides: dict[str, Any] = {}
+    if args.vae_tiling is not None:
+        pipeline_config_overrides["vae_tiling"] = args.vae_tiling
     if args.use_flashinfer_rope is not None:
         pipeline_config_overrides["use_flashinfer_rope"] = args.use_flashinfer_rope
     if args.local_enhancer_mode is not None:
@@ -210,6 +228,10 @@ def _build_server_kwargs(args: argparse.Namespace, output_dir: Path) -> dict[str
     if args.condition_video_vae_target_headroom_gb is not None:
         pipeline_config_overrides["condition_video_vae_target_headroom_gb"] = (
             args.condition_video_vae_target_headroom_gb
+        )
+    if args.condition_video_vae_rng_mode is not None:
+        pipeline_config_overrides["condition_video_vae_sample_rng_mode"] = (
+            args.condition_video_vae_rng_mode
         )
     if args.release_text_encoder_after_prompt_encode is not None:
         pipeline_config_overrides["release_text_encoder_after_prompt_encode"] = (
@@ -572,6 +594,7 @@ def main() -> int:
             request=summary["request"],
             condition_video=summary["condition_video"],
             reference_video=summary["reference_video"],
+            metrics=last_result.metrics or {},
             trajectory_latents=last_result.trajectory_latents,
             trajectory_timesteps=last_result.trajectory_timesteps,
             frame_summary=measured_records[-1]["frame_summary"],

@@ -30,6 +30,17 @@ class STARConditionVideoLoadingStage(PipelineStage):
     """Load and preprocess a full condition video for STAR-style pipelines."""
 
     @staticmethod
+    def _tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
+        tensor_f = tensor.detach().cpu().float()
+        return {
+            "shape": list(tensor_f.shape),
+            "mean": float(tensor_f.mean()),
+            "std": float(tensor_f.std()),
+            "min": float(tensor_f.min()),
+            "max": float(tensor_f.max()),
+        }
+
+    @staticmethod
     def _validate_positive_int(name: str, value: int | None) -> int | None:
         if value is None:
             return None
@@ -288,4 +299,16 @@ class STARConditionVideoLoadingStage(PipelineStage):
         batch.condition_video_num_frames = len(frame_indices)
         batch.width = target_width
         batch.height = target_height
+        if batch.return_trajectory_latents and batch.metrics is not None:
+            batch.metrics.record_annotation(
+                "condition_video_preprocess_summary",
+                {
+                    "original_size": [metadata.width, metadata.height],
+                    "target_size": [target_width, target_height],
+                    "source_num_frames": metadata.num_frames,
+                    "selected_indices": frame_indices,
+                    "video_fps": metadata.fps,
+                    "tensor_summary": self._tensor_summary(condition_video),
+                },
+            )
         return batch

@@ -17,6 +17,17 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 class STARLatentPreparationStage(LatentPreparationStage):
     """Prepare STAR SR denoising latents on the latent timeline directly."""
 
+    @staticmethod
+    def _tensor_summary(tensor: torch.Tensor) -> dict[str, object]:
+        tensor_f = tensor.detach().cpu().float()
+        return {
+            "shape": list(tensor_f.shape),
+            "mean": float(tensor_f.mean()),
+            "std": float(tensor_f.std()),
+            "min": float(tensor_f.min()),
+            "max": float(tensor_f.max()),
+        }
+
     def adjust_video_length(self, batch: Req, server_args: ServerArgs) -> int:
         del server_args
         return int(batch.num_frames)
@@ -92,4 +103,9 @@ class STARLatentPreparationStage(LatentPreparationStage):
 
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
+        if batch.return_trajectory_latents and batch.metrics is not None:
+            batch.metrics.record_annotation(
+                "initial_latents_summary",
+                self._tensor_summary(latents),
+            )
         return batch

@@ -53,6 +53,7 @@ class RequestMetrics:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        self.annotations: Dict[str, Any] = {}
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -71,6 +72,9 @@ class RequestMetrics:
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         self.memory_snapshots[checkpoint_name] = snapshot
 
+    def record_annotation(self, name: str, value: Any):
+        self.annotations[name] = value
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the metrics data to a dictionary."""
         return {
@@ -78,6 +82,7 @@ class RequestMetrics:
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "annotations": self.annotations,
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()

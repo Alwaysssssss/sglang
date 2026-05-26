@@ -33,6 +33,10 @@ STAR_CONDITION_VAE_PEAK_MEMORY_MODES = (
     "text_encoder_and_transformer",
     "auto",
 )
+STAR_CONDITION_VAE_SAMPLE_RNG_MODES = (
+    "generator",
+    "global_seed",
+)
 
 
 def star_t5_postprocess_text(
@@ -88,6 +92,7 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
     temporarily_offload_transformer_during_condition_vae_encode: bool = False
     condition_video_vae_peak_memory_mode: str = "legacy"
     condition_video_vae_target_headroom_gb: float = 6.0
+    condition_video_vae_sample_rng_mode: str = "generator"
     keep_transformer_gpu_resident_between_requests: bool = False
 
     integration_metadata: dict[str, Any] = field(default_factory=dict)
@@ -156,6 +161,10 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
         if isinstance(target_headroom_gb, (int, float)):
             self.condition_video_vae_target_headroom_gb = float(target_headroom_gb)
 
+        sample_rng_mode = payload.get("condition_video_vae_sample_rng_mode")
+        if isinstance(sample_rng_mode, str) and sample_rng_mode:
+            self.condition_video_vae_sample_rng_mode = sample_rng_mode
+
         keep_transformer_resident = payload.get(
             "keep_transformer_gpu_resident_between_requests"
         )
@@ -198,6 +207,15 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
                 "condition_video_vae_target_headroom_gb must be >= 0, "
                 f"got {self.condition_video_vae_target_headroom_gb}."
             )
+        if (
+            self.condition_video_vae_sample_rng_mode
+            not in STAR_CONDITION_VAE_SAMPLE_RNG_MODES
+        ):
+            raise ValueError(
+                "condition_video_vae_sample_rng_mode must be one of "
+                f"{STAR_CONDITION_VAE_SAMPLE_RNG_MODES}, "
+                f"got {self.condition_video_vae_sample_rng_mode!r}."
+            )
 
     def resolve_local_enhancer_mode(self) -> str:
         self._validate_phase7_overrides()
@@ -220,6 +238,10 @@ class StarCogVideoXSRPipelineConfig(PipelineConfig):
         if offload_transformer:
             return "transformer_only"
         return "off"
+
+    def resolve_condition_video_vae_sample_rng_mode(self) -> str:
+        self._validate_phase7_overrides()
+        return self.condition_video_vae_sample_rng_mode
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio

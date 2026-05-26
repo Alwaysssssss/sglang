@@ -203,6 +203,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
+        "--condition-video-vae-rng-mode",
+        choices=["generator", "global_seed"],
+        default=None,
+        help="STAR condition-video VAE posterior sampling RNG mode.",
+    )
+    parser.add_argument(
         "--release-text-encoder-after-prompt-encode",
         dest="release_text_encoder_after_prompt_encode",
         action="store_true",
@@ -239,6 +245,19 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable VAE CPU offload.",
     )
+    parser.add_argument(
+        "--vae-tiling",
+        dest="vae_tiling",
+        action="store_true",
+        help="Force VAE tiling on for this request.",
+    )
+    parser.add_argument(
+        "--no-vae-tiling",
+        dest="vae_tiling",
+        action="store_false",
+        help="Force VAE tiling off for this request.",
+    )
+    parser.set_defaults(vae_tiling=None)
     parser.add_argument(
         "--save-frame-pngs",
         action="store_true",
@@ -464,6 +483,7 @@ def _write_trace_artifacts(
     request: dict[str, Any],
     condition_video: dict[str, Any] | None,
     reference_video: dict[str, Any] | None,
+    metrics: dict[str, Any] | None,
     trajectory_latents: Any,
     trajectory_timesteps: Any,
     frame_summary: dict[str, Any],
@@ -478,6 +498,7 @@ def _write_trace_artifacts(
         "reference_video": reference_video,
         "output_file_path": output_file_path,
         "frame_summary": frame_summary,
+        "metrics_annotations": (metrics or {}).get("annotations"),
         "trajectory": _summarize_trajectory(
             trajectory_latents=trajectory_latents,
             trajectory_timesteps=trajectory_timesteps,
@@ -559,6 +580,8 @@ def _build_nunchaku_config(args: argparse.Namespace) -> NunchakuSVDQuantArgs | N
 
 def _build_pipeline_config_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {}
+    if args.vae_tiling is not None:
+        overrides["vae_tiling"] = args.vae_tiling
     if args.use_flashinfer_rope is not None:
         overrides["use_flashinfer_rope"] = args.use_flashinfer_rope
     if args.local_enhancer_mode is not None:
@@ -570,6 +593,10 @@ def _build_pipeline_config_overrides(args: argparse.Namespace) -> dict[str, Any]
     if args.condition_video_vae_target_headroom_gb is not None:
         overrides["condition_video_vae_target_headroom_gb"] = (
             args.condition_video_vae_target_headroom_gb
+        )
+    if args.condition_video_vae_rng_mode is not None:
+        overrides["condition_video_vae_sample_rng_mode"] = (
+            args.condition_video_vae_rng_mode
         )
     if args.release_text_encoder_after_prompt_encode is not None:
         overrides["release_text_encoder_after_prompt_encode"] = (
@@ -794,6 +821,7 @@ def main() -> int:
             request=summary["request"],
             condition_video=summary["condition_video"],
             reference_video=summary["reference_video"],
+            metrics=result.metrics or {},
             trajectory_latents=result.trajectory_latents,
             trajectory_timesteps=result.trajectory_timesteps,
             frame_summary=summary["result"]["frame_summary"],
