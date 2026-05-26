@@ -119,6 +119,33 @@ class VideoGenerationsRequest(BaseModel):
     perf_dump_path: Optional[str] = None
 
 
+class StarVideoSRRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    prompt: str
+    condition_video_path: Optional[str] = None
+    condition_video_url: Optional[str] = None
+    model: Optional[str] = None
+    seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
+    width: Optional[int] = 720
+    height: Optional[int] = 480
+    fps: Optional[int] = 8
+    num_frames: Optional[int] = 7
+    condition_video_start_frame: Optional[int] = None
+    condition_video_num_frames: Optional[int] = 25
+    condition_video_sample_fps: Optional[int] = None
+    condition_video_frame_stride: Optional[int] = None
+    num_inference_steps: Optional[int] = 50
+    guidance_scale: Optional[float] = 6.0
+    negative_prompt: Optional[str] = ""
+    enable_teacache: Optional[bool] = False
+    output_quality: Optional[str] = "maximum"
+    output_compression: Optional[int] = None
+    output_path: Optional[str] = None
+    perf_dump_path: Optional[str] = None
+
+
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"

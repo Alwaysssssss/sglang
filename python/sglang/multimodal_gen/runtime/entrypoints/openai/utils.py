@@ -153,8 +153,50 @@ async def save_image_to_path(
     return input_path
 
 
+async def save_video_to_path(
+    video: Union[UploadFile, str],
+    target_path: str,
+) -> str:
+    if hasattr(video, "read") and hasattr(video, "filename"):
+        return await _save_upload_video_to_path(video, target_path)
+
+    if not isinstance(video, str):
+        raise ValueError("Unsupported condition video input type")
+
+    if os.path.exists(video):
+        return os.path.abspath(video)
+
+    if video.lower().startswith(("http://", "https://")):
+        return await _save_url_video_to_path(video, target_path)
+
+    if video.startswith("data:video"):
+        return await _save_base64_video_to_path(video, target_path)
+
+    raise ValueError(
+        "Unsupported condition video input. Expected upload, local path, http(s) URL, or data:video base64."
+    )
+
+
 # Helpers
 async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    content = await upload.read()
+    with open(target_path, "wb") as f:
+        f.write(content)
+    return target_path
+
+
+def _append_extension_if_missing(target_path: str, extension: str) -> str:
+    if os.path.splitext(target_path)[1]:
+        return target_path
+    return f"{target_path}{extension}"
+
+
+async def _save_upload_video_to_path(upload: UploadFile, target_path: str) -> str:
+    filename = upload.filename or "condition_video.mp4"
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower() or ".mp4"
+    target_path = _append_extension_if_missing(target_path, ext)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     content = await upload.read()
     with open(target_path, "wb") as f:
@@ -280,6 +322,62 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
         )
 
 
+async def _save_url_video_to_path(video_url: str, target_path: str) -> str:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    max_attempts = 3
+    backoff_seconds = 0.2
+    last_error: Exception | None = None
+
+    def _infer_video_extension(
+        *,
+        url: str,
+        content_type: str,
+    ) -> str:
+        url_path = url.split("?")[0]
+        _, url_ext = os.path.splitext(url_path)
+        url_ext = url_ext.lower()
+        if url_ext in {".mp4", ".mov", ".webm", ".avi", ".mkv"}:
+            return url_ext
+        if content_type.startswith("video/"):
+            ext = content_type.split("/", 1)[1].lower()
+            if ext in {"mp4", "quicktime", "webm", "x-msvideo", "x-matroska"}:
+                return {
+                    "quicktime": ".mov",
+                    "x-msvideo": ".avi",
+                    "x-matroska": ".mkv",
+                }.get(ext, f".{ext}")
+        return ".mp4"
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    response = await client.get(video_url, timeout=30.0)
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").lower()
+                    target_path = _append_extension_if_missing(
+                        target_path,
+                        _infer_video_extension(
+                            url=video_url,
+                            content_type=content_type,
+                        ),
+                    )
+                    with open(target_path, "wb") as f:
+                        f.write(response.content)
+                    return target_path
+                except Exception as e:
+                    last_error = e
+                    if attempt == max_attempts:
+                        raise
+                    await asyncio.sleep(backoff_seconds * (2 ** (attempt - 1)))
+    except Exception as e:
+        final_error = last_error or e
+        raise Exception(
+            f"Failed to download video from URL {video_url}: {str(final_error)}"
+        )
+
+
 async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     """Decode base64 image data and save to target path."""
 
@@ -318,6 +416,41 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
         return target_path
     except Exception as e:
         raise Exception(f"Failed to decode base64 image: {str(e)}")
+
+
+async def _save_base64_video_to_path(base64_data: str, target_path: str) -> str:
+    pattern = r"data:(.*?)(;base64)?,(.*)"
+    match = re.match(pattern, base64_data)
+    if not match:
+        raise ValueError(
+            "Failed to decode base64 video. Expected format `data:video/<type>;base64,<data>`"
+        )
+    media_type = match.group(1)
+    is_base64 = match.group(2)
+    data = match.group(3)
+    if not is_base64 or not data:
+        raise ValueError(
+            "Failed to decode base64 video. Missing ;base64 marker or payload."
+        )
+    ext = ".mp4"
+    if media_type.startswith("video/"):
+        mt = media_type.split("/", 1)[1].lower()
+        ext = {
+            "mp4": ".mp4",
+            "quicktime": ".mov",
+            "webm": ".webm",
+            "x-msvideo": ".avi",
+            "x-matroska": ".mkv",
+        }.get(mt, ".mp4")
+    target_path = _append_extension_if_missing(target_path, ext)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    try:
+        video_data = base64.b64decode(data)
+        with open(target_path, "wb") as f:
+            f.write(video_data)
+        return target_path
+    except Exception as e:
+        raise Exception(f"Failed to decode base64 video: {str(e)}")
 
 
 async def process_generation_batch(

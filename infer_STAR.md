@@ -354,7 +354,179 @@ python -m sglang.multimodal_gen.test.manual.profile_star_cogvideox_sr \
 2. 原版 STAR vs SGLang FP8  
    这是“phase7 量化验收”比较。
 
-## 5. 当前代码状态说明
+## 5. STAR Serve 启动与请求方式
+
+这一节给出当前 STAR 在 `sglang` 中的 HTTP serve 用法。
+
+### 5.1 端口策略
+
+为了避免占用环境中已有的流量转发端口，推荐：
+
+1. 只绑定 `127.0.0.1`
+2. 显式指定一组本地高位端口
+3. 加上 `--strict-ports`
+
+这样如果端口已被占用，服务会直接启动失败，而不是偷偷切换到别的端口。
+
+推荐使用下面这组端口：
+
+- HTTP: `32100`
+- Scheduler: `32150`
+- Master: `32187`
+
+### 5.2 Serve 启动命令
+
+```bash
+python -m sglang.multimodal_gen.runtime.launch_server \
+  --model-path /sgl-workspace/sglang/model_artifacts/sglang_star_cogvideox_sr \
+  --pipeline-class-name StarCogVideoXSRPipeline \
+  --attention-backend fa \
+  --num-gpus 1 \
+  --enable-torch-compile \
+  --dit-cpu-offload \
+  --text-encoder-cpu-offload \
+  --host 127.0.0.1 \
+  --port 32100 \
+  --scheduler-port 32150 \
+  --master-port 32187 \
+  --strict-ports \
+  --output-path /sgl-workspace/sglang/outputs/star_serve \
+  --input-save-path /sgl-workspace/sglang/inputs/star_serve_uploads
+```
+
+说明：
+
+1. `--host 127.0.0.1` 只在本机监听，不向外暴露
+2. `--strict-ports` 可以避免自动切换端口
+3. 当前 STAR serve 路由是：
+   - `POST /v1/star/videos`
+   - `GET /v1/star/videos`
+   - `GET /v1/star/videos/{id}`
+   - `GET /v1/star/videos/{id}/content`
+
+### 5.3 连通性检查
+
+由于当前环境里的 `curl` 可能经过代理，本地访问建议统一加：
+
+```bash
+--noproxy '*'
+```
+
+健康检查：
+
+```bash
+curl --noproxy '*' http://127.0.0.1:32100/health
+```
+
+期望返回：
+
+```json
+{"status":"ok"}
+```
+
+### 5.4 JSON 请求示例
+
+如果低清条件视频已经在本机固定路径上，推荐直接走 JSON 请求：
+
+```bash
+curl --noproxy '*' -X POST http://127.0.0.1:32100/v1/star/videos \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "A serene scene of a panda bear playing a guitar at sunset unfolds by a tranquil lake. The panda, with its black-and-white fur, strums the guitar while seated on a rock. Behind, a breathtaking mountain range glows under the orange and pink hues of the setting sun, contrasting beautifully with the lake'\''s deep blue. The composition highlights the panda'\''s relaxed interaction with the guitar, set against the stunning natural landscape, creating depth and peaceful harmony.",
+    "condition_video_path": "/sgl-workspace/STAR_mg/input/cogvideox_test/lq/023_klingai_reedit.mp4",
+    "seed": 1234,
+    "width": 720,
+    "height": 480,
+    "fps": 8,
+    "num_frames": 7,
+    "condition_video_num_frames": 25,
+    "num_inference_steps": 50,
+    "guidance_scale": 6.0,
+    "negative_prompt": "",
+    "output_quality": "maximum"
+  }'
+```
+
+### 5.5 multipart 上传请求示例
+
+如果想直接上传本地 `mp4`，可以用 multipart：
+
+```bash
+PROMPT="$(cat /sgl-workspace/STAR_mg/input/cogvideox_test/text/023_klingai_reedit.txt)"
+
+curl --noproxy '*' -X POST http://127.0.0.1:32100/v1/star/videos \
+  -F "prompt=${PROMPT}" \
+  -F condition_video=@/sgl-workspace/STAR_mg/input/cogvideox_test/lq/023_klingai_reedit.mp4 \
+  -F seed=1234 \
+  -F width=720 \
+  -F height=480 \
+  -F fps=8 \
+  -F num_frames=7 \
+  -F condition_video_num_frames=25 \
+  -F num_inference_steps=50 \
+  -F guidance_scale=6.0 \
+  -F output_quality=maximum
+```
+
+注意：
+
+1. 上面这个 multipart 命令已经实测通过
+2. 如果你只是想做 smoke，临时把 `num_inference_steps=1`
+   - 服务链路能通
+   - 但视频可能出现纯黑或极差画面
+   - 这不代表服务有 bug，而是因为 `1 step` 本来就不具备可用画质
+3. 用于正常视觉结果时，应保持 `num_inference_steps=50`
+
+### 5.6 任务状态查询
+
+创建任务后会立即返回一个 `id`，例如：
+
+```json
+{
+  "id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "status": "queued"
+}
+```
+
+轮询状态：
+
+```bash
+curl --noproxy '*' http://127.0.0.1:32100/v1/star/videos/<JOB_ID>
+```
+
+列出所有 STAR 任务：
+
+```bash
+curl --noproxy '*' http://127.0.0.1:32100/v1/star/videos
+```
+
+### 5.7 下载视频内容
+
+任务完成后可直接下载：
+
+```bash
+curl --noproxy '*' \
+  -o downloaded_star_candidate.mp4 \
+  http://127.0.0.1:32100/v1/star/videos/<JOB_ID>/content
+```
+
+如果任务已完成但还未上传云端，返回码应为 `200`。
+
+### 5.8 当前 serve 验收结论
+
+当前 STAR serve 已完成以下两类真实验收：
+
+1. JSON 请求 + 本地 `condition_video_path`
+2. multipart 请求 + 直接上传 `condition_video.mp4`
+
+两条路径都能：
+
+1. 成功入队
+2. 正常查询状态
+3. 完成推理
+4. 下载输出视频
+
+## 6. 当前代码状态说明
 
 当前 `sglang` 侧 STAR 已经具备以下性质：
 

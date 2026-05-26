@@ -309,6 +309,10 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    if type(server_args.pipeline_config).__name__ == "StarCogVideoXSRPipelineConfig":
+        from sglang.multimodal_gen.runtime.entrypoints.openai import star_video_api
+
+        app.include_router(star_video_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
