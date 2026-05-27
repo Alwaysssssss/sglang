@@ -274,4 +274,4 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 
 # mgtv
-wheel/
+wheel/output_tyx/
