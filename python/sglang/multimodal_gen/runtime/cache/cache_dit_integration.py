@@ -135,6 +135,46 @@ def _mark_transformer_parallelized(transformer, config, sp_group, tp_group):
     transformer._parallelism_config = config
 
 
+def _is_wan_videoedit_transformer(transformer: torch.nn.Module) -> bool:
+    return transformer.__class__.__name__ == "WanVideoEditTransformer3DModel"
+
+
+def _log_wan_videoedit_adapter(transformer: torch.nn.Module) -> None:
+    blocks = getattr(transformer, "blocks", None)
+    logger.info(
+        "VideoEdit cache-dit uses Wan adapter: blocks=%s, pattern=Pattern_2, separate_cfg=True",
+        len(blocks) if blocks is not None else "missing",
+    )
+
+
+def enable_cache_on_wan_videoedit_transformer(
+    transformer: torch.nn.Module,
+    cache_config: DBCacheConfig,
+    calibrator_config: Optional[TaylorSeerCalibratorConfig],
+) -> torch.nn.Module:
+    blocks = getattr(transformer, "blocks", None)
+    if blocks is None:
+        raise ValueError(
+            "WanVideoEditTransformer3DModel must have a 'blocks' attribute for cache-dit."
+        )
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=transformer,
+            blocks=blocks,
+            forward_pattern=ForwardPattern.Pattern_2,
+            params_modifiers=ParamsModifier(
+                cache_config=cache_config,
+                calibrator_config=calibrator_config,
+            ),
+            check_forward_pattern=True,
+            has_separate_cfg=True,
+        ),
+        parallelism_config=None,
+    )
+    return transformer
+
+
 def get_scm_mask(
     preset: str,
     num_inference_steps: int,
@@ -222,6 +262,29 @@ class CacheDitConfig:
     steps_computation_policy: str = "dynamic"
 
 
+def _build_single_transformer_cache_configs(
+    config: CacheDitConfig,
+) -> tuple[DBCacheConfig, Optional[TaylorSeerCalibratorConfig]]:
+    cache_config = DBCacheConfig(
+        num_inference_steps=config.num_inference_steps,
+        Fn_compute_blocks=config.Fn_compute_blocks,
+        Bn_compute_blocks=config.Bn_compute_blocks,
+        max_warmup_steps=config.max_warmup_steps,
+        residual_diff_threshold=config.residual_diff_threshold,
+        max_continuous_cached_steps=config.max_continuous_cached_steps,
+        steps_computation_mask=config.steps_computation_mask,
+        steps_computation_policy=config.steps_computation_policy,
+    )
+
+    calibrator_config = None
+    if config.enable_taylorseer:
+        calibrator_config = TaylorSeerCalibratorConfig(
+            taylorseer_order=config.taylorseer_order,
+        )
+
+    return cache_config, calibrator_config
+
+
 def enable_cache_on_transformer(
     transformer: torch.nn.Module,
     config: CacheDitConfig,
@@ -249,8 +312,11 @@ def enable_cache_on_transformer(
             "Please provide it in CacheDitConfig."
         )
 
+    use_registered_adapter = BlockAdapterRegister.is_supported(transformer)
+    use_wan_videoedit_adapter = _is_wan_videoedit_transformer(transformer)
+
     # Check if the transformer is pre-registered in cache-dit
-    if not BlockAdapterRegister.is_supported(transformer):
+    if not use_registered_adapter and not use_wan_videoedit_adapter:
         transformer_cls_name = transformer.__class__.__name__
         raise ValueError(
             f"{transformer_cls_name} is not officially supported by cache-dit. "
@@ -261,24 +327,7 @@ def enable_cache_on_transformer(
         )
 
     # Build cache config (including SCM fields if provided)
-    cache_config = DBCacheConfig(
-        num_inference_steps=config.num_inference_steps,
-        Fn_compute_blocks=config.Fn_compute_blocks,
-        Bn_compute_blocks=config.Bn_compute_blocks,
-        max_warmup_steps=config.max_warmup_steps,
-        residual_diff_threshold=config.residual_diff_threshold,
-        max_continuous_cached_steps=config.max_continuous_cached_steps,
-        # SCM fields
-        steps_computation_mask=config.steps_computation_mask,
-        steps_computation_policy=config.steps_computation_policy,
-    )
-
-    # Build calibrator config if TaylorSeer is enabled
-    calibrator_config = None
-    if config.enable_taylorseer:
-        calibrator_config = TaylorSeerCalibratorConfig(
-            taylorseer_order=config.taylorseer_order,
-        )
+    cache_config, calibrator_config = _build_single_transformer_cache_configs(config)
 
     # Enable cache-dit on the transformer
     logger.info(
@@ -312,12 +361,26 @@ def enable_cache_on_transformer(
 
     _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
 
-    cache_dit.enable_cache(
-        transformer,
-        cache_config=cache_config,
-        calibrator_config=calibrator_config,
-        parallelism_config=None,
-    )
+    if use_wan_videoedit_adapter:
+        _log_wan_videoedit_adapter(transformer)
+
+    if use_registered_adapter:
+        cache_dit.enable_cache(
+            transformer,
+            cache_config=cache_config,
+            calibrator_config=calibrator_config,
+            parallelism_config=None,
+        )
+    else:
+        logger.warning(
+            "WanVideoEditTransformer3DModel is not registered by cache-dit; "
+            "falling back to SGLang's explicit Wan adapter."
+        )
+        transformer = enable_cache_on_wan_videoedit_transformer(
+            transformer,
+            cache_config,
+            calibrator_config,
+        )
 
     if parallelism_config is not None:
         context_manager = getattr(transformer, "_context_manager", None)

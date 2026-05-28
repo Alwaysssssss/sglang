@@ -397,6 +397,8 @@ Cache-DiT 不能和 `dit_layerwise_offload` 一起用，所以必须保持：
 --dit-layerwise-offload false
 ```
 
+原生 VideoEdit 第一阶段只通过 `SGLANG_CACHE_DIT_*` 环境变量启用 Cache-DiT；不要使用 `--cache-dit-config`，该参数当前保留给 Diffusers backend。首轮排障建议同时保持 `--enable-torch-compile false`，确认 Cache-DiT 正确后再单独验证 compile。
+
 ### 5.1 启动 serve
 
 先停止第 3 节的 serve，再在 serve 终端执行：
@@ -435,6 +437,7 @@ sglang serve \
   --ring-degree 1 \
   --dit-cpu-offload false \
   --dit-layerwise-offload false \
+  --enable-torch-compile false \
   --text-encoder-cpu-offload false \
   --image-encoder-cpu-offload false \
   --vae-cpu-offload false \
@@ -458,6 +461,7 @@ Uvicorn running on http://0.0.0.0:30000
 
 ```text
 cache-dit enabled on transformer
+VideoEdit cache-dit uses Wan adapter: blocks=..., pattern=Pattern_2, separate_cfg=True
 ```
 
 或包含：

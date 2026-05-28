@@ -122,5 +122,18 @@ class TestComponentPathParsing(unittest.TestCase):
         self.assertEqual(remaining, [])
 
 
+class TestOffloadValidation(unittest.TestCase):
+    def test_cache_dit_conflicts_with_dit_layerwise_offload(self):
+        args = object.__new__(ServerArgs)
+        args.dit_layerwise_offload = True
+        args.dit_offload_prefetch_size = 0
+        args.use_fsdp_inference = False
+        args.dit_cpu_offload = False
+
+        with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
+            with self.assertRaisesRegex(ValueError, "cache-dit"):
+                args._validate_offload()
+
+
 if __name__ == "__main__":
     unittest.main()

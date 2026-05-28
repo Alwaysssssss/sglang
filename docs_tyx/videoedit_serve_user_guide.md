@@ -435,6 +435,36 @@ curl --noproxy '*' -sS http://SERVE_MACHINE_IP:30000/health
 
 如果本机能访问、远端不能访问，检查防火墙、安全组、容器端口映射，以及 `--host` 是否为 `0.0.0.0`。
 
+### 5.6 可选：启用原生 VideoEdit Cache-DiT
+
+原生 `WanVideoEditPipeline` 的 Cache-DiT 第一阶段只读取 `SGLANG_CACHE_DIT_*` 环境变量，不使用 `--cache-dit-config`。该参数当前保留给 Diffusers backend。
+
+启动 serve 前设置：
+
+```bash
+export SGLANG_CACHE_DIT_ENABLED=true
+export SGLANG_CACHE_DIT_FN=1
+export SGLANG_CACHE_DIT_BN=0
+export SGLANG_CACHE_DIT_WARMUP=2
+export SGLANG_CACHE_DIT_RDT=0.24
+export SGLANG_CACHE_DIT_MC=3
+export SGLANG_CACHE_DIT_SCM_PRESET=fast
+```
+
+同时把第 5.3 或 5.4 节 serve 参数改成：
+
+```text
+--dit-layerwise-offload false
+--enable-torch-compile false
+```
+
+`dit_cpu_offload` 不是硬互斥项，但首轮排障建议也先设为 `false`。有效启用时，serve 日志应看到：
+
+```text
+cache-dit enabled on transformer
+VideoEdit cache-dit uses Wan adapter: blocks=..., pattern=Pattern_2, separate_cfg=True
+```
+
 ## 6. 发送本地视频请求
 
 本节要求 serve 使用第 5.3 节的“本地输出模式”启动。本地视频推理结果只保存在本地，不上传云端。

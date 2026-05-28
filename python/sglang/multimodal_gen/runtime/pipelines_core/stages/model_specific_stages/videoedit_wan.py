@@ -381,9 +381,9 @@ class VideoEditDenoisingStage(DenoisingStage):
         latents = params.runtime_latents
 
         self._manage_device_placement(self.transformer, None, server_args)
-        self._maybe_enable_cache_dit(params.runtime_effective_num_inference_steps, batch)
         batch.do_classifier_free_guidance = bool(params.runtime_do_cfg)
         batch.is_cfg_negative = False
+        self._maybe_enable_cache_dit(params.runtime_effective_num_inference_steps, batch)
 
         with torch.autocast(
             device_type=current_platform.device_type,
