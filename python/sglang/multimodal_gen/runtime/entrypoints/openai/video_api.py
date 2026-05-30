@@ -6,7 +6,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 from fastapi import (
@@ -20,6 +20,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse
+from pydantic import ValidationError
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -34,7 +35,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoRepairRequest,
     VideoResponse,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import (
+    RequestCloudStorage,
+    cloud_storage,
+    normalize_object_key,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     DEFAULT_FPS,
@@ -58,6 +63,116 @@ router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 _VIDEOEDIT_QUEUE_CAPACITY = max(1, int(os.environ.get("VIDEOEDIT_QUEUE_CAPACITY", "1")))
 _VIDEOEDIT_SEMAPHORE = asyncio.Semaphore(_VIDEOEDIT_QUEUE_CAPACITY)
+
+CallbackPayloadBuilder = Callable[[str, Dict[str, Any]], Dict[str, Any]]
+
+_VIDEO_REPAIR_FIELD_ALIASES = {
+    "taskId": "task_id",
+    "callbackUrl": "callback_url",
+    "videoUrl": "video_url",
+    "maskUrl": "mask_url",
+    "referenceImageUrl": "reference_image_url",
+    "minioConfig": "minio_config",
+    "outputObjectKey": "output_object_key",
+}
+
+_VIDEO_REPAIR_MINIO_FIELD_ALIASES = {
+    "bucketName": "bucket_name",
+    "accessKey": "access_key",
+    "secretKey": "secret_key",
+}
+
+
+def _video_repair_submit_response(code: int, message: str) -> Dict[str, Any]:
+    return {"code": int(code), "message": str(message)}
+
+
+def _normalize_aliases(
+    payload: Dict[str, Any], aliases: Dict[str, str]
+) -> Dict[str, Any]:
+    normalized = dict(payload)
+    for alias, canonical in aliases.items():
+        if alias not in payload:
+            continue
+        normalized[canonical] = payload[alias]
+        if alias != canonical:
+            normalized.pop(alias, None)
+    return normalized
+
+
+def _normalize_video_repair_payload(body: Any) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object")
+    payload = _normalize_aliases(body, _VIDEO_REPAIR_FIELD_ALIASES)
+    minio_config = payload.get("minio_config")
+    if minio_config is not None:
+        if not isinstance(minio_config, dict):
+            raise ValueError("minioConfig must be a JSON object")
+        payload["minio_config"] = _normalize_aliases(
+            minio_config, _VIDEO_REPAIR_MINIO_FIELD_ALIASES
+        )
+    return payload
+
+
+def _exception_message(e: Exception) -> str:
+    if isinstance(e, HTTPException):
+        return str(e.detail)
+    if isinstance(e, ValidationError):
+        messages = []
+        for error in e.errors():
+            loc = ".".join(str(part) for part in error.get("loc", ()))
+            msg = error.get("msg", "invalid value")
+            messages.append(f"{loc}: {msg}" if loc else msg)
+        return "; ".join(messages) or "invalid request body"
+    return str(e)
+
+
+def _job_error_message(job: Dict[str, Any]) -> str:
+    error = job.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if message:
+            return str(message)
+    if isinstance(error, str):
+        return error
+    return "failed"
+
+
+def _build_video_repair_callback_payload(
+    task_id: str, job: Dict[str, Any]
+) -> Dict[str, Any]:
+    status = job.get("status")
+    if status == "completed":
+        return {
+            "taskId": task_id,
+            "status": "completed",
+            "outputUrl": job.get("url"),
+            "message": "ok",
+        }
+    return {
+        "taskId": task_id,
+        "status": "failed",
+        "outputUrl": None,
+        "message": _job_error_message(job),
+    }
+
+
+def _validate_video_repair_request(req: VideoRepairRequest) -> None:
+    if not req.task_id:
+        raise ValueError("taskId is required")
+    if not req.callback_url:
+        raise ValueError("callbackUrl is required")
+    if req.timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if not (req.video_input_path or req.video_url):
+        raise ValueError("videoUrl or video_input_path is required")
+    if not (req.mask_input_path or req.mask_url):
+        raise ValueError("maskUrl or mask_input_path is required")
+    if req.minio_config is None and (
+        req.output_storage == "s3" or req.output_object_key is not None
+    ):
+        if not cloud_storage.is_enabled():
+            raise ValueError("minioConfig is required for S3 output")
 
 
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
@@ -215,6 +330,10 @@ async def _dispatch_job_async(
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
     callback_url: str | None = None,
+    callback_payload_builder: CallbackPayloadBuilder = _build_video_callback_payload,
+    request_storage: RequestCloudStorage | None = None,
+    output_object_key: str | None = None,
+    output_bucket: str | None = None,
 ) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
@@ -224,7 +343,19 @@ async def _dispatch_job_async(
         )
         save_file_path = save_file_path_list[0]
 
-        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+        if request_storage is not None:
+            destination_key = output_object_key or os.path.basename(save_file_path)
+            cloud_url = await request_storage.upload_and_cleanup(
+                save_file_path,
+                destination_key,
+                bucket_name=output_bucket,
+            )
+        else:
+            cloud_url = await cloud_storage.upload_and_cleanup(
+                save_file_path,
+                destination_key=output_object_key,
+                bucket_name=output_bucket,
+            )
 
         persistent_path = (
             save_file_path if not cloud_url and output_persistent else None
@@ -246,7 +377,7 @@ async def _dispatch_job_async(
                 _post_video_callback(
                     job_id,
                     callback_url,
-                    _build_video_callback_payload(job_id, job),
+                    callback_payload_builder(job_id, job),
                 )
             )
     except Exception as e:
@@ -260,7 +391,7 @@ async def _dispatch_job_async(
                 _post_video_callback(
                     job_id,
                     callback_url,
-                    _build_video_callback_payload(job_id, job),
+                    callback_payload_builder(job_id, job),
                 )
             )
     finally:
@@ -268,14 +399,17 @@ async def _dispatch_job_async(
             shutil.rmtree(td, ignore_errors=True)
 
 
-async def _save_video_source_to_path(source: str, target_path: str) -> str:
+async def _save_video_source_to_path(
+    source: str, target_path: str, *, default_ext: str = ".mp4"
+) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if source.lower().startswith(("http://", "https://")):
         async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(source, timeout=60.0)
             response.raise_for_status()
         if not os.path.splitext(target_path)[1]:
-            target_path = f"{target_path}.mp4"
+            _, ext = os.path.splitext(source.split("?", 1)[0])
+            target_path = f"{target_path}{ext or default_ext}"
         with open(target_path, "wb") as f:
             f.write(response.content)
         return target_path
@@ -286,14 +420,18 @@ async def _save_video_source_to_path(source: str, target_path: str) -> str:
         return source
     if not os.path.splitext(target_path)[1]:
         _, ext = os.path.splitext(source)
-        target_path = f"{target_path}{ext or '.mp4'}"
+        target_path = f"{target_path}{ext or default_ext}"
     shutil.copyfile(source, target_path)
     return target_path
 
 
-def _split_output_path(output_path: str | None, job_id: str, server_output_path: str | None):
+def _split_output_path(
+    output_path: str | None, job_id: str, server_output_path: str | None
+):
     if output_path and os.path.splitext(output_path)[1].lower() == ".mp4":
-        return os.path.dirname(os.path.abspath(output_path)), os.path.basename(output_path)
+        return os.path.dirname(os.path.abspath(output_path)), os.path.basename(
+            output_path
+        )
     output_dir = output_path or server_output_path
     return output_dir, f"{job_id}.mp4"
 
@@ -315,6 +453,8 @@ def _video_repair_job_from_sampling(
         "callback_url": req.callback_url,
         "callback_status": None,
         "callback_error": None,
+        "timeout": req.timeout,
+        "output_object_key": req.output_object_key,
     }
 
 
@@ -325,26 +465,68 @@ async def _dispatch_video_repair_job_async(
     temp_dirs: list[str] | None = None,
     output_persistent: bool = True,
     callback_url: str | None = None,
+    request_storage: RequestCloudStorage | None = None,
+    output_object_key: str | None = None,
+    output_bucket: str | None = None,
+    timeout: int = 300,
 ) -> None:
     try:
         await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
-        await _dispatch_job_async(
-            job_id,
-            batch,
-            temp_dirs=None,
-            output_persistent=output_persistent,
-            callback_url=callback_url,
+        await asyncio.wait_for(
+            _dispatch_job_async(
+                job_id,
+                batch,
+                temp_dirs=None,
+                output_persistent=output_persistent,
+                callback_url=callback_url,
+                callback_payload_builder=_build_video_repair_callback_payload,
+                request_storage=request_storage,
+                output_object_key=output_object_key,
+                output_bucket=output_bucket,
+            ),
+            timeout=timeout,
         )
+    except asyncio.TimeoutError:
+        await VIDEO_STORE.update_fields(
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": "task timeout"},
+            },
+        )
+        job = await VIDEO_STORE.get(job_id)
+        if job and callback_url:
+            asyncio.create_task(
+                _post_video_callback(
+                    job_id,
+                    callback_url,
+                    _build_video_repair_callback_payload(job_id, job),
+                )
+            )
     finally:
         _VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
 
 
-@router.post("/repairs", response_model=VideoResponse)
-async def create_video_repair(req: VideoRepairRequest):
+@router.post("/repairs")
+async def create_video_repair(request: Request):
     if _VIDEOEDIT_SEMAPHORE.locked():
-        raise HTTPException(status_code=429, detail="videoedit_queue_full")
+        return _video_repair_submit_response(2, "A task is running.")
+
+    try:
+        body = await request.json()
+        payload = _normalize_video_repair_payload(body)
+        req = VideoRepairRequest(**payload)
+        _validate_video_repair_request(req)
+    except Exception as e:
+        return _video_repair_submit_response(
+            1, f"Invalid request body: {_exception_message(e)}"
+        )
+
+    if _VIDEOEDIT_SEMAPHORE.locked():
+        return _video_repair_submit_response(2, "A task is running.")
+
     await _VIDEOEDIT_SEMAPHORE.acquire()
 
     server_args = get_global_server_args()
@@ -352,6 +534,11 @@ async def create_video_repair(req: VideoRepairRequest):
     temp_dirs: list[str] = []
 
     try:
+        request_storage = (
+            RequestCloudStorage(req.minio_config)
+            if req.minio_config is not None
+            else None
+        )
         uploads_dir = server_args.input_save_path
         if uploads_dir is None:
             uploads_dir = tempfile.mkdtemp(prefix="sglang_videoedit_input_")
@@ -360,23 +547,52 @@ async def create_video_repair(req: VideoRepairRequest):
 
         video_input_path = req.video_input_path
         mask_input_path = req.mask_input_path
+        reference_image_path = None
         if req.video_url:
-            video_input_path = await _save_video_source_to_path(
-                req.video_url, os.path.join(uploads_dir, f"{request_id}_video")
-            )
+            target_path = os.path.join(uploads_dir, f"{request_id}_video")
+            if request_storage is not None:
+                video_input_path = await request_storage.download_source(
+                    req.video_url, target_path, default_ext=".mp4"
+                )
+            else:
+                video_input_path = await _save_video_source_to_path(
+                    req.video_url, target_path, default_ext=".mp4"
+                )
         if req.mask_url:
-            mask_input_path = await _save_video_source_to_path(
-                req.mask_url, os.path.join(uploads_dir, f"{request_id}_mask")
-            )
+            target_path = os.path.join(uploads_dir, f"{request_id}_mask")
+            if request_storage is not None:
+                mask_input_path = await request_storage.download_source(
+                    req.mask_url, target_path, default_ext=".mp4"
+                )
+            else:
+                mask_input_path = await _save_video_source_to_path(
+                    req.mask_url, target_path, default_ext=".mp4"
+                )
+        if req.reference_image_url:
+            target_path = os.path.join(uploads_dir, f"{request_id}_reference")
+            if request_storage is not None:
+                reference_image_path = await request_storage.download_source(
+                    req.reference_image_url, target_path, default_ext=".png"
+                )
+            else:
+                reference_image_path = await _save_video_source_to_path(
+                    req.reference_image_url, target_path, default_ext=".png"
+                )
         if not video_input_path:
-            raise HTTPException(status_code=400, detail="video_input_path or video_url is required")
+            raise ValueError("videoUrl or video_input_path is required")
         if not mask_input_path:
-            raise HTTPException(status_code=400, detail="mask_input_path or mask_url is required")
+            raise ValueError("maskUrl or mask_input_path is required")
 
         resolved_num_frames = resolve_videoedit_num_frames(
             req.num_frames,
             video_input_path,
             mask_input_path,
+        )
+        has_reference_image = bool(reference_image_path)
+        effective_drop_reference_frame = (
+            req.drop_reference_frame
+            if req.drop_reference_frame is not None
+            else has_reference_image
         )
 
         output_dir, output_file_name = _split_output_path(
@@ -395,6 +611,7 @@ async def create_video_repair(req: VideoRepairRequest):
             negative_prompt=req.negative_prompt,
             video_input_path=video_input_path,
             mask_input_path=mask_input_path,
+            reference_image_path=reference_image_path,
             output_path=output_dir,
             output_file_name=output_file_name,
             num_frames=resolved_num_frames,
@@ -416,7 +633,7 @@ async def create_video_repair(req: VideoRepairRequest):
             adain_boundary_dilate=req.adain_boundary_dilate,
             enable_paste_back=req.enable_paste_back,
             save_crop_only=req.save_crop_only,
-            drop_reference_frame=req.drop_reference_frame,
+            drop_reference_frame=effective_drop_reference_frame,
             keep_intermediate_windows=req.keep_intermediate_windows,
             use_repaired_context=req.use_repaired_context,
             vary_seed_by_window=req.vary_seed_by_window,
@@ -432,9 +649,21 @@ async def create_video_repair(req: VideoRepairRequest):
             output_compression=req.output_compression,
             perf_dump_path=req.perf_dump_path,
         )
+        output_object_key = None
+        if (
+            request_storage is not None
+            or req.output_storage == "s3"
+            or req.output_object_key is not None
+        ):
+            output_object_key = normalize_object_key(
+                req.output_object_key or f"{request_id}.mp4"
+            )
+        req.output_object_key = output_object_key
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)
         await VIDEO_STORE.upsert(request_id, job)
-        batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
+        batch = prepare_request(
+            server_args=server_args, sampling_params=sampling_params
+        )
         asyncio.create_task(
             _dispatch_video_repair_job_async(
                 request_id,
@@ -442,14 +671,19 @@ async def create_video_repair(req: VideoRepairRequest):
                 temp_dirs=temp_dirs or None,
                 output_persistent=output_persistent,
                 callback_url=req.callback_url,
+                request_storage=request_storage,
+                output_object_key=output_object_key,
+                output_bucket=req.output_bucket,
+                timeout=req.timeout,
             )
         )
-        return VideoResponse(**job)
-    except Exception:
+        return _video_repair_submit_response(0, "ok")
+    except Exception as e:
         _VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
-        raise
+        logger.warning("Video repair request failed: %s", _exception_message(e))
+        return _video_repair_submit_response(1, _exception_message(e))
 
 
 # TODO: support image to video generation

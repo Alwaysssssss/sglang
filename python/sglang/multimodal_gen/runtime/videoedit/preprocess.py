@@ -257,6 +257,7 @@ def prepare_global_inputs(
     input_video: str,
     mask_video: str,
     num_frames: int | None = None,
+    reference_image: str | None = None,
     bbox_padding: int = 0,
     dilate_px: int = 15,
     mask_scale: float = 1.2,
@@ -276,7 +277,16 @@ def prepare_global_inputs(
         raise RuntimeError("No frames loaded from input or mask video")
     original_frames = original_frames[:n]
     raw_mask_frames = raw_mask_frames[:n]
-    dilated_masks = expand_mask_frames(raw_mask_frames, dilate_px=dilate_px, scale=mask_scale)
+    if reference_image:
+        with Image.open(reference_image) as image:
+            reference_frame = image.convert("RGB").resize(original_frames[0].size)
+        reference_mask = Image.new("L", original_frames[0].size, 255)
+        original_frames = [reference_frame] + original_frames
+        raw_mask_frames = [reference_mask] + raw_mask_frames
+        n = len(original_frames)
+    dilated_masks = expand_mask_frames(
+        raw_mask_frames, dilate_px=dilate_px, scale=mask_scale
+    )
     bbox = get_mask_bbox(dilated_masks, padding=bbox_padding)
     if bbox is None:
         raise RuntimeError("No mask region detected")

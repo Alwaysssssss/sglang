@@ -117,8 +117,18 @@ class VideoGenerationsRequest(BaseModel):
     perf_dump_path: Optional[str] = None
 
 
+class VideoRepairMinioConfig(BaseModel):
+    endpoint: str
+    bucket_name: str
+    access_key: str
+    secret_key: str
+    secure: bool = False
+    region: str = "us-east-1"
+
+
 class VideoRepairRequest(BaseModel):
     task_id: Optional[str] = None
+    timeout: int = 300
     prompt: str
     negative_prompt: Optional[str] = None
     model: Optional[str] = None
@@ -127,14 +137,16 @@ class VideoRepairRequest(BaseModel):
     mask_input_path: Optional[str] = None
     video_url: Optional[str] = None
     mask_url: Optional[str] = None
+    reference_image_url: Optional[str] = None
 
     callback_url: Optional[str] = None
+    minio_config: Optional[VideoRepairMinioConfig] = None
     output_storage: str = "local"
     output_path: Optional[str] = None
     output_bucket: Optional[str] = None
     output_object_key: Optional[str] = None
 
-    num_frames: int = 81
+    num_frames: int = -1
     infer_len: int = 81
     overlap: int = 0
     strength: float = 1.0
@@ -154,7 +166,7 @@ class VideoRepairRequest(BaseModel):
     adain_boundary_dilate: int = 15
     enable_paste_back: bool = True
     save_crop_only: bool = False
-    drop_reference_frame: bool = True
+    drop_reference_frame: Optional[bool] = None
     keep_intermediate_windows: bool = False
     use_repaired_context: bool = True
     vary_seed_by_window: bool = False

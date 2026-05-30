@@ -122,6 +122,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             input_video=params.video_input_path,
             mask_video=params.mask_input_path,
             num_frames=params.num_frames,
+            reference_image=params.reference_image_path,
             bbox_padding=params.bbox_padding,
             dilate_px=params.dilate_px,
             mask_scale=params.mask_scale,
@@ -227,6 +228,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         metadata = {
             "video_input_path": params.video_input_path,
             "mask_input_path": params.mask_input_path,
+            "reference_image_path": params.reference_image_path,
             "bbox": params.runtime_bbox,
             "crop_h": params.runtime_crop_h,
             "crop_w": params.runtime_crop_w,
