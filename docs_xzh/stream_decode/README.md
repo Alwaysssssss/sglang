@@ -89,7 +89,7 @@
 
 建议默认值：
 
-- 第一阶段默认仍为 `eager`
+- 当前代码默认值为 `stream`
 
 原因：
 
@@ -134,7 +134,7 @@
 
 1. 显式请求参数
 2. CLI 默认值
-3. 代码内默认值 `eager`
+3. 代码内默认值 `stream`
 
 建议行为：
 
@@ -183,6 +183,11 @@ class SequentialVideoDecoder:
 1. 第一阶段只支持单调递增访问。
 2. 不支持随机回跳。
 3. 如遇窗口反射补帧，优先从已提交输出或已缓存原始帧解决，不回源随机 seek。
+
+实现注记：
+
+1. 当前 phase2/phase3 落地版本为保证与原 eager 路径逐帧一致，输入解码 backend 先采用顺序 `OpenCV VideoCapture`。
+2. 抽象层已经收敛在 `stream_decoder.py` / `frame_provider.py`，后续如需切换到常驻 ffmpeg 进程，只需要替换 decoder backend，不需要再改窗口执行逻辑。
 
 ### 4.4 SequentialMaskDecoder
 
@@ -366,7 +371,7 @@ bbox 确定后再正式进入推理期：
 建议在请求和 CLI 中增加：
 
 ```json
-"decode_mode": "eager"
+"decode_mode": "stream"
 ```
 
 CLI 建议增加：
@@ -381,7 +386,7 @@ CLI 建议增加：
 建议在 `WanVideoEditSamplingParams` 中新增字段：
 
 ```python
-decode_mode: str = "eager"
+decode_mode: str = "stream"
 ```
 
 并增加校验：
@@ -572,8 +577,8 @@ max_failed_frame_ratio = 0.0
 
 行为：
 
-1. 默认值保持 `decode_mode=eager`
-2. 新路径只在显式传入 `decode_mode=stream` 时启用
+1. 当前默认值已切换为 `decode_mode=stream`
+2. 如需保留旧路径，可显式传入 `decode_mode=eager`
 3. 若 `stream` 路径出现稳定性问题，调用方可以立即切回 `eager`
 4. 如需调试或压测，可额外补充环境变量覆盖，但不作为主接口
 

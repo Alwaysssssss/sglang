@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VideoEditWindowValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.videoedit.frame_provider import (
+    WindowFrameProvider,
+)
 from sglang.multimodal_gen.runtime.videoedit.io import save_video_frames
 from sglang.multimodal_gen.runtime.videoedit.postprocess import paste_back
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
@@ -119,7 +122,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
     def _prepare_global_videoedit_context(
         self, params: WanVideoEditSamplingParams, batch: Req
     ) -> None:
-        scanned_geometry = None
+        params.runtime_frame_provider = None
         if params.decode_mode == "stream":
             scanned_geometry = scan_global_bbox(
                 input_video=params.video_input_path,
@@ -131,28 +134,50 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 mask_scale=params.mask_scale,
                 align=16,
             )
-        data = prepare_global_inputs(
-            input_video=params.video_input_path,
-            mask_video=params.mask_input_path,
-            num_frames=params.num_frames,
-            reference_image=params.reference_image_path,
-            bbox_padding=params.bbox_padding,
-            dilate_px=params.dilate_px,
-            mask_scale=params.mask_scale,
-            align=16,
-            scanned_geometry=scanned_geometry,
-        )
-        params.runtime_original_frames = data["original_frames"]
-        params.runtime_dilated_cropped_masks = data["dilated_cropped_masks"]
-        params.runtime_resized_frames = data["resized_video"]
-        params.runtime_resized_masks = data["resized_masks"]
-        params.runtime_bbox = data["bbox"]
-        params.runtime_crop_h = data["crop_h"]
-        params.runtime_crop_w = data["crop_w"]
-        params.runtime_aligned_h = data["aligned_h"]
-        params.runtime_aligned_w = data["aligned_w"]
-        params.runtime_fps = data["fps"]
-        params.runtime_num_input_frames = data["num_frames"]
+            provider = WindowFrameProvider.from_scanned_geometry(
+                video_input_path=params.video_input_path,
+                mask_input_path=params.mask_input_path,
+                reference_image_path=params.reference_image_path,
+                scanned_geometry=scanned_geometry,
+                dilate_px=params.dilate_px,
+                mask_scale=params.mask_scale,
+                infer_len=params.infer_len,
+                enable_prefetch=True,
+            )
+            params.runtime_original_frames = None
+            params.runtime_dilated_cropped_masks = None
+            params.runtime_resized_frames = None
+            params.runtime_resized_masks = None
+            params.runtime_frame_provider = provider
+            params.runtime_bbox = tuple(scanned_geometry["bbox"])
+            params.runtime_crop_h = int(scanned_geometry["crop_h"])
+            params.runtime_crop_w = int(scanned_geometry["crop_w"])
+            params.runtime_aligned_h = int(scanned_geometry["aligned_h"])
+            params.runtime_aligned_w = int(scanned_geometry["aligned_w"])
+            params.runtime_fps = float(scanned_geometry["fps"])
+            params.runtime_num_input_frames = int(scanned_geometry["num_frames"])
+        else:
+            data = prepare_global_inputs(
+                input_video=params.video_input_path,
+                mask_video=params.mask_input_path,
+                num_frames=params.num_frames,
+                reference_image=params.reference_image_path,
+                bbox_padding=params.bbox_padding,
+                dilate_px=params.dilate_px,
+                mask_scale=params.mask_scale,
+                align=16,
+            )
+            params.runtime_original_frames = data["original_frames"]
+            params.runtime_dilated_cropped_masks = data["dilated_cropped_masks"]
+            params.runtime_resized_frames = data["resized_video"]
+            params.runtime_resized_masks = data["resized_masks"]
+            params.runtime_bbox = data["bbox"]
+            params.runtime_crop_h = data["crop_h"]
+            params.runtime_crop_w = data["crop_w"]
+            params.runtime_aligned_h = data["aligned_h"]
+            params.runtime_aligned_w = data["aligned_w"]
+            params.runtime_fps = data["fps"]
+            params.runtime_num_input_frames = data["num_frames"]
         params.runtime_accum_frames = [
             np.zeros((params.runtime_aligned_h, params.runtime_aligned_w, 3), dtype=np.float32)
             for _ in range(params.runtime_num_input_frames)
@@ -167,8 +192,15 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
     def _materialize_window_inputs(
         self, params: WanVideoEditSamplingParams, window_spec: Any
     ) -> None:
+        provider = params.runtime_frame_provider
+        if provider is not None:
+            source_frames, masks = provider.materialize_window(window_spec.input_indices)
+        else:
+            source_frames = [params.runtime_resized_frames[idx] for idx in window_spec.input_indices]
+            masks = [params.runtime_resized_masks[idx] for idx in window_spec.input_indices]
+
         frames: list[Image.Image] = []
-        for idx in window_spec.input_indices:
+        for idx, source_frame in zip(window_spec.input_indices, source_frames, strict=True):
             use_repaired = (
                 params.use_repaired_context
                 and params.runtime_accum_weights is not None
@@ -181,8 +213,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 frames.append(_float_array_to_image(repaired))
             else:
-                frames.append(params.runtime_resized_frames[idx])
-        masks = [params.runtime_resized_masks[idx] for idx in window_spec.input_indices]
+                frames.append(source_frame)
         params.runtime_window_frames = frames
         params.runtime_window_masks = masks
 
@@ -226,11 +257,15 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def _finalize_crop_frames(self, params: WanVideoEditSamplingParams) -> list[Image.Image]:
         crop_frames: list[Image.Image] = []
+        provider = params.runtime_frame_provider
         for idx, weight in enumerate(params.runtime_accum_weights):
             if weight > 0:
                 crop_frames.append(_float_array_to_image(params.runtime_accum_frames[idx] / weight))
             else:
-                crop_frames.append(params.runtime_resized_frames[idx])
+                if provider is not None:
+                    crop_frames.append(provider.get_resized_frame(idx))
+                else:
+                    crop_frames.append(params.runtime_resized_frames[idx])
         return crop_frames
 
     def _write_metadata(
@@ -292,16 +327,23 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         self._save_crop_sidecar(params, crop_frames, output_video_path)
 
         if params.enable_paste_back:
-            frames = paste_back(
-                original_frames=params.runtime_original_frames,
-                generated_frames=crop_frames,
-                mask_frames=params.runtime_dilated_cropped_masks,
-                bbox=params.runtime_bbox,
-                crop_h=params.runtime_crop_h,
-                crop_w=params.runtime_crop_w,
-                feather_px=params.feather_px,
-                adain_boundary_dilate=params.adain_boundary_dilate,
-            )
+            if params.runtime_frame_provider is not None:
+                frames = params.runtime_frame_provider.paste_back_frames(
+                    crop_frames,
+                    feather_px=params.feather_px,
+                    adain_boundary_dilate=params.adain_boundary_dilate,
+                )
+            else:
+                frames = paste_back(
+                    original_frames=params.runtime_original_frames,
+                    generated_frames=crop_frames,
+                    mask_frames=params.runtime_dilated_cropped_masks,
+                    bbox=params.runtime_bbox,
+                    crop_h=params.runtime_crop_h,
+                    crop_w=params.runtime_crop_w,
+                    feather_px=params.feather_px,
+                    adain_boundary_dilate=params.adain_boundary_dilate,
+                )
         else:
             frames = resize_frames(crop_frames, params.runtime_crop_h, params.runtime_crop_w)
 
@@ -309,6 +351,11 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             frames = frames[1:]
         self._write_metadata(params, output_video_path)
         return frames
+
+    def _cleanup_videoedit_context(self, params: WanVideoEditSamplingParams) -> None:
+        if params.runtime_frame_provider is not None:
+            params.runtime_frame_provider.close()
+            params.runtime_frame_provider = None
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
@@ -331,22 +378,23 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
         with self.executor.profile_execution(batch, dump_rank=0):
             self._prepare_global_videoedit_context(params, batch)
-            window_specs = build_videoedit_window_specs(
-                num_frames=params.runtime_num_input_frames,
-                infer_len=params.infer_len,
-                overlap=params.overlap,
-            )
-            params.runtime_window_specs = window_specs
-            for window_spec in window_specs:
-                params.reset_window_runtime(window_spec)
-                self._materialize_window_inputs(params, window_spec)
-                # for stage in self.videoedit_stages:
-                #     batch = stage(batch, server_args)
-                self.executor.execute_with_profiling(self.stages, batch, server_args)
-                self._commit_window_output(params, window_spec)
+            try:
+                window_specs = build_videoedit_window_specs(
+                    num_frames=params.runtime_num_input_frames,
+                    infer_len=params.infer_len,
+                    overlap=params.overlap,
+                )
+                params.runtime_window_specs = window_specs
+                for window_spec in window_specs:
+                    params.reset_window_runtime(window_spec)
+                    self._materialize_window_inputs(params, window_spec)
+                    self.executor.execute_with_profiling(self.stages, batch, server_args)
+                    self._commit_window_output(params, window_spec)
 
-            output_frames = self._finalize_long_video_output(params, batch)
-            batch.output = _pil_frames_to_video_tensor(output_frames)
+                output_frames = self._finalize_long_video_output(params, batch)
+                batch.output = _pil_frames_to_video_tensor(output_frames)
+            finally:
+                self._cleanup_videoedit_context(params)
 
         return batch
 

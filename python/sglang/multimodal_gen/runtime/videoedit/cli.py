@@ -53,7 +53,7 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-intermediate-windows", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-repaired-context", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vary-seed-by-window", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--decode-mode", choices=["eager", "stream"], default="eager")
+    parser.add_argument("--decode-mode", choices=["eager", "stream"], default="stream")
     parser.add_argument("--generator-device")
     parser.add_argument("--output-quality", default="default")
     parser.add_argument("--output-compression", type=int)

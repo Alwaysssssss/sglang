@@ -40,7 +40,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     keep_intermediate_windows: bool = False
     use_repaired_context: bool = True
     vary_seed_by_window: bool = False
-    decode_mode: str = "eager"
+    decode_mode: str = "stream"
 
     # VideoEdit defaults
     num_frames: int = 81
@@ -64,6 +64,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_resized_frames: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_resized_masks: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_dilated_cropped_masks: list[Any] | None = field(default=None, init=False, repr=False)
+    runtime_frame_provider: Any | None = field(default=None, init=False, repr=False)
     runtime_window_specs: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_accum_frames: Any | None = field(default=None, init=False, repr=False)
     runtime_accum_weights: Any | None = field(default=None, init=False, repr=False)

@@ -1,0 +1,34 @@
+{
+  "video_input_path": "/mnt/nas/models/DifusserEdit/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4",
+  "mask_input_path": "/mnt/nas/models/DifusserEdit/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4",
+  "reference_image_path": null,
+  "bbox": [
+    788,
+    231,
+    1458,
+    855
+  ],
+  "crop_h": 624,
+  "crop_w": 670,
+  "aligned_h": 624,
+  "aligned_w": 672,
+  "fps": 25.0,
+  "num_input_frames": 156,
+  "num_output_frames": null,
+  "drop_reference_frame": false,
+  "enable_paste_back": true,
+  "window_specs": [
+    {
+      "window_index": 0,
+      "start_index": 0,
+      "end_index": 81,
+      "reflected_count": 0
+    },
+    {
+      "window_index": 1,
+      "start_index": 81,
+      "end_index": 156,
+      "reflected_count": 6
+    }
+  ]
+}
