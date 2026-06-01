@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.videoedit.postprocess import paste_back
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     prepare_global_inputs,
     resize_frames,
+    scan_global_bbox,
 )
 from sglang.multimodal_gen.runtime.videoedit.windowing import (
     build_videoedit_window_specs,
@@ -118,6 +119,18 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
     def _prepare_global_videoedit_context(
         self, params: WanVideoEditSamplingParams, batch: Req
     ) -> None:
+        scanned_geometry = None
+        if params.decode_mode == "stream":
+            scanned_geometry = scan_global_bbox(
+                input_video=params.video_input_path,
+                mask_video=params.mask_input_path,
+                num_frames=params.num_frames,
+                reference_image=params.reference_image_path,
+                bbox_padding=params.bbox_padding,
+                dilate_px=params.dilate_px,
+                mask_scale=params.mask_scale,
+                align=16,
+            )
         data = prepare_global_inputs(
             input_video=params.video_input_path,
             mask_video=params.mask_input_path,
@@ -127,6 +140,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             dilate_px=params.dilate_px,
             mask_scale=params.mask_scale,
             align=16,
+            scanned_geometry=scanned_geometry,
         )
         params.runtime_original_frames = data["original_frames"]
         params.runtime_dilated_cropped_masks = data["dilated_cropped_masks"]

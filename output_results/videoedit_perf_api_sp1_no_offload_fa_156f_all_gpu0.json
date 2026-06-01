@@ -1,0 +1,63 @@
+{
+  "timestamp": "2026-06-01T10:25:58.370356+00:00",
+  "request_id": "sp1_no_offload_fa_156f_all_gpu0",
+  "commit_hash": "N/A",
+  "tag": "server_perf_dump",
+  "total_duration_ms": 683672.7192513645,
+  "steps": [
+    {
+      "name": "VideoEditWindowValidationStage",
+      "duration_ms": 0.028878450393676758
+    },
+    {
+      "name": "VideoEditTextEncodingStage",
+      "duration_ms": 660.4627333581448
+    },
+    {
+      "name": "VideoEditConditionEncodingStage",
+      "duration_ms": 5545.3808680176735
+    },
+    {
+      "name": "VideoEditLatentPreparationStage",
+      "duration_ms": 0.14479458332061768
+    },
+    {
+      "name": "VideoEditTimestepPreparationStage",
+      "duration_ms": 0.23815035820007324
+    },
+    {
+      "name": "VideoEditLatentInitStage",
+      "duration_ms": 0.2508684992790222
+    },
+    {
+      "name": "VideoEditDenoisingStage",
+      "duration_ms": 323372.33001738787
+    },
+    {
+      "name": "VideoEditDecodingStage",
+      "duration_ms": 4811.690032482147
+    },
+    {
+      "name": "VideoEditWindowPostprocessStage",
+      "duration_ms": 0.047110021114349365
+    }
+  ],
+  "denoise_steps_ms": [],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 1552.12,
+      "reserved_mb": 6598.0,
+      "peak_allocated_mb": 1552.12,
+      "peak_reserved_mb": 6598.0
+    },
+    "after_forward": {
+      "allocated_mb": 2433.81,
+      "reserved_mb": 6600.0,
+      "peak_allocated_mb": 5097.46,
+      "peak_reserved_mb": 6600.0
+    }
+  },
+  "meta": {
+    "model": "/mnt/nas/models/DifusserEdit/pretrain_models/VideoEdit-diffusers-model"
+  }
+}

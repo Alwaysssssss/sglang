@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_1_3b_coeffici
 DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
+VIDEOEDIT_DECODE_MODES = ("eager", "stream")
 
 
 @dataclass
@@ -39,6 +40,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     keep_intermediate_windows: bool = False
     use_repaired_context: bool = True
     vary_seed_by_window: bool = False
+    decode_mode: str = "eager"
 
     # VideoEdit defaults
     num_frames: int = 81
@@ -141,6 +143,11 @@ class WanVideoEditSamplingParams(SamplingParams):
             raise ValueError("VideoEdit only supports num_outputs_per_prompt=1")
         if self.dtype not in {"bf16", "fp16", "fp32"}:
             raise ValueError(f"dtype must be one of bf16/fp16/fp32, got {self.dtype!r}")
+        if self.decode_mode not in VIDEOEDIT_DECODE_MODES:
+            raise ValueError(
+                "decode_mode must be one of "
+                f"{'/'.join(VIDEOEDIT_DECODE_MODES)}, got {self.decode_mode!r}"
+            )
 
     def _validate_with_pipeline_config(self, pipeline_config):
         super()._validate_with_pipeline_config(pipeline_config)
