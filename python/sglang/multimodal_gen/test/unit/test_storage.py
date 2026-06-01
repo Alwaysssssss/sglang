@@ -12,7 +12,12 @@ from types import SimpleNamespace
 import pytest
 
 import sglang.multimodal_gen.runtime.entrypoints.openai.storage as storage_mod
-from sglang.multimodal_gen.runtime.entrypoints.openai.storage import CloudStorage
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import (
+    CloudStorage,
+    RequestCloudStorage,
+    normalize_endpoint,
+    normalize_object_key,
+)
 
 
 def _create_temp_file(tmp_path, name="test.png", content=b"\x89PNG\r\n\x1a\nfake"):
@@ -23,6 +28,36 @@ def _create_temp_file(tmp_path, name="test.png", content=b"\x89PNG\r\n\x1a\nfake
 
 
 # UNIT TESTS
+
+
+def test_normalize_endpoint_adds_scheme():
+    assert normalize_endpoint("minio.example.com:9000", secure=False) == (
+        "http://minio.example.com:9000"
+    )
+    assert normalize_endpoint("minio.example.com:9000", secure=True) == (
+        "https://minio.example.com:9000"
+    )
+    assert normalize_endpoint("http://minio.example.com:9000/") == (
+        "http://minio.example.com:9000"
+    )
+
+
+def test_normalize_object_key_rejects_empty_and_parent_segments():
+    assert normalize_object_key("/outputs/demo.mp4") == "outputs/demo.mp4"
+    with pytest.raises(ValueError):
+        normalize_object_key("")
+    with pytest.raises(ValueError):
+        normalize_object_key("outputs/../demo.mp4")
+
+
+def test_request_cloud_storage_parses_minio_http_url():
+    request_storage = object.__new__(RequestCloudStorage)
+    request_storage.bucket_name = "flowcut"
+    request_storage.endpoint_url = "http://minio.example.com:9000"
+
+    assert request_storage._parse_source_object(
+        "http://minio.example.com:9000/flowcut/input/video.mp4"
+    ) == ("flowcut", "input/video.mp4")
 
 
 def test_upload_file_success(tmp_path):

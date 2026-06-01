@@ -5,12 +5,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from sglang.multimodal_gen.runtime.videoedit.mask_io import (
     load_mask_frames,
     probe_mask_frame_count,
 )
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+    prepare_global_inputs,
     resolve_videoedit_num_frames,
 )
 
@@ -79,6 +81,32 @@ class TestVideoEditMaskSources(unittest.TestCase):
                 resolve_videoedit_num_frames(-1, str(video_path), str(mask_path)),
                 5,
             )
+
+    def test_prepare_global_inputs_prepends_reference_frame_and_mask(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "video.avi"
+            mask_path = Path(temp_dir) / "mask.npy"
+            reference_path = Path(temp_dir) / "reference.png"
+            _write_test_video(video_path, 3)
+            masks = np.ones((3, 8, 8), dtype=np.uint8)
+            np.save(mask_path, masks)
+            Image.new("RGB", (4, 4), (200, 10, 20)).save(reference_path)
+
+            data = prepare_global_inputs(
+                str(video_path),
+                str(mask_path),
+                num_frames=3,
+                reference_image=str(reference_path),
+                dilate_px=0,
+                mask_scale=1.0,
+            )
+
+            self.assertEqual(data["num_frames"], 4)
+            self.assertEqual(data["original_frames"][0].size, (8, 8))
+            self.assertEqual(np.asarray(data["original_frames"][0])[0, 0, 0], 200)
+            self.assertEqual(np.asarray(data["original_frames"][1])[0, 0, 0], 0)
+            self.assertEqual(int(np.asarray(data["dilated_cropped_masks"][0]).sum()), 0)
+            self.assertGreater(int(np.asarray(data["dilated_cropped_masks"][1]).sum()), 0)
 
     def test_load_current_coco_rle_json(self):
         with tempfile.TemporaryDirectory() as temp_dir:
