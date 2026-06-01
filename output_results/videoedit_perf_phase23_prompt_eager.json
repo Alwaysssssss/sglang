@@ -1,0 +1,63 @@
+{
+  "timestamp": "2026-06-01T14:38:28.908484+00:00",
+  "request_id": "637b68e9-c124-4283-bae6-ce2b0be816b1",
+  "commit_hash": "7afb7fbd1e1ee75339fc53d4f5b2c9a533052cf7",
+  "tag": "server_perf_dump",
+  "total_duration_ms": 681471.8340262771,
+  "steps": [
+    {
+      "name": "VideoEditWindowValidationStage",
+      "duration_ms": 0.023152679204940796
+    },
+    {
+      "name": "VideoEditTextEncodingStage",
+      "duration_ms": 643.7624283134937
+    },
+    {
+      "name": "VideoEditConditionEncodingStage",
+      "duration_ms": 5634.665850549936
+    },
+    {
+      "name": "VideoEditLatentPreparationStage",
+      "duration_ms": 0.15589967370033264
+    },
+    {
+      "name": "VideoEditTimestepPreparationStage",
+      "duration_ms": 0.24615228176116943
+    },
+    {
+      "name": "VideoEditLatentInitStage",
+      "duration_ms": 0.30578672885894775
+    },
+    {
+      "name": "VideoEditDenoisingStage",
+      "duration_ms": 323370.8453439176
+    },
+    {
+      "name": "VideoEditDecodingStage",
+      "duration_ms": 4678.483217954636
+    },
+    {
+      "name": "VideoEditWindowPostprocessStage",
+      "duration_ms": 0.019859522581100464
+    }
+  ],
+  "denoise_steps_ms": [],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 1552.12,
+      "reserved_mb": 6596.0,
+      "peak_allocated_mb": 1552.12,
+      "peak_reserved_mb": 6596.0
+    },
+    "after_forward": {
+      "allocated_mb": 2433.81,
+      "reserved_mb": 6598.0,
+      "peak_allocated_mb": 5097.46,
+      "peak_reserved_mb": 6598.0
+    }
+  },
+  "meta": {
+    "model": "/mnt/nas/models/DifusserEdit/pretrain_models/VideoEdit-diffusers-model"
+  }
+}

@@ -35,14 +35,17 @@ sglang serve \
   --input-save-path "$INPUT_SAVE_DIR" \
   --transformer-path "$TRANSFORMER_PATH"
 
+# eager
 curl --noproxy '*' -sS -X POST http://127.0.0.1:30042/v1/videos/repairs \
     -H 'Content-Type: application/json' \
     -d '{
+      "task_id": "sp1_no_offload_fa_156f_all_gpu0_eager",
+      "prompt": "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.",
       "video_input_path": "/mnt/nas/models/DifusserEdit/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4",
       "mask_input_path": "/mnt/nas/models/DifusserEdit/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4",
       "callback_url": "http://127.0.0.1:18080/videoedit/callback",
       "output_storage": "local",
-      "output_path": "/mnt/nas/xzh/project/VideoEdit/sglang/output_results/15108907_3840_2160_50fps_api_sp1_no_offload_fa_156f_all_gpu0.mp4",
+      "output_path": "/mnt/nas/xzh/project/VideoEdit/sglang/output_results/15108907_3840_2160_50fps_api_sp1_no_offload_fa_156f_all_gpu0_eager.mp4",
       "num_frames": 156,
       "infer_len": 81,
       "overlap": 0,
@@ -55,5 +58,31 @@ curl --noproxy '*' -sS -X POST http://127.0.0.1:30042/v1/videos/repairs \
       "decode_mode": "eager",
       "enable_paste_back": true,
       "drop_reference_frame": false,
-      "perf_dump_path": "/mnt/nas/xzh/project/VideoEdit/sglang/output_results/videoedit_perf_api_sp1_no_offload_fa_156f_all_gpu0.json"
+      "perf_dump_path": "/mnt/nas/xzh/project/VideoEdit/sglang/output_results/videoedit_perf_api_sp1_no_offload_fa_156f_all_gpu0_eager.json"
+    }'
+
+# stream
+curl --noproxy '*' -sS -X POST http://127.0.0.1:30042/v1/videos/repairs \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "task_id": "sp1_no_offload_fa_156f_all_gpu0_stream",
+      "prompt": "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.",
+      "video_input_path": "/mnt/nas/models/DifusserEdit/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4",
+      "mask_input_path": "/mnt/nas/models/DifusserEdit/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4",
+      "callback_url": "http://127.0.0.1:18080/videoedit/callback",
+      "output_storage": "local",
+      "output_path": "/mnt/nas/xzh/project/VideoEdit/sglang/output_results/15108907_3840_2160_50fps_api_sp1_no_offload_fa_156f_all_gpu0_stream.mp4",
+      "num_frames": 156,
+      "infer_len": 81,
+      "overlap": 0,
+      "num_inference_steps": 20,
+      "guidance_scale": 5.0,
+      "dynamic_cfg": true,
+      "dynamic_cfg_max_step": 15,
+      "seed": 42,
+      "dtype": "bf16",
+      "decode_mode": "stream",
+      "enable_paste_back": true,
+      "drop_reference_frame": false,
+      "perf_dump_path": "/mnt/nas/xzh/project/VideoEdit/sglang/output_results/videoedit_perf_api_sp1_no_offload_fa_156f_all_gpu0_stream.json"
     }'

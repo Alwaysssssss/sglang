@@ -273,5 +273,8 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 
+# Video files
+*.mp4
+
 # mgtv
 wheel/output_tyx/

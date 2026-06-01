@@ -184,6 +184,11 @@ class SequentialVideoDecoder:
 2. 不支持随机回跳。
 3. 如遇窗口反射补帧，优先从已提交输出或已缓存原始帧解决，不回源随机 seek。
 
+实现注记：
+
+1. 当前 phase2/phase3 落地版本为保证与原 eager 路径逐帧一致，输入解码 backend 先采用顺序 `OpenCV VideoCapture`。
+2. 抽象层已经收敛在 `stream_decoder.py` / `frame_provider.py`，后续如需切换到常驻 ffmpeg 进程，只需要替换 decoder backend，不需要再改窗口执行逻辑。
+
 ### 4.4 SequentialMaskDecoder
 
 mask 源有三类：

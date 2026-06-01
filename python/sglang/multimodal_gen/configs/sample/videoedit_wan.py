@@ -64,6 +64,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_resized_frames: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_resized_masks: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_dilated_cropped_masks: list[Any] | None = field(default=None, init=False, repr=False)
+    runtime_frame_provider: Any | None = field(default=None, init=False, repr=False)
     runtime_window_specs: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_accum_frames: Any | None = field(default=None, init=False, repr=False)
     runtime_accum_weights: Any | None = field(default=None, init=False, repr=False)
