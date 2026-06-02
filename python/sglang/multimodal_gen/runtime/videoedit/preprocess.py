@@ -57,6 +57,24 @@ def probe_video_frame_count(video_path: str) -> int:
     return count
 
 
+def probe_video_frame_size_and_fps(video_path: str) -> tuple[tuple[int, int], float]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video file: {video_path}")
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if width <= 0 or height <= 0:
+            ok, frame = cap.read()
+            if not ok:
+                raise RuntimeError(f"Could not read a frame from video file: {video_path}")
+            height, width = frame.shape[:2]
+    finally:
+        cap.release()
+    return (width, height), fps
+
+
 def resolve_videoedit_num_frames(
     requested_num_frames: int,
     video_input_path: str,
@@ -88,10 +106,11 @@ def get_aligned_size(h: int, w: int, align: int = 16) -> tuple[int, int]:
 
 
 def resize_frames(frames: list[Image.Image], target_h: int, target_w: int) -> list[Image.Image]:
-    return [
-        Image.fromarray(cv2.resize(np.array(frame), (target_w, target_h)))
-        for frame in frames
-    ]
+    return [resize_frame(frame, target_h, target_w) for frame in frames]
+
+
+def resize_frame(frame: Image.Image, target_h: int, target_w: int) -> Image.Image:
+    return Image.fromarray(cv2.resize(np.array(frame), (target_w, target_h)))
 
 
 def _dilate_single(binary: np.ndarray, dilate_px: int) -> np.ndarray:
@@ -131,14 +150,31 @@ def expand_mask_frames(
 ) -> list[Image.Image]:
     result: list[Image.Image] = []
     for i, mask in enumerate(mask_frames):
-        if i == 0:
-            result.append(Image.new("L", mask.size, 0))
-            continue
-        gray = np.array(mask.convert("L")).astype(np.float32) / 255.0
-        binary = ((gray > threshold) * 255).astype(np.uint8)
-        expanded = _scale_single(_dilate_single(binary, dilate_px), scale)
-        result.append(Image.fromarray(expanded, mode="L"))
+        result.append(
+            expand_mask_frame(
+                mask,
+                dilate_px=dilate_px,
+                scale=scale,
+                threshold=threshold,
+                force_zero=i == 0,
+            )
+        )
     return result
+
+
+def expand_mask_frame(
+    mask: Image.Image,
+    dilate_px: int = 15,
+    scale: float = 1.2,
+    threshold: float = 0.5,
+    force_zero: bool = False,
+) -> Image.Image:
+    if force_zero:
+        return Image.new("L", mask.size, 0)
+    gray = np.array(mask.convert("L")).astype(np.float32) / 255.0
+    binary = ((gray > threshold) * 255).astype(np.uint8)
+    expanded = _scale_single(_dilate_single(binary, dilate_px), scale)
+    return Image.fromarray(expanded, mode="L")
 
 
 def get_mask_bbox(
@@ -211,11 +247,38 @@ def expand_bbox_for_small(
     return max(0, x_min), max(0, y_min), min(width, x_max), min(height, y_max)
 
 
+def _finalize_bbox_geometry(
+    bbox: tuple[int, int, int, int],
+    *,
+    height: int,
+    width: int,
+    align: int,
+) -> dict[str, int | tuple[int, int, int, int]]:
+    x_min, y_min, x_max, y_max = bbox
+    crop_w, crop_h = x_max - x_min, y_max - y_min
+    if (crop_w * crop_h) / float(height * width) < 0.2:
+        bbox = expand_bbox_for_small(bbox, height, width)
+        x_min, y_min, x_max, y_max = bbox
+        crop_w, crop_h = x_max - x_min, y_max - y_min
+    aligned_h, aligned_w = get_aligned_size(crop_h, crop_w, align)
+    return {
+        "bbox": bbox,
+        "crop_h": crop_h,
+        "crop_w": crop_w,
+        "aligned_h": aligned_h,
+        "aligned_w": aligned_w,
+    }
+
+
 def crop_frames(
     frames: list[Image.Image], bbox: tuple[int, int, int, int]
 ) -> list[Image.Image]:
+    return [crop_frame(frame, bbox) for frame in frames]
+
+
+def crop_frame(frame: Image.Image, bbox: tuple[int, int, int, int]) -> Image.Image:
     x_min, y_min, x_max, y_max = bbox
-    return [Image.fromarray(np.array(frame)[y_min:y_max, x_min:x_max]) for frame in frames]
+    return Image.fromarray(np.array(frame)[y_min:y_max, x_min:x_max])
 
 
 def create_masked_video(
@@ -253,6 +316,98 @@ def frames_to_tensor(frames: list[Image.Image], normalize: bool = True) -> torch
     return torch.stack(tensors)
 
 
+def scan_global_bbox(
+    input_video: str,
+    mask_video: str,
+    num_frames: int | None = None,
+    reference_image: str | None = None,
+    bbox_padding: int = 0,
+    dilate_px: int = 15,
+    mask_scale: float = 1.2,
+    align: int = 16,
+) -> dict:
+    from sglang.multimodal_gen.runtime.videoedit.stream_decoder import (
+        SequentialMaskDecoder,
+    )
+
+    frame_size, fps = probe_video_frame_size_and_fps(input_video)
+    width, height = frame_size
+    video_frame_count = probe_video_frame_count(input_video)
+    mask_frame_count = probe_mask_frame_count(mask_video)
+    raw_num_frames = min(
+        video_frame_count,
+        mask_frame_count,
+        num_frames if num_frames is not None else min(video_frame_count, mask_frame_count),
+    )
+    if raw_num_frames <= 0:
+        raise RuntimeError("No frames available for VideoEdit bbox scan")
+    global_offset = 1 if reference_image else 0
+    all_x_min = all_y_min = float("inf")
+    all_x_max = all_y_max = 0
+    loaded_raw_frames = 0
+    decoder = SequentialMaskDecoder(mask_video, target_size=frame_size)
+    try:
+        for raw_idx in range(raw_num_frames):
+            raw_mask = decoder.read_next()
+            if raw_mask is None:
+                break
+            loaded_raw_frames += 1
+            expanded_mask = expand_mask_frame(
+                raw_mask,
+                dilate_px=dilate_px,
+                scale=mask_scale,
+                force_zero=(raw_idx + global_offset) == 0,
+            )
+            mask_np = np.array(expanded_mask.convert("L"))
+            ys, xs = np.where(mask_np > 10)
+            if len(ys):
+                all_y_min = min(all_y_min, int(ys.min()))
+                all_y_max = max(all_y_max, int(ys.max()))
+                all_x_min = min(all_x_min, int(xs.min()))
+                all_x_max = max(all_x_max, int(xs.max()))
+    finally:
+        decoder.close()
+    if loaded_raw_frames <= 0:
+        raise RuntimeError("No mask frames loaded during VideoEdit bbox scan")
+    effective_num_frames = loaded_raw_frames + global_offset
+    if all_x_min == float("inf"):
+        raise RuntimeError("No mask region detected")
+
+    crop_w = all_x_max - all_x_min
+    crop_h = all_y_max - all_y_min
+    cx = (all_x_min + all_x_max) / 2.0
+    cy = (all_y_min + all_y_max) / 2.0
+    target_w = crop_w + 2 * bbox_padding
+    target_h = crop_h + 2 * bbox_padding
+    x_min = int(round(cx - target_w / 2))
+    x_max = int(round(cx + target_w / 2))
+    y_min = int(round(cy - target_h / 2))
+    y_max = int(round(cy + target_h / 2))
+    if x_min < 0 or y_min < 0 or x_max > width or y_max > height:
+        raise ValueError(
+            f"Expanded mask bbox is out of bounds: {(x_min, y_min, x_max, y_max)} "
+            f"for frame size {(width, height)}"
+        )
+    bbox = (x_min, y_min, x_max, y_max)
+
+    geometry = _finalize_bbox_geometry(
+        bbox,
+        height=height,
+        width=width,
+        align=align,
+    )
+    geometry.update(
+        {
+            "fps": fps,
+            "num_frames": effective_num_frames,
+            "frame_size": frame_size,
+            "frame_width": width,
+            "frame_height": height,
+        }
+    )
+    return geometry
+
+
 def prepare_global_inputs(
     input_video: str,
     mask_video: str,
@@ -263,6 +418,7 @@ def prepare_global_inputs(
     mask_scale: float = 1.2,
     align: int = 16,
     debug_dir: str | None = None,
+    scanned_geometry: dict | None = None,
 ) -> dict:
     original_frames, fps = load_video_frames(input_video, num_frames)
     if not original_frames:
@@ -287,19 +443,39 @@ def prepare_global_inputs(
     dilated_masks = expand_mask_frames(
         raw_mask_frames, dilate_px=dilate_px, scale=mask_scale
     )
-    bbox = get_mask_bbox(dilated_masks, padding=bbox_padding)
-    if bbox is None:
-        raise RuntimeError("No mask region detected")
-    x_min, y_min, x_max, y_max = bbox
     height, width = original_frames[0].height, original_frames[0].width
-    crop_w, crop_h = x_max - x_min, y_max - y_min
-    if (crop_w * crop_h) / float(height * width) < 0.2:
-        bbox = expand_bbox_for_small(bbox, height, width)
-        x_min, y_min, x_max, y_max = bbox
-        crop_w, crop_h = x_max - x_min, y_max - y_min
+    if scanned_geometry is None:
+        bbox = get_mask_bbox(dilated_masks, padding=bbox_padding)
+        if bbox is None:
+            raise RuntimeError("No mask region detected")
+        geometry = _finalize_bbox_geometry(
+            bbox,
+            height=height,
+            width=width,
+            align=align,
+        )
+    else:
+        bbox = tuple(scanned_geometry["bbox"])
+        crop_h = int(scanned_geometry.get("crop_h", bbox[3] - bbox[1]))
+        crop_w = int(scanned_geometry.get("crop_w", bbox[2] - bbox[0]))
+        aligned_h = int(scanned_geometry.get("aligned_h", get_aligned_size(crop_h, crop_w, align)[0]))
+        aligned_w = int(scanned_geometry.get("aligned_w", get_aligned_size(crop_h, crop_w, align)[1]))
+        geometry = {
+            "bbox": bbox,
+            "crop_h": crop_h,
+            "crop_w": crop_w,
+            "aligned_h": aligned_h,
+            "aligned_w": aligned_w,
+        }
+        fps = float(scanned_geometry.get("fps", fps))
+
+    bbox = geometry["bbox"]
+    crop_h = int(geometry["crop_h"])
+    crop_w = int(geometry["crop_w"])
+    aligned_h = int(geometry["aligned_h"])
+    aligned_w = int(geometry["aligned_w"])
     cropped_video = crop_frames(original_frames, bbox)
     dilated_cropped_masks = crop_frames(dilated_masks, bbox)
-    aligned_h, aligned_w = get_aligned_size(crop_h, crop_w, align)
     resized_video = resize_frames(cropped_video, aligned_h, aligned_w)
     resized_masks = resize_frames(dilated_cropped_masks, aligned_h, aligned_w)
     if debug_dir:

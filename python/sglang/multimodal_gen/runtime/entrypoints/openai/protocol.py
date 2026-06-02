@@ -2,7 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -170,6 +170,7 @@ class VideoRepairRequest(BaseModel):
     keep_intermediate_windows: bool = False
     use_repaired_context: bool = True
     vary_seed_by_window: bool = False
+    decode_mode: Literal["eager", "stream"] = "stream"
     enable_teacache: bool = False
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1

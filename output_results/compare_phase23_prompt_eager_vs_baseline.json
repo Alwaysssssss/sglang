@@ -1,0 +1,1428 @@
+{
+  "summary": {
+    "compared_frames": 156,
+    "ssim_mean": 1.0,
+    "ssim_min": 1.0,
+    "mse_mean": 0.0,
+    "mse_max": 0.0,
+    "mae_mean": 0.0,
+    "mae_max": 0.0,
+    "psnr_mean": Infinity,
+    "max_abs_diff": 0,
+    "failed_frames": [],
+    "pass_compare": true,
+    "thresholds": {
+      "min_ssim": 0.95,
+      "max_mse": 60.0,
+      "max_mae": 5.0,
+      "allow_frame_count_delta": 0,
+      "max_failed_frame_ratio": 0.0
+    }
+  },
+  "frames": [
+    {
+      "index": 0,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 1,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 2,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 3,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 4,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 5,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 6,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 7,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 8,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 9,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 10,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 11,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 12,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 13,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 14,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 15,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 16,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 17,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 18,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 19,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 20,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 21,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 22,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 23,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 24,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 25,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 26,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 27,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 28,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 29,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 30,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 31,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 32,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 33,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 34,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 35,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 36,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 37,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 38,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 39,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 40,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 41,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 42,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 43,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 44,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 45,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 46,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 47,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 48,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 49,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 50,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 51,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 52,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 53,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 54,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 55,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 56,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 57,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 58,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 59,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 60,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 61,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 62,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 63,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 64,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 65,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 66,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 67,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 68,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 69,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 70,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 71,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 72,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 73,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 74,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 75,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 76,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 77,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 78,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 79,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 80,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 81,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 82,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 83,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 84,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 85,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 86,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 87,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 88,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 89,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 90,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 91,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 92,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 93,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 94,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 95,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 96,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 97,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 98,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 99,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 100,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 101,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 102,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 103,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 104,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 105,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 106,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 107,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 108,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 109,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 110,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 111,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 112,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 113,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 114,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 115,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 116,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 117,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 118,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 119,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 120,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 121,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 122,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 123,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 124,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 125,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 126,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 127,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 128,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 129,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 130,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 131,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 132,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 133,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 134,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 135,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 136,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 137,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 138,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 139,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 140,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 141,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 142,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 143,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 144,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 145,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 146,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 147,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 148,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 149,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 150,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 151,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 152,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 153,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 154,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    },
+    {
+      "index": 155,
+      "ssim": 1.0,
+      "mse": 0.0,
+      "mae": 0.0,
+      "psnr": Infinity,
+      "max_abs_diff": 0,
+      "pass_frame": true
+    }
+  ]
+}

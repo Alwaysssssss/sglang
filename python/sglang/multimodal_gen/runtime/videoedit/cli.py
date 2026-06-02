@@ -53,6 +53,7 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-intermediate-windows", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-repaired-context", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vary-seed-by-window", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--decode-mode", choices=["eager", "stream"], default="stream")
     parser.add_argument("--generator-device")
     parser.add_argument("--output-quality", default="default")
     parser.add_argument("--output-compression", type=int)
@@ -227,6 +228,7 @@ def repair_cmd(args: argparse.Namespace) -> int:
         keep_intermediate_windows=args.keep_intermediate_windows,
         use_repaired_context=args.use_repaired_context,
         vary_seed_by_window=args.vary_seed_by_window,
+        decode_mode=args.decode_mode,
         output_quality=args.output_quality,
         output_compression=args.output_compression,
         enable_teacache=args.enable_teacache,

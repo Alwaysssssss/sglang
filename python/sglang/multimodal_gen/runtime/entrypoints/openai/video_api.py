@@ -72,6 +72,7 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
     "videoUrl": "video_url",
     "maskUrl": "mask_url",
     "referenceImageUrl": "reference_image_url",
+    "decodeMode": "decode_mode",
     "minioConfig": "minio_config",
     "outputObjectKey": "output_object_key",
 }
@@ -638,6 +639,7 @@ async def create_video_repair(request: Request):
             keep_intermediate_windows=req.keep_intermediate_windows,
             use_repaired_context=req.use_repaired_context,
             vary_seed_by_window=req.vary_seed_by_window,
+            decode_mode=req.decode_mode,
             enable_teacache=req.enable_teacache,
             enable_frame_interpolation=req.enable_frame_interpolation,
             frame_interpolation_exp=req.frame_interpolation_exp,
