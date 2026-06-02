@@ -163,8 +163,8 @@ def _validate_video_repair_request(req: VideoRepairRequest) -> None:
         raise ValueError("taskId is required")
     if not req.callback_url:
         raise ValueError("callbackUrl is required")
-    if req.timeout <= 0:
-        raise ValueError("timeout must be positive")
+    if req.timeout == 0 or req.timeout < -1:
+        raise ValueError("timeout must be positive or -1")
     if not (req.video_input_path or req.video_url):
         raise ValueError("videoUrl or video_input_path is required")
     if not (req.mask_input_path or req.mask_url):
@@ -473,20 +473,21 @@ async def _dispatch_video_repair_job_async(
 ) -> None:
     try:
         await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
-        await asyncio.wait_for(
-            _dispatch_job_async(
-                job_id,
-                batch,
-                temp_dirs=None,
-                output_persistent=output_persistent,
-                callback_url=callback_url,
-                callback_payload_builder=_build_video_repair_callback_payload,
-                request_storage=request_storage,
-                output_object_key=output_object_key,
-                output_bucket=output_bucket,
-            ),
-            timeout=timeout,
+        dispatch_coro = _dispatch_job_async(
+            job_id,
+            batch,
+            temp_dirs=None,
+            output_persistent=output_persistent,
+            callback_url=callback_url,
+            callback_payload_builder=_build_video_repair_callback_payload,
+            request_storage=request_storage,
+            output_object_key=output_object_key,
+            output_bucket=output_bucket,
         )
+        if timeout == -1:
+            await dispatch_coro
+        else:
+            await asyncio.wait_for(dispatch_coro, timeout=timeout)
     except asyncio.TimeoutError:
         await VIDEO_STORE.update_fields(
             job_id,
