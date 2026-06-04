@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
+from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.models.dits.cogvideox import CogVideoXConfig
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.models.vaes.cogvideox import CogVideoXVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -29,8 +31,8 @@ class VividVRPipelineConfig(PipelineConfig):
     """
 
     task_type: ModelTaskType = ModelTaskType.VIDEO_EDIT
-    dit_config: DiTConfig = field(default_factory=DiTConfig)
-    vae_config: VAEConfig = field(default_factory=VAEConfig)
+    dit_config: CogVideoXConfig = field(default_factory=CogVideoXConfig)
+    vae_config: CogVideoXVAEConfig = field(default_factory=CogVideoXVAEConfig)
 
     precision: str = "bf16"
     dit_precision: str = "bf16"
