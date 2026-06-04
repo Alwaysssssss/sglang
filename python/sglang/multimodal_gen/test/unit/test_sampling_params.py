@@ -1,7 +1,11 @@
 import argparse
 import math
 import unittest
+from types import SimpleNamespace
 
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
+    VividVRPipelineConfig,
+)
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
@@ -12,11 +16,15 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     _json_safe,
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     WanI2V_14B_480P_SamplingParam,
     WanI2V_14B_720P_SamplingParam,
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
+)
+from sglang.multimodal_gen.configs.vividvr_defaults import (
+    DEFAULT_VIVIDVR_PROMPT_FILE_PATH,
 )
 
 
@@ -77,6 +85,74 @@ class TestSamplingParamsSubclass(unittest.TestCase):
     def test_diffusers_generic_calls_base_post_init(self):
         with self.assertRaises(AssertionError):
             DiffusersGenericSamplingParams(num_frames=0)
+
+    def test_vividvr_defaults_are_instantiable(self):
+        params = VividVRSamplingParams()
+
+        self.assertEqual(params.prompt_path, DEFAULT_VIVIDVR_PROMPT_FILE_PATH)
+        self.assertEqual(params.prompt_file_path, DEFAULT_VIVIDVR_PROMPT_FILE_PATH)
+        self.assertEqual(params.width, 960)
+        self.assertEqual(params.height, 720)
+        self.assertEqual(params.num_frames, 121)
+
+    def test_vividvr_prompt_file_alias_populates_prompt_path(self):
+        params = VividVRSamplingParams(prompt_file_path="/tmp/custom_prompt.txt")
+
+        self.assertEqual(params.prompt_path, "/tmp/custom_prompt.txt")
+        self.assertEqual(params.prompt_file_path, "/tmp/custom_prompt.txt")
+
+    def test_vividvr_rejects_conflicting_prompt_aliases(self):
+        with self.assertRaisesRegex(ValueError, r"prompt_path and prompt_file_path"):
+            VividVRSamplingParams(
+                prompt_path="/tmp/from_prompt_path.txt",
+                prompt_file_path="/tmp/from_prompt_file_path.txt",
+            )
+
+    def test_vividvr_rejects_invalid_tile_stride(self):
+        with self.assertRaisesRegex(ValueError, r"tile_stride"):
+            VividVRSamplingParams(tile_size=64, tile_stride=65)
+
+    def test_vividvr_rejects_live_cogvlm2_caption_contract(self):
+        with self.assertRaisesRegex(ValueError, r"CogVLM2"):
+            VividVRSamplingParams(use_live_cogvlm2_caption=True)
+        with self.assertRaisesRegex(ValueError, r"cogvlm2_model_path"):
+            VividVRSamplingParams(cogvlm2_model_path="/tmp/cogvlm2")
+
+    def test_vividvr_from_user_kwargs_uses_stage_a_contract(self):
+        server_args = SimpleNamespace(
+            pipeline_config=VividVRPipelineConfig(),
+            output_path=None,
+            num_gpus=1,
+            comfyui_mode=False,
+            prompt_file_path=None,
+        )
+
+        params = VividVRSamplingParams.from_user_kwargs(
+            server_args,
+            video_input_path="/tmp/input.mp4",
+        )
+
+        self.assertEqual(params.video_input_path, "/tmp/input.mp4")
+        self.assertEqual(params.prompt_path, DEFAULT_VIVIDVR_PROMPT_FILE_PATH)
+        self.assertEqual(params.prompt_file_path, DEFAULT_VIVIDVR_PROMPT_FILE_PATH)
+        self.assertFalse(params.enable_sequence_shard)
+
+    def test_vividvr_from_user_kwargs_allows_server_prompt_file_override(self):
+        server_args = SimpleNamespace(
+            pipeline_config=VividVRPipelineConfig(),
+            output_path=None,
+            num_gpus=1,
+            comfyui_mode=False,
+            prompt_file_path="/tmp/server_prompt.txt",
+        )
+
+        params = VividVRSamplingParams.from_user_kwargs(
+            server_args,
+            video_input_path="/tmp/input.mp4",
+        )
+
+        self.assertEqual(params.prompt_path, "/tmp/server_prompt.txt")
+        self.assertEqual(params.prompt_file_path, "/tmp/server_prompt.txt")
 
     def test_output_file_name_supports_callable_teacache_params(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
