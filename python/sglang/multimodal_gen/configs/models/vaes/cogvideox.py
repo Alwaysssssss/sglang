@@ -47,3 +47,5 @@ class CogVideoXVAEConfig(VAEConfig):
     arch_config: CogVideoXVAEArchConfig = field(
         default_factory=CogVideoXVAEArchConfig
     )
+    tile_sample_min_height: int = 240
+    tile_sample_min_width: int = 360

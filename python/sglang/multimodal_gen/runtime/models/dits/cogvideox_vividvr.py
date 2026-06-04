@@ -10,6 +10,7 @@ from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscal
 
 from sglang.multimodal_gen.configs.models.dits.cogvideox import CogVideoXConfig
 from sglang.multimodal_gen.runtime.models.dits.cogvideox import CogVideoXTransformer3DModel
+from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
     Connector,
     build_control_feat_proj,
@@ -17,6 +18,11 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
 )
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _mark_sidecar_params_for_late_load(module: nn.Module) -> None:
+    for parameter in module.parameters():
+        set_weight_attrs(parameter, {"missing_param_init": "zeros"})
 
 
 class CogVideoXVividVRTransformer3DModel(CogVideoXTransformer3DModel):
@@ -59,6 +65,21 @@ class CogVideoXVividVRTransformer3DModel(CogVideoXTransformer3DModel):
                 use_learned_positional_embeddings=False,
             )
         )
+        _mark_sidecar_params_for_late_load(self.connectors)
+        _mark_sidecar_params_for_late_load(self.control_feat_proj)
+        _mark_sidecar_params_for_late_load(self.control_patch_embed)
+
+    def load_connectors(self, path: str) -> None:
+        state_dict = torch.load(path, map_location="cpu")
+        self.connectors.load_state_dict(state_dict, strict=True)
+
+    def load_control_feat_proj(self, path: str) -> None:
+        state_dict = torch.load(path, map_location="cpu")
+        self.control_feat_proj.load_state_dict(state_dict, strict=True)
+
+    def load_control_patch_embed(self, path: str) -> None:
+        state_dict = torch.load(path, map_location="cpu")
+        self.control_patch_embed.load_state_dict(state_dict, strict=True)
 
     def forward(
         self,

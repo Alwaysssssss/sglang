@@ -11,3 +11,9 @@ DEFAULT_VIVIDVR_NEGATIVE_PROMPT = (
     "worst quality, low quality, frames, watermark, signature, jpeg artifacts, "
     "deformed, lowres, over-smooth"
 )
+DEFAULT_VIVIDVR_POSITIVE_PROMPT_SUFFIX = (
+    "Cinematic, High Contrast, highly detailed, taken using a Canon EOS R camera, "
+    "hyper detailed photo - realistic maximum detail, 32k, Color Grading, ultra HD, "
+    "extreme meticulous detailing, skin pore detailing, hyper sharpness, perfect "
+    "without deformations."
+)
