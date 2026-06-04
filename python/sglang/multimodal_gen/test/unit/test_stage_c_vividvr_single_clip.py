@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,12 +40,9 @@ ACCEPTANCE_ROOT = Path("/home/zhiheng/sglang/Vivid_Acceptance")
 INDICATOR_DIR = ACCEPTANCE_ROOT / "indicator"
 RESULT_VIDEOS_DIR = ACCEPTANCE_ROOT / "result_videos"
 ACCEPTANCE_COMMAND = (
-    "SGLANG_RUN_VIVIDVR_ACCEPTANCE=1 PYTHONPATH=python uv run "
-    "--with pytest --with diffusers==0.37.0 --with imageio==2.36.0 "
-    "--with imageio-ffmpeg==0.5.1 --with addict==2.4.0 --with PyYAML==6.0.1 "
-    "--with av==16.1.0 --with scikit-image==0.25.2 --with cache-dit==1.3.0 "
-    "--with opencv-python-headless==4.10.0.84 --with trimesh "
-    "python -m pytest python/sglang/multimodal_gen/test/unit/test_stage_c_vividvr_single_clip.py -q"
+    "SGLANG_RUN_VIVIDVR_ACCEPTANCE=1 PYTHONPATH=python "
+    "/home/zhiheng/sglang/.venv/bin/python -m pytest "
+    "python/sglang/multimodal_gen/test/unit/test_stage_c_vividvr_single_clip.py -q"
 )
 
 
@@ -127,6 +125,7 @@ class TestStageCVividVRSingleClip(unittest.TestCase):
         return prepare_request(server_args, params)
 
     def test_single_clip_reference_alignment(self):
+        total_start_time = time.perf_counter()
         INDICATOR_DIR.mkdir(parents=True, exist_ok=True)
         RESULT_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -143,7 +142,9 @@ class TestStageCVividVRSingleClip(unittest.TestCase):
             output_file_name=candidate_path.name,
             seed=42,
         )
+        first_forward_start_time = time.perf_counter()
         first_result = pipeline.forward(first_req, server_args)
+        first_forward_runtime_seconds = time.perf_counter() - first_forward_start_time
 
         second_req = self._make_request(
             server_args=server_args,
@@ -151,7 +152,9 @@ class TestStageCVividVRSingleClip(unittest.TestCase):
             output_file_name=f"phase_c_candidate_repeat_seed42_{run_id}.mp4",
             seed=42,
         )
+        second_forward_start_time = time.perf_counter()
         second_result = pipeline.forward(second_req, server_args)
+        second_forward_runtime_seconds = time.perf_counter() - second_forward_start_time
 
         torch.testing.assert_close(first_result.output, second_result.output)
 
@@ -185,9 +188,14 @@ class TestStageCVividVRSingleClip(unittest.TestCase):
         )
         metrics_record = {
             "phase": "C",
+            "mode": "single_run_reference_alignment",
             "run_id": run_id,
             "run_datetime_utc": datetime.now(timezone.utc).isoformat(),
             "command": ACCEPTANCE_COMMAND,
+            "total_runtime_seconds": round(time.perf_counter() - total_start_time, 6),
+            "model_inference_runtime_seconds": round(
+                first_forward_runtime_seconds + second_forward_runtime_seconds, 6
+            ),
             "seed": 42,
             "prompt_path": str(PROMPT_FILE),
             "input_video_path": str(INPUT_VIDEO),

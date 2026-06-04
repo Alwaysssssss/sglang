@@ -34,9 +34,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
-    VividVRBeforeDenoisingStage,
+    VividVRConditionEncodingStage,
     VividVRDecodingStage,
     VividVRDenoisingStage,
+    VividVRInputValidationStage,
+    VividVRLatentPreparationStage,
+    VividVROutputPostprocessStage,
+    VividVRPromptPreparationStage,
+    VividVRTextEncodingStage,
+    VividVRTilingPreparationStage,
+    VividVRTimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -188,13 +195,27 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         del server_args
         self.add_stages(
             [
-                VividVRBeforeDenoisingStage(
+                VividVRInputValidationStage(),
+                VividVRPromptPreparationStage(),
+                VividVRTextEncodingStage(
                     text_encoder=self.get_module("text_encoder"),
                     tokenizer=self.get_module("tokenizer"),
+                    transformer=self.get_module("transformer"),
+                ),
+                VividVRConditionEncodingStage(
+                    vae=self.get_module("vae"),
+                    transformer=self.get_module("transformer"),
+                    video_processor=self.video_processor,
+                ),
+                VividVRLatentPreparationStage(
                     vae=self.get_module("vae"),
                     transformer=self.get_module("transformer"),
                     scheduler=self.get_module("scheduler"),
-                    video_processor=self.video_processor,
+                ),
+                VividVRTilingPreparationStage(),
+                VividVRTimestepPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
                 ),
                 VividVRDenoisingStage(
                     transformer=self.get_module("transformer"),
@@ -203,6 +224,8 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 ),
                 VividVRDecodingStage(
                     vae=self.get_module("vae"),
+                ),
+                VividVROutputPostprocessStage(
                     video_processor=self.video_processor,
                 ),
             ]

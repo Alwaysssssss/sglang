@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.vividvr_defaults import (
@@ -11,7 +12,7 @@ from sglang.multimodal_gen.configs.vividvr_defaults import (
 
 @dataclass
 class VividVRSamplingParams(SamplingParams):
-    """Sampling contract for the Stage A VividVR integration."""
+    """Sampling contract for the Stage A/C VividVR integration."""
 
     video_input_path: str | None = None
     prompt_file_path: str | None = DEFAULT_VIVIDVR_PROMPT_FILE_PATH
@@ -37,6 +38,44 @@ class VividVRSamplingParams(SamplingParams):
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: [(960, 720)]
     )
+
+    # Runtime request-derived fields
+    runtime_prompt_file_path: str | None = field(default=None, init=False, repr=False)
+    runtime_raw_prompt_text: str | None = field(default=None, init=False, repr=False)
+    runtime_model_prompt_text: str | None = field(default=None, init=False, repr=False)
+    runtime_negative_prompt_text: str | None = field(default=None, init=False, repr=False)
+    runtime_do_cfg: bool = field(default=False, init=False, repr=False)
+
+    # Runtime input / condition fields
+    runtime_control_video: Any | None = field(default=None, init=False, repr=False)
+    runtime_reference_video: Any | None = field(default=None, init=False, repr=False)
+    runtime_original_height: int | None = field(default=None, init=False, repr=False)
+    runtime_original_width: int | None = field(default=None, init=False, repr=False)
+    runtime_original_num_frames: int | None = field(default=None, init=False, repr=False)
+    runtime_num_padding_frames: int | None = field(default=None, init=False, repr=False)
+    runtime_padded_input_frames: int | None = field(default=None, init=False, repr=False)
+    runtime_fps: int | None = field(default=None, init=False, repr=False)
+
+    # Runtime tensor fields
+    runtime_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
+    runtime_negative_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
+    runtime_tiled_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
+    runtime_tiled_negative_prompt_embeds: Any | None = field(
+        default=None, init=False, repr=False
+    )
+    runtime_control_latents: Any | None = field(default=None, init=False, repr=False)
+    runtime_generator: Any | None = field(default=None, init=False, repr=False)
+    runtime_latents: Any | None = field(default=None, init=False, repr=False)
+    runtime_num_latent_padding_frames: int | None = field(
+        default=None, init=False, repr=False
+    )
+    runtime_tiling_infos: list[Any] | None = field(default=None, init=False, repr=False)
+    runtime_tile_count: int | None = field(default=None, init=False, repr=False)
+    runtime_timesteps: Any | None = field(default=None, init=False, repr=False)
+    runtime_timestep_count: int | None = field(default=None, init=False, repr=False)
+    runtime_progress: float | None = field(default=None, init=False, repr=False)
+    runtime_decoded_video: Any | None = field(default=None, init=False, repr=False)
+    runtime_output_video: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.prompt_path = self._normalize_prompt_file_aliases()
@@ -125,3 +164,35 @@ class VividVRSamplingParams(SamplingParams):
         params._adjust(server_args)
         params._validate_with_pipeline_config(server_args.pipeline_config)
         return params
+
+    def reset_runtime(self) -> None:
+        self.runtime_prompt_file_path = None
+        self.runtime_raw_prompt_text = None
+        self.runtime_model_prompt_text = None
+        self.runtime_negative_prompt_text = None
+        self.runtime_do_cfg = False
+
+        self.runtime_control_video = None
+        self.runtime_reference_video = None
+        self.runtime_original_height = None
+        self.runtime_original_width = None
+        self.runtime_original_num_frames = None
+        self.runtime_num_padding_frames = None
+        self.runtime_padded_input_frames = None
+        self.runtime_fps = None
+
+        self.runtime_prompt_embeds = None
+        self.runtime_negative_prompt_embeds = None
+        self.runtime_tiled_prompt_embeds = None
+        self.runtime_tiled_negative_prompt_embeds = None
+        self.runtime_control_latents = None
+        self.runtime_generator = None
+        self.runtime_latents = None
+        self.runtime_num_latent_padding_frames = None
+        self.runtime_tiling_infos = None
+        self.runtime_tile_count = None
+        self.runtime_timesteps = None
+        self.runtime_timestep_count = None
+        self.runtime_progress = None
+        self.runtime_decoded_video = None
+        self.runtime_output_video = None

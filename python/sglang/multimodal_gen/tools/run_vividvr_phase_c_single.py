@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +38,26 @@ REFERENCE_VIDEO = (
 ACCEPTANCE_ROOT = Path("/home/zhiheng/sglang/Vivid_Acceptance")
 INDICATOR_DIR = ACCEPTANCE_ROOT / "indicator"
 RESULT_VIDEOS_DIR = ACCEPTANCE_ROOT / "result_videos"
+
+
+def build_recorded_command() -> str:
+    parts: list[str] = []
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath:
+        parts.append(f"PYTHONPATH={shlex.quote(pythonpath)}")
+
+    repo_root = Path("/home/zhiheng/sglang")
+    script_path = Path(__file__).resolve()
+    script_display = script_path
+    try:
+        script_display = script_path.relative_to(repo_root)
+    except ValueError:
+        pass
+
+    parts.append(shlex.quote(str(Path(sys.executable).resolve())))
+    parts.append(shlex.quote(str(script_display)))
+    parts.extend(shlex.quote(arg) for arg in sys.argv[1:])
+    return " ".join(parts)
 
 
 def build_server_args() -> ServerArgs:
@@ -80,6 +103,7 @@ def make_request(
 
 
 def main() -> int:
+    total_start_time = time.perf_counter()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for the Phase C single-run acceptance")
 
@@ -102,7 +126,11 @@ def main() -> int:
     print(f"[PhaseC] run_id={run_id}")
     print(f"[PhaseC] candidate_video={candidate_path}")
     print(f"[PhaseC] metrics_report={report_path}")
+    model_inference_start_time = time.perf_counter()
     result = pipeline.forward(request, server_args)
+    model_inference_runtime_seconds = round(
+        time.perf_counter() - model_inference_start_time, 6
+    )
 
     post_process_sample(
         result.output,
@@ -136,11 +164,9 @@ def main() -> int:
         "mode": "single_run_reference_alignment",
         "run_id": run_id,
         "run_datetime_utc": datetime.now(timezone.utc).isoformat(),
-        "command": "PYTHONPATH=python uv run --with pytest --with diffusers==0.37.0 "
-        "--with imageio==2.36.0 --with imageio-ffmpeg==0.5.1 --with addict==2.4.0 "
-        "--with PyYAML==6.0.1 --with av==16.1.0 --with scikit-image==0.25.2 "
-        "--with cache-dit==1.3.0 --with opencv-python-headless==4.10.0.84 "
-        "--with trimesh python python/sglang/multimodal_gen/tools/run_vividvr_phase_c_single.py",
+        "command": build_recorded_command(),
+        "total_runtime_seconds": round(time.perf_counter() - total_start_time, 6),
+        "model_inference_runtime_seconds": model_inference_runtime_seconds,
         "seed": 42,
         "prompt_path": str(PROMPT_FILE),
         "input_video_path": str(INPUT_VIDEO),
