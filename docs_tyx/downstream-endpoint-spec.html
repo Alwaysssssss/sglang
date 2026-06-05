@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlowCut 下游服务接口规范</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Noto Sans SC', sans-serif;
+            background: #ffffff;
+            color: #111827;
+            line-height: 1.7;
+            font-size: 15px;
+        }
+
+        /* Top nav bar */
+        .topnav {
+            background: #111827;
+            color: #f9fafb;
+            padding: 10px 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .topnav-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: #f9fafb;
+        }
+
+        .topnav a {
+            color: #93c5fd;
+            text-decoration: none;
+            font-size: 13px;
+        }
+
+        .topnav a:hover {
+            color: #bfdbfe;
+            text-decoration: underline;
+        }
+
+        .topnav .sep {
+            color: #4b5563;
+        }
+
+        /* Layout */
+        .layout {
+            display: flex;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 260px;
+            min-width: 260px;
+            border-right: 1px solid #e5e7eb;
+            padding: 20px 16px;
+            position: sticky;
+            top: 41px;
+            height: calc(100vh - 41px);
+            overflow-y: auto;
+            font-size: 13px;
+        }
+
+        .sidebar-section {
+            margin-bottom: 16px;
+        }
+
+        .sidebar-section-title {
+            font-size: 11px;
+            font-weight: 700;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+            padding: 0 8px;
+        }
+
+        .sidebar a {
+            display: block;
+            color: #374151;
+            text-decoration: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .sidebar a:hover {
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        .sidebar a.active {
+            background: #eff6ff;
+            color: #1d4ed8;
+            font-weight: 600;
+        }
+
+        .sidebar .indent-1 { padding-left: 20px; font-size: 12px; }
+        .sidebar .indent-2 { padding-left: 32px; font-size: 12px; }
+
+        /* Content */
+        .content {
+            flex: 1;
+            min-width: 0;
+            padding: 32px 48px 80px;
+            max-width: 900px;
+        }
+
+        h1 {
+            font-size: 28px;
+            font-weight: 800;
+            color: #111827;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+
+        .lead {
+            font-size: 16px;
+            color: #4b5563;
+            margin-bottom: 32px;
+            padding: 16px 20px;
+            background: #f8fafc;
+            border-left: 4px solid #3b82f6;
+            border-radius: 0 6px 6px 0;
+        }
+
+        h2 {
+            font-size: 22px;
+            font-weight: 700;
+            color: #111827;
+            margin-top: 48px;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        h3 {
+            font-size: 18px;
+            font-weight: 700;
+            color: #1f2937;
+            margin-top: 32px;
+            margin-bottom: 12px;
+        }
+
+        h4 {
+            font-size: 15px;
+            font-weight: 700;
+            color: #374151;
+            margin-top: 24px;
+            margin-bottom: 8px;
+        }
+
+        p {
+            margin-bottom: 12px;
+        }
+
+        /* Checklist box */
+        .checklist-box {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 8px;
+            padding: 20px 24px;
+            margin-bottom: 24px;
+        }
+
+        .checklist-box h3 {
+            margin-top: 0;
+            color: #166534;
+            font-size: 16px;
+        }
+
+        .checklist-box ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        .checklist-box > ul > li {
+            margin-bottom: 12px;
+        }
+
+        .checklist-box > ul > li > strong {
+            color: #166534;
+        }
+
+        .checklist-box ul ul {
+            padding-left: 24px;
+            margin-top: 4px;
+        }
+
+        .checklist-box ul ul li {
+            margin-bottom: 2px;
+            color: #374151;
+        }
+
+        /* Alert / callout boxes */
+        .callout {
+            padding: 14px 18px;
+            border-radius: 6px;
+            margin: 16px 0;
+            font-size: 14px;
+        }
+
+        .callout-warn {
+            background: #fffbeb;
+            border: 1px solid #fde68a;
+            border-left: 4px solid #f59e0b;
+        }
+
+        .callout-danger {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-left: 4px solid #ef4444;
+        }
+
+        .callout-info {
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            border-left: 4px solid #3b82f6;
+        }
+
+        .callout-title {
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 12px 0 20px;
+            font-size: 14px;
+        }
+
+        th {
+            background: #f3f4f6;
+            color: #111827;
+            padding: 10px 12px;
+            text-align: left;
+            font-weight: 700;
+            border-bottom: 2px solid #d1d5db;
+            font-size: 13px;
+        }
+
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid #e5e7eb;
+            vertical-align: top;
+        }
+
+        tr:hover {
+            background: #f9fafb;
+        }
+
+        /* Code */
+        code {
+            font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+            font-size: 13px;
+            background: #f3f4f6;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #be185d;
+        }
+
+        pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 16px 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 12px 0 20px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        pre code {
+            background: none;
+            color: inherit;
+            padding: 0;
+            font-size: 13px;
+        }
+
+        /* JSON syntax highlights */
+        .json-key { color: #7dd3fc; }
+        .json-string { color: #86efac; }
+        .json-number { color: #fbbf24; }
+        .json-bool { color: #c084fc; }
+        .comment { color: #64748b; font-style: italic; }
+
+        /* Lists */
+        ul, ol {
+            margin: 8px 0 16px 24px;
+        }
+
+        li {
+            margin-bottom: 4px;
+        }
+
+        /* Diagram blocks */
+        .diagram {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+
+        .diagram pre {
+            background: none;
+            color: #334155;
+            padding: 0;
+            margin: 0;
+            font-size: 13px;
+        }
+
+        /* Response card */
+        .response-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            margin: 16px 0;
+            overflow: hidden;
+        }
+
+        .response-card-header {
+            padding: 10px 16px;
+            font-weight: 700;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .response-card-header.success { background: #f0fdf4; color: #166534; }
+        .response-card-header.danger { background: #fef2f2; color: #991b1b; }
+        .response-card-header.warning { background: #fffbeb; color: #92400e; }
+
+        .response-card pre {
+            margin: 0;
+            border-radius: 0;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .badge-required { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+        .badge-optional { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+        .badge-recommended { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
+
+        /* Status indicator */
+        .status-tag {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .status-tag.running { background: #dbeafe; color: #1e40af; }
+        .status-tag.succeeded { background: #dcfce7; color: #166534; }
+        .status-tag.failed { background: #fee2e2; color: #991b1b; }
+
+        /* Pseudo code */
+        .pseudocode {
+            background: #fefce8;
+            border: 1px solid #fde68a;
+            border-radius: 8px;
+            margin: 16px 0;
+        }
+
+        .pseudocode-title {
+            background: #fef3c7;
+            padding: 8px 16px;
+            font-weight: 700;
+            font-size: 13px;
+            color: #92400e;
+            border-bottom: 1px solid #fde68a;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .pseudocode pre {
+            background: none;
+            color: #78350f;
+            margin: 0;
+            border-radius: 0 0 8px 8px;
+        }
+
+        /* Checklist table */
+        .check-table td:first-child {
+            text-align: center;
+            font-weight: 700;
+            color: #6b7280;
+            width: 30px;
+        }
+
+        /* Flow diagram */
+        .flow-steps {
+            display: flex;
+            gap: 12px;
+            margin: 16px 0;
+            flex-wrap: wrap;
+        }
+
+        .flow-step {
+            flex: 1;
+            min-width: 180px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 14px;
+            text-align: center;
+            position: relative;
+        }
+
+        .flow-step-num {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+            border-radius: 50%;
+            background: #3b82f6;
+            color: white;
+            font-size: 12px;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .flow-step-title {
+            font-weight: 700;
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        .flow-step-desc {
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        /* Responsive */
+        @media (max-width: 960px) {
+            .sidebar { display: none; }
+            .content { padding: 24px 20px 60px; }
+        }
+
+        /* Smooth scroll */
+        html {
+            scroll-behavior: smooth;
+        }
+
+        /* Scroll offset for sticky header */
+        [id] {
+            scroll-margin-top: 56px;
+        }
+    </style>
+</head>
+<body>
+    <div class="topnav">
+        <span class="topnav-title">FlowCut</span>
+        <span class="sep">|</span>
+        <a href="/static/health.html">运行监控</a>
+        <span class="sep">|</span>
+        <a href="/static/config.html">配置</a>
+        <span class="sep">|</span>
+        <a href="/static/downstream-endpoint-spec.html" style="color:#fff; font-weight:600;">下游接口规范</a>
+    </div>
+
+    <div class="layout">
+        <!-- Sidebar -->
+        <nav class="sidebar" id="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">快速开始</div>
+                <a href="#checklist">开发者实现清单</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">一、概述</div>
+                <a href="#overview" class="indent-1">1.1 交互模型</a>
+                <a href="#constraints" class="indent-1">1.2 关键约束</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">二、任务分发接口</div>
+                <a href="#dispatch" class="indent-1">2.1 接口定义</a>
+                <a href="#request-body" class="indent-1">2.2 请求体</a>
+                <a href="#response" class="indent-1">2.3 响应规范</a>
+                <a href="#resp-success" class="indent-2">接受任务 (code: 0)</a>
+                <a href="#resp-fail" class="indent-2">业务失败 (code: 1)</a>
+                <a href="#resp-busy" class="indent-2">并发限制 (code: 2)</a>
+                <a href="#resp-summary" class="indent-2">响应总览表</a>
+                <a href="#resp-notes" class="indent-2">重要提醒</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">三、回调接口</div>
+                <a href="#callback" class="indent-1">3.1 接口定义</a>
+                <a href="#callback-body" class="indent-1">3.2 请求体</a>
+                <a href="#callback-resp" class="indent-1">3.3 响应</a>
+                <a href="#callback-reset" class="indent-1">3.4 重置为 pending</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">四、并发管理</div>
+                <a href="#concurrency" class="indent-1">4.1 服务侧并发控制</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">五、对接流程</div>
+                <a href="#onboarding" class="indent-1">5.1 接入步骤</a>
+                <a href="#checklist-table" class="indent-1">5.2 自检清单</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">六、附录</div>
+                <a href="#mock" class="indent-1">Mock 参考实现</a>
+            </div>
+        </nav>
+
+        <!-- Main content -->
+        <main class="content">
+            <h1>FlowCut 下游服务接口规范</h1>
+            <div class="lead">
+                本文档面向<strong>下游处理服务的开发者</strong>。FlowCut 作为调度层，负责任务创建、排队、分发和状态管理。下游服务只需按本规范实现接口，即可与调度层对接。
+            </div>
+
+            <!-- Checklist -->
+            <div id="checklist" class="checklist-box">
+                <h3>开发者实现清单</h3>
+                <ul>
+                    <li>
+                        <strong>实现任务分发接口</strong>
+                        <ul>
+                            <li>提供一个 <code>POST</code> 接口（例如 <code>/generate</code>），用于接收 FlowCut 分发的任务。</li>
+                            <li>在 <strong>30 秒内</strong>同步响应请求。</li>
+                            <li>正确解析请求体中的 <code>taskId</code>、<code>callbackUrl</code>、<code>minioConfig</code> 及业务参数。</li>
+                            <li>根据处理意图返回特定的 <code>code</code>：
+                                <ul>
+                                    <li><code>code: 0</code> — 成功接受任务，将异步处理。</li>
+                                    <li><code>code: 1</code> — 业务参数错误或资源不可用，任务永久失败。</li>
+                                    <li><code>code: 2</code> — 当前并发已满，任务稍后重试。</li>
+                                </ul>
+                            </li>
+                        </ul>
+                    </li>
+                    <li>
+                        <strong>实现异步任务处理</strong>
+                        <ul>
+                            <li>在接受任务后，将实际处理逻辑放入后台异步执行。</li>
+                        </ul>
+                    </li>
+                    <li>
+                        <strong>实现结果回调逻辑</strong>
+                        <ul>
+                            <li>任务处理完成后（无论成功或失败），<strong>必须</strong>向 <code>callbackUrl</code> 发送 <code>POST</code> 请求。</li>
+                            <li>回调请求体中需包含 <code>status</code>（<code>succeeded</code> 或 <code>failed</code>）及可选的 <code>reason</code> 和 <code>output</code>。</li>
+                            <li>（可选）可在处理过程中多次回调上报 <code>running</code> 状态和 <code>progress</code>。</li>
+                        </ul>
+                    </li>
+                    <li>
+                        <strong>实现服务并发管理</strong>
+                        <ul>
+                            <li>服务需自行维护并发计数，当达到上限时，对新的 <code>/generate</code> 请求返回 <code>code: 2</code>。</li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+
+            <!-- Section 1 -->
+            <h2 id="overview">一、概述</h2>
+            <h3>1.1 交互模型</h3>
+
+            <div class="diagram">
+<pre>                                    <span class="comment">异步回调</span>
+FlowCut 调度层 ──POST──&gt; 下游服务 ──────────&gt; FlowCut 回调接口
+  <span class="comment">(同步请求)</span>               <span class="comment">(接受任务)</span>            POST /tasks/{id}/callback
+                        <span class="comment">后台异步处理...</span>               <span class="comment">(报告结果)</span></pre>
+            </div>
+
+            <p>交互分为<strong>两个阶段</strong>：</p>
+            <table>
+                <thead>
+                    <tr><th>阶段</th><th>方向</th><th>协议</th><th>时效要求</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>任务分发</td>
+                        <td>调度层 &rarr; 服务</td>
+                        <td><code>POST /generate</code> 同步请求</td>
+                        <td>服务必须在 <strong>30 秒</strong>内响应</td>
+                    </tr>
+                    <tr>
+                        <td>结果回报</td>
+                        <td>服务 &rarr; 调度层</td>
+                        <td><code>POST /tasks/{id}/callback</code></td>
+                        <td>处理完成后调用，无严格超时</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3 id="constraints">1.2 关键约束</h3>
+            <ul>
+                <li>服务接受任务后需<strong>异步处理</strong>，完成后<strong>必须主动调用回调接口</strong>通知调度层。</li>
+                <li>服务需<strong>自行管理并发</strong>，超出上限时应返回特定业务码拒绝新任务。</li>
+            </ul>
+
+            <!-- Section 2 -->
+            <h2 id="dispatch">二、任务分发接口（下游服务须实现）</h2>
+
+            <h3>2.1 接口定义</h3>
+            <p>可使用 <code>/generate</code> 或其他路由路径。</p>
+<pre><code>POST /generate
+Content-Type: application/json</code></pre>
+
+            <h3 id="request-body">2.2 请求体</h3>
+            <p>调度层会将用户创建任务时提交的 <code>input</code> JSON 字符串解析后，注入以下系统字段，作为请求体发出：</p>
+<pre><code>{
+  <span class="json-key">"taskId"</span>:      <span class="json-string">"a1b2c3d4-e5f6-7890-abcd-ef1234567890"</span>,
+  <span class="json-key">"timeout"</span>:     <span class="json-number">300</span>,
+  <span class="json-key">"callbackUrl"</span>: <span class="json-string">"http://flowcut.example.com/tasks/a1b2c3d4-.../callback"</span>,
+  <span class="json-key">"minioConfig"</span>: {
+    <span class="json-key">"endpoint"</span>:    <span class="json-string">"minio.example.com:9000"</span>,
+    <span class="json-key">"bucket_name"</span>: <span class="json-string">"flowcut"</span>,
+    <span class="json-key">"access_key"</span>:  <span class="json-string">"admin"</span>,
+    <span class="json-key">"secret_key"</span>:  <span class="json-string">"******"</span>,
+    <span class="json-key">"secure"</span>:      <span class="json-bool">false</span>,
+    <span class="json-key">"region"</span>:      <span class="json-string">"us-east-1"</span>
+  },
+  <span class="json-key">"image_url"</span>:   <span class="json-string">"https://example.com/input.jpg"</span>,
+  <span class="json-key">"mask_url"</span>:    <span class="json-string">"https://example.com/mask.png"</span>
+}</code></pre>
+
+            <h4>字段说明</h4>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>来源</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>taskId</code></td>
+                        <td>string</td>
+                        <td>调度层注入</td>
+                        <td>任务唯一标识（UUID），回调时需携带。<span class="badge badge-required">必须处理</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>timeout</code></td>
+                        <td>int</td>
+                        <td>调度层注入</td>
+                        <td>超时秒数（0 表示默认 300 秒）。服务应据此控制处理时长。<span class="badge badge-recommended">建议处理</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>callbackUrl</code></td>
+                        <td>string</td>
+                        <td>调度层注入</td>
+                        <td>回调地址。服务处理完成后<strong>必须</strong>向此 URL 发送结果。<span class="badge badge-required">必须处理</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>minioConfig</code></td>
+                        <td>object</td>
+                        <td>调度层注入</td>
+                        <td>MinIO 存储配置。仅在调度层配置了 MinIO 时存在。<span class="badge badge-optional">可选</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>image_url</code></td>
+                        <td>string</td>
+                        <td>用户 input</td>
+                        <td>业务参数示例，实际字段取决于上游调用方。<span class="badge badge-required">必须处理</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>mask_url</code></td>
+                        <td>string</td>
+                        <td>用户 input</td>
+                        <td>业务参数示例，实际字段取决于上游调用方。<span class="badge badge-required">必须处理</span></td>
+                    </tr>
+                    <tr>
+                        <td><code>...</code></td>
+                        <td>any</td>
+                        <td>用户 input</td>
+                        <td>用户创建任务时传入的所有 <code>input</code> 原始参数。</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>minioConfig 详细结构</h4>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>endpoint</code></td><td>string</td><td>MinIO 服务地址（host:port）</td></tr>
+                    <tr><td><code>bucket_name</code></td><td>string</td><td>存储桶名称</td></tr>
+                    <tr><td><code>access_key</code></td><td>string</td><td>访问密钥</td></tr>
+                    <tr><td><code>secret_key</code></td><td>string</td><td>密钥</td></tr>
+                    <tr><td><code>secure</code></td><td>bool</td><td>是否使用 HTTPS</td></tr>
+                    <tr><td><code>region</code></td><td>string</td><td>存储区域</td></tr>
+                </tbody>
+            </table>
+
+            <!-- Response -->
+            <h3 id="response">2.3 响应规范</h3>
+            <p>服务收到请求后，<strong>同步返回</strong>一个 JSON 响应，通过 HTTP 状态码和 <code>code</code> 字段共同表达处理意图。</p>
+
+            <h4 id="resp-success">2.3.1 接受任务（成功）</h4>
+            <div class="response-card">
+                <div class="response-card-header success">code: 0 — 成功接受</div>
+<pre><code><span class="comment">// HTTP/1.1 200 OK</span>
+{
+  <span class="json-key">"code"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>
+}</code></pre>
+            </div>
+            <ul>
+                <li><code>code</code> 必须为 <strong><code>0</code></strong>（整数）。</li>
+                <li><code>message</code> 可自定义。</li>
+                <li>表示服务已接受任务，将进入异步处理。</li>
+            </ul>
+            <div class="callout callout-warn">
+                <div class="callout-title">注意</div>
+                返回 <code>code: 0</code> 后，服务<strong>必须</strong>通过回调接口回报最终结果，否则任务将停留在 <code>running</code> 状态。
+            </div>
+
+            <h4 id="resp-fail">2.3.2 业务失败（永久失败）</h4>
+            <div class="response-card">
+                <div class="response-card-header danger">code: 1 — 业务失败</div>
+<pre><code><span class="comment">// HTTP/1.1 200 OK</span>
+{
+  <span class="json-key">"code"</span>: <span class="json-number">1</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"invalid mask image format"</span>
+}</code></pre>
+            </div>
+            <ul>
+                <li><code>code</code> 必须为 <strong><code>1</code></strong>（整数）。</li>
+                <li><code>message</code> 为失败原因描述，将记录到任务的 <code>reason</code> 字段。</li>
+                <li><strong>适用场景</strong>：输入参数错误、资源不可访问、业务规则不通过等。</li>
+            </ul>
+
+            <h4 id="resp-busy">2.3.3 并发限制（可重试拒绝）</h4>
+            <div class="response-card">
+                <div class="response-card-header warning">code: 2 — 并发限制</div>
+<pre><code><span class="comment">// HTTP/1.1 200 OK</span>
+{
+  <span class="json-key">"code"</span>: <span class="json-number">2</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"A task is running."</span>
+}</code></pre>
+            </div>
+            <ul>
+                <li><code>code</code> 必须为 <strong><code>2</code></strong>（整数）。</li>
+                <li><code>message</code> 可自定义。</li>
+                <li>表示服务当前并发已满，无法接受新任务。</li>
+                <li>调度层收到此响应后，任务<strong>保持 <code>pending</code> 状态</strong>，约 5 秒后自动重试。</li>
+            </ul>
+            <div class="callout callout-info">
+                <div class="callout-title">重要</div>
+                这是服务向调度层传递「我很忙」信号的<strong>唯一正确方式</strong>。不要通过返回 HTTP 503 或其他状态码来表达并发限制。
+            </div>
+
+            <h4 id="resp-summary">2.3.4 响应总览表</h4>
+            <table>
+                <thead>
+                    <tr><th>场景</th><th>HTTP Status</th><th>code</th><th>调度层行为</th><th>任务状态变化</th><th>自动重试</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>成功接受</td><td>200</td><td><code>0</code></td>
+                        <td>任务进入运行态</td><td><code>pending</code> &rarr; <code>running</code></td><td>-</td>
+                    </tr>
+                    <tr>
+                        <td>业务失败</td><td>200</td><td><code>1</code></td>
+                        <td>任务标记为失败</td><td><code>pending</code> &rarr; <code>failed</code></td><td>否</td>
+                    </tr>
+                    <tr>
+                        <td>并发限制</td><td>200</td><td><code>2</code></td>
+                        <td>任务等待后重试</td><td><code>pending</code>（不变）</td><td>是，约 5 秒后</td>
+                    </tr>
+                    <tr>
+                        <td>服务不可用</td><td>503</td><td>(忽略)</td>
+                        <td>任务等待后重试</td><td><code>pending</code>（不变）</td><td>是，约 5 秒后</td>
+                    </tr>
+                    <tr>
+                        <td>其他 5xx</td><td>500/502/...</td><td>(忽略)</td>
+                        <td>任务标记失败 + 端点不健康 + 告警</td><td><code>pending</code> &rarr; <code>failed</code></td><td>否</td>
+                    </tr>
+                    <tr>
+                        <td>4xx 错误</td><td>400/404/...</td><td>(忽略)</td>
+                        <td>任务标记失败</td><td><code>pending</code> &rarr; <code>failed</code></td><td>否</td>
+                    </tr>
+                    <tr>
+                        <td>响应体非 JSON</td><td>200</td><td>-</td>
+                        <td>任务标记失败</td><td><code>pending</code> &rarr; <code>failed</code></td><td>否</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4 id="resp-notes">2.3.5 重要提醒</h4>
+            <div class="callout callout-info">
+                <div class="callout-title">HTTP 503 特殊语义</div>
+                调度层将 503 视为暂时不可用（可重试），且<strong>不会</strong>标记服务为不健康。如需表达「当前忙」，优先使用 <code>code: 2</code>。
+            </div>
+            <div class="callout callout-danger">
+                <div class="callout-title">HTTP 5xx 严重后果</div>
+                除 503 外的任何 5xx 响应会导致服务被标记为不健康（跳过后续调度），并触发告警。请确保服务稳定时不要返回 5xx。
+            </div>
+            <ol>
+                <li><strong>响应体格式</strong>：HTTP 200 时，响应体必须是合法 JSON（至少包含 <code>code</code> 字段），否则任务直接失败。</li>
+                <li><strong><code>code</code> 字段类型</strong>：必须为<strong>数字类型</strong>（整数 0/1/2），不是字符串。</li>
+            </ol>
+
+            <!-- Section 3: Callback -->
+            <h2 id="callback">三、回调接口（下游服务调用调度层）</h2>
+
+            <h3>3.1 接口定义</h3>
+            <p>服务在异步处理任务过程中或完成后，<strong>必须</strong>向请求体中携带的 <code>callbackUrl</code> 发送 POST 请求。</p>
+<pre><code>POST {callbackUrl}
+Content-Type: application/json</code></pre>
+            <p>其中 <code>{callbackUrl}</code> 格式为：<code>http://&lt;flowcut-host&gt;/tasks/&lt;taskId&gt;/callback</code></p>
+
+            <h3 id="callback-body">3.2 请求体</h3>
+<pre><code>{
+  <span class="json-key">"status"</span>:   <span class="json-string">"succeeded"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">100</span>,
+  <span class="json-key">"reason"</span>:   <span class="json-string">""</span>,
+  <span class="json-key">"output"</span>:   <span class="json-string">"{\"result_url\":\"https://minio.example.com/outputs/result.jpg\",\"duration\":45}"</span>
+}</code></pre>
+
+            <h4>字段说明</h4>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>status</code></td><td>string</td>
+                        <td><span class="badge badge-required">是</span></td>
+                        <td>任务结果状态，合法值见下表。</td>
+                    </tr>
+                    <tr>
+                        <td><code>progress</code></td><td>number</td>
+                        <td><span class="badge badge-optional">否</span></td>
+                        <td>处理进度，范围 0.0 ~ 100.0。</td>
+                    </tr>
+                    <tr>
+                        <td><code>reason</code></td><td>string</td>
+                        <td><span class="badge badge-optional">否</span></td>
+                        <td>状态原因说明。成功时可空，失败时应填写错误描述。</td>
+                    </tr>
+                    <tr>
+                        <td><code>output</code></td><td>string</td>
+                        <td><span class="badge badge-optional">否</span></td>
+                        <td>处理结果，<strong>建议为 JSON 字符串</strong>。成功时填写结果数据，失败时可省略。</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>status 合法值</h4>
+            <table>
+                <thead>
+                    <tr><th>status</th><th>含义</th><th>使用场景</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><span class="status-tag succeeded">succeeded</span></td><td>处理成功</td><td>任务正常完成</td></tr>
+                    <tr><td><span class="status-tag failed">failed</span></td><td>处理失败</td><td>任务执行出错、资源异常等</td></tr>
+                    <tr><td><span class="status-tag running">running</span></td><td>处理中</td><td>上报中间进度（配合 <code>progress</code> 字段）</td></tr>
+                </tbody>
+            </table>
+
+            <h4>典型调用时机</h4>
+
+            <p><strong>1) 处理成功</strong></p>
+<pre><code>{
+  <span class="json-key">"status"</span>:   <span class="json-string">"succeeded"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">100</span>,
+  <span class="json-key">"reason"</span>:   <span class="json-string">""</span>,
+  <span class="json-key">"output"</span>:   <span class="json-string">"{\"result_url\":\"https://storage.example.com/out/result.jpg\"}"</span>
+}</code></pre>
+
+            <p><strong>2) 处理失败</strong></p>
+<pre><code>{
+  <span class="json-key">"status"</span>:   <span class="json-string">"failed"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"reason"</span>:   <span class="json-string">"GPU out of memory during inference"</span>,
+  <span class="json-key">"output"</span>:   <span class="json-string">""</span>
+}</code></pre>
+
+            <p><strong>3) 进度上报（可选）</strong></p>
+<pre><code>{
+  <span class="json-key">"status"</span>:   <span class="json-string">"running"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">45.5</span>,
+  <span class="json-key">"reason"</span>:   <span class="json-string">"processing frame 23/50"</span>,
+  <span class="json-key">"output"</span>:   <span class="json-string">""</span>
+}</code></pre>
+
+            <div class="callout callout-info">
+                进度上报不是必须的。如果服务支持，可在处理过程中多次调用回调接口。
+            </div>
+
+            <h3 id="callback-resp">3.3 响应</h3>
+            <p>回调接口无需认证，成功时返回：</p>
+<pre><code>{
+  <span class="json-key">"code"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"msg"</span>:  <span class="json-string">"callback processed"</span>
+}</code></pre>
+            <p>服务<strong>无需关心回调的响应内容</strong>，只需确保 HTTP 请求发送成功即可。</p>
+
+            <h3 id="callback-reset">3.4 重置任务为 pending（高级用法）</h3>
+            <p>在特殊场景下（如服务内部 OOM 导致任务异常中断），服务可通过回调将任务重置为 <code>pending</code> 状态，触发调度层重新分发：</p>
+<pre><code>{
+  <span class="json-key">"status"</span>:   <span class="json-string">"pending"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"reason"</span>:   <span class="json-string">"task reset due to OOM, requesting re-dispatch"</span>,
+  <span class="json-key">"output"</span>:   <span class="json-string">""</span>
+}</code></pre>
+            <div class="callout callout-warn">
+                <div class="callout-title">约束</div>
+                仅当任务当前处于 <code>pending</code>、<code>running</code> 或 <code>failed</code> 状态时允许重置。<code>succeeded</code>、<code>paused</code>、<code>canceled</code> 状态的任务<strong>不允许</strong>被重置为 <code>pending</code>。
+            </div>
+
+            <!-- Section 4 -->
+            <h2 id="concurrency">四、并发管理</h2>
+            <h3>4.1 服务侧并发控制</h3>
+            <p>服务<strong>必须</strong>自行维护并发计数，在接收 <code>POST /generate</code> 请求时：</p>
+            <ol>
+                <li>检查当前运行任务数是否已达并发上限。</li>
+                <li>未达上限 &rarr; 接受任务，计数 +1，返回 <code>code: 0</code>。</li>
+                <li>已达上限 &rarr; 拒绝任务，返回 <code>code: 2</code>。</li>
+                <li>任务处理完成后（无论成功失败），计数 -1。</li>
+            </ol>
+
+            <!-- Section 5 -->
+            <h2 id="onboarding">五、完整对接流程</h2>
+            <h3>5.1 接入步骤</h3>
+            <div class="flow-steps">
+                <div class="flow-step">
+                    <div class="flow-step-num">1</div>
+                    <div class="flow-step-title">实现分发接口</div>
+                    <div class="flow-step-desc">POST /generate<br>解析参数 + 并发检查 + 异步处理</div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-step-num">2</div>
+                    <div class="flow-step-title">实现回调逻辑</div>
+                    <div class="flow-step-desc">处理完成后 POST callbackUrl<br>可选进度上报</div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-step-num">3</div>
+                    <div class="flow-step-title">确认并发配置</div>
+                    <div class="flow-step-desc">与调度层运维确认 concurrency<br>实现对应并发限制</div>
+                </div>
+            </div>
+
+            <h3 id="checklist-table">5.2 自检清单</h3>
+            <table class="check-table">
+                <thead>
+                    <tr><th>#</th><th>检查项</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>1</td><td><code>POST /generate</code> 接口可达</td><td>调度层配置的 URL 能正确路由到服务。</td></tr>
+                    <tr><td>2</td><td>请求体能正确解析</td><td>兼容 <code>taskId</code>、<code>timeout</code>、<code>callbackUrl</code>、<code>minioConfig</code> 及业务字段。</td></tr>
+                    <tr><td>3</td><td>成功时返回 <code>{"code": 0, ...}</code></td><td>HTTP 200 + JSON。</td></tr>
+                    <tr><td>4</td><td>业务失败时返回 <code>{"code": 1, ...}</code></td><td>HTTP 200 + JSON。</td></tr>
+                    <tr><td>5</td><td>并发满时返回 <code>{"code": 2, ...}</code></td><td>HTTP 200 + JSON。</td></tr>
+                    <tr><td>6</td><td>异步处理后回调 <code>callbackUrl</code></td><td>成功/失败都必须回调。</td></tr>
+                    <tr><td>7</td><td>回调体包含 <code>status</code> 字段</td><td>值为 <code>succeeded</code> / <code>failed</code>。</td></tr>
+                    <tr><td>8</td><td>并发控制逻辑正确</td><td>超限时拒绝，完成后释放。</td></tr>
+                    <tr><td>9</td><td>TCP 端口可达</td><td>调度层健康检查（每 30 秒 TCP Dial）能连通。</td></tr>
+                    <tr><td>10</td><td>30 秒内返回同步响应</td><td>超时会被视为网络错误并重试。</td></tr>
+                </tbody>
+            </table>
+
+            <!-- Section 6 -->
+            <h2 id="mock">六、附录：Mock 服务参考实现</h2>
+            <p>以下是 FlowCut 内置的 Mock 服务代码，可作为实现参考：</p>
+<pre><code><span class="comment">// POST /generate</span>
+func HandleGenerate(c *gin.Context) {
+    var req struct {
+        TaskID  string <span class="json-key">`json:"taskId"`</span>
+        Timeout int    <span class="json-key">`json:"timeout"`</span>
+    }
+    <span class="comment">// 参数错误 &rarr; code: 1</span>
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(200, gin.H{<span class="json-key">"code"</span>: 1, <span class="json-key">"message"</span>: <span class="json-string">"invalid request"</span>})
+        return
+    }
+
+    <span class="comment">// 并发已满 &rarr; code: 2</span>
+    if !CanStartTask() {
+        c.JSON(200, gin.H{<span class="json-key">"code"</span>: 2, <span class="json-key">"message"</span>: <span class="json-string">"A task is running."</span>})
+        return
+    }
+
+    <span class="comment">// 接受任务 &rarr; code: 0</span>
+    IncrementRunningCount()
+    go processTaskAsync(req.TaskID, req.Timeout)
+    c.JSON(200, gin.H{<span class="json-key">"code"</span>: 0, <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>})
+}
+
+<span class="comment">// 异步处理完成后回调</span>
+func processTaskAsync(taskID string, timeout int) {
+    defer DecrementRunningCount()
+
+    <span class="comment">// ... 执行实际处理 ...</span>
+
+    <span class="comment">// 回调通知调度层</span>
+    callbackURL := fmt.Sprintf(<span class="json-string">"%s/tasks/%s/callback"</span>, flowcutHost, taskID)
+    body := map[string]interface{}{
+        <span class="json-key">"status"</span>:   <span class="json-string">"succeeded"</span>,
+        <span class="json-key">"progress"</span>: 100,
+        <span class="json-key">"output"</span>:   `<span class="json-string">{"result_url":"https://..."}</span>`,
+    }
+    data, _ := json.Marshal(body)
+    http.Post(callbackURL, <span class="json-string">"application/json"</span>, bytes.NewBuffer(data))
+}</code></pre>
+        </main>
+    </div>
+
+    <script>
+        // Active sidebar tracking on scroll
+        const sections = document.querySelectorAll('[id]');
+        const navLinks = document.querySelectorAll('.sidebar a');
+
+        function updateActiveLink() {
+            let currentId = '';
+            sections.forEach(section => {
+                const rect = section.getBoundingClientRect();
+                if (rect.top <= 80) {
+                    currentId = section.id;
+                }
+            });
+            navLinks.forEach(link => {
+                link.classList.remove('active');
+                if (link.getAttribute('href') === '#' + currentId) {
+                    link.classList.add('active');
+                }
+            });
+        }
+
+        window.addEventListener('scroll', updateActiveLink);
+        updateActiveLink();
+    </script>
+</body>
+</html>

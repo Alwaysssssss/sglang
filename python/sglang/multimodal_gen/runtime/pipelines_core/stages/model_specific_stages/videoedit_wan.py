@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.preprocess import prepare_window_inputs
+from sglang.multimodal_gen.runtime.videoedit.progress import (
+    build_window_progress_payload,
+    write_videoedit_progress,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 
@@ -453,6 +457,19 @@ class VideoEditDenoisingStage(DenoisingStage):
                     params.runtime_latents = latents
                     batch.latents = latents
                     params.runtime_progress = float(i + 1) / float(len(timesteps))
+                    write_videoedit_progress(
+                        params.progress_path,
+                        build_window_progress_payload(
+                            stage="denoising",
+                            total_frames=params.runtime_num_input_frames,
+                            infer_len=params.infer_len,
+                            overlap=params.overlap,
+                            total_windows=len(params.runtime_window_specs or [None]),
+                            current_window_index=params.runtime_window_index,
+                            current_step_index=i,
+                            steps_per_window=len(timesteps),
+                        ),
+                    )
                     if progress_bar is not None:
                         progress_bar.update()
 

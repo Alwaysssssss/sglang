@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlowCut VideoEdit 修复服务接口说明</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Noto Sans SC', sans-serif;
+            background: #ffffff;
+            color: #111827;
+            line-height: 1.7;
+            font-size: 15px;
+        }
+
+        /* Top nav bar */
+        .topnav {
+            background: #111827;
+            color: #f9fafb;
+            padding: 10px 24px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .topnav-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: #f9fafb;
+        }
+
+        .topnav a {
+            color: #93c5fd;
+            text-decoration: none;
+            font-size: 13px;
+        }
+
+        .topnav a:hover {
+            color: #bfdbfe;
+            text-decoration: underline;
+        }
+
+        .topnav .sep {
+            color: #4b5563;
+        }
+
+        /* Layout */
+        .layout {
+            display: flex;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 260px;
+            min-width: 260px;
+            border-right: 1px solid #e5e7eb;
+            padding: 20px 16px;
+            position: sticky;
+            top: 41px;
+            height: calc(100vh - 41px);
+            overflow-y: auto;
+            font-size: 13px;
+        }
+
+        .sidebar-section {
+            margin-bottom: 16px;
+        }
+
+        .sidebar-section-title {
+            font-size: 11px;
+            font-weight: 700;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+            padding: 0 8px;
+        }
+
+        .sidebar a {
+            display: block;
+            color: #374151;
+            text-decoration: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .sidebar a:hover {
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        .sidebar a.active {
+            background: #eff6ff;
+            color: #1d4ed8;
+            font-weight: 600;
+        }
+
+        .sidebar .indent-1 { padding-left: 20px; font-size: 12px; }
+        .sidebar .indent-2 { padding-left: 32px; font-size: 12px; }
+
+        /* Content */
+        .content {
+            flex: 1;
+            min-width: 0;
+            padding: 32px 48px 80px;
+            max-width: 900px;
+        }
+
+        h1 {
+            font-size: 28px;
+            font-weight: 800;
+            color: #111827;
+            margin-bottom: 12px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+
+        .lead {
+            font-size: 16px;
+            color: #4b5563;
+            margin-bottom: 32px;
+            padding: 16px 20px;
+            background: #f8fafc;
+            border-left: 4px solid #3b82f6;
+            border-radius: 0 6px 6px 0;
+        }
+
+        h2 {
+            font-size: 22px;
+            font-weight: 700;
+            color: #111827;
+            margin-top: 48px;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        h3 {
+            font-size: 18px;
+            font-weight: 700;
+            color: #1f2937;
+            margin-top: 32px;
+            margin-bottom: 12px;
+        }
+
+        h4 {
+            font-size: 15px;
+            font-weight: 700;
+            color: #374151;
+            margin-top: 24px;
+            margin-bottom: 8px;
+        }
+
+        p {
+            margin-bottom: 12px;
+        }
+
+        /* Checklist box */
+        .checklist-box {
+            background: #f0fdf4;
+            border: 1px solid #bbf7d0;
+            border-radius: 8px;
+            padding: 20px 24px;
+            margin-bottom: 24px;
+        }
+
+        .checklist-box h3 {
+            margin-top: 0;
+            color: #166534;
+            font-size: 16px;
+        }
+
+        .checklist-box ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        .checklist-box > ul > li {
+            margin-bottom: 12px;
+        }
+
+        .checklist-box > ul > li > strong {
+            color: #166534;
+        }
+
+        .checklist-box ul ul {
+            padding-left: 24px;
+            margin-top: 4px;
+        }
+
+        .checklist-box ul ul li {
+            margin-bottom: 2px;
+            color: #374151;
+        }
+
+        /* Alert / callout boxes */
+        .callout {
+            padding: 14px 18px;
+            border-radius: 6px;
+            margin: 16px 0;
+            font-size: 14px;
+        }
+
+        .callout-warn {
+            background: #fffbeb;
+            border: 1px solid #fde68a;
+            border-left: 4px solid #f59e0b;
+        }
+
+        .callout-danger {
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            border-left: 4px solid #ef4444;
+        }
+
+        .callout-info {
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            border-left: 4px solid #3b82f6;
+        }
+
+        .callout-title {
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 12px 0 20px;
+            font-size: 14px;
+        }
+
+        th {
+            background: #f3f4f6;
+            color: #111827;
+            padding: 10px 12px;
+            text-align: left;
+            font-weight: 700;
+            border-bottom: 2px solid #d1d5db;
+            font-size: 13px;
+        }
+
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid #e5e7eb;
+            vertical-align: top;
+        }
+
+        tr:hover {
+            background: #f9fafb;
+        }
+
+        /* Code */
+        code {
+            font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+            font-size: 13px;
+            background: #f3f4f6;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #be185d;
+        }
+
+        pre {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 16px 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 12px 0 20px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        pre code {
+            background: none;
+            color: inherit;
+            padding: 0;
+            font-size: 13px;
+        }
+
+        /* JSON syntax highlights */
+        .json-key { color: #7dd3fc; }
+        .json-string { color: #86efac; }
+        .json-number { color: #fbbf24; }
+        .json-bool { color: #c084fc; }
+        .comment { color: #64748b; font-style: italic; }
+
+        /* Lists */
+        ul, ol {
+            margin: 8px 0 16px 24px;
+        }
+
+        li {
+            margin-bottom: 4px;
+        }
+
+        /* Diagram blocks */
+        .diagram {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+
+        .diagram pre {
+            background: none;
+            color: #334155;
+            padding: 0;
+            margin: 0;
+            font-size: 13px;
+        }
+
+        /* Response card */
+        .response-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            margin: 16px 0;
+            overflow: hidden;
+        }
+
+        .response-card-header {
+            padding: 10px 16px;
+            font-weight: 700;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .response-card-header.success { background: #f0fdf4; color: #166534; }
+        .response-card-header.danger { background: #fef2f2; color: #991b1b; }
+        .response-card-header.warning { background: #fffbeb; color: #92400e; }
+
+        .response-card pre {
+            margin: 0;
+            border-radius: 0;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .badge-required { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+        .badge-optional { background: #f0fdf4; color: #16a34a; border: 1px solid #bbf7d0; }
+        .badge-recommended { background: #eff6ff; color: #2563eb; border: 1px solid #bfdbfe; }
+
+        /* Status indicator */
+        .status-tag {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .status-tag.running { background: #dbeafe; color: #1e40af; }
+        .status-tag.succeeded { background: #dcfce7; color: #166534; }
+        .status-tag.failed { background: #fee2e2; color: #991b1b; }
+
+        /* Pseudo code */
+        .pseudocode {
+            background: #fefce8;
+            border: 1px solid #fde68a;
+            border-radius: 8px;
+            margin: 16px 0;
+        }
+
+        .pseudocode-title {
+            background: #fef3c7;
+            padding: 8px 16px;
+            font-weight: 700;
+            font-size: 13px;
+            color: #92400e;
+            border-bottom: 1px solid #fde68a;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .pseudocode pre {
+            background: none;
+            color: #78350f;
+            margin: 0;
+            border-radius: 0 0 8px 8px;
+        }
+
+        /* Checklist table */
+        .check-table td:first-child {
+            text-align: center;
+            font-weight: 700;
+            color: #6b7280;
+            width: 30px;
+        }
+
+        /* Flow diagram */
+        .flow-steps {
+            display: flex;
+            gap: 12px;
+            margin: 16px 0;
+            flex-wrap: wrap;
+        }
+
+        .flow-step {
+            flex: 1;
+            min-width: 180px;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 14px;
+            text-align: center;
+            position: relative;
+        }
+
+        .flow-step-num {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+            border-radius: 50%;
+            background: #3b82f6;
+            color: white;
+            font-size: 12px;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .flow-step-title {
+            font-weight: 700;
+            font-size: 13px;
+            margin-bottom: 4px;
+        }
+
+        .flow-step-desc {
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        /* Responsive */
+        @media (max-width: 960px) {
+            .sidebar { display: none; }
+            .content { padding: 24px 20px 60px; }
+        }
+
+        /* Smooth scroll */
+        html {
+            scroll-behavior: smooth;
+        }
+
+        /* Scroll offset for sticky header */
+        [id] {
+            scroll-margin-top: 56px;
+        }
+    </style>
+</head>
+<body>
+    <div class="topnav">
+        <span class="topnav-title">FlowCut</span>
+        <span class="sep">|</span>
+        <a href="/static/health.html">运行监控</a>
+        <span class="sep">|</span>
+        <a href="/static/config.html">配置</a>
+        <span class="sep">|</span>
+        <a href="/static/downstream-endpoint-spec.html">下游接口规范</a>
+        <span class="sep">|</span>
+        <a href="/static/videoedit-repair-endpoint-spec.html" style="color:#fff; font-weight:600;">VideoEdit 修复接口</a>
+    </div>
+
+    <div class="layout">
+        <nav class="sidebar" id="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">快速开始</div>
+                <a href="#checklist">调用方检查清单</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">一、概述</div>
+                <a href="#overview" class="indent-1">1.1 交互模型</a>
+                <a href="#constraints" class="indent-1">1.2 关键约束</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">二、任务提交接口</div>
+                <a href="#submit" class="indent-1">2.1 接口定义</a>
+                <a href="#request-example" class="indent-1">2.2 当前请求示例</a>
+                <a href="#request-body" class="indent-1">2.3 请求体字段</a>
+                <a href="#minio" class="indent-1">2.4 MinIO 配置</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">三、同步响应</div>
+                <a href="#response" class="indent-1">3.1 响应规范</a>
+                <a href="#resp-success" class="indent-2">接受任务 (code: 0)</a>
+                <a href="#resp-fail" class="indent-2">业务失败 (code: 1)</a>
+                <a href="#resp-busy" class="indent-2">并发限制 (code: 2)</a>
+                <a href="#resp-summary" class="indent-2">响应总览表</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">四、查询和任务管理</div>
+                <a href="#health" class="indent-1">4.1 健康检查</a>
+                <a href="#video-detail" class="indent-1">4.2 任务详情</a>
+                <a href="#progress" class="indent-1">4.3 查询进度</a>
+                <a href="#content" class="indent-1">4.4 下载内容</a>
+                <a href="#delete" class="indent-1">4.5 删除任务</a>
+                <a href="#output" class="indent-1">4.6 输出位置</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">五、超时和回调</div>
+                <a href="#timeout" class="indent-1">5.1 timeout 语义</a>
+                <a href="#callback" class="indent-1">5.2 回调请求</a>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">六、自检</div>
+                <a href="#checklist-table" class="indent-1">6.1 自检清单</a>
+                <a href="#appendix" class="indent-1">6.2 对象路径对照</a>
+            </div>
+        </nav>
+
+        <main class="content">
+            <h1>FlowCut VideoEdit 修复服务接口说明</h1>
+            <div class="lead">
+                本文档对照当前发送到 <strong>SGLang VideoEdit Serve</strong> 的 <code>POST /v1/videos/repairs</code> 请求，说明请求字段、MinIO 输入输出、同步响应、进度查询、超时和回调行为。
+            </div>
+
+            <div id="checklist" class="checklist-box">
+                <h3>调用方检查清单</h3>
+                <ul>
+                    <li>
+                        <strong>准备输入资源</strong>
+                        <ul>
+                            <li>视频地址 <code>videoUrl</code> 可由服务端访问。</li>
+                            <li>mask 地址 <code>maskUrl</code> 可由服务端访问。</li>
+                            <li>参考图地址 <code>referenceImageUrl</code> 可由服务端访问。</li>
+                        </ul>
+                    </li>
+                    <li>
+                        <strong>提交修复任务</strong>
+                        <ul>
+                            <li>请求方法为 <code>POST</code>，路径为 <code>/v1/videos/repairs</code>。</li>
+                            <li>请求头必须包含 <code>Content-Type: application/json</code>。</li>
+                            <li>请求体必须包含 <code>taskId</code>、<code>callbackUrl</code>、<code>prompt</code>、<code>videoUrl</code>、<code>maskUrl</code>。</li>
+                            <li>当前任务需要参考图，因此携带 <code>referenceImageUrl</code>。</li>
+                        </ul>
+                    </li>
+                    <li>
+                        <strong>配置输出</strong>
+                        <ul>
+                            <li>携带 <code>minioConfig</code> 和 <code>outputObjectKey</code> 时，结果会上传到指定 bucket/object。</li>
+                            <li>当前输出对象为 <code>outputs/ubuntu-minio-videoedit-008.mp4</code>。</li>
+                        </ul>
+                    </li>
+                    <li>
+                        <strong>处理长任务</strong>
+                        <ul>
+                            <li><code>timeout: -1</code> 表示不因任务超时取消后台推理。</li>
+                            <li>提交后用 <code>GET /v1/videos/{taskId}/progress</code> 轮询状态。</li>
+                        </ul>
+                    </li>
+                </ul>
+            </div>
+
+            <h2 id="overview">一、概述</h2>
+            <h3>1.1 交互模型</h3>
+            <div class="diagram">
+<pre>调用方 / FlowCut ──POST /v1/videos/repairs──&gt; SGLang VideoEdit Serve
+     <span class="comment">同步返回 code/message</span>                    <span class="comment">后台下载输入并执行修复</span>
+
+调用方 / FlowCut &lt;──POST callbackUrl──────── SGLang VideoEdit Serve
+     <span class="comment">任务完成或失败后回调</span>                   <span class="comment">输出上传到 MinIO 或保留本地文件</span>
+
+调用方 ──GET /v1/videos/{taskId}──────────&gt; SGLang VideoEdit Serve
+调用方 ──GET /v1/videos/{taskId}/progress──&gt; SGLang VideoEdit Serve
+调用方 ──GET /v1/videos/{taskId}/content───&gt; SGLang VideoEdit Serve
+调用方 ──DELETE /v1/videos/{taskId}────────&gt; SGLang VideoEdit Serve
+     <span class="comment">查询详情、轮询进度、下载内容或删除任务记录</span></pre>
+            </div>
+
+            <p>交互分为<strong>三个阶段</strong>：</p>
+            <table>
+                <thead>
+                    <tr><th>阶段</th><th>方向</th><th>协议</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>任务提交</td>
+                        <td>调用方 &rarr; VideoEdit Serve</td>
+                        <td><code>POST /v1/videos/repairs</code></td>
+                        <td>服务快速返回 <code>{"code":0,"message":"ok"}</code>，后台异步处理。</td>
+                    </tr>
+                    <tr>
+                        <td>查询和管理</td>
+                        <td>调用方 &rarr; VideoEdit Serve</td>
+                        <td><code>GET /v1/videos/{taskId}</code><br><code>GET /v1/videos/{taskId}/progress</code><br><code>GET /v1/videos/{taskId}/content</code><br><code>DELETE /v1/videos/{taskId}</code></td>
+                        <td>查询任务详情、轮询进度、下载输出视频或删除任务记录。</td>
+                    </tr>
+                    <tr>
+                        <td>结果回调</td>
+                        <td>VideoEdit Serve &rarr; 调用方</td>
+                        <td><code>POST {callbackUrl}</code></td>
+                        <td>任务完成或失败后，服务主动通知调用方。</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h3 id="constraints">1.2 关键约束</h3>
+            <ul>
+                <li>接口是异步任务接口，提交成功只表示任务已被接受，不表示推理完成。</li>
+                <li>默认服务并发为 1。已有任务运行时，新请求会返回 <code>code: 2</code>。</li>
+                <li><code>callbackUrl</code> 当前为必填字段；如果使用占位地址，将无法收到真实回调。</li>
+                <li>输入 URL 必须能被 serve 所在机器访问，包含视频、mask 和参考图。</li>
+                <li>携带 <code>referenceImageUrl</code> 时，服务会把参考图作为参考首帧参与修复；未显式传 <code>drop_reference_frame</code> 时，默认会在输出中丢弃该参考首帧。</li>
+            </ul>
+
+            <h2 id="submit">二、任务提交接口</h2>
+            <h3>2.1 接口定义</h3>
+<pre><code>POST http://10.51.28.123:30000/v1/videos/repairs
+Content-Type: application/json</code></pre>
+
+            <h3 id="request-example">2.2 当前请求示例</h3>
+            <p>以下示例在原请求基础上加入了参考图 <code>referenceImageUrl</code>，并将 <code>timeout</code> 设置为 <code>-1</code>，表示后台任务不因超时被取消。</p>
+<pre><code>curl -v --fail-with-body -X POST "http://10.51.28.123:30000/v1/videos/repairs" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "taskId":"ubuntu-minio-videoedit-008",
+    "timeout":-1,
+    "callbackUrl":"https://example.com/videoedit/callback",
+    "prompt":"A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video.",
+    "videoUrl":"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/test/video/15108907_3840_2160_50fps_short.mp4",
+    "maskUrl":"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/test/mask/mask.json",
+    "referenceImageUrl":"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/test/image/15108907_first_frame.png",
+    "minioConfig":{
+      "endpoint":"https://sites-hurricane-substantial-really.trycloudflare.com",
+      "bucket_name":"flowcut",
+      "access_key":"admin",
+      "secret_key":"admin123456",
+      "secure":true,
+      "region":"us-east-1"
+    },
+    "outputObjectKey":"outputs/ubuntu-minio-videoedit-008.mp4",
+    "num_frames":-1,
+    "infer_len":81,
+    "overlap":5,
+    "num_inference_steps":20,
+    "guidance_scale":5.0,
+    "seed":42,
+    "dtype":"bf16",
+    "enable_paste_back":true
+  }'</code></pre>
+
+            <div class="callout callout-warn">
+                <div class="callout-title">注意</div>
+                示例中的 <code>callbackUrl</code> 是占位地址。生产环境需要替换成调用方真实可访问的回调地址，否则任务完成后回调会失败，但不影响通过进度接口查询任务状态。
+            </div>
+
+            <h3 id="request-body">2.3 请求体字段</h3>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>必填</th><th>当前值</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>taskId</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>ubuntu-minio-videoedit-008</code></td>
+                        <td>任务唯一 ID。后续进度查询和回调中都会使用该 ID。</td>
+                    </tr>
+                    <tr>
+                        <td><code>timeout</code></td><td>int</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>-1</code></td>
+                        <td>后台任务超时秒数。<code>-1</code> 表示不设置任务超时；正数表示超过该秒数后标记为超时失败。</td>
+                    </tr>
+                    <tr>
+                        <td><code>callbackUrl</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>https://example.com/videoedit/callback</code></td>
+                        <td>任务完成或失败后，服务主动 POST 的回调地址。</td>
+                    </tr>
+                    <tr>
+                        <td><code>prompt</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td>橙色花朵描述</td>
+                        <td>视频修复提示词，用于约束生成内容和画面风格。</td>
+                    </tr>
+                    <tr>
+                        <td><code>videoUrl</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>.../test/video/15108907_3840_2160_50fps_short.mp4</code></td>
+                        <td>待修复输入视频地址。</td>
+                    </tr>
+                    <tr>
+                        <td><code>maskUrl</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>.../test/mask/mask.json</code></td>
+                        <td>mask JSON 地址。服务端读取该 JSON 获取 mask 信息；内容需与输入视频帧范围匹配或可被预处理逻辑兼容。</td>
+                    </tr>
+                    <tr>
+                        <td><code>referenceImageUrl</code></td><td>string</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>.../test/image/15108907_first_frame.png</code></td>
+                        <td>参考图片地址。当前请求使用 MinIO 中的 <code>15108907_first_frame.png</code>。</td>
+                    </tr>
+                    <tr>
+                        <td><code>minioConfig</code></td><td>object</td><td><span class="badge badge-required">是</span></td>
+                        <td>见下表</td>
+                        <td>用于下载输入资源和上传输出结果的存储配置。</td>
+                    </tr>
+                    <tr>
+                        <td><code>outputObjectKey</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>outputs/ubuntu-minio-videoedit-008.mp4</code></td>
+                        <td>输出视频在 bucket 中的对象路径。</td>
+                    </tr>
+                    <tr>
+                        <td><code>num_frames</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>-1</code></td>
+                        <td>处理帧数。<code>-1</code> 表示读取输入视频的全部可用帧，并按 mask 配置处理对应帧。</td>
+                    </tr>
+                    <tr>
+                        <td><code>infer_len</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>81</code></td>
+                        <td>单次窗口推理长度。</td>
+                    </tr>
+                    <tr>
+                        <td><code>overlap</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>5</code></td>
+                        <td>多窗口推理时相邻窗口重叠帧数。</td>
+                    </tr>
+                    <tr>
+                        <td><code>num_inference_steps</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>20</code></td>
+                        <td>扩散采样步数。</td>
+                    </tr>
+                    <tr>
+                        <td><code>guidance_scale</code></td><td>float</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>5.0</code></td>
+                        <td>提示词引导强度。</td>
+                    </tr>
+                    <tr>
+                        <td><code>seed</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>42</code></td>
+                        <td>随机种子，用于结果复现。</td>
+                    </tr>
+                    <tr>
+                        <td><code>dtype</code></td><td>string</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>bf16</code></td>
+                        <td>推理精度。</td>
+                    </tr>
+                    <tr>
+                        <td><code>enable_paste_back</code></td><td>bool</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>true</code></td>
+                        <td>启用修复区域回贴到原视频。</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h4>字段别名</h4>
+            <p>接口支持当前请求中的驼峰字段名，并在服务端转换为内部 snake_case 字段。</p>
+            <table>
+                <thead>
+                    <tr><th>请求字段</th><th>服务端字段</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>taskId</code></td><td><code>task_id</code></td></tr>
+                    <tr><td><code>callbackUrl</code></td><td><code>callback_url</code></td></tr>
+                    <tr><td><code>videoUrl</code></td><td><code>video_url</code></td></tr>
+                    <tr><td><code>maskUrl</code></td><td><code>mask_url</code></td></tr>
+                    <tr><td><code>referenceImageUrl</code></td><td><code>reference_image_url</code></td></tr>
+                    <tr><td><code>minioConfig</code></td><td><code>minio_config</code></td></tr>
+                    <tr><td><code>outputObjectKey</code></td><td><code>output_object_key</code></td></tr>
+                </tbody>
+            </table>
+
+            <h3 id="minio">2.4 MinIO 配置</h3>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>当前值</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>endpoint</code></td><td>string</td><td><code>https://sites-hurricane-substantial-really.trycloudflare.com</code></td><td>MinIO/S3 访问入口。</td></tr>
+                    <tr><td><code>bucket_name</code></td><td>string</td><td><code>flowcut</code></td><td>输入和输出对象所在 bucket。</td></tr>
+                    <tr><td><code>access_key</code></td><td>string</td><td><code>admin</code></td><td>访问密钥。</td></tr>
+                    <tr><td><code>secret_key</code></td><td>string</td><td><code>admin123456</code></td><td>访问密钥对应的 secret。</td></tr>
+                    <tr><td><code>secure</code></td><td>bool</td><td><code>true</code></td><td>使用 HTTPS 访问。</td></tr>
+                    <tr><td><code>region</code></td><td>string</td><td><code>us-east-1</code></td><td>S3 region。</td></tr>
+                </tbody>
+            </table>
+
+            <h2 id="response">三、同步响应</h2>
+            <h3>3.1 响应规范</h3>
+            <p>服务收到任务提交请求后，会同步返回一个 JSON 响应。<code>code</code> 表示提交阶段的处理结果，不代表最终视频修复结果。</p>
+
+            <h4 id="resp-success">3.1.1 接受任务（成功）</h4>
+            <div class="response-card">
+                <div class="response-card-header success">code: 0 — 成功接受</div>
+<pre><code><span class="comment">// HTTP/1.1 200 OK</span>
+{
+  <span class="json-key">"code"</span>: <span class="json-number">0</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>
+}</code></pre>
+            </div>
+            <ul>
+                <li>表示任务已入队或已开始后台执行。</li>
+                <li>后续需要通过进度查询接口或回调确认最终结果。</li>
+            </ul>
+
+            <h4 id="resp-fail">3.1.2 业务失败（永久失败）</h4>
+            <div class="response-card">
+                <div class="response-card-header danger">code: 1 — 业务失败</div>
+<pre><code><span class="comment">// HTTP/1.1 200 OK</span>
+{
+  <span class="json-key">"code"</span>: <span class="json-number">1</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"videoUrl or video_input_path is required"</span>
+}</code></pre>
+            </div>
+            <ul>
+                <li>表示请求参数错误、输入资源不可访问、MinIO 配置缺失等提交阶段错误。</li>
+                <li><code>message</code> 会给出失败原因。</li>
+            </ul>
+
+            <h4 id="resp-busy">3.1.3 并发限制（可重试拒绝）</h4>
+            <div class="response-card">
+                <div class="response-card-header warning">code: 2 — 并发限制</div>
+<pre><code><span class="comment">// HTTP/1.1 200 OK</span>
+{
+  <span class="json-key">"code"</span>: <span class="json-number">2</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"A task is running."</span>
+}</code></pre>
+            </div>
+            <ul>
+                <li>表示当前 VideoEdit 服务已有任务运行，无法接受新任务。</li>
+                <li>调用方可以稍后重试。</li>
+            </ul>
+
+            <h4 id="resp-summary">3.1.4 响应总览表</h4>
+            <table>
+                <thead>
+                    <tr><th>场景</th><th>HTTP Status</th><th>code</th><th>调用方行为</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>成功接受</td><td>200</td><td><code>0</code></td><td>开始轮询进度，等待回调或输出 URL。</td></tr>
+                    <tr><td>提交阶段业务失败</td><td>200</td><td><code>1</code></td><td>读取 <code>message</code>，修正参数后重新提交。</td></tr>
+                    <tr><td>服务忙</td><td>200</td><td><code>2</code></td><td>等待当前任务结束后重试。</td></tr>
+                    <tr><td>非 2xx 或网络错误</td><td>其他</td><td>-</td><td>检查 serve 进程、端口、网络连通性。</td></tr>
+                </tbody>
+            </table>
+
+            <h2 id="runtime-apis">四、查询、下载和删除接口</h2>
+            <p>以下接口用于提交任务后的健康检查、任务详情查询、进度轮询、输出下载和任务记录删除。示例中的 <code>video_id</code> 使用当前请求的 <code>taskId</code>：<code>ubuntu-minio-videoedit-008</code>。</p>
+
+            <h3 id="health">4.1 健康检查</h3>
+<pre><code>GET http://10.51.28.123:30000/health</code></pre>
+            <p>用于确认 VideoEdit Serve 进程和 HTTP 服务是否可访问。</p>
+<pre><code>{
+  <span class="json-key">"status"</span>: <span class="json-string">"ok"</span>
+}</code></pre>
+
+            <h3 id="video-detail">4.2 查询任务详情</h3>
+<pre><code>GET http://10.51.28.123:30000/v1/videos/ubuntu-minio-videoedit-008</code></pre>
+            <p>返回任务详情。该接口中的 <code>progress</code> 与 <code>/progress</code> 接口保持同步，都会读取当前窗口和采样 step 换算出的最新进度。</p>
+<pre><code>{
+  <span class="json-key">"id"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
+  <span class="json-key">"object"</span>: <span class="json-string">"video"</span>,
+  <span class="json-key">"model"</span>: <span class="json-string">"videoedit"</span>,
+  <span class="json-key">"status"</span>: <span class="json-string">"running"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">52</span>,
+  <span class="json-key">"created_at"</span>: <span class="json-number">1710000000</span>,
+  <span class="json-key">"url"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"file_path"</span>: <span class="json-string">"/tmp/sglang_videoedit_output_xxx/ubuntu-minio-videoedit-008.mp4"</span>,
+  <span class="json-key">"error"</span>: <span class="json-bool">null</span>
+}</code></pre>
+
+            <h4>主要字段说明</h4>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>id</code></td><td>string</td><td>任务 ID，即提交时的 <code>taskId</code>。</td></tr>
+                    <tr><td><code>status</code></td><td>string</td><td><code>queued</code>、<code>running</code>、<code>completed</code>、<code>failed</code> 或 <code>deleted</code>。</td></tr>
+                    <tr><td><code>progress</code></td><td>number</td><td>当前百分比进度。运行中按窗口和采样 step 更新，完成后为 <code>100</code>。</td></tr>
+                    <tr><td><code>url</code></td><td>string/null</td><td>上传到 MinIO/S3 后的输出视频地址。</td></tr>
+                    <tr><td><code>file_path</code></td><td>string/null</td><td>服务端本地输出文件路径。上传到云存储并清理本地文件后可能为 <code>null</code>。</td></tr>
+                    <tr><td><code>error</code></td><td>object/null</td><td>失败时包含错误信息。</td></tr>
+                </tbody>
+            </table>
+
+            <h3 id="progress">4.3 查询进度</h3>
+<pre><code>GET http://10.51.28.123:30000/v1/videos/ubuntu-minio-videoedit-008/progress</code></pre>
+            <p>返回轻量级进度信息，适合调用方定时轮询。</p>
+<pre><code>{
+  <span class="json-key">"id"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
+  <span class="json-key">"status"</span>: <span class="json-string">"running"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">52</span>,
+  <span class="json-key">"file_path"</span>: <span class="json-string">"/tmp/sglang_videoedit_output_vgfu4tlr/ubuntu-minio-videoedit-008.mp4"</span>,
+  <span class="json-key">"url"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"error"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"callback_status"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"callback_error"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"callback_attempts"</span>: <span class="json-bool">null</span>
+}</code></pre>
+
+            <h4>状态字段说明</h4>
+            <table>
+                <thead>
+                    <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>status</code></td><td>string</td><td><code>running</code> 表示处理中，<code>completed</code> 表示完成，<code>failed</code> 表示失败。</td></tr>
+                    <tr><td><code>progress</code></td><td>number</td><td>当前百分比进度。VideoEdit 修复任务会按窗口和采样 step 换算当前进度。</td></tr>
+                    <tr><td><code>file_path</code></td><td>string</td><td>服务端本地输出路径。</td></tr>
+                    <tr><td><code>url</code></td><td>string/null</td><td>上传到 MinIO/S3 后的访问地址。运行中通常为 <code>null</code>。</td></tr>
+                    <tr><td><code>error</code></td><td>object/null</td><td>失败时包含错误信息。</td></tr>
+                    <tr><td><code>callback_status</code></td><td>string/null</td><td>回调发送状态。</td></tr>
+                    <tr><td><code>callback_error</code></td><td>string/null</td><td>回调失败原因。</td></tr>
+                    <tr><td><code>callback_attempts</code></td><td>number/null</td><td>回调尝试次数。</td></tr>
+                </tbody>
+            </table>
+
+            <h3 id="content">4.4 下载视频内容</h3>
+<pre><code>GET http://10.51.28.123:30000/v1/videos/ubuntu-minio-videoedit-008/content</code></pre>
+            <p>当任务完成且输出仍保留在服务端本地文件系统时，可以用该接口下载 MP4 文件。</p>
+<pre><code>curl -v --fail-with-body "http://10.51.28.123:30000/v1/videos/ubuntu-minio-videoedit-008/content" -o ubuntu-minio-videoedit-008.mp4</code></pre>
+            <table>
+                <thead>
+                    <tr><th>场景</th><th>响应</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>本地文件存在</td><td><code>200 video/mp4</code></td><td>直接返回视频文件。</td></tr>
+                    <tr><td>任务仍在运行或文件不存在</td><td><code>404</code></td><td>返回 <code>Generation is still in-progress</code>。</td></tr>
+                    <tr><td>输出已上传到云存储</td><td><code>400</code></td><td>返回提示信息，调用方应使用 <code>url</code> 字段中的云端地址下载。</td></tr>
+                    <tr><td>任务不存在</td><td><code>404</code></td><td>返回 <code>Video not found</code>。</td></tr>
+                </tbody>
+            </table>
+
+            <h3 id="delete">4.5 删除任务记录</h3>
+<pre><code>DELETE http://10.51.28.123:30000/v1/videos/ubuntu-minio-videoedit-008</code></pre>
+            <p>从服务端内存任务表中删除该任务记录，并返回一个 <code>status</code> 为 <code>deleted</code> 的任务响应。</p>
+<pre><code>{
+  <span class="json-key">"id"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
+  <span class="json-key">"object"</span>: <span class="json-string">"video"</span>,
+  <span class="json-key">"model"</span>: <span class="json-string">"videoedit"</span>,
+  <span class="json-key">"status"</span>: <span class="json-string">"deleted"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">100</span>
+}</code></pre>
+            <div class="callout callout-warn">
+                <div class="callout-title">注意</div>
+                删除接口用于删除任务记录，不建议在任务运行中调用。该操作不等价于取消 GPU 推理，也不保证删除已经上传到 MinIO/S3 的输出对象。
+            </div>
+
+            <h3 id="output">4.6 输出位置</h3>
+            <p>当前请求指定：</p>
+<pre><code>{
+  <span class="json-key">"bucket_name"</span>: <span class="json-string">"flowcut"</span>,
+  <span class="json-key">"outputObjectKey"</span>: <span class="json-string">"outputs/ubuntu-minio-videoedit-008.mp4"</span>
+}</code></pre>
+            <p>因此最终输出对象路径为：</p>
+<pre><code>flowcut/outputs/ubuntu-minio-videoedit-008.mp4</code></pre>
+            <p>如果上传成功，进度接口的 <code>url</code> 字段和回调体中的 <code>outputUrl</code> 应指向该输出视频。</p>
+            <div class="callout callout-info">
+                <div class="callout-title">本地内容下载</div>
+                如果任务没有上传到云存储，且 <code>file_path</code> 存在，可以通过 <code>GET /v1/videos/{taskId}/content</code> 下载本地文件。已上传到云存储时，应使用 <code>url</code> 返回的云端地址。
+            </div>
+
+            <h2 id="timeout">五、超时和回调</h2>
+            <h3>5.1 timeout 语义</h3>
+            <table>
+                <thead>
+                    <tr><th>timeout 值</th><th>含义</th><th>后台任务行为</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td><code>-1</code></td><td>不设置任务超时</td><td>一直等待后台推理完成，不因超时取消。</td></tr>
+                    <tr><td><code>&gt; 0</code></td><td>超时秒数</td><td>超过指定秒数后，任务会标记为失败，错误信息为 <code>task timeout</code>。</td></tr>
+                    <tr><td><code>0</code></td><td>非法值</td><td>提交阶段返回 <code>code: 1</code>。</td></tr>
+                    <tr><td><code>&lt; -1</code></td><td>非法值</td><td>提交阶段返回 <code>code: 1</code>。</td></tr>
+                </tbody>
+            </table>
+            <div class="callout callout-info">
+                <div class="callout-title">说明</div>
+                <code>timeout</code> 控制后台 VideoEdit 任务是否被服务端取消，不是 curl 命令本身的 HTTP 等待时间。任务提交接口仍会尽快同步返回。
+            </div>
+
+            <h3 id="callback">5.2 回调请求</h3>
+            <p>任务完成或失败后，服务会向 <code>callbackUrl</code> 发送 POST 请求。</p>
+<pre><code>POST {callbackUrl}
+Content-Type: application/json</code></pre>
+
+            <p><strong>成功回调示例</strong></p>
+<pre><code>{
+  <span class="json-key">"taskId"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
+  <span class="json-key">"status"</span>: <span class="json-string">"completed"</span>,
+  <span class="json-key">"outputUrl"</span>: <span class="json-string">"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/outputs/ubuntu-minio-videoedit-008.mp4"</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>
+}</code></pre>
+
+            <p><strong>失败回调示例</strong></p>
+<pre><code>{
+  <span class="json-key">"taskId"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
+  <span class="json-key">"status"</span>: <span class="json-string">"failed"</span>,
+  <span class="json-key">"outputUrl"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"message"</span>: <span class="json-string">"task timeout"</span>
+}</code></pre>
+
+            <h2 id="checklist-table">六、自检</h2>
+            <h3>6.1 自检清单</h3>
+            <table class="check-table">
+                <thead>
+                    <tr><th>#</th><th>检查项</th><th>说明</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>1</td><td><code>POST /v1/videos/repairs</code> 可达</td><td>确认 <code>10.51.28.123:30000</code> 端口能访问。</td></tr>
+                    <tr><td>2</td><td>输入视频 URL 可访问</td><td>服务端能下载 <code>videoUrl</code>。</td></tr>
+                    <tr><td>3</td><td>mask URL 可访问</td><td>服务端能下载 <code>maskUrl</code>。</td></tr>
+                    <tr><td>4</td><td>参考图 URL 可访问</td><td>服务端能下载 <code>referenceImageUrl</code>。</td></tr>
+                    <tr><td>5</td><td>MinIO 凭据正确</td><td>可读取 bucket <code>flowcut</code> 并上传到 <code>outputs/</code>。</td></tr>
+                    <tr><td>6</td><td><code>taskId</code> 唯一</td><td>重复 ID 会覆盖或混淆任务状态。</td></tr>
+                    <tr><td>7</td><td><code>timeout</code> 符合预期</td><td>长任务建议使用 <code>-1</code>，避免后台推理被超时取消。</td></tr>
+                    <tr><td>8</td><td>进度接口可查</td><td>提交后执行 <code>GET /v1/videos/{taskId}/progress</code>。</td></tr>
+                    <tr><td>9</td><td>回调地址真实可达</td><td>生产环境不要使用 <code>https://example.com/...</code> 占位地址。</td></tr>
+                    <tr><td>10</td><td>输出对象路径正确</td><td>完成后检查 <code>flowcut/outputs/ubuntu-minio-videoedit-008.mp4</code>。</td></tr>
+                </tbody>
+            </table>
+
+            <h3 id="appendix">6.2 对象路径对照</h3>
+            <table>
+                <thead>
+                    <tr><th>用途</th><th>MinIO 对象路径</th><th>HTTP URL</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>输入视频</td>
+                        <td><code>flowcut/test/video/15108907_3840_2160_50fps_short.mp4</code></td>
+                        <td><code>https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/test/video/15108907_3840_2160_50fps_short.mp4</code></td>
+                    </tr>
+                    <tr>
+                        <td>输入 mask</td>
+                        <td><code>flowcut/test/mask/mask.json</code></td>
+                        <td><code>https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/test/mask/mask.json</code></td>
+                    </tr>
+                    <tr>
+                        <td>参考图</td>
+                        <td><code>flowcut/test/image/15108907_first_frame.png</code></td>
+                        <td><code>https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/test/image/15108907_first_frame.png</code></td>
+                    </tr>
+                    <tr>
+                        <td>输出视频</td>
+                        <td><code>flowcut/outputs/ubuntu-minio-videoedit-008.mp4</code></td>
+                        <td><code>https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/outputs/ubuntu-minio-videoedit-008.mp4</code></td>
+                    </tr>
+                </tbody>
+            </table>
+        </main>
+    </div>
+
+    <script>
+        // Active sidebar tracking on scroll
+        const sections = document.querySelectorAll('[id]');
+        const navLinks = document.querySelectorAll('.sidebar a');
+
+        function updateActiveLink() {
+            let currentId = '';
+            sections.forEach(section => {
+                const rect = section.getBoundingClientRect();
+                if (rect.top <= 80) {
+                    currentId = section.id;
+                }
+            });
+            navLinks.forEach(link => {
+                link.classList.remove('active');
+                if (link.getAttribute('href') === '#' + currentId) {
+                    link.classList.add('active');
+                }
+            });
+        }
+
+        window.addEventListener('scroll', updateActiveLink);
+        updateActiveLink();
+    </script>
+</body>
+</html>

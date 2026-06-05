@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resolve_videoedit_num_frames,
 )
+from sglang.multimodal_gen.runtime.videoedit.progress import read_videoedit_progress
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -437,6 +438,14 @@ def _split_output_path(
     return output_dir, f"{job_id}.mp4"
 
 
+def _current_video_progress(job: Dict[str, Any]) -> int:
+    progress_payload = read_videoedit_progress(job.get("progress_path"))
+    progress = progress_payload.get("progress", job.get("progress", 0))
+    if job.get("status") == "completed":
+        progress = 100
+    return int(progress)
+
+
 def _video_repair_job_from_sampling(
     request_id: str, req: VideoRepairRequest, sampling: SamplingParams
 ) -> Dict[str, Any]:
@@ -606,6 +615,8 @@ async def create_video_repair(request: Request):
             temp_dirs.append(output_dir)
             output_persistent = False
 
+        progress_path = os.path.join(output_dir, f"{request_id}.progress.json")
+
         sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
             server_args,
             request_id=request_id,
@@ -651,6 +662,7 @@ async def create_video_repair(request: Request):
             output_quality=req.output_quality,
             output_compression=req.output_compression,
             perf_dump_path=req.perf_dump_path,
+            progress_path=progress_path,
         )
         output_object_key = None
         if (
@@ -663,6 +675,7 @@ async def create_video_repair(request: Request):
             )
         req.output_object_key = output_object_key
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)
+        job["progress_path"] = progress_path
         await VIDEO_STORE.upsert(request_id, job)
         batch = prepare_request(
             server_args=server_args, sampling_params=sampling_params
@@ -914,7 +927,9 @@ async def retrieve_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    return VideoResponse(**job)
+    response_job = dict(job)
+    response_job["progress"] = _current_video_progress(job)
+    return VideoResponse(**response_job)
 
 
 @router.get("/{video_id}/progress")
@@ -922,10 +937,11 @@ async def retrieve_video_progress(video_id: str = Path(...)):
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+
     return {
         "id": video_id,
         "status": job.get("status"),
-        "progress": job.get("progress", 0),
+        "progress": _current_video_progress(job),
         "file_path": job.get("file_path"),
         "url": job.get("url"),
         "error": job.get("error"),

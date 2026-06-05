@@ -45,6 +45,10 @@ from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resize_frames,
     scan_global_bbox,
 )
+from sglang.multimodal_gen.runtime.videoedit.progress import (
+    build_window_progress_payload,
+    write_videoedit_progress,
+)
 from sglang.multimodal_gen.runtime.videoedit.windowing import (
     build_videoedit_window_specs,
 )
@@ -385,11 +389,49 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     overlap=params.overlap,
                 )
                 params.runtime_window_specs = window_specs
+                write_videoedit_progress(
+                    params.progress_path,
+                    build_window_progress_payload(
+                        stage="windowing",
+                        total_frames=params.runtime_num_input_frames,
+                        infer_len=params.infer_len,
+                        overlap=params.overlap,
+                        total_windows=len(window_specs),
+                    ),
+                )
                 for window_spec in window_specs:
                     params.reset_window_runtime(window_spec)
+                    write_videoedit_progress(
+                        params.progress_path,
+                        build_window_progress_payload(
+                            stage="window_start",
+                            total_frames=params.runtime_num_input_frames,
+                            infer_len=params.infer_len,
+                            overlap=params.overlap,
+                            total_windows=len(window_specs),
+                            current_window_index=window_spec.window_index,
+                            steps_per_window=params.num_inference_steps,
+                        ),
+                    )
                     self._materialize_window_inputs(params, window_spec)
                     self.executor.execute_with_profiling(self.stages, batch, server_args)
                     self._commit_window_output(params, window_spec)
+                    write_videoedit_progress(
+                        params.progress_path,
+                        build_window_progress_payload(
+                            stage="window_done",
+                            total_frames=params.runtime_num_input_frames,
+                            infer_len=params.infer_len,
+                            overlap=params.overlap,
+                            total_windows=len(window_specs),
+                            current_window_index=window_spec.window_index,
+                            current_step_index=params.runtime_effective_num_inference_steps - 1
+                            if params.runtime_effective_num_inference_steps
+                            else None,
+                            steps_per_window=params.runtime_effective_num_inference_steps
+                            or params.num_inference_steps,
+                        ),
+                    )
 
                 output_frames = self._finalize_long_video_output(params, batch)
                 batch.output = _pil_frames_to_video_tensor(output_frames)

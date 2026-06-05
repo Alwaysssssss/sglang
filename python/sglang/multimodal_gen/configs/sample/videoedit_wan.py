@@ -41,6 +41,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     use_repaired_context: bool = True
     vary_seed_by_window: bool = False
     decode_mode: str = "stream"
+    progress_path: str | None = None
 
     # VideoEdit defaults
     num_frames: int = 81
