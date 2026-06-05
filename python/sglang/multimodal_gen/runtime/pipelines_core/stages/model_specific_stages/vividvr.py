@@ -5,7 +5,6 @@ import inspect
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from diffusers.pipelines.cogvideo.pipeline_cogvideox import retrieve_timesteps
 from diffusers.pipelines.cogvideo.pipeline_cogvideox_image2video import (
     retrieve_latents,
@@ -27,14 +26,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.vividvr import (
-    adaptive_instance_normalization,
-    compose_positive_prompt,
+    apply_reference_color_fix,
+    decoded_video_to_frame_tensor,
     load_control_video,
     prepare_rotary_positional_embeddings,
     prepare_tiling_infos_generator,
-    read_prompt_file,
-    resolve_negative_prompt,
-    resolve_prompt_file_path,
+    prepare_vividvr_prompt_context,
+    run_optional_postprocess_modules,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -170,20 +168,33 @@ class VividVRInputValidationStage(PipelineStage):
 class VividVRPromptPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         params = _vividvr_params(batch)
-        pipeline_config = server_args.pipeline_config
+        debug = batch.extra.setdefault("vividvr_debug", {})
 
-        prompt_file_path = resolve_prompt_file_path(params, pipeline_config)
-        prompt_text = read_prompt_file(prompt_file_path)
-        model_prompt_text = compose_positive_prompt(prompt_text, pipeline_config)
-        negative_prompt_text = resolve_negative_prompt(params, pipeline_config)
+        prompt_context = prepare_vividvr_prompt_context(
+            params,
+            server_args.pipeline_config,
+            debug=debug,
+        )
 
-        params.runtime_prompt_file_path = prompt_file_path
-        params.runtime_raw_prompt_text = prompt_text
-        params.runtime_model_prompt_text = model_prompt_text
-        params.runtime_negative_prompt_text = negative_prompt_text
+        params.runtime_prompt_file_path = prompt_context["prompt_file_path"]
+        params.runtime_caption_file_path = prompt_context.get("caption_file_path")
+        caption_texts = prompt_context.get("caption_texts")
+        if caption_texts is not None:
+            params.runtime_caption_texts = list(caption_texts)
+        params.runtime_raw_prompt_text = prompt_context["prompt_text"]
+        params.runtime_model_prompt_text = prompt_context["model_prompt_text"]
+        params.runtime_negative_prompt_text = prompt_context["negative_prompt_text"]
+        debug["caption_backend"] = prompt_context["caption_backend"]
+        if params.runtime_caption_file_path is not None:
+            debug["caption_file_path"] = params.runtime_caption_file_path
+            debug["caption_entry_count"] = len(params.runtime_caption_texts or [])
+        if "optional_module_warnings" in debug:
+            params.runtime_optional_module_warnings = list(
+                debug["optional_module_warnings"]
+            )
 
-        batch.prompt = model_prompt_text
-        batch.negative_prompt = negative_prompt_text
+        batch.prompt = params.runtime_model_prompt_text
+        batch.negative_prompt = params.runtime_negative_prompt_text
         return batch
 
 
@@ -200,11 +211,14 @@ class VividVRTextEncodingStage(PipelineStage):
         self.text_stage = TextEncodingStage([text_encoder], [tokenizer])
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        params = _vividvr_params(batch)
-        if params.runtime_model_prompt_text is None:
-            raise ValueError("VividVR prompt text must be prepared before text encoding")
-
+    def encode_prompt_pair(
+        self,
+        *,
+        prompt: str | list[str],
+        negative_prompt: str | list[str] | None,
+        do_classifier_free_guidance: bool,
+        server_args: ServerArgs,
+    ) -> dict[str, torch.Tensor | None]:
         device = get_local_torch_device()
         target_dtype = _module_dtype(
             self.transformer,
@@ -214,28 +228,49 @@ class VividVRTextEncodingStage(PipelineStage):
         self.text_encoder = self.text_encoder.to(device=device)
 
         prompt_embeds_list, _, _ = self.text_stage.encode_text(
-            params.runtime_model_prompt_text,
+            prompt,
             server_args,
             encoder_index=[0],
             return_attention_mask=True,
             device=device,
             dtype=target_dtype,
         )
-        params.runtime_prompt_embeds = prompt_embeds_list[0]
-
-        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
-        if params.runtime_do_cfg:
+        prompt_embeds = prompt_embeds_list[0]
+        negative_prompt_embeds = None
+        if do_classifier_free_guidance:
+            if isinstance(prompt, list):
+                empty_negative_prompt = [""] * len(prompt)
+            else:
+                empty_negative_prompt = ""
             negative_prompt_embeds_list, _, _ = self.text_stage.encode_text(
-                params.runtime_negative_prompt_text or "",
+                negative_prompt if negative_prompt is not None else empty_negative_prompt,
                 server_args,
                 encoder_index=[0],
                 return_attention_mask=True,
                 device=device,
                 dtype=target_dtype,
             )
-            params.runtime_negative_prompt_embeds = negative_prompt_embeds_list[0]
-        else:
-            params.runtime_negative_prompt_embeds = None
+            negative_prompt_embeds = negative_prompt_embeds_list[0]
+        return {
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+        }
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        if params.runtime_model_prompt_text is None:
+            raise ValueError("VividVR prompt text must be prepared before text encoding")
+
+        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+        encoded = self.encode_prompt_pair(
+            prompt=params.runtime_model_prompt_text,
+            negative_prompt=params.runtime_negative_prompt_text,
+            do_classifier_free_guidance=bool(params.runtime_do_cfg),
+            server_args=server_args,
+        )
+        params.runtime_prompt_embeds = encoded["prompt_embeds"]
+        params.runtime_negative_prompt_embeds = encoded["negative_prompt_embeds"]
 
         batch.do_classifier_free_guidance = bool(params.runtime_do_cfg)
         return batch
@@ -253,8 +288,47 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
         self.transformer = transformer
         self.video_processor = video_processor
 
+    def _resolve_control_video_info(
+        self,
+        batch: Req,
+        params: VividVRSamplingParams,
+        control_video_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if control_video_info is not None:
+            return control_video_info
+        preloaded = batch.extra.pop("vividvr_input_video_info", None)
+        if preloaded is not None:
+            return preloaded
+        return load_control_video(params.video_input_path)
+
+    def _resolve_generator(
+        self,
+        batch: Req,
+        params: VividVRSamplingParams,
+        device: torch.device,
+        generator: torch.Generator | None = None,
+    ) -> torch.Generator:
+        if generator is not None:
+            batch.generator = generator
+            return generator
+        if isinstance(params.runtime_generator, torch.Generator):
+            batch.generator = params.runtime_generator
+            return params.runtime_generator
+        if isinstance(batch.generator, torch.Generator):
+            return batch.generator
+        generator = torch.Generator(device=device.type).manual_seed(int(params.seed))
+        batch.generator = generator
+        return generator
+
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def prepare_condition_inputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        control_video_info: dict[str, Any] | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, Any]:
         params = _vividvr_params(batch)
         device = get_local_torch_device()
 
@@ -266,16 +340,15 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             self.vae,
             PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
         )
-
         self.vae = self.vae.to(device=device, dtype=vae_dtype)
 
-        # Keep generator creation before VAE latent retrieval so control latents and
-        # noise latents consume RNG in the same order as the accepted Phase C path.
-        generator = torch.Generator(device=device.type).manual_seed(int(params.seed))
-        params.runtime_generator = generator
-        batch.generator = generator
+        generator = self._resolve_generator(batch, params, device, generator)
+        control_video_info = self._resolve_control_video_info(
+            batch,
+            params,
+            control_video_info,
+        )
 
-        control_video_info = load_control_video(params.video_input_path)
         control_video = self.video_processor.preprocess_video(
             control_video_info["video"],
             height=params.height,
@@ -287,15 +360,34 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             generator=generator,
         )
 
-        params.runtime_control_video = control_video
-        params.runtime_reference_video = control_video_info["reference_video"]
-        params.runtime_control_latents = control_latents
-        params.runtime_original_height = int(control_video_info["original_height"])
-        params.runtime_original_width = int(control_video_info["original_width"])
-        params.runtime_original_num_frames = int(control_video_info["original_num_frames"])
-        params.runtime_num_padding_frames = int(control_video_info["num_padding_frames"])
-        params.runtime_padded_input_frames = int(control_video.shape[2])
-        params.runtime_fps = max(1, int(round(float(control_video_info["fps"]))))
+        return {
+            "generator": generator,
+            "control_video": control_video,
+            "reference_video": control_video_info["reference_video"],
+            "control_latents": control_latents,
+            "original_height": int(control_video_info["original_height"]),
+            "original_width": int(control_video_info["original_width"]),
+            "original_num_frames": int(control_video_info["original_num_frames"]),
+            "num_padding_frames": int(control_video_info["num_padding_frames"]),
+            "padded_input_frames": int(control_video.shape[2]),
+            "fps": max(1, int(round(float(control_video_info["fps"])))),
+        }
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        prepared = self.prepare_condition_inputs(batch, server_args)
+
+        params.runtime_generator = prepared["generator"]
+        params.runtime_control_video = prepared["control_video"]
+        params.runtime_reference_video = prepared["reference_video"]
+        params.runtime_control_latents = prepared["control_latents"]
+        params.runtime_original_height = prepared["original_height"]
+        params.runtime_original_width = prepared["original_width"]
+        params.runtime_original_num_frames = prepared["original_num_frames"]
+        params.runtime_num_padding_frames = prepared["num_padding_frames"]
+        params.runtime_padded_input_frames = prepared["padded_input_frames"]
+        params.runtime_fps = prepared["fps"]
 
         debug = batch.extra.setdefault("vividvr_debug", {})
         debug["padded_input_frames"] = params.runtime_padded_input_frames
@@ -320,6 +412,38 @@ class VividVRLatentPreparationStage(_VividVRLatentMixin, PipelineStage):
         self.scheduler = scheduler
 
     @torch.no_grad()
+    def prepare_latents(
+        self,
+        *,
+        control_video: torch.Tensor,
+        control_latents: torch.Tensor,
+        generator: torch.Generator,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        default_device = get_local_torch_device()
+        device = _module_device(self.transformer, default_device)
+        target_dtype = _module_dtype(
+            self.transformer,
+            control_video.dtype,
+        )
+
+        control_video = control_video.to(device=device, dtype=target_dtype)
+        control_latents = control_latents.to(device=device, dtype=target_dtype)
+        return self._prepare_latent_noise(
+            control_video=control_video,
+            control_latents=control_latents,
+            batch_size=1,
+            num_channels_latents=int(self.transformer.config.in_channels),
+            height=height,
+            width=width,
+            dtype=target_dtype,
+            device=device,
+            generator=generator,
+            scheduler=self.scheduler,
+        )
+
+    @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         del server_args
         params = _vividvr_params(batch)
@@ -330,29 +454,18 @@ class VividVRLatentPreparationStage(_VividVRLatentMixin, PipelineStage):
         if params.runtime_generator is None:
             raise ValueError("VividVR generator must be prepared before latent init")
 
-        default_device = get_local_torch_device()
-        device = _module_device(self.transformer, default_device)
-        target_dtype = _module_dtype(
-            self.transformer,
-            params.runtime_control_video.dtype,
-        )
-
-        control_video = params.runtime_control_video.to(device=device, dtype=target_dtype)
-        control_latents = params.runtime_control_latents.to(device=device, dtype=target_dtype)
-        latents, control_latents, num_latent_padding_frames = self._prepare_latent_noise(
-            control_video=control_video,
-            control_latents=control_latents,
-            batch_size=1,
-            num_channels_latents=int(self.transformer.config.in_channels),
+        latents, control_latents, num_latent_padding_frames = self.prepare_latents(
+            control_video=params.runtime_control_video,
+            control_latents=params.runtime_control_latents,
+            generator=params.runtime_generator,
             height=params.height,
             width=params.width,
-            dtype=target_dtype,
-            device=device,
-            generator=params.runtime_generator,
-            scheduler=self.scheduler,
         )
 
-        params.runtime_control_video = control_video
+        params.runtime_control_video = params.runtime_control_video.to(
+            device=latents.device,
+            dtype=latents.dtype,
+        )
         params.runtime_control_latents = control_latents
         params.runtime_latents = latents
         params.runtime_num_latent_padding_frames = num_latent_padding_frames
@@ -367,6 +480,86 @@ class VividVRLatentPreparationStage(_VividVRLatentMixin, PipelineStage):
 
 
 class VividVRTilingPreparationStage(PipelineStage):
+    @staticmethod
+    @torch.no_grad()
+    def build_tiling_infos(
+        *,
+        latents: torch.Tensor,
+        enable_spatial_tiling: bool,
+        enable_temporal_tiling: bool,
+        tile_size: int,
+        tile_stride: int,
+    ) -> list[Any]:
+        return list(
+            prepare_tiling_infos_generator(
+                latents=latents,
+                enable_spatial_tiling=enable_spatial_tiling,
+                enable_temporal_tiling=enable_temporal_tiling,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
+        )
+
+    @staticmethod
+    def _align_prompt_embeds_to_tile_count(
+        prompt_embeds: torch.Tensor | None,
+        *,
+        tile_count: int,
+        tensor_name: str,
+    ) -> torch.Tensor | None:
+        if prompt_embeds is None:
+            return None
+        batch_size = int(prompt_embeds.shape[0])
+        if batch_size == tile_count:
+            return prompt_embeds
+        if batch_size == 1:
+            return prompt_embeds.repeat(tile_count, 1, 1)
+        raise ValueError(
+            f"{tensor_name} batch size must be 1 or tile_count={tile_count}, "
+            f"got {batch_size}"
+        )
+
+    @classmethod
+    @torch.no_grad()
+    def prepare_tiling_state(
+        cls,
+        *,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        enable_spatial_tiling: bool,
+        enable_temporal_tiling: bool,
+        tile_size: int,
+        tile_stride: int,
+        tiling_infos: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_tiling_infos = tiling_infos
+        if resolved_tiling_infos is None:
+            resolved_tiling_infos = cls.build_tiling_infos(
+                latents=latents,
+                enable_spatial_tiling=enable_spatial_tiling,
+                enable_temporal_tiling=enable_temporal_tiling,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
+        tile_count = len(resolved_tiling_infos)
+        tiled_prompt_embeds = cls._align_prompt_embeds_to_tile_count(
+            prompt_embeds,
+            tile_count=tile_count,
+            tensor_name="prompt_embeds",
+        )
+        tiled_negative_prompt_embeds = cls._align_prompt_embeds_to_tile_count(
+            negative_prompt_embeds,
+            tile_count=tile_count,
+            tensor_name="negative_prompt_embeds",
+        )
+        return {
+            "tiling_infos": resolved_tiling_infos,
+            "tile_count": tile_count,
+            "tiled_prompt_embeds": tiled_prompt_embeds,
+            "tiled_negative_prompt_embeds": tiled_negative_prompt_embeds,
+        }
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         del server_args
@@ -376,32 +569,26 @@ class VividVRTilingPreparationStage(PipelineStage):
         if params.runtime_prompt_embeds is None:
             raise ValueError("VividVR prompt embeds must be prepared before tiling")
 
-        tiling_infos = list(
-            prepare_tiling_infos_generator(
-                latents=params.runtime_latents,
-                enable_spatial_tiling=params.enable_spatial_tiling,
-                enable_temporal_tiling=params.enable_temporal_tiling,
-                tile_size=params.tile_size,
-                tile_stride=params.tile_stride,
-            )
+        tiling_state = self.prepare_tiling_state(
+            latents=params.runtime_latents,
+            prompt_embeds=params.runtime_prompt_embeds,
+            negative_prompt_embeds=params.runtime_negative_prompt_embeds,
+            enable_spatial_tiling=params.enable_spatial_tiling,
+            enable_temporal_tiling=params.enable_temporal_tiling,
+            tile_size=params.tile_size,
+            tile_stride=params.tile_stride,
         )
-        tile_count = len(tiling_infos)
 
-        params.runtime_tiling_infos = tiling_infos
-        params.runtime_tile_count = tile_count
-        params.runtime_tiled_prompt_embeds = params.runtime_prompt_embeds.repeat(
-            tile_count, 1, 1
-        )
-        if params.runtime_negative_prompt_embeds is not None:
-            params.runtime_tiled_negative_prompt_embeds = (
-                params.runtime_negative_prompt_embeds.repeat(tile_count, 1, 1)
-            )
-        else:
-            params.runtime_tiled_negative_prompt_embeds = None
+        params.runtime_tiling_infos = tiling_state["tiling_infos"]
+        params.runtime_tile_count = tiling_state["tile_count"]
+        params.runtime_tiled_prompt_embeds = tiling_state["tiled_prompt_embeds"]
+        params.runtime_tiled_negative_prompt_embeds = tiling_state[
+            "tiled_negative_prompt_embeds"
+        ]
 
         debug = batch.extra.setdefault("vividvr_debug", {})
         debug["prompt_embed_shape"] = tuple(params.runtime_tiled_prompt_embeds.shape)
-        debug["tile_count"] = tile_count
+        debug["tile_count"] = params.runtime_tile_count
         return batch
 
 
@@ -412,16 +599,22 @@ class VividVRTimestepPreparationStage(PipelineStage):
         self.transformer = transformer
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        params = _vividvr_params(batch)
+    def prepare_timesteps(self, num_inference_steps: int) -> torch.Tensor:
         default_device = get_local_torch_device()
         device = _module_device(self.transformer, default_device)
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
-            params.num_inference_steps,
+            num_inference_steps,
             device,
             None,
         )
+        return timesteps
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _vividvr_params(batch)
+        timesteps = self.prepare_timesteps(params.num_inference_steps)
         params.runtime_timesteps = timesteps
         params.runtime_timestep_count = len(timesteps)
 
@@ -452,24 +645,19 @@ class VividVRDenoisingStage(PipelineStage):
         return tqdm(total=total, disable=local_rank != 0, desc="VividVR denoising")
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        params = _vividvr_params(batch)
-        if params.runtime_latents is None:
-            raise ValueError("VividVR latents must be prepared before denoising")
-        if params.runtime_control_latents is None:
-            raise ValueError("VividVR control latents must be prepared before denoising")
-        if params.runtime_tiled_prompt_embeds is None:
-            raise ValueError("VividVR tiled prompt embeds must be prepared before denoising")
-        if params.runtime_timesteps is None:
-            raise ValueError("VividVR timesteps must be prepared before denoising")
-
-        latents = params.runtime_latents
-        control_latents = params.runtime_control_latents
-        prompt_embeds = params.runtime_tiled_prompt_embeds
-        negative_prompt_embeds = params.runtime_tiled_negative_prompt_embeds
-        do_classifier_free_guidance = bool(params.runtime_do_cfg)
-        timesteps = params.runtime_timesteps
-
+    def prepare_denoising_state(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        latents: torch.Tensor,
+        control_latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        do_classifier_free_guidance: bool,
+        timesteps: torch.Tensor,
+        tiling_infos: list[Any],
+    ) -> dict[str, Any]:
         default_device = get_local_torch_device()
         device = _module_device(self.transformer, default_device)
         target_dtype = _module_dtype(
@@ -479,6 +667,7 @@ class VividVRDenoisingStage(PipelineStage):
 
         self.transformer = self.transformer.to(device=device, dtype=target_dtype)
         self.controlnet = self.controlnet.to(device=device, dtype=target_dtype)
+
         latents = latents.to(device=device, dtype=target_dtype)
         control_latents = control_latents.to(device=device, dtype=target_dtype)
         prompt_embeds = prompt_embeds.to(device=device, dtype=target_dtype)
@@ -488,11 +677,6 @@ class VividVRDenoisingStage(PipelineStage):
                 dtype=target_dtype,
             )
 
-        extra_step_kwargs = _prepare_extra_step_kwargs(
-            self.scheduler,
-            batch.generator,
-            batch.eta,
-        )
         ofs_emb = (
             None
             if self.transformer.config.ofs_embed_dim is None
@@ -514,126 +698,201 @@ class VividVRDenoisingStage(PipelineStage):
             else None
         )
 
-        old_pred_original_sample = None
-        tiling_infos = params.runtime_tiling_infos or []
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
-            for timestep_index, timestep in enumerate(timesteps):
-                latents_meshgrid = torch.zeros_like(latents)
-                old_pred_original_sample_meshgrid = torch.zeros_like(latents)
-                weights_meshgrid = torch.zeros_like(latents)
+        return {
+            "latents": latents,
+            "control_latents": control_latents,
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "do_classifier_free_guidance": do_classifier_free_guidance,
+            "timesteps": timesteps,
+            "tiling_infos": tiling_infos,
+            "extra_step_kwargs": _prepare_extra_step_kwargs(
+                self.scheduler,
+                batch.generator,
+                batch.eta,
+            ),
+            "ofs_emb": ofs_emb,
+            "image_rotary_emb": image_rotary_emb,
+            "old_pred_original_sample": None,
+            "target_dtype": target_dtype,
+        }
 
-                for tile_index, (tile_slice, tile_weights) in enumerate(tiling_infos):
-                    prompt_slice = slice(tile_index, tile_index + 1)
-                    tile_slice_tuple = tuple(tile_slice)
+    @torch.no_grad()
+    def run_denoising_step(
+        self,
+        batch: Req,
+        denoising_state: dict[str, Any],
+        timestep_index: int,
+        *,
+        guidance_scale: float,
+        restoration_guidance_scale: float,
+    ) -> None:
+        latents = denoising_state["latents"]
+        control_latents = denoising_state["control_latents"]
+        prompt_embeds = denoising_state["prompt_embeds"]
+        negative_prompt_embeds = denoising_state["negative_prompt_embeds"]
+        do_classifier_free_guidance = denoising_state["do_classifier_free_guidance"]
+        timesteps = denoising_state["timesteps"]
+        tiling_infos = denoising_state["tiling_infos"]
+        extra_step_kwargs = denoising_state["extra_step_kwargs"]
+        ofs_emb = denoising_state["ofs_emb"]
+        image_rotary_emb = denoising_state["image_rotary_emb"]
+        old_pred_original_sample = denoising_state["old_pred_original_sample"]
+        target_dtype = denoising_state["target_dtype"]
 
-                    tile_latents = latents[tile_slice_tuple]
-                    tile_control_latents = control_latents[tile_slice_tuple]
-                    tile_old_pred_original_sample = (
-                        old_pred_original_sample[tile_slice_tuple]
-                        if old_pred_original_sample is not None
-                        else None
+        timestep = timesteps[timestep_index]
+        latents_meshgrid = torch.zeros_like(latents)
+        old_pred_original_sample_meshgrid = torch.zeros_like(latents)
+        weights_meshgrid = torch.zeros_like(latents)
+
+        for tile_index, (tile_slice, tile_weights) in enumerate(tiling_infos):
+            prompt_slice = slice(tile_index, tile_index + 1)
+            tile_slice_tuple = tuple(tile_slice)
+
+            tile_latents = latents[tile_slice_tuple]
+            tile_control_latents = control_latents[tile_slice_tuple]
+            tile_old_pred_original_sample = (
+                old_pred_original_sample[tile_slice_tuple]
+                if old_pred_original_sample is not None
+                else None
+            )
+            timestep_expand = timestep.expand(tile_latents.shape[0])
+
+            latent_model_input = (
+                torch.cat([tile_latents] * 2)
+                if do_classifier_free_guidance
+                else tile_latents
+            )
+            latent_model_input = self.scheduler.scale_model_input(
+                latent_model_input,
+                timestep,
+            )
+
+            control_model_input = (
+                torch.cat([tile_control_latents] * 2)
+                if do_classifier_free_guidance
+                else tile_control_latents
+            )
+            tile_prompt_embeds = prompt_embeds[prompt_slice]
+            if do_classifier_free_guidance:
+                if negative_prompt_embeds is None:
+                    raise ValueError(
+                        "VividVR negative prompt embeds are required for CFG"
                     )
-                    timestep_expand = timestep.expand(tile_latents.shape[0])
-
-                    latent_model_input = (
-                        torch.cat([tile_latents] * 2)
-                        if do_classifier_free_guidance
-                        else tile_latents
-                    )
-                    latent_model_input = self.scheduler.scale_model_input(
-                        latent_model_input,
-                        timestep,
-                    )
-
-                    control_model_input = (
-                        torch.cat([tile_control_latents] * 2)
-                        if do_classifier_free_guidance
-                        else tile_control_latents
-                    )
-                    tile_prompt_embeds = prompt_embeds[prompt_slice]
-                    if do_classifier_free_guidance:
-                        if negative_prompt_embeds is None:
-                            raise ValueError(
-                                "VividVR negative prompt embeds are required for CFG"
-                            )
-                        tile_prompt_embeds = torch.cat(
-                            [negative_prompt_embeds[prompt_slice], tile_prompt_embeds],
-                            dim=0,
-                        )
-
-                    concat_latent_model_input = torch.cat(
-                        [latent_model_input, control_model_input],
-                        dim=2,
-                    )
-
-                    with set_forward_context(
-                        current_timestep=timestep_index,
-                        attn_metadata=None,
-                        forward_batch=batch,
-                    ):
-                        control_hidden_states = self.controlnet(
-                            hidden_states=latent_model_input,
-                            encoder_hidden_states=tile_prompt_embeds,
-                            control_states=control_model_input,
-                            image_rotary_emb=image_rotary_emb,
-                            timestep=timestep_expand,
-                            ofs=ofs_emb,
-                            return_dict=False,
-                        )[0]
-                        control_hidden_states = tuple(
-                            [state_tensor.to(tile_prompt_embeds.dtype) for state_tensor in state]
-                            for state in control_hidden_states
-                        )
-                        noise_pred = self.transformer(
-                            hidden_states=concat_latent_model_input,
-                            encoder_hidden_states=tile_prompt_embeds,
-                            control_hidden_states=control_hidden_states,
-                            image_rotary_emb=image_rotary_emb,
-                            timestep=timestep_expand,
-                            ofs=ofs_emb,
-                            return_dict=False,
-                        )[0]
-
-                    noise_pred = noise_pred.float()
-                    if do_classifier_free_guidance:
-                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + float(params.guidance_scale) * (
-                            noise_pred_text - noise_pred_uncond
-                        )
-
-                    tile_latents, tile_old_pred_original_sample = self.scheduler.step(
-                        noise_pred,
-                        tile_old_pred_original_sample if timestep_index > 0 else None,
-                        timestep,
-                        timesteps[timestep_index - 1] if timestep_index > 0 else None,
-                        tile_latents,
-                        **extra_step_kwargs,
-                        return_dict=False,
-                        restoration_guidance_scale=params.restoration_guidance_scale,
-                        restoration_ori_latent=tile_control_latents,
-                    )
-                    tile_latents = tile_latents.to(target_dtype)
-                    tile_old_pred_original_sample = tile_old_pred_original_sample.to(
-                        target_dtype
-                    )
-
-                    latents_meshgrid[tile_slice_tuple] += tile_latents * tile_weights
-                    old_pred_original_sample_meshgrid[tile_slice_tuple] += (
-                        tile_old_pred_original_sample * tile_weights
-                    )
-                    weights_meshgrid[tile_slice_tuple] += tile_weights
-
-                latents = latents_meshgrid / weights_meshgrid.clamp_min(1e-6)
-                old_pred_original_sample = (
-                    old_pred_original_sample_meshgrid / weights_meshgrid.clamp_min(1e-6)
+                tile_prompt_embeds = torch.cat(
+                    [negative_prompt_embeds[prompt_slice], tile_prompt_embeds],
+                    dim=0,
                 )
-                params.runtime_progress = float(timestep_index + 1) / float(len(timesteps))
+
+            concat_latent_model_input = torch.cat(
+                [latent_model_input, control_model_input],
+                dim=2,
+            )
+
+            with set_forward_context(
+                current_timestep=timestep_index,
+                attn_metadata=None,
+                forward_batch=batch,
+            ):
+                control_hidden_states = self.controlnet(
+                    hidden_states=latent_model_input,
+                    encoder_hidden_states=tile_prompt_embeds,
+                    control_states=control_model_input,
+                    image_rotary_emb=image_rotary_emb,
+                    timestep=timestep_expand,
+                    ofs=ofs_emb,
+                    return_dict=False,
+                )[0]
+                control_hidden_states = tuple(
+                    tuple(state_tensor.to(tile_prompt_embeds.dtype) for state_tensor in state)
+                    for state in control_hidden_states
+                )
+                noise_pred = self.transformer(
+                    hidden_states=concat_latent_model_input,
+                    encoder_hidden_states=tile_prompt_embeds,
+                    control_hidden_states=control_hidden_states,
+                    image_rotary_emb=image_rotary_emb,
+                    timestep=timestep_expand,
+                    ofs=ofs_emb,
+                    return_dict=False,
+                )[0]
+
+            noise_pred = noise_pred.float()
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + float(guidance_scale) * (
+                    noise_pred_text - noise_pred_uncond
+                )
+
+            tile_latents, tile_old_pred_original_sample = self.scheduler.step(
+                noise_pred,
+                tile_old_pred_original_sample if timestep_index > 0 else None,
+                timestep,
+                timesteps[timestep_index - 1] if timestep_index > 0 else None,
+                tile_latents,
+                **extra_step_kwargs,
+                return_dict=False,
+                restoration_guidance_scale=restoration_guidance_scale,
+                restoration_ori_latent=tile_control_latents,
+            )
+            tile_latents = tile_latents.to(target_dtype)
+            tile_old_pred_original_sample = tile_old_pred_original_sample.to(target_dtype)
+
+            latents_meshgrid[tile_slice_tuple] += tile_latents * tile_weights
+            old_pred_original_sample_meshgrid[tile_slice_tuple] += (
+                tile_old_pred_original_sample * tile_weights
+            )
+            weights_meshgrid[tile_slice_tuple] += tile_weights
+
+        denoising_state["latents"] = latents_meshgrid / weights_meshgrid.clamp_min(1e-6)
+        denoising_state["old_pred_original_sample"] = (
+            old_pred_original_sample_meshgrid / weights_meshgrid.clamp_min(1e-6)
+        )
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        if params.runtime_latents is None:
+            raise ValueError("VividVR latents must be prepared before denoising")
+        if params.runtime_control_latents is None:
+            raise ValueError("VividVR control latents must be prepared before denoising")
+        if params.runtime_tiled_prompt_embeds is None:
+            raise ValueError("VividVR tiled prompt embeds must be prepared before denoising")
+        if params.runtime_timesteps is None:
+            raise ValueError("VividVR timesteps must be prepared before denoising")
+
+        denoising_state = self.prepare_denoising_state(
+            batch,
+            server_args,
+            latents=params.runtime_latents,
+            control_latents=params.runtime_control_latents,
+            prompt_embeds=params.runtime_tiled_prompt_embeds,
+            negative_prompt_embeds=params.runtime_tiled_negative_prompt_embeds,
+            do_classifier_free_guidance=bool(params.runtime_do_cfg),
+            timesteps=params.runtime_timesteps,
+            tiling_infos=params.runtime_tiling_infos or [],
+        )
+
+        with self.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
+            for timestep_index, _ in enumerate(params.runtime_timesteps):
+                self.run_denoising_step(
+                    batch,
+                    denoising_state,
+                    timestep_index,
+                    guidance_scale=float(params.guidance_scale),
+                    restoration_guidance_scale=float(
+                        params.restoration_guidance_scale
+                    ),
+                )
+                params.runtime_progress = float(timestep_index + 1) / float(
+                    len(params.runtime_timesteps)
+                )
                 if progress_bar is not None:
                     progress_bar.update()
 
-        params.runtime_control_latents = control_latents
-        params.runtime_latents = latents
-        batch.latents = latents
+        params.runtime_control_latents = denoising_state["control_latents"]
+        params.runtime_latents = denoising_state["latents"]
+        batch.latents = denoising_state["latents"]
         return batch
 
 
@@ -643,12 +902,12 @@ class VividVRDecodingStage(PipelineStage):
         self.vae = vae
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        params = _vividvr_params(batch)
-        if params.runtime_latents is None:
-            raise ValueError("VividVR denoised latents must be prepared before decoding")
-
-        latents = params.runtime_latents
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        num_latent_padding_frames: int,
+        server_args: ServerArgs,
+    ) -> torch.Tensor:
         device = latents.device
         vae_dtype = _module_dtype(
             self.vae,
@@ -656,16 +915,26 @@ class VividVRDecodingStage(PipelineStage):
         )
         self.vae = self.vae.to(device=device, dtype=vae_dtype)
 
-        num_latent_padding_frames = int(params.runtime_num_latent_padding_frames or 0)
         if num_latent_padding_frames > 0:
             latents = latents[:, num_latent_padding_frames:]
 
         decode_latents = latents.permute(0, 2, 1, 3, 4)
         decode_latents = decode_latents / self.vae.config.scaling_factor
-        decoded = _ensure_tensor_decode_output(
+        return _ensure_tensor_decode_output(
             self.vae.decode(decode_latents.to(dtype=vae_dtype))
         )
 
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        if params.runtime_latents is None:
+            raise ValueError("VividVR denoised latents must be prepared before decoding")
+
+        decoded = self.decode_latents(
+            params.runtime_latents,
+            int(params.runtime_num_latent_padding_frames or 0),
+            server_args,
+        )
         params.runtime_decoded_video = decoded
         return batch
 
@@ -676,35 +945,22 @@ class VividVROutputPostprocessStage(PipelineStage):
         self.video_processor = video_processor
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        del server_args
-        params = _vividvr_params(batch)
+    def finalize_output_video(
+        self,
+        params: VividVRSamplingParams,
+        debug: dict[str, Any],
+    ) -> torch.Tensor:
         if params.runtime_decoded_video is None:
             raise ValueError("VividVR decoded video must be prepared before postprocess")
         if params.runtime_original_height is None or params.runtime_original_width is None:
             raise ValueError("VividVR original video size must be available for postprocess")
 
-        debug = batch.extra.setdefault("vividvr_debug", {})
-        decoded = params.runtime_decoded_video
-
-        resized_video = [
-            F.interpolate(
-                sample.permute(1, 0, 2, 3),
-                size=(params.runtime_original_height, params.runtime_original_width),
-                mode="bilinear",
-                align_corners=False,
-            )
-            for sample in decoded
-        ]
-        resized_video = torch.stack(resized_video, dim=0).permute(0, 2, 1, 3, 4)
-        processed = self.video_processor.postprocess_video(
-            video=resized_video.float(),
-            output_type="pt",
+        output_video = decoded_video_to_frame_tensor(
+            params.runtime_decoded_video,
+            video_processor=self.video_processor,
+            original_height=int(params.runtime_original_height),
+            original_width=int(params.runtime_original_width),
         )
-        if isinstance(processed, list):
-            processed = torch.stack(processed, dim=0)
-
-        output_video = processed[0]
         if output_video.shape[0] % 4 == 0:
             output_video = output_video[3:]
 
@@ -712,28 +968,31 @@ class VividVROutputPostprocessStage(PipelineStage):
         if num_padding_frames > 0:
             output_video = output_video[:-num_padding_frames]
 
-        reference_video = params.runtime_reference_video
-        if reference_video is not None:
-            reference_video = reference_video.to(
-                device=output_video.device,
-                dtype=output_video.dtype,
+        output_video = apply_reference_color_fix(
+            output_video,
+            params.runtime_reference_video,
+        )
+        output_video = run_optional_postprocess_modules(
+            output_video,
+            reference_video=params.runtime_reference_video,
+            enabled=bool(params.enable_optional_postprocess_module),
+            allow_fallback=bool(params.allow_optional_module_fallback),
+            debug=debug,
+            processor=None,
+        )
+        if "optional_module_warnings" in debug:
+            params.runtime_optional_module_warnings = list(
+                debug["optional_module_warnings"]
             )
-            if reference_video.shape[-2:] != output_video.shape[-2:]:
-                reference_video = F.interpolate(
-                    reference_video,
-                    size=output_video.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            if reference_video.shape[0] != output_video.shape[0]:
-                frame_count = min(reference_video.shape[0], output_video.shape[0])
-                reference_video = reference_video[:frame_count]
-                output_video = output_video[:frame_count]
-            output_video = adaptive_instance_normalization(
-                output_video,
-                reference_video,
-            ).clamp_(0.0, 1.0)
+        return output_video
 
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _vividvr_params(batch)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+
+        output_video = self.finalize_output_video(params, debug)
         params.runtime_output_video = output_video
         batch.output = output_video.permute(1, 0, 2, 3).contiguous()
         batch.fps = int(params.runtime_fps or batch.fps)

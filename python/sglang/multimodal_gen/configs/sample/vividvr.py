@@ -16,9 +16,13 @@ class VividVRSamplingParams(SamplingParams):
 
     video_input_path: str | None = None
     prompt_file_path: str | None = DEFAULT_VIVIDVR_PROMPT_FILE_PATH
+    caption_file_path: str | None = None
     caption_source: str = "prompt_file"
     use_live_cogvlm2_caption: bool = False
     cogvlm2_model_path: str | None = None
+    enable_optional_caption_module: bool = True
+    enable_optional_postprocess_module: bool = True
+    allow_optional_module_fallback: bool = True
 
     dtype: str = "bf16"
     enable_spatial_tiling: bool = True
@@ -41,6 +45,8 @@ class VividVRSamplingParams(SamplingParams):
 
     # Runtime request-derived fields
     runtime_prompt_file_path: str | None = field(default=None, init=False, repr=False)
+    runtime_caption_file_path: str | None = field(default=None, init=False, repr=False)
+    runtime_caption_texts: list[str] | None = field(default=None, init=False, repr=False)
     runtime_raw_prompt_text: str | None = field(default=None, init=False, repr=False)
     runtime_model_prompt_text: str | None = field(default=None, init=False, repr=False)
     runtime_negative_prompt_text: str | None = field(default=None, init=False, repr=False)
@@ -76,10 +82,21 @@ class VividVRSamplingParams(SamplingParams):
     runtime_progress: float | None = field(default=None, init=False, repr=False)
     runtime_decoded_video: Any | None = field(default=None, init=False, repr=False)
     runtime_output_video: Any | None = field(default=None, init=False, repr=False)
+    runtime_execution_mode: str | None = field(default=None, init=False, repr=False)
+    runtime_clip_specs: list[Any] | None = field(default=None, init=False, repr=False)
+    runtime_num_temporal_overlapped_frames: int | None = field(
+        default=None, init=False, repr=False
+    )
+    runtime_temporal_frame_stride: int | None = field(default=None, init=False, repr=False)
+    runtime_temporal_merge_plan: Any | None = field(default=None, init=False, repr=False)
+    runtime_optional_module_warnings: list[str] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.prompt_path = self._normalize_prompt_file_aliases()
         self.prompt_file_path = self.prompt_path
+        self.caption_source = self._normalize_caption_source()
         super().__post_init__()
         self._validate_vividvr()
 
@@ -92,10 +109,20 @@ class VividVRSamplingParams(SamplingParams):
             return self.prompt_path
         return self.prompt_path or self.prompt_file_path
 
+    def _normalize_caption_source(self) -> str:
+        if self.caption_file_path not in (None, "") and self.caption_source == "prompt_file":
+            return "caption_file"
+        return self.caption_source
+
     def _validate_vividvr(self) -> None:
-        if self.caption_source != "prompt_file":
+        if self.caption_source not in {"prompt_file", "caption_file"}:
             raise ValueError(
-                "VividVR integration currently only supports caption_source='prompt_file'"
+                "VividVR integration currently only supports caption_source in "
+                "{'prompt_file', 'caption_file'}"
+            )
+        if self.caption_source == "caption_file" and self.caption_file_path in (None, ""):
+            raise ValueError(
+                "VividVR caption_source='caption_file' requires caption_file_path"
             )
         if self.use_live_cogvlm2_caption:
             raise ValueError(
@@ -108,6 +135,14 @@ class VividVRSamplingParams(SamplingParams):
             )
         if self.num_outputs_per_prompt != 1:
             raise ValueError("VividVR only supports num_outputs_per_prompt=1")
+        for field_name in (
+            "enable_optional_caption_module",
+            "enable_optional_postprocess_module",
+            "allow_optional_module_fallback",
+        ):
+            field_value = getattr(self, field_name)
+            if not isinstance(field_value, bool):
+                raise ValueError(f"{field_name} must be a bool, got {field_value!r}")
         if self.dtype not in {"bf16", "fp16", "fp32"}:
             raise ValueError(f"dtype must be one of bf16/fp16/fp32, got {self.dtype!r}")
         if not isinstance(self.tile_size, int) or self.tile_size <= 0:
@@ -147,6 +182,10 @@ class VividVRSamplingParams(SamplingParams):
         super()._validate_with_pipeline_config(pipeline_config)
         if self.video_input_path is None:
             raise ValueError("VividVR requires video_input_path")
+        if self.caption_source == "caption_file":
+            if self.caption_file_path in (None, ""):
+                raise ValueError("VividVR caption_file mode requires caption_file_path")
+            return
         if self.prompt_path is None:
             raise ValueError("VividVR requires prompt_file_path/prompt_path")
 
@@ -167,6 +206,8 @@ class VividVRSamplingParams(SamplingParams):
 
     def reset_runtime(self) -> None:
         self.runtime_prompt_file_path = None
+        self.runtime_caption_file_path = None
+        self.runtime_caption_texts = None
         self.runtime_raw_prompt_text = None
         self.runtime_model_prompt_text = None
         self.runtime_negative_prompt_text = None
@@ -196,3 +237,9 @@ class VividVRSamplingParams(SamplingParams):
         self.runtime_progress = None
         self.runtime_decoded_video = None
         self.runtime_output_video = None
+        self.runtime_execution_mode = None
+        self.runtime_clip_specs = None
+        self.runtime_num_temporal_overlapped_frames = None
+        self.runtime_temporal_frame_stride = None
+        self.runtime_temporal_merge_plan = None
+        self.runtime_optional_module_warnings = None

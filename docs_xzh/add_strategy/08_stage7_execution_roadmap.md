@@ -320,6 +320,12 @@
 
 细化验收标准：
 
+- 默认长视频验收输入固定为：
+  - `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4`
+  - `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt`
+- 默认长视频 reference 固定为：
+  - `/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_6step/videos/test_video_long_960x720_130f.mp4`
+- 上述 reference 默认指原版 `Vivid-VR` 在 `step=6` 条件下生成的公平对比结果
 - clip 切分数量与 reference 逻辑一致
 - `latent_id` 映射表与预期一致，无越界
 - overlap 区域无明显时间跳变、重复帧、丢帧
@@ -329,6 +335,16 @@
   - `mse_max <= 150.0`
   - `mae_max <= 8.0`
   - `failed_frame_ratio <= 0.05`
+- 验收结果的指标口径与 `Phase 5 / Phase C` 保持一致，至少稳定输出：
+  - `ssim_mean`
+  - `ssim_min`
+  - `mse_mean`
+  - `mse_max`
+  - `mae_mean`
+  - `mae_max`
+  - `failed_frames`
+  - `failed_frame_ratio`
+- 若有 JSON 验收报告，默认复用 `Phase C` 的字段结构，只在必要时附加长视频特有调试字段
 - 若局部接缝区域不达标，需单独输出 overlap 帧索引区间
 
 完成标准：

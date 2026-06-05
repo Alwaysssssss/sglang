@@ -213,6 +213,11 @@ strict 档位：
 
 - 长视频 clip split / merge / temporal orchestration 稳定
 - `caption / postprocess` 作为可选模块接入，且不破坏主链
+- 默认长视频验收输入固定，避免 benchmark 口径漂移：
+  - 输入视频固定为 `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4`
+  - 对应 prompts / caption sidecar 固定为 `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt`
+  - 验收对比的 reference 视频固定为 `/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_6step/videos/test_video_long_960x720_130f.mp4`
+  - 上述 reference 是原版 `Vivid-VR` 在 `step=6` 条件下得到的长视频结果，后续默认以这条结果作为公平对比基准
 
 ### 5.3 必须完成的检查项
 
@@ -220,6 +225,11 @@ strict 档位：
 - clip 间的 latent / frame merge 规则与 reference 理解一致
 - overlap 区域无明显重复、缺帧、接缝跳变
 - 长视频输出帧数与总时长合理
+- 默认长视频验收必须使用：
+  - `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4`
+  - `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt`
+- 默认长视频 reference 必须使用：
+  - `/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_6step/videos/test_video_long_960x720_130f.mp4`
 - 长视频 candidate 与 reference 完成逐帧比较
 - `captioning.py` 和 `postprocess.py` 可独立启停
 - `captioning.py` 当前阶段若存在，仅允许保留占位或文件读取逻辑，不允许默认调用 `CogVLM2`
@@ -229,6 +239,16 @@ strict 档位：
 
 - 长视频 merge 稳定，无明显边界伪影
 - 长视频结果达到默认宽松基线，或不低于单 clip 阶段的可接受误差级别
+- 验收结果指标口径与 `Phase C` 相同；长视频 benchmark 至少要稳定上报与 `Phase C` 相同的一组核心指标：
+  - `ssim_mean`
+  - `ssim_min`
+  - `mse_mean`
+  - `mse_max`
+  - `mae_mean`
+  - `mae_max`
+  - `failed_frames`
+  - `failed_frame_ratio`
+- 若产出 JSON 验收报告，其字段集合应默认与 `Phase C` 验收 JSON 保持一致，只允许在此基础上新增长视频特有调试字段，不应减少既有质量指标或用时字段
 - 可选模块开关测试通过，不破坏主链
 
 ### 5.5 不通过时禁止进入下一阶段的阻断项

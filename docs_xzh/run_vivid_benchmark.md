@@ -41,14 +41,17 @@ tmux attach -t vividvr_phase_c
 需要注意：
 
 - 当前 `sglang` `Phase C` 验收语义固定读取 `/home/zhiheng/Vivid-VR/input/720p/prompt.txt`，不走 live `CogVLM2`。
-- 原版 `Vivid-VR` 默认会实时 caption，因此它更适合做“原版行为复现 / 侧向性能与画面对比”，而不是直接替代当前 `Phase C` 的 acceptance gold。
+- 原版 `Vivid-VR` 默认会实时 caption，因此做公平对比时，不能直接拿“原版 live caption”去和 `sglang` 的固定 `prompt.txt` 结果比较。
+- 原版 benchmark 必须使用 `/home/zhiheng/Vivid-VR/.venv/bin/python`，不要用 `/home/zhiheng/sglang/.venv/bin/python` 代跑原版；否则当前机器上的高版本 `transformers` 会让 `CogVLM2` 产出错误 caption。
+- 当前机器上，如果原版 `Vivid-VR` 在启动时因为 Python 头文件路径报错，需要先额外导出：`CPATH=/home/zhiheng/tmp_py310_headers/extracted/libpython3.10-dev/usr/include/python3.10:/home/zhiheng/tmp_py310_headers/extracted/libpython3.10-dev/usr/include`。
+- 正确做法是：先跑原版 `Vivid-VR`，从日志里提取它实际生成的 raw caption，保存到 `/home/zhiheng/Vivid-VR/input/captions/<video_stem>.txt`，再让 `sglang` 版本用这个 caption sidecar 重跑。
 - 当前 `Phase C` 的正式 gold 仍然是现有 reference 视频：`/home/zhiheng/Vivid-VR/result/720p_up1_result_vivid_ori/videos/test_video_960x720.mp4`。
 
 ### 2.1 原版 `Vivid-VR` 默认对比命令
 
 ```bash
 tmux new-session -d -s vividvr_ori_benchmark \
-  'cd /home/zhiheng/Vivid-VR && mkdir -p /home/zhiheng/sglang/Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && /home/zhiheng/sglang/.venv/bin/python VRDiT/inference.py \
+  'cd /home/zhiheng/Vivid-VR && mkdir -p /home/zhiheng/sglang/Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=/home/zhiheng/Vivid-VR/src && /home/zhiheng/Vivid-VR/.venv/bin/python VRDiT/inference.py \
     --ckpt_dir=/home/zhiheng/Vivid-VR/ckpts \
     --cogvideox_ckpt_path=/home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --cogvlm2_ckpt_path=/home/zhiheng/Vivid-VR/ckpts/cogvlm2-llama3-caption \
@@ -58,7 +61,7 @@ tmux new-session -d -s vividvr_ori_benchmark \
     --num_inference_steps=50 \
     --guidance_scale=6 \
     --restoration_guidance_scale=-1.0 \
-    --upscale=0 \
+    --upscale=1 \
     --seed=42 \
     2>&1 | tee /home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_ori_benchmark_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
@@ -86,7 +89,7 @@ CUDA_VISIBLE_DEVICES=0 HF_ENDPOINT=https://huggingface.co \
 
 ```bash
 tmux new-session -d -s vividvr_ori_sglang_caption \
-  'cd /home/zhiheng/Vivid-VR && mkdir -p /home/zhiheng/sglang/Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF=expandable_segments:True /home/zhiheng/sglang/.venv/bin/python VRDiT/inference.py \
+  'cd /home/zhiheng/Vivid-VR && mkdir -p /home/zhiheng/sglang/Vivid_Acceptance/logs && export PYTHONPATH=/home/zhiheng/Vivid-VR/src && CUDA_VISIBLE_DEVICES=1 PYTORCH_ALLOC_CONF=expandable_segments:True /home/zhiheng/Vivid-VR/.venv/bin/python VRDiT/inference.py \
     --ckpt_dir=/home/zhiheng/Vivid-VR/ckpts \
     --cogvideox_ckpt_path=/home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --input_dir=/home/zhiheng/Vivid-VR/input/720p \
@@ -95,7 +98,7 @@ tmux new-session -d -s vividvr_ori_sglang_caption \
     --num_inference_steps=50 \
     --guidance_scale=6 \
     --restoration_guidance_scale=-1.0 \
-    --upscale=0 \
+    --upscale=1 \
     --seed=42 \
     --caption_backend=sglang \
     --caption_sglang_base_url=http://127.0.0.1:31000/v1 \
@@ -103,17 +106,105 @@ tmux new-session -d -s vividvr_ori_sglang_caption \
     2>&1 | tee /home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_ori_sglang_caption_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
+### 2.3 Phase D 长视频公平对比命令
+
+当前 `Phase D` 的正式长视频 benchmark 不再使用旧的 `x3 duplicate` 输入，而是固定使用下面这条 `130f` 输入视频：
+
+```text
+/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4
+```
+
+当前日常 benchmark 默认使用 `num_inference_steps=20`，便于后续做性能迭代；`num_inference_steps=50` 只保留给最终回归和阶段验收。
+
+需要注意：
+
+- 当前这条 `130f` 基准对应 2 个 temporal clip，不再是旧的 `x3` / 3 clip 流程。
+- `sglang` benchmark 和后续 `Phase E` 默认统一使用通用脚本：`python/sglang/multimodal_gen/tools/run_vividvr_inference.py`
+- 这份脚本是单视频通用入口，直接在启动命令里修改 `--input-video`、`--caption-file`、`--reference-video`、`--num-inference-steps` 等参数即可，不再依赖 `Phase D` 专项 helper 或 preset。
+
+原版 `Vivid-VR` long-video reference：
+
+```bash
+tmux new-session -d -s vividvr_ori_phase_d_20step \
+  'cd /home/zhiheng/Vivid-VR && mkdir -p /home/zhiheng/sglang/Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=/home/zhiheng/Vivid-VR/src && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/Vivid-VR/.venv/bin/python VRDiT/inference.py \
+    --ckpt_dir=/home/zhiheng/Vivid-VR/ckpts \
+    --cogvideox_ckpt_path=/home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+    --cogvlm2_ckpt_path=/home/zhiheng/Vivid-VR/ckpts/cogvlm2-llama3-caption \
+    --input_dir=/home/zhiheng/Vivid-VR/input/720p_long \
+    --output_dir=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step \
+    --num_temporal_process_frames=121 \
+    --num_inference_steps=20 \
+    --guidance_scale=6 \
+    --restoration_guidance_scale=-1.0 \
+    --upscale=1 \
+    --seed=42 \
+    2>&1 | tee /home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_ori_phase_d_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+原版跑完后，需要把日志里每次 `Generating 1 video with prompt: ...` 对应的原始 caption 依次提取出来，保存到：
+
+```text
+/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
+```
+
+要求：
+
+- 一行一个 caption，顺序必须与原版 clip/tile 生成顺序一致。
+- 保存原始 caption 文本，不要把正向 prompt suffix 手工拼进去。
+- 当前这条 `130f` 基准的 caption 文件名必须与输入视频 stem 一致。
+- 当前这条 `test_video_long_960x720_130f.txt` 应包含 2 行 raw caption，对应 2 个 temporal clip。
+
+`sglang` Phase D 验收：
+
+```bash
+tmux new-session -d -s vividvr_phase_d_20step \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_inference.py \
+    --input-video /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 \
+    --caption-file /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt \
+    --reference-video /home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4 \
+    --output-dir /home/zhiheng/sglang/Vivid_Acceptance/result_videos \
+    --report-dir /home/zhiheng/sglang/Vivid_Acceptance/indicator \
+    --artifact-prefix phase_d_130f_20step \
+    --phase-label D \
+    --mode-label temporal_windowed_reference_alignment \
+    --num-temporal-process-frames 121 \
+    --num-inference-steps 20 \
+    --guidance-scale 6 \
+    --restoration-guidance-scale -1.0 \
+    --seed 42 \
+    2>&1 | tee Vivid_Acceptance/logs/phase_d_130f_20step_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+查看进度：
+
+```bash
+tmux attach -t vividvr_phase_d_20step
+```
+
+如果要做最终 `50 step` 回归，把上面两条 `Phase D` 命令里的 `20` 同步改成 `50`，并同时更新：
+
+- 原版命令里的输出目录改成 `720p_long_up1_result_vivid_ori_50step`
+- `sglang` 命令里的 `--caption-file` 改成 `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f_50step.txt`
+- `sglang` 命令里的 `--reference-video` 改成 `/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_50step/videos/test_video_long_960x720_130f.mp4`
+- `sglang` 命令里的 `--artifact-prefix` 改成 `phase_d_130f_50step`
+- `sglang` 命令里的 `--num-inference-steps` 改成 `50`
+
 ## 3. 对比时必须保持一致的关键参数
 
-- 输入目录：`/home/zhiheng/Vivid-VR/input/720p`
+- 输入视频：`/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4`
 - seed：`42`
 - `num_temporal_process_frames=121`
-- `num_inference_steps=50`
+- `num_inference_steps=20`
 - `guidance_scale=6`
 - `restoration_guidance_scale=-1.0`
-- `upscale=0`
+- `upscale=1`
 - 默认不启用 `textfix`
 - 默认不加 `--save_images`
+
+补充说明：
+
+- `20 step` 是当前日常 benchmark 默认档位。
+- `50 step` 仍然是最终回归和阶段验收档位。
 
 如果后续这些参数发生变化，必须同步修改：
 

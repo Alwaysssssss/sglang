@@ -6,6 +6,80 @@
 
 - 除非更深层目录存在新的 `AGENTS.md`，否则这些规则适用于整个仓库。
 
+## 项目背景
+
+- 当前工作的主线不是从零设计一个新模型，而是把原版 `/home/zhiheng/Vivid-VR` 以原生、可维护的方式集成到 `sglang.multimodal_gen` 中。
+- 这条线经历过一次仓库误清空和恢复；`Phase A / B / C` 已恢复并建立了稳定基线，当前继续推进的是 `Phase D` 和 `Phase E`。
+- 当前稳定基线是 `Phase C` 单 clip 路径；后续所有改动默认都要保护这条基线，避免回归。
+- `Phase D` 的重点是长视频 `clip split / merge / temporal orchestration` 以及公平 benchmark；截至目前，这部分代码和 benchmark 流程已具备，但公平验收尚未完全通过。
+- `Phase E` 的重点不是再发明新语义，而是在 `Phase D` 语义对齐基础上做性能收口、默认配置收口和回归验收，逐步进入 release gate。
+- `Vivid-VR` 在 `sglang` 中必须作为原生模型集成运行；推理时不要依赖原版仓库的运行时代码。
+- 允许继续复用原版仓库中的外部资源，例如：
+  - checkpoint
+  - 输入视频
+  - `prompt.txt`
+  - caption sidecar
+  - 原版 reference 视频
+
+## 当前阶段任务
+
+- `Phase C` 代表当前单 clip 稳定基线，目标是把原版 `Vivid-VR` 的单段视频编辑主链语义稳定迁移到 `sglang` 中，并通过现有单 clip 验收。
+- `Phase C` 必须守住的关键语义包括：
+  - prompt 默认来自 `/home/zhiheng/Vivid-VR/input/720p/prompt.txt`
+  - 不走 live `CogVLM2`
+  - `prompt_embed_shape` 保持 `226` 长度，不回退到 `512`
+  - VAE tiling 默认值保持 `240 / 360`
+  - preprocess 保留未 padding 的 `reference_video`
+  - decode / postprocess 保留 `drop first 3 frames + crop padding + AdaIN/reference color fix`
+- `Phase D` 不是单纯“优化”，而是要继续对齐原版 `Vivid-VR` 的长视频主语义。
+- `Phase D` 的核心任务包括：
+  - 长视频 `clip split`
+  - 多 clip 的 timestep 级时序编排
+  - 跨 clip latent merge
+  - clip trim / stitch
+  - 使用原版 caption sidecar 的公平 benchmark
+- 对 `Phase D` 的默认理解应是“补齐原版长视频语义”，不是随意做一个能跑的近似实现。
+- 目前 `Phase D` 代码路径、helper、测试和 benchmark 工具已经具备，但和原版的公平验收仍未通过；后续工作应优先继续查长视频 orchestration 语义，而不是破坏 `Phase C` 基线。
+- 如果本轮任务没有明确要求推进 `Phase D`，默认仍应先保护 `Phase C` 已验收结果。
+- `Phase E` 代表“性能收口 + 回归验收”阶段，不应被理解成脱离语义基线的随意调参。
+- `Phase E` 的核心任务包括：
+  - 收口默认推理配置，例如 `dtype`、attention backend、VAE tiling / slicing、offload 策略、是否启用 compile
+  - 基于稳定实现做 profile，形成可复用的性能结论
+  - 建立可重复运行的 regression 套件
+  - 让验收逐步从阶段性对齐进入 strict 或接近 strict 的 release gate
+- 推进 `Phase E` 时，默认前提是不能破坏 `Phase C` 已验收基线，也不要用性能优化掩盖 `Phase D` 尚未解决的长视频语义偏差。
+- 如果任务明确属于 `Phase E`，先确认当前 benchmark 和验收口径是否已经固定；如果默认参数、后端或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
+
+## 文档入口与实现指引
+
+- 在开始实现、重构或验收前，优先阅读 `/home/zhiheng/sglang/docs_xzh/add_strategy` 下的文档；这些文档是当前集成路线的规划合同，不要脱离这些文档自行改架构。
+- 推荐至少按下面顺序建立上下文：
+  - `docs_xzh/add_strategy/README.md`：总览
+  - `docs_xzh/add_strategy/02_stage1_sglang_mapping.md`：原版 `Vivid-VR` 到 `sglang` 的语义映射
+  - `docs_xzh/add_strategy/03_stage2_mvp_scope.md`：MVP 和阶段边界
+  - `docs_xzh/add_strategy/04_stage3_pipeline_mod_plan.md`：pipeline 改造方向
+  - `docs_xzh/add_strategy/05_stage4_component_migration.md`：组件迁移范围
+  - `docs_xzh/add_strategy/09_code_mod_order.md`：推荐改动顺序
+  - `docs_xzh/add_strategy/10_grouped_stage_acceptance.md`：分阶段验收要求
+- 如果任务与当前实现状态、恢复背景或上一轮未完成问题有关，优先查看 `/home/zhiheng/sglang/docs_xzh/hand_over` 下最新的交接文档，不要忽略历史上下文。
+- 当前最重要的交接文档包括：
+  - `docs_xzh/hand_over/phase_abc_restore_and_next_stage_handover.md`
+  - `docs_xzh/hand_over/phase_d_modular_refactor_and_fair_benchmark_handover.md`
+- 如果任务涉及 modular 化方向，额外参考：
+  - `docs_xzh/modular_style/vividvr_modular_refactor_plan.md`
+- 如果任务涉及 `Phase D` 长视频对齐，优先参考：
+  - `docs_xzh/add_strategy/02_stage1_sglang_mapping.md`
+  - `docs_xzh/add_strategy/03_stage2_mvp_scope.md`
+  - `docs_xzh/add_strategy/10_grouped_stage_acceptance.md`
+  - `docs_xzh/hand_over/phase_d_modular_refactor_and_fair_benchmark_handover.md`
+- 如果任务涉及 `Phase E` 性能收口、默认配置、compile / offload / backend 选择或回归门槛，优先参考：
+  - `docs_xzh/add_strategy/08_stage7_execution_roadmap.md`
+  - `docs_xzh/add_strategy/10_grouped_stage_acceptance.md`
+  - `docs_xzh/run_vivid_benchmark.md`
+- 如果任务涉及 benchmark、原版公平对比、caption sidecar 或验收命令，额外参考：
+  - `docs_xzh/run_vivid_benchmark.md`
+- 默认要求是“先对齐文档约束，再动代码”；如果代码现状与文档不一致，应先查明这是已知偏差、未完成阶段，还是新的回归，而不是直接按个人判断改动。
+
 ## 文件安全
 
 - 不要随意删除文件或目录。
@@ -28,6 +102,8 @@
 - 默认使用 `uv pip install --python /home/zhiheng/sglang/.venv/bin/python ...` 向该环境补依赖。
 - 除非用户明确要求，或 `.venv` 本身已损坏且无法继续使用，否则不要切换到临时 `uv run --with ...` 环境、其他 `.venv`，或系统 Python。
 - 如果因为环境问题无法继续，先说明问题，再处理环境，不要静默切换到别的解释器。
+- 唯一的基准对比例外是“运行原版 `/home/zhiheng/Vivid-VR` 做公平对比”时，必须使用原版本身的 `/home/zhiheng/Vivid-VR/.venv/bin/python`，不要用 `sglang` 的 `.venv` 代跑原版。
+- 做原版 `Vivid-VR` 公平对比时，必须优先保证原版 caption 语义正确；如果 `sglang` 环境里的 `transformers` 版本会导致 `CogVLM2` caption 异常，禁止继续用 `sglang` 的环境跑原版。
 
 ## 在 tmux 中做推理验收
 
@@ -65,6 +141,8 @@ tmux attach -t vividvr_phase_c
 ```
 
 - 如果后续推理参数、脚本路径、环境路径或日志路径发生变化，必须同步修改本文件中的标准推理命令，避免继续引用过时命令。
+- 如果是此前没有做过公平对比的新视频，先用原版 `/home/zhiheng/Vivid-VR/.venv/bin/python` 跑原版结果，再从原版日志中提取每个 temporal clip 的原始 caption，逐行保存到 `/home/zhiheng/Vivid-VR/input/captions/<video_stem>.txt`。
+- 之后再让 `sglang` 版本通过 `--caption-file /home/zhiheng/Vivid-VR/input/captions/<video_stem>.txt` 重跑；caption 文件必须一行一个 clip caption，顺序与原版生成顺序一致。
 
 ## 验收与提交纪律
 
