@@ -51,9 +51,21 @@ def _prepare_cogvideox_qkv(
     hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
     batch_size = hidden_states.shape[0]
-    query = attn.to_q(hidden_states)
-    key = attn.to_k(hidden_states)
-    value = attn.to_v(hidden_states)
+    if getattr(attn, "use_fused_qkv", False) and hasattr(attn, "to_qkv"):
+        qkv = attn.to_qkv(hidden_states)
+        if isinstance(qkv, tuple):
+            qkv = qkv[0]
+        output_sizes = getattr(attn, "_sglang_qkv_output_sizes", None)
+        if output_sizes is None:
+            output_sizes = (qkv.shape[-1] // 3,) * 3
+        query, key, value = [
+            tensor.contiguous()
+            for tensor in torch.split(qkv, output_sizes, dim=-1)
+        ]
+    else:
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
 
     inner_dim = key.shape[-1]
     head_dim = inner_dim // attn.heads
@@ -195,6 +207,81 @@ def set_cogvideox_attention_backend(module: nn.Module, backend: str) -> str:
         )
 
     return normalized_backend
+
+
+def _can_fuse_attention_qkv(attn: Attention) -> bool:
+    projections = (
+        getattr(attn, "to_q", None),
+        getattr(attn, "to_k", None),
+        getattr(attn, "to_v", None),
+    )
+    return all(isinstance(proj, nn.Linear) for proj in projections)
+
+
+def _enable_attention_qkv_fusion(attn: Attention) -> bool:
+    if getattr(attn, "use_fused_qkv", False) and hasattr(attn, "to_qkv"):
+        return True
+
+    if not _can_fuse_attention_qkv(attn):
+        return False
+
+    output_sizes = (
+        int(attn.to_q.out_features),
+        int(attn.to_k.out_features),
+        int(attn.to_v.out_features),
+    )
+    if (
+        attn.to_q.in_features != attn.to_k.in_features
+        or attn.to_q.in_features != attn.to_v.in_features
+    ):
+        return False
+
+    has_bias = attn.to_q.bias is not None
+    if (
+        (attn.to_k.bias is not None) != has_bias
+        or (attn.to_v.bias is not None) != has_bias
+    ):
+        return False
+
+    if getattr(attn, "is_cross_attention", False):
+        return False
+
+    attn.fuse_projections(fuse=True)
+    if not hasattr(attn, "to_qkv") or not isinstance(attn.to_qkv, nn.Linear):
+        return False
+
+    attn.to_qkv = attn.to_qkv.to(
+        device=attn.to_q.weight.device,
+        dtype=attn.to_q.weight.dtype,
+    )
+    attn.to_qkv.eval()
+    attn.use_fused_qkv = True
+    attn._sglang_qkv_output_sizes = output_sizes
+    attn._sglang_qkv_fusion_impl = "diffusers_fused_linear"
+    return True
+
+
+def enable_cogvideox_qkv_fusion(module: nn.Module) -> int:
+    applied = 0
+    for child in module.modules():
+        if isinstance(child, Attention) and _enable_attention_qkv_fusion(child):
+            applied += 1
+
+    if applied == 0:
+        raise ValueError(
+            "No fuseable diffusers Attention modules were found while enabling CogVideoX QKV fusion."
+        )
+
+    return applied
+
+
+def inspect_cogvideox_qkv_fusion(module: nn.Module) -> str | None:
+    for child in module.modules():
+        if not isinstance(child, Attention):
+            continue
+        if getattr(child, "use_fused_qkv", False) and hasattr(child, "to_qkv"):
+            return str(getattr(child, "_sglang_qkv_fusion_impl", "diffusers_fused_linear"))
+    return None
 
 
 def inspect_cogvideox_attention_backend(module: nn.Module) -> str | None:

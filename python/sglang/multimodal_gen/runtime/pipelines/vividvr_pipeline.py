@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 from enum import Enum
 from pathlib import Path
 
@@ -25,8 +26,14 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
     CogVideoXVividVRTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
+    inspect_cogvideox_qkv_fusion,
     normalize_cogvideox_attention_backend,
+)
+from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import (
+    enable_cogvideox_modulation_fusion,
+    inspect_cogvideox_modulation_fusion,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_controlnet import (
     CogVideoXVividVRControlNetModel,
@@ -52,6 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VividVRTimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
@@ -71,6 +79,7 @@ from sglang.multimodal_gen.runtime.vividvr import (
     trim_vividvr_temporal_output_clip,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -97,6 +106,7 @@ def _clip_spec_record(clip_spec) -> dict[str, int]:
         "trim_back_frames": int(clip_spec.trim_back_frames),
     }
 
+
 def _enum_value_or_none(value: object) -> str | None:
     if isinstance(value, Enum):
         return str(value.value)
@@ -119,6 +129,106 @@ def _inspect_module_attention_backend(module: nn.Module | None) -> str | None:
         if backend is not None:
             return _enum_value_or_none(backend)
     return None
+
+
+def _inspect_module_torch_compile(module: nn.Module | None) -> bool:
+    return bool(
+        module is not None and getattr(module, "_sglang_torch_compile_enabled", False)
+    )
+
+
+def _inspect_module_qkv_fusion(module: nn.Module | None) -> str | None:
+    if module is None:
+        return None
+    return inspect_cogvideox_qkv_fusion(module)
+
+
+def _inspect_module_modulation_fusion(module: nn.Module | None) -> str | None:
+    if module is None:
+        return None
+    return inspect_cogvideox_modulation_fusion(module)
+
+
+def _normalize_component_targets(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ("transformer",)
+
+    if isinstance(value, str):
+        raw_targets = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_targets = value
+    else:
+        raw_targets = [value]
+
+    normalized: list[str] = []
+    for raw_target in raw_targets:
+        target = str(raw_target).strip().lower()
+        if not target or target not in {"transformer", "controlnet"}:
+            continue
+        if target not in normalized:
+            normalized.append(target)
+    return tuple(normalized or ("transformer",))
+
+
+def _normalize_qkv_fusion_targets(value: object) -> tuple[str, ...]:
+    return _normalize_component_targets(value)
+
+
+def _normalize_modulation_fusion_targets(value: object) -> tuple[str, ...]:
+    return _normalize_component_targets(value)
+
+
+def _maybe_torch_compile_module(
+    module: nn.Module,
+    *,
+    enabled: bool,
+    module_name: str,
+) -> nn.Module:
+    if not enabled or not isinstance(module, nn.Module):
+        return module
+    if getattr(module, "_sglang_torch_compile_enabled", False):
+        return module
+
+    compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
+    if current_platform.is_npu():
+        backend = get_compiler_backend()
+        compile_kwargs["backend"] = backend
+        compile_kwargs["dynamic"] = False
+        logger.info("Compiling VividVR %s with torchair backend on NPU.", module_name)
+    else:
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get(
+            "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+        )
+        compile_kwargs["mode"] = mode
+        logger.info("Compiling VividVR %s with mode=%s.", module_name, mode)
+
+    try:
+        if hasattr(module, "compile"):
+            module.compile(**compile_kwargs)
+            compiled_module = module
+        else:
+            compiled_module = torch.compile(module, **compile_kwargs)
+        setattr(compiled_module, "_sglang_torch_compile_enabled", True)
+        setattr(compiled_module, "_sglang_torch_compile_kwargs", dict(compile_kwargs))
+        logger.info("Applied torch.compile to VividVR %s.", module_name)
+        return compiled_module
+    except Exception as exc:
+        logger.warning(
+            "Failed to apply torch.compile to VividVR %s: %s",
+            module_name,
+            exc,
+        )
+        return module
 
 
 class _VividVRT5EncoderWrapper(nn.Module):
@@ -170,6 +280,41 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             "attention_backend_controlnet": _inspect_module_attention_backend(
                 controlnet
             ),
+            "torch_compile_requested": bool(server_args.enable_torch_compile),
+            "torch_compile_transformer": _inspect_module_torch_compile(transformer),
+            "torch_compile_controlnet": _inspect_module_torch_compile(controlnet),
+            "qkv_fusion_requested": bool(
+                getattr(server_args, "enable_cogvideox_qkv_fusion", False)
+            ),
+            "qkv_fusion_targets": list(
+                _normalize_qkv_fusion_targets(
+                    getattr(
+                        server_args,
+                        "cogvideox_qkv_fusion_targets",
+                        "transformer",
+                    )
+                )
+            ),
+            "qkv_fusion_transformer": _inspect_module_qkv_fusion(transformer),
+            "qkv_fusion_controlnet": _inspect_module_qkv_fusion(controlnet),
+            "modulation_fusion_requested": bool(
+                getattr(server_args, "enable_cogvideox_modulation_fusion", False)
+            ),
+            "modulation_fusion_targets": list(
+                _normalize_modulation_fusion_targets(
+                    getattr(
+                        server_args,
+                        "cogvideox_modulation_fusion_targets",
+                        "transformer",
+                    )
+                )
+            ),
+            "modulation_fusion_transformer": _inspect_module_modulation_fusion(
+                transformer
+            ),
+            "modulation_fusion_controlnet": _inspect_module_modulation_fusion(
+                controlnet
+            ),
         }
 
     def _attach_runtime_acceleration_debug(
@@ -218,6 +363,113 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 component_name,
                 applied_backend,
             )
+
+    def _apply_qkv_fusion(self, server_args: ServerArgs) -> None:
+        if not getattr(server_args, "enable_cogvideox_qkv_fusion", False):
+            return
+
+        resolved_backend = normalize_cogvideox_attention_backend(
+            server_args.attention_backend
+        )
+        if resolved_backend != "fa":
+            logger.warning(
+                "CogVideoX QKV fusion is enabled, but the requested backend resolves to %s. "
+                "Phase E3 acceleration is currently consumed by the custom flash-attention path.",
+                resolved_backend,
+            )
+        target_components = set(
+            _normalize_qkv_fusion_targets(
+                getattr(
+                    server_args,
+                    "cogvideox_qkv_fusion_targets",
+                    "transformer",
+                )
+            )
+        )
+
+        components = {
+            "transformer": self.get_module("transformer"),
+            "controlnet": self.get_module("controlnet"),
+        }
+        for component_name, component in components.items():
+            if component_name not in target_components:
+                logger.info(
+                    "Skipping CogVideoX QKV fusion for VividVR %s because it is not in the requested targets=%s.",
+                    component_name,
+                    sorted(target_components),
+                )
+                continue
+            if component is None:
+                logger.warning(
+                    "Skipping CogVideoX QKV fusion for %s because the component is not loaded.",
+                    component_name,
+                )
+                continue
+            fused_modules = enable_cogvideox_qkv_fusion(component)
+            logger.info(
+                "Enabled CogVideoX QKV fusion on VividVR %s; attention_modules=%s, effective_impl=%s.",
+                component_name,
+                fused_modules,
+                _inspect_module_qkv_fusion(component),
+            )
+
+    def _apply_modulation_fusion(self, server_args: ServerArgs) -> None:
+        if not getattr(server_args, "enable_cogvideox_modulation_fusion", False):
+            return
+
+        target_components = set(
+            _normalize_modulation_fusion_targets(
+                getattr(
+                    server_args,
+                    "cogvideox_modulation_fusion_targets",
+                    "transformer",
+                )
+            )
+        )
+        components = {
+            "transformer": self.get_module("transformer"),
+            "controlnet": self.get_module("controlnet"),
+        }
+        for component_name, component in components.items():
+            if component_name not in target_components:
+                logger.info(
+                    "Skipping CogVideoX modulation fusion for VividVR %s because it is not in the requested targets=%s.",
+                    component_name,
+                    sorted(target_components),
+                )
+                continue
+            if component is None:
+                logger.warning(
+                    "Skipping CogVideoX modulation fusion for %s because the component is not loaded.",
+                    component_name,
+                )
+                continue
+            fused_blocks = enable_cogvideox_modulation_fusion(component)
+            logger.info(
+                "Enabled CogVideoX modulation fusion on VividVR %s; fused_blocks=%s, effective_impl=%s.",
+                component_name,
+                fused_blocks,
+                _inspect_module_modulation_fusion(component),
+            )
+
+    def _apply_torch_compile(self, server_args: ServerArgs) -> None:
+        if not server_args.enable_torch_compile:
+            return
+
+        for component_name in ("transformer", "controlnet"):
+            component = self.get_module(component_name)
+            if component is None:
+                logger.warning(
+                    "Skipping torch.compile for %s because the component is not loaded.",
+                    component_name,
+                )
+                continue
+            compiled_component = _maybe_torch_compile_module(
+                component,
+                enabled=True,
+                module_name=component_name,
+            )
+            self.add_module(component_name, compiled_component)
 
     def initialize_pipeline(self, server_args: ServerArgs):
         vivid_root = Path(
@@ -319,6 +571,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_module("transformer", transformer)
         self.add_module("controlnet", controlnet)
         self._apply_attention_backend(server_args)
+        self._apply_modulation_fusion(server_args)
+        self._apply_qkv_fusion(server_args)
+        self._apply_torch_compile(server_args)
 
         vae = self.get_module("vae")
         vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)

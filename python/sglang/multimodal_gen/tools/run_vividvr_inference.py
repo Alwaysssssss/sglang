@@ -47,8 +47,12 @@ def _json_ready(value: Any) -> Any:
 
 
 def build_runtime_config_snapshot(
-    *, args: argparse.Namespace, server_args: ServerArgs
+    *,
+    args: argparse.Namespace,
+    server_args: ServerArgs,
+    debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    debug = debug or {}
     return {
         "attention_backend_requested": args.attention_backend,
         "attention_backend_effective": server_args.attention_backend,
@@ -57,6 +61,34 @@ def build_runtime_config_snapshot(
         "torch_compile_mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE")
         if server_args.enable_torch_compile
         else None,
+        "torch_compile_transformer": bool(debug.get("torch_compile_transformer", False)),
+        "torch_compile_controlnet": bool(debug.get("torch_compile_controlnet", False)),
+        "enable_cogvideox_modulation_fusion": bool(
+            getattr(server_args, "enable_cogvideox_modulation_fusion", False)
+        ),
+        "cogvideox_modulation_fusion_targets": _json_ready(
+            debug.get(
+                "modulation_fusion_targets",
+                getattr(
+                    server_args,
+                    "cogvideox_modulation_fusion_targets",
+                    "transformer",
+                ),
+            )
+        ),
+        "modulation_fusion_transformer": debug.get("modulation_fusion_transformer"),
+        "modulation_fusion_controlnet": debug.get("modulation_fusion_controlnet"),
+        "enable_cogvideox_qkv_fusion": bool(
+            getattr(server_args, "enable_cogvideox_qkv_fusion", False)
+        ),
+        "cogvideox_qkv_fusion_targets": _json_ready(
+            debug.get(
+                "qkv_fusion_targets",
+                getattr(server_args, "cogvideox_qkv_fusion_targets", "transformer"),
+            )
+        ),
+        "qkv_fusion_transformer": debug.get("qkv_fusion_transformer"),
+        "qkv_fusion_controlnet": debug.get("qkv_fusion_controlnet"),
         "dit_cpu_offload": bool(server_args.dit_cpu_offload),
         "text_encoder_cpu_offload": bool(server_args.text_encoder_cpu_offload),
         "vae_cpu_offload": bool(server_args.vae_cpu_offload),
@@ -131,6 +163,10 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         text_encoder_cpu_offload=args.text_encoder_cpu_offload,
         vae_cpu_offload=args.vae_cpu_offload,
         enable_torch_compile=args.enable_torch_compile,
+        enable_cogvideox_modulation_fusion=args.enable_cogvideox_modulation_fusion,
+        cogvideox_modulation_fusion_targets=args.cogvideox_modulation_fusion_targets,
+        enable_cogvideox_qkv_fusion=args.enable_cogvideox_qkv_fusion,
+        cogvideox_qkv_fusion_targets=args.cogvideox_qkv_fusion_targets,
         warmup=args.warmup,
         warmup_steps=args.warmup_steps,
         disable_autocast=args.disable_autocast,
@@ -346,6 +382,30 @@ def parse_args() -> argparse.Namespace:
         help="Optional attention backend config string or JSON path.",
     )
     parser.add_argument(
+        "--enable-cogvideox-modulation-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable or disable CogVideoX/VividVR block modulation fusion on the native pipeline.",
+    )
+    parser.add_argument(
+        "--cogvideox-modulation-fusion-targets",
+        type=str,
+        default="transformer",
+        help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
+    )
+    parser.add_argument(
+        "--enable-cogvideox-qkv-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable CogVideoX/VividVR fused QKV projection path.",
+    )
+    parser.add_argument(
+        "--cogvideox-qkv-fusion-targets",
+        type=str,
+        default="transformer",
+        help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
+    )
+    parser.add_argument(
         "--dit-cpu-offload",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -541,6 +601,10 @@ def build_dry_run_payload(
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
         "enable_torch_compile": args.enable_torch_compile,
+        "enable_cogvideox_modulation_fusion": args.enable_cogvideox_modulation_fusion,
+        "cogvideox_modulation_fusion_targets": args.cogvideox_modulation_fusion_targets,
+        "enable_cogvideox_qkv_fusion": args.enable_cogvideox_qkv_fusion,
+        "cogvideox_qkv_fusion_targets": args.cogvideox_qkv_fusion_targets,
         "num_gpus": 1,
         "tp_size": 1,
         "dp_size": 1,
@@ -616,6 +680,14 @@ def main() -> int:
         output_file_name=output_file_name,
     )
 
+    if args.warmup:
+        warmup_request = request.copy_as_warmup(args.warmup_steps)
+        print(
+            "[VividVR] warmup_enabled=true "
+            f"warmup_steps={args.warmup_steps}"
+        )
+        pipeline.forward(warmup_request, server_args)
+
     model_inference_start_time = time.perf_counter()
     result = pipeline.forward(request, server_args)
     model_inference_runtime_seconds = round(
@@ -639,7 +711,11 @@ def main() -> int:
     )
 
     debug = result.extra.get("vividvr_debug", {})
-    runtime_config = build_runtime_config_snapshot(args=args, server_args=server_args)
+    runtime_config = build_runtime_config_snapshot(
+        args=args,
+        server_args=server_args,
+        debug=debug,
+    )
     metrics_record: dict[str, Any] = {
         "phase": args.phase_label,
         "mode": args.mode_label,

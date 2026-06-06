@@ -174,6 +174,10 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_cogvideox_modulation_fusion: bool = False
+    cogvideox_modulation_fusion_targets: str = "transformer"
+    enable_cogvideox_qkv_fusion: bool = False
+    cogvideox_qkv_fusion_targets: str = "transformer"
 
     # warmup
     warmup: bool = False
@@ -695,6 +699,30 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-cogvideox-qkv-fusion",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cogvideox_qkv_fusion,
+            help="Fuse CogVideoX/VividVR attention Q/K/V projections with a fused linear path.",
+        )
+        parser.add_argument(
+            "--enable-cogvideox-modulation-fusion",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cogvideox_modulation_fusion,
+            help="Fuse CogVideoX/VividVR block modulation with existing sglang norm/residual kernels.",
+        )
+        parser.add_argument(
+            "--cogvideox-modulation-fusion-targets",
+            type=str,
+            default=ServerArgs.cogvideox_modulation_fusion_targets,
+            help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
+        )
+        parser.add_argument(
+            "--cogvideox-qkv-fusion-targets",
+            type=str,
+            default=ServerArgs.cogvideox_qkv_fusion_targets,
+            help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
         )
 
         # warmup
