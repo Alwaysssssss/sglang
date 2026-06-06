@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
 
 import torch
@@ -22,6 +23,10 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
     CogVideoXVividVRTransformer3DModel,
+)
+from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    inspect_cogvideox_attention_backend,
+    normalize_cogvideox_attention_backend,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_controlnet import (
     CogVideoXVividVRControlNetModel,
@@ -51,6 +56,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.vividvr import (
     apply_reference_color_fix,
     build_vividvr_caption_prompt_lists,
@@ -91,6 +97,29 @@ def _clip_spec_record(clip_spec) -> dict[str, int]:
         "trim_back_frames": int(clip_spec.trim_back_frames),
     }
 
+def _enum_value_or_none(value: object) -> str | None:
+    if isinstance(value, Enum):
+        return str(value.value)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _inspect_module_attention_backend(module: nn.Module | None) -> str | None:
+    if module is None:
+        return None
+
+    backend = inspect_cogvideox_attention_backend(module)
+    if backend is not None:
+        return backend
+
+    for child in module.modules():
+        processor = getattr(child, "processor", None)
+        backend = getattr(processor, "_attention_backend", None)
+        if backend is not None:
+            return _enum_value_or_none(backend)
+    return None
+
 
 class _VividVRT5EncoderWrapper(nn.Module):
     def __init__(self, encoder: T5EncoderModel):
@@ -126,6 +155,69 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
 
     def build_executor(self, server_args: ServerArgs):
         return SyncExecutor(server_args=server_args)
+
+    def _build_runtime_acceleration_debug(self, server_args: ServerArgs) -> dict[str, object]:
+        transformer = self.get_module("transformer")
+        controlnet = self.get_module("controlnet")
+        requested_backend = server_args.attention_backend
+        resolved_backend = normalize_cogvideox_attention_backend(requested_backend)
+        return {
+            "attention_backend_requested": requested_backend,
+            "attention_backend_resolved": resolved_backend,
+            "attention_backend_transformer": _inspect_module_attention_backend(
+                transformer
+            ),
+            "attention_backend_controlnet": _inspect_module_attention_backend(
+                controlnet
+            ),
+        }
+
+    def _attach_runtime_acceleration_debug(
+        self, batch: Req, server_args: ServerArgs
+    ) -> None:
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        debug.update(self._build_runtime_acceleration_debug(server_args))
+
+    def _apply_attention_backend(self, server_args: ServerArgs) -> None:
+        requested_backend = server_args.attention_backend
+        if requested_backend is None:
+            logger.info(
+                "VividVR attention backend not specified; using component defaults."
+            )
+            return
+
+        resolved_backend = normalize_cogvideox_attention_backend(requested_backend)
+        if resolved_backend is None:
+            return
+
+        components = {
+            "transformer": self.get_module("transformer"),
+            "controlnet": self.get_module("controlnet"),
+        }
+        for component_name, component in components.items():
+            if component is None:
+                logger.warning(
+                    "Skipping attention backend '%s' for %s because the component is not loaded.",
+                    resolved_backend,
+                    component_name,
+                )
+                continue
+            if not hasattr(component, "set_attention_backend"):
+                logger.warning(
+                    "Skipping attention backend '%s' for %s because the component does not expose set_attention_backend().",
+                    resolved_backend,
+                    component_name,
+                )
+                continue
+            component.set_attention_backend(resolved_backend)
+            applied_backend = _inspect_module_attention_backend(component)
+            logger.info(
+                "Applied attention backend '%s' (requested='%s') to VividVR %s; effective_backend=%s.",
+                resolved_backend,
+                requested_backend,
+                component_name,
+                applied_backend,
+            )
 
     def initialize_pipeline(self, server_args: ServerArgs):
         vivid_root = Path(
@@ -226,6 +318,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_module("text_encoder", text_encoder)
         self.add_module("transformer", transformer)
         self.add_module("controlnet", controlnet)
+        self._apply_attention_backend(server_args)
 
         vae = self.get_module("vae")
         vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
@@ -313,11 +406,13 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         input_video_info: dict[str, object],
     ) -> Req:
         params = _as_vividvr_params(batch)
+        perf_dump_path_provided = batch.perf_dump_path is not None
 
         batch = self.input_validation_stage(batch, server_args)
         batch = self.prompt_preparation_stage(batch, server_args)
 
         debug = batch.extra.setdefault("vividvr_debug", {})
+        self._attach_runtime_acceleration_debug(batch, server_args)
         raw_reference_video = input_video_info["reference_video"]
         original_num_frames = int(input_video_info["original_num_frames"])
         window_plan = build_vividvr_temporal_window_plan(
@@ -353,90 +448,96 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         clip_states: list[dict[str, object]] = []
         clip_caption_records: list[dict[str, object]] = []
         caption_cursor = 0
-        for clip_spec in window_plan.clip_specs:
-            clip_video_info = self._build_temporal_clip_video_info(
-                input_video_info,
-                clip_spec,
-            )
-            prepared_condition = self.condition_encoding_stage.prepare_condition_inputs(
-                batch,
-                server_args,
-                control_video_info=clip_video_info,
-                generator=generator,
-            )
-            latents, control_latents, num_latent_padding_frames = (
-                self.latent_preparation_stage.prepare_latents(
-                    control_video=prepared_condition["control_video"],
-                    control_latents=prepared_condition["control_latents"],
-                    generator=prepared_condition["generator"],
-                    height=params.height,
-                    width=params.width,
+        with StageProfiler(
+            "vividvr_long_video_clip_preparation",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=perf_dump_path_provided,
+        ):
+            for clip_spec in window_plan.clip_specs:
+                clip_video_info = self._build_temporal_clip_video_info(
+                    input_video_info,
+                    clip_spec,
                 )
-            )
-            tiling_infos = self.tiling_preparation_stage.build_tiling_infos(
-                latents=latents,
-                enable_spatial_tiling=params.enable_spatial_tiling,
-                enable_temporal_tiling=params.enable_temporal_tiling,
-                tile_size=params.tile_size,
-                tile_stride=params.tile_stride,
-            )
-            if params.runtime_caption_texts is not None:
-                tiled_prompts = build_vividvr_caption_prompt_lists(
-                    caption_texts=params.runtime_caption_texts,
-                    start_index=caption_cursor,
-                    tile_count=len(tiling_infos),
-                    negative_prompt_text=params.runtime_negative_prompt_text,
-                    pipeline_config=server_args.pipeline_config,
+                prepared_condition = self.condition_encoding_stage.prepare_condition_inputs(
+                    batch,
+                    server_args,
+                    control_video_info=clip_video_info,
+                    generator=generator,
                 )
-                caption_cursor = int(tiled_prompts["next_index"])
-                clip_caption_records.append(
+                latents, control_latents, num_latent_padding_frames = (
+                    self.latent_preparation_stage.prepare_latents(
+                        control_video=prepared_condition["control_video"],
+                        control_latents=prepared_condition["control_latents"],
+                        generator=prepared_condition["generator"],
+                        height=params.height,
+                        width=params.width,
+                    )
+                )
+                tiling_infos = self.tiling_preparation_stage.build_tiling_infos(
+                    latents=latents,
+                    enable_spatial_tiling=params.enable_spatial_tiling,
+                    enable_temporal_tiling=params.enable_temporal_tiling,
+                    tile_size=params.tile_size,
+                    tile_stride=params.tile_stride,
+                )
+                if params.runtime_caption_texts is not None:
+                    tiled_prompts = build_vividvr_caption_prompt_lists(
+                        caption_texts=params.runtime_caption_texts,
+                        start_index=caption_cursor,
+                        tile_count=len(tiling_infos),
+                        negative_prompt_text=params.runtime_negative_prompt_text,
+                        pipeline_config=server_args.pipeline_config,
+                    )
+                    caption_cursor = int(tiled_prompts["next_index"])
+                    clip_caption_records.append(
+                        {
+                            "clip_index": int(clip_spec.clip_index),
+                            "caption_texts": list(tiled_prompts["caption_texts"]),
+                        }
+                    )
+                else:
+                    tiled_prompts = build_vividvr_tiled_prompt_lists(
+                        model_prompt_text=params.runtime_model_prompt_text or "",
+                        negative_prompt_text=params.runtime_negative_prompt_text,
+                        tile_count=len(tiling_infos),
+                    )
+                encoded_prompts = self.text_encoding_stage.encode_prompt_pair(
+                    prompt=tiled_prompts["prompt_list"],
+                    negative_prompt=tiled_prompts["negative_prompt_list"],
+                    do_classifier_free_guidance=bool(params.runtime_do_cfg),
+                    server_args=server_args,
+                )
+                tiling_state = self.tiling_preparation_stage.prepare_tiling_state(
+                    latents=latents,
+                    prompt_embeds=encoded_prompts["prompt_embeds"],
+                    negative_prompt_embeds=encoded_prompts["negative_prompt_embeds"],
+                    enable_spatial_tiling=params.enable_spatial_tiling,
+                    enable_temporal_tiling=params.enable_temporal_tiling,
+                    tile_size=params.tile_size,
+                    tile_stride=params.tile_stride,
+                    tiling_infos=tiling_infos,
+                )
+
+                clip_states.append(
                     {
-                        "clip_index": int(clip_spec.clip_index),
-                        "caption_texts": list(tiled_prompts["caption_texts"]),
+                        "clip_spec": clip_spec,
+                        "control_latents": control_latents,
+                        "latents": latents,
+                        "num_latent_padding_frames": num_latent_padding_frames,
+                        "tiling_infos": tiling_state["tiling_infos"],
+                        "tiled_prompt_embeds": tiling_state["tiled_prompt_embeds"],
+                        "tiled_negative_prompt_embeds": tiling_state[
+                            "tiled_negative_prompt_embeds"
+                        ],
+                        "prompt_embeds": encoded_prompts["prompt_embeds"],
+                        "negative_prompt_embeds": encoded_prompts[
+                            "negative_prompt_embeds"
+                        ],
+                        "do_classifier_free_guidance": bool(params.runtime_do_cfg),
+                        "old_pred_original_sample": None,
                     }
                 )
-            else:
-                tiled_prompts = build_vividvr_tiled_prompt_lists(
-                    model_prompt_text=params.runtime_model_prompt_text or "",
-                    negative_prompt_text=params.runtime_negative_prompt_text,
-                    tile_count=len(tiling_infos),
-                )
-            encoded_prompts = self.text_encoding_stage.encode_prompt_pair(
-                prompt=tiled_prompts["prompt_list"],
-                negative_prompt=tiled_prompts["negative_prompt_list"],
-                do_classifier_free_guidance=bool(params.runtime_do_cfg),
-                server_args=server_args,
-            )
-            tiling_state = self.tiling_preparation_stage.prepare_tiling_state(
-                latents=latents,
-                prompt_embeds=encoded_prompts["prompt_embeds"],
-                negative_prompt_embeds=encoded_prompts["negative_prompt_embeds"],
-                enable_spatial_tiling=params.enable_spatial_tiling,
-                enable_temporal_tiling=params.enable_temporal_tiling,
-                tile_size=params.tile_size,
-                tile_stride=params.tile_stride,
-                tiling_infos=tiling_infos,
-            )
-
-            clip_states.append(
-                {
-                    "clip_spec": clip_spec,
-                    "control_latents": control_latents,
-                    "latents": latents,
-                    "num_latent_padding_frames": num_latent_padding_frames,
-                    "tiling_infos": tiling_state["tiling_infos"],
-                    "tiled_prompt_embeds": tiling_state["tiled_prompt_embeds"],
-                    "tiled_negative_prompt_embeds": tiling_state[
-                        "tiled_negative_prompt_embeds"
-                    ],
-                    "prompt_embeds": encoded_prompts["prompt_embeds"],
-                    "negative_prompt_embeds": encoded_prompts[
-                        "negative_prompt_embeds"
-                    ],
-                    "do_classifier_free_guidance": bool(params.runtime_do_cfg),
-                    "old_pred_original_sample": None,
-                }
-            )
 
         if params.runtime_caption_texts is not None:
             if caption_cursor != len(params.runtime_caption_texts):
@@ -446,9 +547,15 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
             debug["clip_caption_texts"] = clip_caption_records
 
-        timesteps = self.timestep_preparation_stage.prepare_timesteps(
-            params.num_inference_steps
-        )
+        with StageProfiler(
+            "vividvr_long_video_timestep_preparation",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=perf_dump_path_provided,
+        ):
+            timesteps = self.timestep_preparation_stage.prepare_timesteps(
+                params.num_inference_steps
+            )
         params.runtime_timesteps = timesteps
         params.runtime_timestep_count = len(timesteps)
 
@@ -463,72 +570,103 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         params.runtime_temporal_merge_plan = merge_plan
 
         denoising_states: list[dict[str, object]] = []
-        for clip_state in clip_states:
-            denoising_state = self.denoising_stage.prepare_denoising_state(
-                batch,
-                server_args,
-                latents=clip_state["latents"],
-                control_latents=clip_state["control_latents"],
-                prompt_embeds=clip_state["tiled_prompt_embeds"],
-                negative_prompt_embeds=clip_state["tiled_negative_prompt_embeds"],
-                do_classifier_free_guidance=bool(
-                    clip_state["do_classifier_free_guidance"]
-                ),
-                timesteps=timesteps,
-                tiling_infos=clip_state["tiling_infos"],
-            )
-            denoising_states.append(denoising_state)
-
-        with self.denoising_stage.progress_bar(total=len(timesteps)) as progress_bar:
-            for timestep_index, _ in enumerate(timesteps):
-                for denoising_state in denoising_states:
-                    self.denoising_stage.run_denoising_step(
-                        batch,
-                        denoising_state,
-                        timestep_index,
-                        guidance_scale=float(params.guidance_scale),
-                        restoration_guidance_scale=float(
-                            params.restoration_guidance_scale
-                        ),
-                    )
-                merge_vividvr_temporal_latent_states(denoising_states, merge_plan)
-                params.runtime_progress = float(timestep_index + 1) / float(len(timesteps))
-                if progress_bar is not None:
-                    progress_bar.update()
-
-        trimmed_clips: list[torch.Tensor] = []
-        for clip_state, denoising_state in zip(clip_states, denoising_states, strict=True):
-            decoded_video = self.decoding_stage.decode_latents(
-                denoising_state["latents"],
-                int(clip_state["num_latent_padding_frames"]),
-                server_args,
-            )
-            output_video = decoded_video_to_frame_tensor(
-                decoded_video,
-                video_processor=self.video_processor,
-                original_height=int(input_video_info["original_height"]),
-                original_width=int(input_video_info["original_width"]),
-            )
-            trimmed_clips.append(
-                trim_vividvr_temporal_output_clip(
-                    output_video,
-                    clip_state["clip_spec"],
+        with StageProfiler(
+            "vividvr_long_video_denoising_state_preparation",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=perf_dump_path_provided,
+        ):
+            for clip_state in clip_states:
+                denoising_state = self.denoising_stage.prepare_denoising_state(
+                    batch,
+                    server_args,
+                    latents=clip_state["latents"],
+                    control_latents=clip_state["control_latents"],
+                    prompt_embeds=clip_state["tiled_prompt_embeds"],
+                    negative_prompt_embeds=clip_state["tiled_negative_prompt_embeds"],
+                    do_classifier_free_guidance=bool(
+                        clip_state["do_classifier_free_guidance"]
+                    ),
+                    timesteps=timesteps,
+                    tiling_infos=clip_state["tiling_infos"],
                 )
-            )
+                denoising_states.append(denoising_state)
 
-        final_output_video = stitch_vividvr_temporal_output_clips(trimmed_clips)
-        final_output_video = apply_reference_color_fix(
-            final_output_video,
-            raw_reference_video,
-        )
-        final_output_video = run_optional_postprocess_modules(
-            final_output_video,
-            reference_video=raw_reference_video,
-            enabled=bool(params.enable_optional_postprocess_module),
-            allow_fallback=bool(params.allow_optional_module_fallback),
-            debug=debug,
-            processor=None,
-        )
+        with StageProfiler(
+            "vividvr_long_video_denoising_loop",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=perf_dump_path_provided,
+        ):
+            with self.denoising_stage.progress_bar(total=len(timesteps)) as progress_bar:
+                for timestep_index, _ in enumerate(timesteps):
+                    with StageProfiler(
+                        f"denoising_step_{timestep_index}",
+                        logger=logger,
+                        metrics=batch.metrics,
+                        perf_dump_path_provided=perf_dump_path_provided,
+                        record_as_step=True,
+                    ):
+                        for denoising_state in denoising_states:
+                            self.denoising_stage.run_denoising_step(
+                                batch,
+                                denoising_state,
+                                timestep_index,
+                                guidance_scale=float(params.guidance_scale),
+                                restoration_guidance_scale=float(
+                                    params.restoration_guidance_scale
+                                ),
+                            )
+                        merge_vividvr_temporal_latent_states(
+                            denoising_states, merge_plan
+                        )
+                    params.runtime_progress = float(timestep_index + 1) / float(
+                        len(timesteps)
+                    )
+                    if progress_bar is not None:
+                        progress_bar.update()
+
+        with StageProfiler(
+            "vividvr_long_video_decode_postprocess",
+            logger=logger,
+            metrics=batch.metrics,
+            perf_dump_path_provided=perf_dump_path_provided,
+        ):
+            trimmed_clips: list[torch.Tensor] = []
+            for clip_state, denoising_state in zip(
+                clip_states, denoising_states, strict=True
+            ):
+                decoded_video = self.decoding_stage.decode_latents(
+                    denoising_state["latents"],
+                    int(clip_state["num_latent_padding_frames"]),
+                    server_args,
+                )
+                output_video = decoded_video_to_frame_tensor(
+                    decoded_video,
+                    video_processor=self.video_processor,
+                    original_height=int(input_video_info["original_height"]),
+                    original_width=int(input_video_info["original_width"]),
+                )
+                trimmed_clips.append(
+                    trim_vividvr_temporal_output_clip(
+                        output_video,
+                        clip_state["clip_spec"],
+                    )
+                )
+
+            final_output_video = stitch_vividvr_temporal_output_clips(trimmed_clips)
+            final_output_video = apply_reference_color_fix(
+                final_output_video,
+                raw_reference_video,
+            )
+            final_output_video = run_optional_postprocess_modules(
+                final_output_video,
+                reference_video=raw_reference_video,
+                enabled=bool(params.enable_optional_postprocess_module),
+                allow_fallback=bool(params.allow_optional_module_fallback),
+                debug=debug,
+                processor=None,
+            )
         if "optional_module_warnings" in debug:
             params.runtime_optional_module_warnings = list(
                 debug["optional_module_warnings"]
@@ -576,7 +714,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
 
         if int(input_video_info["original_num_frames"]) <= params.num_temporal_process_frames:
             batch.extra["vividvr_input_video_info"] = input_video_info
-            return super().forward(batch, server_args)
+            result = super().forward(batch, server_args)
+            self._attach_runtime_acceleration_debug(result, server_args)
+            return result
 
         if self.is_lora_set() and not self.is_lora_effective():
             logger.warning(
@@ -590,7 +730,11 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             )
 
         with self.executor.profile_execution(batch, dump_rank=0):
-            return self._forward_temporal_windowed(batch, server_args, input_video_info)
+            result = self._forward_temporal_windowed(
+                batch, server_args, input_video_info
+            )
+        self._attach_runtime_acceleration_debug(result, server_args)
+        return result
 
 
 EntryClass = VividVRPipeline

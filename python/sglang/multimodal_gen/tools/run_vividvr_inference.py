@@ -34,6 +34,66 @@ DEFAULT_REPORT_DIR = ACCEPTANCE_ROOT / "indicator"
 DEFAULT_OUTPUT_DIR = ACCEPTANCE_ROOT / "result_videos"
 
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, torch.Size):
+        return list(value)
+    return value
+
+
+def build_runtime_config_snapshot(
+    *, args: argparse.Namespace, server_args: ServerArgs
+) -> dict[str, Any]:
+    return {
+        "attention_backend_requested": args.attention_backend,
+        "attention_backend_effective": server_args.attention_backend,
+        "attention_backend_config": _json_ready(dict(server_args.attention_backend_config)),
+        "enable_torch_compile": bool(server_args.enable_torch_compile),
+        "torch_compile_mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE")
+        if server_args.enable_torch_compile
+        else None,
+        "dit_cpu_offload": bool(server_args.dit_cpu_offload),
+        "text_encoder_cpu_offload": bool(server_args.text_encoder_cpu_offload),
+        "vae_cpu_offload": bool(server_args.vae_cpu_offload),
+        "disable_autocast": server_args.disable_autocast,
+        "num_gpus": int(server_args.num_gpus),
+        "tp_size": int(server_args.tp_size),
+        "dp_size": int(server_args.dp_size),
+        "dp_degree": int(server_args.dp_degree),
+        "sp_degree": int(server_args.sp_degree),
+        "ulysses_degree": int(server_args.ulysses_degree),
+        "ring_degree": int(server_args.ring_degree),
+        "enable_cfg_parallel": bool(server_args.enable_cfg_parallel),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        "cuda_device_name": (
+            torch.cuda.get_device_name(torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
+        ),
+        "stage_profiling_enabled": True,
+        "stage_profiling_synchronized": (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+        ),
+    }
+
+
+def build_request_metrics_payload(result: Any, model_inference_runtime_seconds: float) -> dict[str, Any] | None:
+    metrics = getattr(result, "metrics", None)
+    if metrics is None:
+        return None
+
+    if getattr(metrics, "total_duration_ms", 0.0) <= 0:
+        metrics.total_duration_ms = model_inference_runtime_seconds * 1000.0
+
+    return _json_ready(metrics.to_dict())
+
+
 def build_recorded_command() -> str:
     parts: list[str] = []
     pythonpath = os.environ.get("PYTHONPATH")
@@ -481,6 +541,14 @@ def build_dry_run_payload(
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
         "enable_torch_compile": args.enable_torch_compile,
+        "num_gpus": 1,
+        "tp_size": 1,
+        "dp_size": 1,
+        "dp_degree": 1,
+        "sp_degree": 1,
+        "ulysses_degree": 1,
+        "ring_degree": 1,
+        "enable_cfg_parallel": False,
         "warmup": args.warmup,
         "warmup_steps": args.warmup_steps,
         "disable_autocast": args.disable_autocast,
@@ -494,6 +562,7 @@ def main() -> int:
     validate_args(args)
 
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    os.environ.setdefault("SGLANG_DIFFUSION_STAGE_LOGGING", "1")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_file_name = build_output_file_name(args, run_id)
@@ -552,6 +621,9 @@ def main() -> int:
     model_inference_runtime_seconds = round(
         time.perf_counter() - model_inference_start_time, 6
     )
+    request_metrics = build_request_metrics_payload(
+        result, model_inference_runtime_seconds
+    )
 
     reference_video_for_save = None
     if args.reference_video is not None and args.reference_video.exists():
@@ -567,6 +639,7 @@ def main() -> int:
     )
 
     debug = result.extra.get("vividvr_debug", {})
+    runtime_config = build_runtime_config_snapshot(args=args, server_args=server_args)
     metrics_record: dict[str, Any] = {
         "phase": args.phase_label,
         "mode": args.mode_label,
@@ -590,6 +663,17 @@ def main() -> int:
         ),
         "candidate_video_path": str(candidate_path),
         "compare_enabled": args.reference_video is not None,
+        "runtime_config": runtime_config,
+        "request_metrics": request_metrics,
+        "stage_metrics_ms": None if request_metrics is None else request_metrics["stages"],
+        "denoising_step_metrics_ms": (
+            None if request_metrics is None else request_metrics["steps"]
+        ),
+        "request_metrics_total_duration_ms": (
+            None
+            if request_metrics is None
+            else request_metrics["total_duration_ms"]
+        ),
         "summary": None,
         "frames": None,
         "reference_frame_count": None,
@@ -632,6 +716,7 @@ def main() -> int:
                 "candidate_frame_count": len(cand_frames),
                 "frame_count_delta": abs(len(ref_frames) - len(cand_frames)),
                 "failed_frame_ratio": failed_frame_ratio,
+                "pass_compare": bool(summary["pass_compare"]),
             }
         )
         print(
@@ -644,6 +729,7 @@ def main() -> int:
         )
         exit_code = 0 if summary["pass_compare"] else 1
     else:
+        metrics_record["pass_compare"] = None
         print("[VividVR] summary compare_disabled reference_video=None")
 
     if report_path is not None:

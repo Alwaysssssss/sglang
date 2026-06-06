@@ -6,6 +6,10 @@ from diffusers.models.transformers.cogvideox_transformer_3d import (
 )
 
 from sglang.multimodal_gen.configs.models.dits.cogvideox import CogVideoXConfig
+from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    inspect_cogvideox_attention_backend,
+    set_cogvideox_attention_backend,
+)
 
 
 class CogVideoXTransformer3DModel(DiffusersCogVideoXTransformer3DModel):
@@ -65,9 +69,18 @@ class CogVideoXTransformer3DModel(DiffusersCogVideoXTransformer3DModel):
     def post_load_weights(self) -> None:
         return None
 
+    def set_attention_backend(self, backend: str) -> None:
+        # CogVideoX uses a custom processor that does not honor diffusers'
+        # generic backend flag, so wire it directly to the sglang-backed path.
+        set_cogvideox_attention_backend(self, backend)
+
     @property
     def supported_attention_backends(self):
         return self._supported_attention_backends
+
+    @property
+    def attention_backend(self):
+        return inspect_cogvideox_attention_backend(self)
 
     @property
     def device(self):

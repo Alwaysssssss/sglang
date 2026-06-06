@@ -15,6 +15,10 @@ from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscal
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
     CogVideoXVividVRTransformer3DModel,
 )
+from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    inspect_cogvideox_attention_backend,
+    set_cogvideox_attention_backend,
+)
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
     build_control_feat_proj,
     zero_module,
@@ -154,6 +158,13 @@ class CogVideoXVividVRControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin)
 
     def post_load_weights(self) -> None:
         return None
+
+    def set_attention_backend(self, backend: str) -> None:
+        set_cogvideox_attention_backend(self, backend)
+
+    @property
+    def attention_backend(self):
+        return inspect_cogvideox_attention_backend(self)
 
     def forward(
         self,
