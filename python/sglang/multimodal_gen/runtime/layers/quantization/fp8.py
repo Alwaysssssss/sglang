@@ -181,10 +181,18 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
+        self.use_dequant_fallback = False
         if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+            if auto_enable and not force_marlin:
+                # Some sm80 environments cannot JIT the FP8 Marlin kernel used
+                # by diffusion runtime dynamic quantization. Keep FP8 storage and
+                # use an unfused dequantized matmul fallback unless Marlin is
+                # explicitly forced.
+                self.use_marlin = False
+                self.use_dequant_fallback = True
 
         self.block_quant = self.quant_config.weight_block_size is not None
 
@@ -355,15 +363,18 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.cutlass_fp8_supported:
                     # apply per-channel quantization default as
-                    # cutlass sgl-kernel and marlin only support per-channel scale
+                    # cutlass sgl-kernel supports per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
                     weight_scale = weight_scale.t().contiguous()
                 else:
                     # per-tensor quantization
+                    # On sm80 Marlin fallback, Triton per-channel FP8 quantization
+                    # can compile to an unsupported fp8e4nv dtype. Tensor-wise
+                    # conversion keeps runtime FP8 dynamic loading usable there.
                     qweight, weight_scale = input_to_float8(layer.weight)
 
                 # Update the layer with the new values.
@@ -445,6 +456,13 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_dequant_fallback and not self.block_quant:
+            weight = layer.weight.float() * layer.weight_scale.float()
+            output = torch.matmul(x, weight.to(x.dtype))
+            if bias is not None:
+                output = output + bias
+            return output
+
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,

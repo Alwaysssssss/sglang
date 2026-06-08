@@ -73,12 +73,13 @@ class WanVideoEditTransformer3DModel(WanTransformer3DModel):
 
     def __init__(self, config: WanVideoEditConfig, hf_config, quant_config=None):
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             block.attn2 = WanVideoEditCrossAttention(
                 config.hidden_size,
                 config.num_attention_heads,
                 qk_norm=config.qk_norm,
                 eps=config.eps,
+                prefix=f"blocks.{i}.attn2",
                 supported_attention_backends={
                     b for b in self._supported_attention_backends if not b.is_sparse
                 },

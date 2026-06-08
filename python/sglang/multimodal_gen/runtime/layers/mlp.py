@@ -38,6 +38,8 @@ class MLP(nn.Module):
         dtype: torch.dtype | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig = None,
+        fc_in_quant_prefix: str | None = None,
+        fc_out_quant_prefix: str | None = None,
     ):
         super().__init__()
         self.fc_in = ColumnParallelLinear(
@@ -46,7 +48,9 @@ class MLP(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
-            prefix=add_prefix("0.proj", prefix),
+            prefix=fc_in_quant_prefix
+            if fc_in_quant_prefix is not None
+            else add_prefix("0.proj", prefix),
         )
 
         self.act = get_act_fn(act_type)
@@ -58,7 +62,9 @@ class MLP(nn.Module):
             bias=True,
             input_is_parallel=True,
             quant_config=quant_config,
-            prefix=add_prefix("2", prefix),
+            prefix=fc_out_quant_prefix
+            if fc_out_quant_prefix is not None
+            else add_prefix("2", prefix),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     _patch_nunchaku_scales,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
@@ -268,6 +269,23 @@ def _resolve_quant_config(
     priority: model config.json -> safetensors metadata -> format-specific fallback
     """
     quant_config = get_quant_config(hf_config, component_model_path)
+    runtime_quantization = getattr(server_args, "transformer_quantization", None)
+    if runtime_quantization:
+        if quant_config is not None:
+            raise ValueError(
+                "transformer_quantization was set, but the transformer config already "
+                "contains quantization metadata. Use one quantization source."
+            )
+        if runtime_quantization == "fp8_dynamic":
+            logger.info("Using runtime transformer quantization: fp8_dynamic")
+            return Fp8Config(
+                is_checkpoint_fp8_serialized=False,
+                activation_scheme="dynamic",
+            )
+        raise ValueError(
+            f"Unsupported transformer_quantization: {runtime_quantization}"
+        )
+
     if quant_config is None and server_args.transformer_weights_path:
         for safetensors_file in safetensors_list:
             quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)

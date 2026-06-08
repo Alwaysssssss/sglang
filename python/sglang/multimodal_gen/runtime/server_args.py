@@ -155,6 +155,8 @@ class ServerArgs:
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # Runtime transformer quantization override for unquantized checkpoints.
+    transformer_quantization: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None

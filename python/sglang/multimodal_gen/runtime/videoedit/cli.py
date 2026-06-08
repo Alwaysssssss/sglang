@@ -25,6 +25,8 @@ from sglang.multimodal_gen.runtime.videoedit.preprocess import (
 def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--transformer-path")
+    parser.add_argument("--transformer-weights-path")
+    parser.add_argument("--transformer-quantization", choices=["fp8_dynamic"])
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--negative-prompt", default=DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT)
     parser.add_argument("--video-input-path", required=True)
@@ -118,6 +120,8 @@ def _server_args_kwargs(args: argparse.Namespace, component_paths: dict[str, str
         "model_path": args.model_path,
         "backend": Backend.SGLANG,
         "component_paths": component_paths,
+        "transformer_weights_path": args.transformer_weights_path,
+        "transformer_quantization": args.transformer_quantization,
         "output_path": args.output_path,
         "tp_size": args.tp_size,
         "num_gpus": args.num_gpus,
