@@ -13,6 +13,7 @@ from functools import lru_cache
 import psutil
 import torch
 import zmq
+from diffusers.utils.torch_utils import randn_tensor
 
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
@@ -250,6 +251,40 @@ def is_host_cpu_x86() -> bool:
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
+
+
+def resolve_generator_device(
+    generator: torch.Generator | None,
+    default_device: torch.device | str,
+) -> torch.device:
+    if not isinstance(generator, torch.Generator):
+        return torch.device(default_device)
+
+    generator_device = getattr(generator, "device", None)
+    if generator_device is None:
+        return torch.device(default_device)
+
+    return torch.device(str(generator_device))
+
+
+def randn_tensor_with_generator_device(
+    shape: tuple[int, ...],
+    *,
+    generator: torch.Generator | None,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    target_device = torch.device(device)
+    noise_device = resolve_generator_device(generator, target_device)
+    noise = randn_tensor(
+        shape,
+        generator=generator,
+        device=noise_device,
+        dtype=dtype,
+    )
+    if noise.device != target_device:
+        noise = noise.to(device=target_device, dtype=dtype)
+    return noise
 
 
 # cuda

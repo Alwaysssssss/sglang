@@ -9,7 +9,6 @@ from diffusers.pipelines.cogvideo.pipeline_cogvideox import retrieve_timesteps
 from diffusers.pipelines.cogvideo.pipeline_cogvideox_image2video import (
     retrieve_latents,
 )
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from tqdm.auto import tqdm
 
@@ -18,13 +17,21 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_group,
 )
+from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import (
+    randn_tensor_with_generator_device,
+)
 from sglang.multimodal_gen.runtime.vividvr import (
     apply_reference_color_fix,
     decoded_video_to_frame_tensor,
@@ -54,17 +61,23 @@ def _module_dtype(module: torch.nn.Module, default: torch.dtype) -> torch.dtype:
         return default
 
 
-def _module_device(
-    module: torch.nn.Module,
-    default: torch.device,
-) -> torch.device:
+def _runtime_compute_device() -> torch.device:
+    # CPU offload may temporarily park modules on CPU, but VividVR denoising
+    # should still prepare compute tensors on the active local accelerator.
+    return get_local_torch_device()
+
+
+def _resolve_attn_backend_cls(
+    *,
+    head_size: int,
+    dtype: torch.dtype,
+) -> Any:
     try:
-        return next(module.parameters()).device
-    except StopIteration:
-        try:
-            return next(module.buffers()).device
-        except StopIteration:
-            return default
+        return get_attn_backend(head_size=head_size, dtype=dtype)
+    except ValueError as exc:
+        if str(exc) != "Global sgl_diffusion args is not set.":
+            raise
+        return current_platform.get_attn_backend(None, head_size, dtype)
 
 
 def _ensure_tensor_decode_output(decode_output: Any) -> torch.Tensor:
@@ -152,7 +165,12 @@ class _VividVRLatentMixin:
             ]
             control_latents = torch.cat([first_frame, control_latents], dim=1)
 
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = randn_tensor_with_generator_device(
+            shape,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
         latents = latents * scheduler.init_noise_sigma
         return latents, control_latents, num_latent_padding_frames
 
@@ -251,6 +269,8 @@ class VividVRTextEncodingStage(PipelineStage):
                 dtype=target_dtype,
             )
             negative_prompt_embeds = negative_prompt_embeds_list[0]
+        if server_args.text_encoder_cpu_offload:
+            self.text_encoder = self.text_encoder.to("cpu")
         return {
             "prompt_embeds": prompt_embeds,
             "negative_prompt_embeds": negative_prompt_embeds,
@@ -359,6 +379,8 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             dtype=target_dtype,
             generator=generator,
         )
+        if server_args.vae_cpu_offload:
+            self.vae = self.vae.to("cpu")
 
         return {
             "generator": generator,
@@ -421,8 +443,7 @@ class VividVRLatentPreparationStage(_VividVRLatentMixin, PipelineStage):
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        default_device = get_local_torch_device()
-        device = _module_device(self.transformer, default_device)
+        device = _runtime_compute_device()
         target_dtype = _module_dtype(
             self.transformer,
             control_video.dtype,
@@ -600,8 +621,7 @@ class VividVRTimestepPreparationStage(PipelineStage):
 
     @torch.no_grad()
     def prepare_timesteps(self, num_inference_steps: int) -> torch.Tensor:
-        default_device = get_local_torch_device()
-        device = _module_device(self.transformer, default_device)
+        device = _runtime_compute_device()
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
@@ -636,6 +656,26 @@ class VividVRDenoisingStage(PipelineStage):
         self.transformer = transformer
         self.controlnet = controlnet
         self.scheduler = scheduler
+        attn_head_size = int(self.transformer.config.attention_head_dim)
+        self.attn_backend = _resolve_attn_backend_cls(
+            head_size=attn_head_size,
+            dtype=torch.float16,
+        )
+
+    def _prepare_runtime_module(
+        self,
+        module: torch.nn.Module,
+        *,
+        device: torch.device,
+        target_dtype: torch.dtype,
+        server_args: ServerArgs,
+    ) -> torch.nn.Module:
+        module = module.to(dtype=target_dtype)
+        if getattr(server_args, "dit_cpu_offload", False):
+            DenoisingStage._manage_device_placement(self, module, None, server_args)
+        if next(module.parameters()).device != device:
+            module = module.to(device=device)
+        return module
 
     def progress_bar(self, total: int) -> tqdm:
         try:
@@ -643,6 +683,29 @@ class VividVRDenoisingStage(PipelineStage):
         except AssertionError:
             local_rank = 0
         return tqdm(total=total, disable=local_rank != 0, desc="VividVR denoising")
+
+    def _build_runtime_attn_metadata(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        timestep_index: int,
+    ) -> Any | None:
+        attn_metadata = DenoisingStage._build_attn_metadata(
+            self,
+            timestep_index,
+            batch,
+            server_args,
+        )
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        debug["attn_metadata_enabled"] = attn_metadata is not None
+        debug["attn_metadata_backend"] = str(self.attn_backend.get_enum())
+        debug["attn_metadata_builder"] = (
+            None
+            if self.attn_metadata_builder is None
+            else self.attn_metadata_builder.__class__.__name__
+        )
+        return attn_metadata
 
     @torch.no_grad()
     def prepare_denoising_state(
@@ -658,15 +721,27 @@ class VividVRDenoisingStage(PipelineStage):
         timesteps: torch.Tensor,
         tiling_infos: list[Any],
     ) -> dict[str, Any]:
-        default_device = get_local_torch_device()
-        device = _module_device(self.transformer, default_device)
+        device = _runtime_compute_device()
         target_dtype = _module_dtype(
             self.transformer,
             PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision],
         )
+        autocast_enabled = (
+            target_dtype != torch.float32
+        ) and not server_args.disable_autocast
 
-        self.transformer = self.transformer.to(device=device, dtype=target_dtype)
-        self.controlnet = self.controlnet.to(device=device, dtype=target_dtype)
+        self.transformer = self._prepare_runtime_module(
+            self.transformer,
+            device=device,
+            target_dtype=target_dtype,
+            server_args=server_args,
+        )
+        self.controlnet = self._prepare_runtime_module(
+            self.controlnet,
+            device=device,
+            target_dtype=target_dtype,
+            server_args=server_args,
+        )
 
         latents = latents.to(device=device, dtype=target_dtype)
         control_latents = control_latents.to(device=device, dtype=target_dtype)
@@ -698,6 +773,21 @@ class VividVRDenoisingStage(PipelineStage):
             else None
         )
 
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        debug.update(
+            {
+                "denoising_target_dtype": str(target_dtype).removeprefix("torch."),
+                "denoising_device_type": device.type,
+                "denoising_autocast_enabled": bool(autocast_enabled),
+                "device_placement_helper": "DenoisingStage._manage_device_placement",
+                "denoising_step_profile_helper": "DenoisingStage.step_profile",
+                "attn_metadata_enabled": False,
+                "attn_metadata_backend": None,
+                "attn_metadata_builder": None,
+                "vae_tiling_enabled": False,
+            }
+        )
+
         return {
             "latents": latents,
             "control_latents": control_latents,
@@ -715,12 +805,15 @@ class VividVRDenoisingStage(PipelineStage):
             "image_rotary_emb": image_rotary_emb,
             "old_pred_original_sample": None,
             "target_dtype": target_dtype,
+            "autocast_enabled": autocast_enabled,
+            "raw_latent_shape": tuple(latents.shape),
         }
 
     @torch.no_grad()
     def run_denoising_step(
         self,
         batch: Req,
+        server_args: ServerArgs,
         denoising_state: dict[str, Any],
         timestep_index: int,
         *,
@@ -739,6 +832,7 @@ class VividVRDenoisingStage(PipelineStage):
         image_rotary_emb = denoising_state["image_rotary_emb"]
         old_pred_original_sample = denoising_state["old_pred_original_sample"]
         target_dtype = denoising_state["target_dtype"]
+        autocast_enabled = denoising_state["autocast_enabled"]
 
         timestep = timesteps[timestep_index]
         latents_meshgrid = torch.zeros_like(latents)
@@ -788,34 +882,47 @@ class VividVRDenoisingStage(PipelineStage):
                 [latent_model_input, control_model_input],
                 dim=2,
             )
+            attn_metadata = self._build_runtime_attn_metadata(
+                batch,
+                server_args,
+                timestep_index=timestep_index,
+            )
 
-            with set_forward_context(
-                current_timestep=timestep_index,
-                attn_metadata=None,
-                forward_batch=batch,
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
             ):
-                control_hidden_states = self.controlnet(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=tile_prompt_embeds,
-                    control_states=control_model_input,
-                    image_rotary_emb=image_rotary_emb,
-                    timestep=timestep_expand,
-                    ofs=ofs_emb,
-                    return_dict=False,
-                )[0]
-                control_hidden_states = tuple(
-                    tuple(state_tensor.to(tile_prompt_embeds.dtype) for state_tensor in state)
-                    for state in control_hidden_states
-                )
-                noise_pred = self.transformer(
-                    hidden_states=concat_latent_model_input,
-                    encoder_hidden_states=tile_prompt_embeds,
-                    control_hidden_states=control_hidden_states,
-                    image_rotary_emb=image_rotary_emb,
-                    timestep=timestep_expand,
-                    ofs=ofs_emb,
-                    return_dict=False,
-                )[0]
+                with set_forward_context(
+                    current_timestep=timestep_index,
+                    attn_metadata=attn_metadata,
+                    forward_batch=batch,
+                ):
+                    control_hidden_states = self.controlnet(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=tile_prompt_embeds,
+                        control_states=control_model_input,
+                        image_rotary_emb=image_rotary_emb,
+                        timestep=timestep_expand,
+                        ofs=ofs_emb,
+                        return_dict=False,
+                    )[0]
+                    control_hidden_states = tuple(
+                        tuple(
+                            state_tensor.to(tile_prompt_embeds.dtype)
+                            for state_tensor in state
+                        )
+                        for state in control_hidden_states
+                    )
+                    noise_pred = self.transformer(
+                        hidden_states=concat_latent_model_input,
+                        encoder_hidden_states=tile_prompt_embeds,
+                        control_hidden_states=control_hidden_states,
+                        image_rotary_emb=image_rotary_emb,
+                        timestep=timestep_expand,
+                        ofs=ofs_emb,
+                        return_dict=False,
+                    )[0]
 
             noise_pred = noise_pred.float()
             if do_classifier_free_guidance:
@@ -872,11 +979,11 @@ class VividVRDenoisingStage(PipelineStage):
             timesteps=params.runtime_timesteps,
             tiling_infos=params.runtime_tiling_infos or [],
         )
-
         with self.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
             for timestep_index, _ in enumerate(params.runtime_timesteps):
                 self.run_denoising_step(
                     batch,
+                    server_args,
                     denoising_state,
                     timestep_index,
                     guidance_scale=float(params.guidance_scale),
@@ -884,6 +991,7 @@ class VividVRDenoisingStage(PipelineStage):
                         params.restoration_guidance_scale
                     ),
                 )
+                DenoisingStage.step_profile(self)
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
                 )
@@ -907,22 +1015,33 @@ class VividVRDecodingStage(PipelineStage):
         latents: torch.Tensor,
         num_latent_padding_frames: int,
         server_args: ServerArgs,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, bool]:
         device = latents.device
         vae_dtype = _module_dtype(
             self.vae,
             PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
         )
         self.vae = self.vae.to(device=device, dtype=vae_dtype)
+        vae_tiling_enabled = False
+
+        try:
+            if getattr(server_args.pipeline_config, "vae_tiling", False):
+                self.vae.enable_tiling()
+                vae_tiling_enabled = True
+        except Exception:
+            vae_tiling_enabled = False
 
         if num_latent_padding_frames > 0:
             latents = latents[:, num_latent_padding_frames:]
 
         decode_latents = latents.permute(0, 2, 1, 3, 4)
         decode_latents = decode_latents / self.vae.config.scaling_factor
-        return _ensure_tensor_decode_output(
+        decoded = _ensure_tensor_decode_output(
             self.vae.decode(decode_latents.to(dtype=vae_dtype))
         )
+        if server_args.vae_cpu_offload:
+            self.vae = self.vae.to("cpu")
+        return decoded, vae_tiling_enabled
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -930,12 +1049,14 @@ class VividVRDecodingStage(PipelineStage):
         if params.runtime_latents is None:
             raise ValueError("VividVR denoised latents must be prepared before decoding")
 
-        decoded = self.decode_latents(
+        decoded, vae_tiling_enabled = self.decode_latents(
             params.runtime_latents,
             int(params.runtime_num_latent_padding_frames or 0),
             server_args,
         )
         params.runtime_decoded_video = decoded
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        debug["vae_tiling_enabled"] = bool(vae_tiling_enabled)
         return batch
 
 

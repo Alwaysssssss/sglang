@@ -93,6 +93,17 @@ def build_runtime_config_snapshot(
         "text_encoder_cpu_offload": bool(server_args.text_encoder_cpu_offload),
         "vae_cpu_offload": bool(server_args.vae_cpu_offload),
         "disable_autocast": server_args.disable_autocast,
+        "denoising_autocast_enabled": debug.get("denoising_autocast_enabled"),
+        "denoising_target_dtype": debug.get("denoising_target_dtype"),
+        "denoising_device_type": debug.get("denoising_device_type"),
+        "device_placement_helper": debug.get("device_placement_helper"),
+        "denoising_step_profile_helper": debug.get(
+            "denoising_step_profile_helper"
+        ),
+        "attn_metadata_enabled": bool(debug.get("attn_metadata_enabled", False)),
+        "attn_metadata_backend": debug.get("attn_metadata_backend"),
+        "attn_metadata_builder": debug.get("attn_metadata_builder"),
+        "vae_tiling_enabled": bool(debug.get("vae_tiling_enabled", False)),
         "num_gpus": int(server_args.num_gpus),
         "tp_size": int(server_args.tp_size),
         "dp_size": int(server_args.dp_size),

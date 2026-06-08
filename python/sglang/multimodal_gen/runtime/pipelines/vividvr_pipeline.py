@@ -46,6 +46,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
     VividVRConditionEncodingStage,
     VividVRDecodingStage,
@@ -863,8 +866,10 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                         record_as_step=True,
                     ):
                         for denoising_state in denoising_states:
+                            batch.raw_latent_shape = tuple(denoising_state["latents"].shape)
                             self.denoising_stage.run_denoising_step(
                                 batch,
+                                server_args,
                                 denoising_state,
                                 timestep_index,
                                 guidance_scale=float(params.guidance_scale),
@@ -875,6 +880,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                         merge_vividvr_temporal_latent_states(
                             denoising_states, merge_plan
                         )
+                        DenoisingStage.step_profile(self.denoising_stage)
                     params.runtime_progress = float(timestep_index + 1) / float(
                         len(timesteps)
                     )
@@ -888,13 +894,19 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             perf_dump_path_provided=perf_dump_path_provided,
         ):
             trimmed_clips: list[torch.Tensor] = []
+            vae_tiling_enabled = False
             for clip_state, denoising_state in zip(
                 clip_states, denoising_states, strict=True
             ):
-                decoded_video = self.decoding_stage.decode_latents(
-                    denoising_state["latents"],
-                    int(clip_state["num_latent_padding_frames"]),
-                    server_args,
+                decoded_video, clip_vae_tiling_enabled = (
+                    self.decoding_stage.decode_latents(
+                        denoising_state["latents"],
+                        int(clip_state["num_latent_padding_frames"]),
+                        server_args,
+                    )
+                )
+                vae_tiling_enabled = vae_tiling_enabled or bool(
+                    clip_vae_tiling_enabled
                 )
                 output_video = decoded_video_to_frame_tensor(
                     decoded_video,
@@ -926,6 +938,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             params.runtime_optional_module_warnings = list(
                 debug["optional_module_warnings"]
             )
+        debug["vae_tiling_enabled"] = vae_tiling_enabled
 
         params.runtime_prompt_embeds = clip_states[0]["prompt_embeds"]
         params.runtime_negative_prompt_embeds = clip_states[0]["negative_prompt_embeds"]

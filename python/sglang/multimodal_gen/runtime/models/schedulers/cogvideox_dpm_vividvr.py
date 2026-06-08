@@ -9,7 +9,9 @@ from diffusers.schedulers.scheduling_dpm_cogvideox import (
 from diffusers.schedulers.scheduling_dpm_cogvideox import DDIMSchedulerOutput
 from diffusers.schedulers.scheduling_dpm_cogvideox import betas_for_alpha_bar
 from diffusers.schedulers.scheduling_dpm_cogvideox import rescale_zero_terminal_snr
-from diffusers.utils.torch_utils import randn_tensor
+from sglang.multimodal_gen.runtime.utils.common import (
+    randn_tensor_with_generator_device,
+)
 
 
 class CogVideoXDPMScheduler(DiffusersCogVideoXDPMScheduler):
@@ -135,7 +137,7 @@ class CogVideoXDPMScheduler(DiffusersCogVideoXDPMScheduler):
         mult = list(self.get_mult(h, r, alpha_prod_t, alpha_prod_t_prev, alpha_prod_t_back))
         mult_noise = (1 - alpha_prod_t_prev) ** 0.5 * (1 - (-2 * h).exp()) ** 0.5
 
-        noise = randn_tensor(
+        noise = randn_tensor_with_generator_device(
             sample.shape,
             generator=generator,
             device=sample.device,
@@ -152,7 +154,7 @@ class CogVideoXDPMScheduler(DiffusersCogVideoXDPMScheduler):
             )
 
         denoised_d = mult[2] * pred_original_sample - mult[3] * old_pred_original_sample
-        noise = randn_tensor(
+        noise = randn_tensor_with_generator_device(
             sample.shape,
             generator=generator,
             device=sample.device,
