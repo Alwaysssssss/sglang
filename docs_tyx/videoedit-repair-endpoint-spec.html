@@ -817,12 +817,13 @@ Content-Type: application/json</code></pre>
 <pre><code><span class="comment">// HTTP/1.1 200 OK</span>
 {
   <span class="json-key">"code"</span>: <span class="json-number">1</span>,
-  <span class="json-key">"message"</span>: <span class="json-string">"videoUrl or video_input_path is required"</span>
+  <span class="json-key">"message"</span>: <span class="json-string">"videoUrl or video_input_path is required"</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">"videoUrl or video_input_path is required"</span>
 }</code></pre>
             </div>
             <ul>
                 <li>表示请求参数错误、输入资源不可访问、MinIO 配置缺失等提交阶段错误。</li>
-                <li><code>message</code> 会给出失败原因。</li>
+                <li><code>message</code> 和 <code>reason</code> 会给出失败原因。</li>
             </ul>
 
             <h4 id="resp-busy">3.1.3 并发限制（可重试拒绝）</h4>
@@ -874,7 +875,8 @@ Content-Type: application/json</code></pre>
   <span class="json-key">"created_at"</span>: <span class="json-number">1710000000</span>,
   <span class="json-key">"url"</span>: <span class="json-bool">null</span>,
   <span class="json-key">"file_path"</span>: <span class="json-string">"/tmp/sglang_videoedit_output_xxx/ubuntu-minio-videoedit-008.mp4"</span>,
-  <span class="json-key">"error"</span>: <span class="json-bool">null</span>
+  <span class="json-key">"error"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"reason"</span>: <span class="json-bool">null</span>
 }</code></pre>
 
             <h4>主要字段说明</h4>
@@ -889,6 +891,7 @@ Content-Type: application/json</code></pre>
                     <tr><td><code>url</code></td><td>string/null</td><td>上传到 MinIO/S3 后的输出视频地址。</td></tr>
                     <tr><td><code>file_path</code></td><td>string/null</td><td>服务端本地输出文件路径。上传到云存储并清理本地文件后可能为 <code>null</code>。</td></tr>
                     <tr><td><code>error</code></td><td>object/null</td><td>失败时包含错误信息。</td></tr>
+                    <tr><td><code>reason</code></td><td>string/null</td><td>失败时包含可直接展示或写入任务表的失败原因。</td></tr>
                 </tbody>
             </table>
 
@@ -902,6 +905,7 @@ Content-Type: application/json</code></pre>
   <span class="json-key">"file_path"</span>: <span class="json-string">"/tmp/sglang_videoedit_output_vgfu4tlr/ubuntu-minio-videoedit-008.mp4"</span>,
   <span class="json-key">"url"</span>: <span class="json-bool">null</span>,
   <span class="json-key">"error"</span>: <span class="json-bool">null</span>,
+  <span class="json-key">"reason"</span>: <span class="json-bool">null</span>,
   <span class="json-key">"callback_status"</span>: <span class="json-bool">null</span>,
   <span class="json-key">"callback_error"</span>: <span class="json-bool">null</span>,
   <span class="json-key">"callback_attempts"</span>: <span class="json-bool">null</span>
@@ -918,6 +922,7 @@ Content-Type: application/json</code></pre>
                     <tr><td><code>file_path</code></td><td>string</td><td>服务端本地输出路径。</td></tr>
                     <tr><td><code>url</code></td><td>string/null</td><td>上传到 MinIO/S3 后的访问地址。运行中通常为 <code>null</code>。</td></tr>
                     <tr><td><code>error</code></td><td>object/null</td><td>失败时包含错误信息。</td></tr>
+                    <tr><td><code>reason</code></td><td>string/null</td><td>失败时包含可直接展示或写入任务表的失败原因。</td></tr>
                     <tr><td><code>callback_status</code></td><td>string/null</td><td>回调发送状态。</td></tr>
                     <tr><td><code>callback_error</code></td><td>string/null</td><td>回调失败原因。</td></tr>
                     <tr><td><code>callback_attempts</code></td><td>number/null</td><td>回调尝试次数。</td></tr>
@@ -997,7 +1002,8 @@ Content-Type: application/json</code></pre>
   <span class="json-key">"taskId"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
   <span class="json-key">"status"</span>: <span class="json-string">"completed"</span>,
   <span class="json-key">"outputUrl"</span>: <span class="json-string">"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/outputs/ubuntu-minio-videoedit-008.mp4"</span>,
-  <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>
+  <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">""</span>
 }</code></pre>
 
             <p><strong>失败回调示例</strong></p>
@@ -1005,7 +1011,8 @@ Content-Type: application/json</code></pre>
   <span class="json-key">"taskId"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
   <span class="json-key">"status"</span>: <span class="json-string">"failed"</span>,
   <span class="json-key">"outputUrl"</span>: <span class="json-bool">null</span>,
-  <span class="json-key">"message"</span>: <span class="json-string">"task timeout"</span>
+  <span class="json-key">"message"</span>: <span class="json-string">"task timeout"</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">"task timeout"</span>
 }</code></pre>
 
             <h2 id="checklist-table">六、自检</h2>

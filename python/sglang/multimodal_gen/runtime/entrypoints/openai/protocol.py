@@ -74,6 +74,7 @@ class VideoResponse(BaseModel):
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
+    reason: Optional[str] = None
     file_path: Optional[str] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None

@@ -87,7 +87,10 @@ _VIDEO_REPAIR_MINIO_FIELD_ALIASES = {
 
 
 def _video_repair_submit_response(code: int, message: str) -> Dict[str, Any]:
-    return {"code": int(code), "message": str(message)}
+    response = {"code": int(code), "message": str(message)}
+    if int(code) == 1:
+        response["reason"] = str(message)
+    return response
 
 
 def _normalize_aliases(
@@ -141,6 +144,15 @@ def _job_error_message(job: Dict[str, Any]) -> str:
     return "failed"
 
 
+def _job_reason(job: Dict[str, Any]) -> str | None:
+    if job.get("status") != "failed":
+        return None
+    reason = job.get("reason")
+    if reason:
+        return str(reason)
+    return _job_error_message(job)
+
+
 def _build_video_repair_callback_payload(
     task_id: str, job: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -151,12 +163,15 @@ def _build_video_repair_callback_payload(
             "status": "completed",
             "outputUrl": job.get("url"),
             "message": "ok",
+            "reason": "",
         }
+    reason = _job_error_message(job)
     return {
         "taskId": task_id,
         "status": "failed",
         "outputUrl": None,
-        "message": _job_error_message(job),
+        "message": reason,
+        "reason": reason,
     }
 
 
@@ -264,6 +279,7 @@ def _build_video_callback_payload(
         "file_path": job.get("file_path"),
         "url": job.get("url"),
         "error": job.get("error"),
+        "reason": _job_reason(job),
     }
     for key in ("peak_memory_mb", "inference_time_s"):
         if key in job:
@@ -384,7 +400,12 @@ async def _dispatch_job_async(
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": str(e)},
+                "reason": str(e),
+            },
         )
         job = await VIDEO_STORE.get(job_id)
         if job and callback_url:
@@ -464,6 +485,7 @@ def _video_repair_job_from_sampling(
         "callback_error": None,
         "timeout": req.timeout,
         "output_object_key": req.output_object_key,
+        "reason": None,
     }
 
 
@@ -502,6 +524,7 @@ async def _dispatch_video_repair_job_async(
             {
                 "status": "failed",
                 "error": {"message": "task timeout"},
+                "reason": "task timeout",
             },
         )
         job = await VIDEO_STORE.get(job_id)
@@ -930,6 +953,7 @@ async def retrieve_video(video_id: str = Path(...)):
         raise HTTPException(status_code=404, detail="Video not found")
     response_job = dict(job)
     response_job["progress"] = _current_video_progress(job)
+    response_job["reason"] = _job_reason(response_job)
     return VideoResponse(**response_job)
 
 
@@ -946,6 +970,7 @@ async def retrieve_video_progress(video_id: str = Path(...)):
         "file_path": job.get("file_path"),
         "url": job.get("url"),
         "error": job.get("error"),
+        "reason": _job_reason(job),
         "callback_status": job.get("callback_status"),
         "callback_error": job.get("callback_error"),
         "callback_attempts": job.get("callback_attempts"),

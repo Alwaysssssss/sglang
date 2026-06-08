@@ -33,7 +33,7 @@
 - `minioConfig` 请求字段。
 - 单独的参考图输入字段。
 - 请求级 MinIO/S3 endpoint、bucket、ak/sk、secure、region 配置。
-- 固定 `{code:int, message:string}` 的提交响应格式。
+- 固定 `{code:int, message:string}` 的提交响应格式；提交阶段失败时额外返回 `reason`。
 
 当前云存储配置主要从服务端环境变量读取：
 
@@ -196,7 +196,8 @@ HTTP/1.1 200 OK
 ```json
 {
   "code": 1,
-  "message": "invalid mask image format"
+  "message": "invalid mask image format",
+  "reason": "invalid mask image format"
 }
 ```
 
@@ -205,7 +206,7 @@ HTTP/1.1 200 OK
 - 请求已到达服务端，但业务校验失败。
 - 例如输入视频无法下载、mask 格式不合法、参考图格式不合法、MinIO 配置缺失等。
 - `code` 必须是整数 `1`。
-- `message` 返回明确失败原因。
+- `message` 和 `reason` 返回明确失败原因。
 
 ### 6.3 并发限制
 
@@ -238,7 +239,8 @@ HTTP/1.1 200 OK
   "taskId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "completed",
   "outputUrl": "http://minio.example.com:9000/flowcut/a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4",
-  "message": "ok"
+  "message": "ok",
+  "reason": ""
 }
 ```
 
@@ -249,7 +251,8 @@ HTTP/1.1 200 OK
   "taskId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "failed",
   "outputUrl": null,
-  "message": "invalid mask image format"
+  "message": "invalid mask image format",
+  "reason": "invalid mask image format"
 }
 ```
 

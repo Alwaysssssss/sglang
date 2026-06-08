@@ -5,8 +5,14 @@ from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VideoResponse,
     VideoRepairRequest,
     default_video_repair_output_object_key,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
+    _build_video_repair_callback_payload,
+    _job_reason,
+    _video_repair_submit_response,
 )
 from sglang.multimodal_gen.runtime.videoedit.cli import build_parser
 
@@ -92,6 +98,44 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             ]
         )
         self.assertEqual(args.decode_mode, "stream")
+
+    def test_failed_job_reason_uses_error_message(self):
+        job = {"status": "failed", "error": {"message": "mask file not found"}}
+        self.assertEqual(_job_reason(job), "mask file not found")
+
+    def test_failed_job_reason_prefers_reason_field(self):
+        job = {
+            "status": "failed",
+            "error": {"message": "low-level error"},
+            "reason": "user-facing reason",
+        }
+        self.assertEqual(_job_reason(job), "user-facing reason")
+
+    def test_running_job_reason_is_none(self):
+        job = {"status": "running", "error": {"message": "not final"}}
+        self.assertIsNone(_job_reason(job))
+
+    def test_video_repair_failed_callback_includes_reason(self):
+        payload = _build_video_repair_callback_payload(
+            "task-1",
+            {"status": "failed", "error": {"message": "task timeout"}},
+        )
+        self.assertEqual(payload["message"], "task timeout")
+        self.assertEqual(payload["reason"], "task timeout")
+
+    def test_video_repair_submit_failure_includes_reason(self):
+        payload = _video_repair_submit_response(1, "videoUrl is required")
+        self.assertEqual(payload["message"], "videoUrl is required")
+        self.assertEqual(payload["reason"], "videoUrl is required")
+
+    def test_video_response_accepts_reason(self):
+        response = VideoResponse(
+            id="task-1",
+            status="failed",
+            error={"message": "mask file not found"},
+            reason="mask file not found",
+        )
+        self.assertEqual(response.reason, "mask file not found")
 
 
 if __name__ == "__main__":
