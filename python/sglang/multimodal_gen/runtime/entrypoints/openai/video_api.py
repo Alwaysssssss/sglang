@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoListResponse,
     VideoRepairRequest,
     VideoResponse,
+    default_video_repair_output_object_key,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import (
     RequestCloudStorage,
@@ -162,8 +163,6 @@ def _build_video_repair_callback_payload(
 def _validate_video_repair_request(req: VideoRepairRequest) -> None:
     if not req.task_id:
         raise ValueError("taskId is required")
-    if not req.callback_url:
-        raise ValueError("callbackUrl is required")
     if req.timeout == 0 or req.timeout < -1:
         raise ValueError("timeout must be positive or -1")
     if not (req.video_input_path or req.video_url):
@@ -478,7 +477,7 @@ async def _dispatch_video_repair_job_async(
     request_storage: RequestCloudStorage | None = None,
     output_object_key: str | None = None,
     output_bucket: str | None = None,
-    timeout: int = 300,
+    timeout: int = -1,
 ) -> None:
     try:
         await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
@@ -667,11 +666,13 @@ async def create_video_repair(request: Request):
         output_object_key = None
         if (
             request_storage is not None
+            or cloud_storage.is_enabled()
             or req.output_storage == "s3"
             or req.output_object_key is not None
         ):
             output_object_key = normalize_object_key(
-                req.output_object_key or f"{request_id}.mp4"
+                req.output_object_key
+                or default_video_repair_output_object_key(request_id)
             )
         req.output_object_key = output_object_key
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)

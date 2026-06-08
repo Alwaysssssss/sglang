@@ -553,7 +553,7 @@
                         <ul>
                             <li>请求方法为 <code>POST</code>，路径为 <code>/v1/videos/repairs</code>。</li>
                             <li>请求头必须包含 <code>Content-Type: application/json</code>。</li>
-                            <li>请求体必须包含 <code>taskId</code>、<code>callbackUrl</code>、<code>prompt</code>、<code>videoUrl</code>、<code>maskUrl</code>。</li>
+                            <li>请求体必须包含 <code>taskId</code>、<code>prompt</code>、<code>videoUrl</code>、<code>maskUrl</code>。</li>
                             <li>当前任务需要参考图，因此携带 <code>referenceImageUrl</code>。</li>
                         </ul>
                     </li>
@@ -581,7 +581,7 @@
      <span class="comment">同步返回 code/message</span>                    <span class="comment">后台下载输入并执行修复</span>
 
 调用方 / FlowCut &lt;──POST callbackUrl──────── SGLang VideoEdit Serve
-     <span class="comment">任务完成或失败后回调</span>                   <span class="comment">输出上传到 MinIO 或保留本地文件</span>
+     <span class="comment">提供 callbackUrl 时回调</span>                 <span class="comment">输出上传到 MinIO 或保留本地文件</span>
 
 调用方 ──GET /v1/videos/{taskId}──────────&gt; SGLang VideoEdit Serve
 调用方 ──GET /v1/videos/{taskId}/progress──&gt; SGLang VideoEdit Serve
@@ -612,7 +612,7 @@
                         <td>结果回调</td>
                         <td>VideoEdit Serve &rarr; 调用方</td>
                         <td><code>POST {callbackUrl}</code></td>
-                        <td>任务完成或失败后，服务主动通知调用方。</td>
+                        <td>提供 <code>callbackUrl</code> 时，任务完成或失败后服务主动通知调用方。</td>
                     </tr>
                 </tbody>
             </table>
@@ -621,7 +621,7 @@
             <ul>
                 <li>接口是异步任务接口，提交成功只表示任务已被接受，不表示推理完成。</li>
                 <li>默认服务并发为 1。已有任务运行时，新请求会返回 <code>code: 2</code>。</li>
-                <li><code>callbackUrl</code> 当前为必填字段；如果使用占位地址，将无法收到真实回调。</li>
+                <li><code>callbackUrl</code> 为可选字段；未提供时服务不会发送回调，可通过进度接口查询任务状态。</li>
                 <li>输入 URL 必须能被 serve 所在机器访问，包含视频、mask 和参考图。</li>
                 <li>携带 <code>referenceImageUrl</code> 时，服务会把参考图作为参考首帧参与修复；未显式传 <code>drop_reference_frame</code> 时，默认会在输出中丢弃该参考首帧。</li>
             </ul>
@@ -664,7 +664,7 @@ Content-Type: application/json</code></pre>
 
             <div class="callout callout-warn">
                 <div class="callout-title">注意</div>
-                示例中的 <code>callbackUrl</code> 是占位地址。生产环境需要替换成调用方真实可访问的回调地址，否则任务完成后回调会失败，但不影响通过进度接口查询任务状态。
+                示例中的 <code>callbackUrl</code> 是占位地址。生产环境需要替换成调用方真实可访问的回调地址；也可以不传，此时任务完成后不会发送回调，但仍可通过进度接口查询任务状态。
             </div>
 
             <h3 id="request-body">2.3 请求体字段</h3>
@@ -679,14 +679,14 @@ Content-Type: application/json</code></pre>
                         <td>任务唯一 ID。后续进度查询和回调中都会使用该 ID。</td>
                     </tr>
                     <tr>
-                        <td><code>timeout</code></td><td>int</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>timeout</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
                         <td><code>-1</code></td>
                         <td>后台任务超时秒数。<code>-1</code> 表示不设置任务超时；正数表示超过该秒数后标记为超时失败。</td>
                     </tr>
                     <tr>
-                        <td><code>callbackUrl</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>callbackUrl</code></td><td>string</td><td><span class="badge badge-optional">否</span></td>
                         <td><code>https://example.com/videoedit/callback</code></td>
-                        <td>任务完成或失败后，服务主动 POST 的回调地址。</td>
+                        <td>任务完成或失败后，服务主动 POST 的回调地址；不传时跳过回调。</td>
                     </tr>
                     <tr>
                         <td><code>prompt</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
@@ -714,7 +714,7 @@ Content-Type: application/json</code></pre>
                         <td>用于下载输入资源和上传输出结果的存储配置。</td>
                     </tr>
                     <tr>
-                        <td><code>outputObjectKey</code></td><td>string</td><td><span class="badge badge-required">是</span></td>
+                        <td><code>outputObjectKey</code></td><td>string</td><td><span class="badge badge-optional">否</span></td>
                         <td><code>outputs/ubuntu-minio-videoedit-008.mp4</code></td>
                         <td>输出视频在 bucket 中的对象路径。</td>
                     </tr>
@@ -988,7 +988,7 @@ Content-Type: application/json</code></pre>
             </div>
 
             <h3 id="callback">5.2 回调请求</h3>
-            <p>任务完成或失败后，服务会向 <code>callbackUrl</code> 发送 POST 请求。</p>
+            <p>请求中提供 <code>callbackUrl</code> 时，任务完成或失败后，服务会向该地址发送 POST 请求；未提供时不发送回调。</p>
 <pre><code>POST {callbackUrl}
 Content-Type: application/json</code></pre>
 

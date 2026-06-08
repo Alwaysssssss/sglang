@@ -55,7 +55,7 @@
 ```json
 {
   "taskId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "timeout": 300,
+  "timeout": -1,
   "callbackUrl": "http://flowcut.example.com/tasks/a1b2c3d4-e5f6-7890-abcd-ef1234567890/callback",
   "prompt": "remove the selected object and keep the background natural",
   "videoUrl": "http://minio.example.com:9000/flowcut/input/video.mp4",
@@ -78,15 +78,15 @@
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |---|---:|---:|---:|---|
-| `taskId` | string | 是 | 无 | 业务任务 id。服务端用作任务 id 和默认输出文件名基础。 |
-| `timeout` | integer | 否 | `300` | 本次任务允许的业务超时时间，单位秒。 |
-| `callbackUrl` | string | 是 | 无 | 任务完成或失败后的回调地址。 |
+| `taskId` | string | 是 | 无 | 业务任务 id。服务端用作任务 id 和本地默认输出文件名基础。 |
+| `timeout` | integer | 否 | `-1` | 本次任务允许的业务超时时间，单位秒；`-1` 表示不因任务超时取消。 |
+| `callbackUrl` | string | 否 | `null` | 任务完成或失败后的回调地址；不传时服务端跳过回调。 |
 | `prompt` | string | 是 | 无 | VideoEdit 提示词。 |
 | `videoUrl` | string | 是 | 无 | 输入视频地址。 |
 | `maskUrl` | string | 是 | 无 | 输入 mask 地址。 |
 | `referenceImageUrl` | string | 否 | `null` | 参考图地址。存在时服务端插入为视频首帧。 |
 | `minioConfig` | object | 是 | 无 | 本次请求使用的 MinIO/S3 配置。 |
-| `outputObjectKey` | string | 否 | `{taskId}.mp4` | 输出对象 key。可后续扩展支持目录，例如 `outputs/{taskId}.mp4`。 |
+| `outputObjectKey` | string | 否 | `YYYYMMDD/HHMMSS_{taskId}.mp4` | 输出对象 key。调用方传入时按传入值输出。 |
 
 ### 3.3 MinIO 配置字段
 
@@ -160,7 +160,7 @@
 | `use_repaired_context` | `true` | 默认使用已修复上下文。 |
 | `vary_seed_by_window` | `false` | 默认窗口之间不改变 seed。 |
 | `enable_teacache` | `false` | 默认不开启 TeaCache。 |
-| `outputObjectKey` | `{taskId}.mp4` | 默认输出对象 key。 |
+| `outputObjectKey` | `YYYYMMDD/HHMMSS_{taskId}.mp4` | 默认输出对象 key，按日期目录和时间命名。 |
 
 如果调用方传入高级参数，服务端可覆盖默认值，但基础调用不需要填写。
 
@@ -229,7 +229,7 @@ HTTP/1.1 200 OK
 
 ## 7. 回调规范
 
-任务完成或失败后，服务端向 `callbackUrl` 发起 HTTP POST。
+如果请求中提供了 `callbackUrl`，任务完成或失败后，服务端向 `callbackUrl` 发起 HTTP POST；未提供时不发送回调。
 
 回调 payload 建议至少包含：
 
@@ -264,12 +264,12 @@ HTTP/1.1 200 OK
 - 参考图插帧后，要同步修正视频帧数、mask 帧数、输出帧数和 metadata。
 - 插入参考图时，输出文件不应包含参考图帧。
 - 没有参考图时，不应因为默认 `drop_reference_frame=true` 丢掉原始第 0 帧。
-- `timeout` 需要定义作用范围：任务总耗时超时、下载超时、推理超时、上传超时、回调超时可以分开实现；第一版至少要记录请求级 timeout，并用于任务总超时控制。
+- `timeout` 需要定义作用范围：任务总耗时超时、下载超时、推理超时、上传超时、回调超时可以分开实现；第一版至少要记录请求级 timeout，并用于任务总超时控制。默认 `-1` 表示不因任务超时取消。
 
 ## 9. 待确认项
 
 - `videoUrl` 和 `maskUrl` 是否一定都是 MinIO/S3 HTTP 地址，还是也需要支持本地路径。
 - `referenceImageUrl` 是否只支持图片 URL，还是也需要支持 base64 或本地路径。
 - 全 1 mask 的业务语义是否固定为像素值 `255`，以及是否需要兼容内部 mask 反转逻辑。
-- 输出对象 key 是否固定为 `{taskId}.mp4`，还是由调用方传 `outputObjectKey`。
+- 输出对象 key 默认按 `YYYYMMDD/HHMMSS_{taskId}.mp4` 生成；调用方传 `outputObjectKey` 时使用调用方指定值。
 - 是否需要在提交成功响应中返回 `taskId`。当前示例只要求 `code` 和 `message`。

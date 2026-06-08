@@ -2,6 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
@@ -126,9 +127,16 @@ class VideoRepairMinioConfig(BaseModel):
     region: str = "us-east-1"
 
 
+def default_video_repair_output_object_key(
+    request_id: str, now: datetime | None = None
+) -> str:
+    now = now or datetime.now()
+    return f"{now:%Y%m%d}/{now:%H%M%S}_{request_id}.mp4"
+
+
 class VideoRepairRequest(BaseModel):
     task_id: Optional[str] = None
-    timeout: int = 300
+    timeout: int = -1
     prompt: str
     negative_prompt: Optional[str] = None
     model: Optional[str] = None
