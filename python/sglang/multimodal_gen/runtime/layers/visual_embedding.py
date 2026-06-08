@@ -34,6 +34,28 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils import add_prefix
 
 _is_cuda = current_platform.is_cuda()
+_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+)
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _FP8_DTYPES
+
+
+def _activation_dtype_for_linear_weight(
+    weight_dtype: torch.dtype, fallback_dtype: torch.dtype
+) -> torch.dtype:
+    if _is_fp8_dtype(weight_dtype):
+        return fallback_dtype if not _is_fp8_dtype(fallback_dtype) else torch.float32
+    return weight_dtype
 
 
 class PatchEmbed(nn.Module):
@@ -184,9 +206,13 @@ class TimestepEmbedder(nn.Module):
     def forward(
         self, t: torch.Tensor, timestep_seq_len: int | None = None
     ) -> torch.Tensor:
+        target_dtype = _activation_dtype_for_linear_weight(
+            self.mlp.fc_in.weight.dtype,
+            t.dtype if torch.is_floating_point(t) else torch.float32,
+        )
         t_freq = timestep_embedding(
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
-        ).to(self.mlp.fc_in.weight.dtype)
+        ).to(target_dtype)
         if timestep_seq_len is not None:
             assert (
                 t_freq.shape[0] % timestep_seq_len == 0
