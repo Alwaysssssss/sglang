@@ -216,7 +216,9 @@ def _build_video_repair_callback_payload(
     status = job.get("status")
     progress = _current_video_progress(job)
     if status == "completed":
-        result_url = job.get("url") or job.get("file_path") or ""
+        result_url = (
+            job.get("output_object_key") or job.get("url") or job.get("file_path") or ""
+        )
         duration = job.get("inference_time_s")
         if duration is None and job.get("completed_at") and job.get("created_at"):
             duration = max(0, int(job["completed_at"] - job["created_at"]))
@@ -242,6 +244,32 @@ def _build_video_repair_callback_payload(
         "reason": "",
         "output": "",
     }
+
+
+async def _store_failed_video_repair_submission(
+    request_id: str,
+    reason: str,
+    *,
+    req: VideoRepairRequest | None = None,
+    body: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    job = _failed_video_repair_submission_job(
+        request_id,
+        reason,
+        req=req,
+        body=body,
+    )
+    await VIDEO_STORE.upsert(request_id, job)
+    callback_url = job.get("callback_url")
+    if callback_url:
+        asyncio.create_task(
+            _post_video_callback(
+                request_id,
+                callback_url,
+                _build_video_repair_callback_payload(request_id, job),
+            )
+        )
+    return job
 
 
 async def _post_video_repair_progress_callbacks(
@@ -677,13 +705,10 @@ async def create_video_repair(request: Request):
         reason = f"Invalid request body: {_exception_message(e)}"
         task_id = _task_id_from_video_repair_body(body)
         if task_id is not None:
-            await VIDEO_STORE.upsert(
+            await _store_failed_video_repair_submission(
                 task_id,
-                _failed_video_repair_submission_job(
-                    task_id,
-                    reason,
-                    body=body if isinstance(body, dict) else None,
-                ),
+                reason,
+                body=body if isinstance(body, dict) else None,
             )
         return _video_repair_submit_response(1, reason)
 
@@ -853,9 +878,10 @@ async def create_video_repair(request: Request):
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
         reason = _exception_message(e)
-        await VIDEO_STORE.upsert(
+        await _store_failed_video_repair_submission(
             request_id,
-            _failed_video_repair_submission_job(request_id, reason, req=req),
+            reason,
+            req=req,
         )
         logger.warning("Video repair request failed: %s", reason)
         return _video_repair_submit_response(1, reason)

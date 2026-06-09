@@ -239,7 +239,7 @@ HTTP/1.1 200 OK
   "status": "succeeded",
   "progress": 100,
   "reason": "",
-  "output": "{\"result_url\":\"http://minio.example.com:9000/flowcut/a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4\",\"duration\":45}"
+  "output": "{\"result_url\":\"2026/06/09/060635_a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4\",\"duration\":45}"
 }
 ```
 

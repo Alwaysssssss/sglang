@@ -1,10 +1,12 @@
 import json
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
+import sglang.multimodal_gen.runtime.entrypoints.openai.video_api as video_api_mod
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoResponse,
     VideoRepairRequest,
@@ -14,6 +16,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_repair_callback_payload,
     _failed_video_repair_submission_job,
     _job_reason,
+    _store_failed_video_repair_submission,
     _task_id_from_video_repair_body,
     _video_repair_submit_response,
 )
@@ -143,6 +146,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             {
                 "status": "completed",
                 "url": "https://minio.example.com/outputs/result.mp4",
+                "output_object_key": "2026/06/09/060635_task-1.mp4",
                 "created_at": 10,
                 "completed_at": 55,
             },
@@ -153,7 +157,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(
             json.loads(payload["output"]),
             {
-                "result_url": "https://minio.example.com/outputs/result.mp4",
+                "result_url": "2026/06/09/060635_task-1.mp4",
                 "duration": 45,
             },
         )
@@ -189,6 +193,39 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         )
         self.assertEqual(job["callback_url"], "http://127.0.0.1/callback")
         self.assertEqual(job["timeout"], 0)
+
+    def test_failed_video_repair_submission_callbacks_reason(self):
+        calls = []
+
+        async def fake_post_callback(job_id, callback_url, payload, **kwargs):
+            calls.append((job_id, callback_url, payload))
+
+        async def run_test():
+            with patch.object(
+                video_api_mod, "_post_video_callback", fake_post_callback
+            ):
+                await _store_failed_video_repair_submission(
+                    "task-1",
+                    "An error occurred (404) when calling the HeadObject operation: Not Found",
+                    body={
+                        "taskId": "task-1",
+                        "callbackUrl": "http://127.0.0.1/callback",
+                    },
+                )
+                await asyncio.sleep(0)
+
+        import asyncio
+
+        asyncio.run(run_test())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "task-1")
+        self.assertEqual(calls[0][1], "http://127.0.0.1/callback")
+        self.assertEqual(calls[0][2]["status"], "failed")
+        self.assertEqual(
+            calls[0][2]["reason"],
+            "An error occurred (404) when calling the HeadObject operation: Not Found",
+        )
 
     def test_video_response_accepts_reason(self):
         response = VideoResponse(
