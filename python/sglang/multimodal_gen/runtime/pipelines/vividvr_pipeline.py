@@ -26,8 +26,10 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
     CogVideoXVividVRTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    enable_cogvideox_qk_norm_rope_fusion,
     enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
+    inspect_cogvideox_qk_norm_rope_fusion,
     inspect_cogvideox_qkv_fusion,
     normalize_cogvideox_attention_backend,
 )
@@ -46,9 +48,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
-    DenoisingStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
     VividVRConditionEncodingStage,
     VividVRDecodingStage,
@@ -146,6 +145,12 @@ def _inspect_module_qkv_fusion(module: nn.Module | None) -> str | None:
     return inspect_cogvideox_qkv_fusion(module)
 
 
+def _inspect_module_qk_norm_rope_fusion(module: nn.Module | None) -> str | None:
+    if module is None:
+        return None
+    return inspect_cogvideox_qk_norm_rope_fusion(module)
+
+
 def _inspect_module_modulation_fusion(module: nn.Module | None) -> str | None:
     if module is None:
         return None
@@ -174,6 +179,10 @@ def _normalize_component_targets(value: object) -> tuple[str, ...]:
 
 
 def _normalize_qkv_fusion_targets(value: object) -> tuple[str, ...]:
+    return _normalize_component_targets(value)
+
+
+def _normalize_qk_norm_rope_fusion_targets(value: object) -> tuple[str, ...]:
     return _normalize_component_targets(value)
 
 
@@ -300,6 +309,24 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "qkv_fusion_transformer": _inspect_module_qkv_fusion(transformer),
             "qkv_fusion_controlnet": _inspect_module_qkv_fusion(controlnet),
+            "qk_norm_rope_fusion_requested": bool(
+                getattr(server_args, "enable_cogvideox_qk_norm_rope_fusion", False)
+            ),
+            "qk_norm_rope_fusion_targets": list(
+                _normalize_qk_norm_rope_fusion_targets(
+                    getattr(
+                        server_args,
+                        "cogvideox_qk_norm_rope_fusion_targets",
+                        "transformer",
+                    )
+                )
+            ),
+            "qk_norm_rope_fusion_transformer": _inspect_module_qk_norm_rope_fusion(
+                transformer
+            ),
+            "qk_norm_rope_fusion_controlnet": _inspect_module_qk_norm_rope_fusion(
+                controlnet
+            ),
             "modulation_fusion_requested": bool(
                 getattr(server_args, "enable_cogvideox_modulation_fusion", False)
             ),
@@ -325,6 +352,27 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
     ) -> None:
         debug = batch.extra.setdefault("vividvr_debug", {})
         debug.update(self._build_runtime_acceleration_debug(server_args))
+
+    def _build_control_video_cache_key(
+        self, video_input_path: str
+    ) -> tuple[str, int, int]:
+        resolved_path = os.path.abspath(os.fspath(video_input_path))
+        stat = os.stat(resolved_path)
+        return resolved_path, int(stat.st_mtime_ns), int(stat.st_size)
+
+    def _resolve_input_video_info(self, video_input_path: str) -> dict[str, object]:
+        cache_key = self._build_control_video_cache_key(video_input_path)
+        cached_key = getattr(self, "_cached_control_video_cache_key", None)
+        cached_info = getattr(self, "_cached_control_video_info", None)
+        if cached_key == cache_key and cached_info is not None:
+            return cached_info
+
+        # Warmup requests are built via deepcopy(req), so keep the large decoded
+        # control video cache on the pipeline instance instead of the request.
+        input_video_info = load_control_video(video_input_path)
+        self._cached_control_video_cache_key = cache_key
+        self._cached_control_video_info = input_video_info
+        return input_video_info
 
     def _apply_attention_backend(self, server_args: ServerArgs) -> None:
         requested_backend = server_args.attention_backend
@@ -414,6 +462,55 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 component_name,
                 fused_modules,
                 _inspect_module_qkv_fusion(component),
+            )
+
+    def _apply_qk_norm_rope_fusion(self, server_args: ServerArgs) -> None:
+        if not getattr(server_args, "enable_cogvideox_qk_norm_rope_fusion", False):
+            return
+
+        resolved_backend = normalize_cogvideox_attention_backend(
+            server_args.attention_backend
+        )
+        if resolved_backend != "fa":
+            logger.warning(
+                "CogVideoX QK-norm/RoPE fusion is enabled, but the requested backend resolves to %s. "
+                "This Phase E3 path is only consumed by the custom flash-attention processor.",
+                resolved_backend,
+            )
+
+        target_components = set(
+            _normalize_qk_norm_rope_fusion_targets(
+                getattr(
+                    server_args,
+                    "cogvideox_qk_norm_rope_fusion_targets",
+                    "transformer",
+                )
+            )
+        )
+        components = {
+            "transformer": self.get_module("transformer"),
+            "controlnet": self.get_module("controlnet"),
+        }
+        for component_name, component in components.items():
+            if component_name not in target_components:
+                logger.info(
+                    "Skipping CogVideoX QK-norm/RoPE fusion for VividVR %s because it is not in the requested targets=%s.",
+                    component_name,
+                    sorted(target_components),
+                )
+                continue
+            if component is None:
+                logger.warning(
+                    "Skipping CogVideoX QK-norm/RoPE fusion for %s because the component is not loaded.",
+                    component_name,
+                )
+                continue
+            fused_modules = enable_cogvideox_qk_norm_rope_fusion(component)
+            logger.info(
+                "Enabled CogVideoX QK-norm/RoPE fusion on VividVR %s; attention_modules=%s, effective_impl=%s.",
+                component_name,
+                fused_modules,
+                _inspect_module_qk_norm_rope_fusion(component),
             )
 
     def _apply_modulation_fusion(self, server_args: ServerArgs) -> None:
@@ -574,6 +671,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_module("transformer", transformer)
         self.add_module("controlnet", controlnet)
         self._apply_attention_backend(server_args)
+        self._apply_qk_norm_rope_fusion(server_args)
         self._apply_modulation_fusion(server_args)
         self._apply_qkv_fusion(server_args)
         self._apply_torch_compile(server_args)
@@ -880,7 +978,6 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                         merge_vividvr_temporal_latent_states(
                             denoising_states, merge_plan
                         )
-                        DenoisingStage.step_profile(self.denoising_stage)
                     params.runtime_progress = float(timestep_index + 1) / float(
                         len(timesteps)
                     )
@@ -894,19 +991,13 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             perf_dump_path_provided=perf_dump_path_provided,
         ):
             trimmed_clips: list[torch.Tensor] = []
-            vae_tiling_enabled = False
             for clip_state, denoising_state in zip(
                 clip_states, denoising_states, strict=True
             ):
-                decoded_video, clip_vae_tiling_enabled = (
-                    self.decoding_stage.decode_latents(
-                        denoising_state["latents"],
-                        int(clip_state["num_latent_padding_frames"]),
-                        server_args,
-                    )
-                )
-                vae_tiling_enabled = vae_tiling_enabled or bool(
-                    clip_vae_tiling_enabled
+                decoded_video = self.decoding_stage.decode_latents(
+                    denoising_state["latents"],
+                    int(clip_state["num_latent_padding_frames"]),
+                    server_args,
                 )
                 output_video = decoded_video_to_frame_tensor(
                     decoded_video,
@@ -938,7 +1029,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             params.runtime_optional_module_warnings = list(
                 debug["optional_module_warnings"]
             )
-        debug["vae_tiling_enabled"] = vae_tiling_enabled
+        debug["vae_tiling_enabled"] = bool(
+            getattr(self.get_module("vae"), "use_tiling", False)
+        )
 
         params.runtime_prompt_embeds = clip_states[0]["prompt_embeds"]
         params.runtime_negative_prompt_embeds = clip_states[0]["negative_prompt_embeds"]
@@ -978,7 +1071,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         params = _as_vividvr_params(batch)
-        input_video_info = load_control_video(params.video_input_path)
+        input_video_info = self._resolve_input_video_info(params.video_input_path)
 
         if int(input_video_info["original_num_frames"]) <= params.num_temporal_process_frames:
             batch.extra["vividvr_input_video_info"] = input_video_info

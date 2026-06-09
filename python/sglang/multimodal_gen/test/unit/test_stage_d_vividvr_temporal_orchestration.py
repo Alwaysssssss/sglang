@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
+from diffusers.video_processor import VideoProcessor
 
 from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipelineConfig
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
@@ -18,6 +20,7 @@ from sglang.multimodal_gen.runtime.vividvr.captioning import (
     read_caption_file,
 )
 from sglang.multimodal_gen.runtime.vividvr.postprocess import (
+    decoded_video_to_frame_tensor,
     run_optional_postprocess_modules,
 )
 from sglang.multimodal_gen.runtime.vividvr.windowing import (
@@ -353,6 +356,58 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
                 processor=lambda *_args: (_ for _ in ()).throw(RuntimeError("postprocess boom")),
             )
 
+    def test_decoded_video_to_frame_tensor_matches_reference_processor_path(self):
+        decoded_video = torch.linspace(
+            -1.0,
+            1.0,
+            steps=1 * 3 * 2 * 3 * 4,
+            dtype=torch.float32,
+        ).reshape(1, 3, 2, 3, 4)
+        video_processor = VideoProcessor(vae_scale_factor=8)
+
+        expected_resized = [
+            F.interpolate(
+                sample.permute(1, 0, 2, 3),
+                size=(5, 6),
+                mode="bilinear",
+                align_corners=False,
+            )
+            for sample in decoded_video
+        ]
+        expected_resized = torch.stack(expected_resized, dim=0).permute(0, 2, 1, 3, 4)
+        expected = video_processor.postprocess_video(
+            video=expected_resized.float(),
+            output_type="pt",
+        )[0]
+
+        actual = decoded_video_to_frame_tensor(
+            decoded_video,
+            video_processor=video_processor,
+            original_height=5,
+            original_width=6,
+        )
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_resolve_input_video_info_reuses_pipeline_cache_for_same_file(self):
+        pipeline = object.__new__(VividVRPipeline)
+        fake_video_info = {"original_num_frames": 121}
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.os.stat",
+            return_value=SimpleNamespace(st_mtime_ns=123, st_size=456),
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.load_control_video",
+            return_value=fake_video_info,
+        ) as mock_load_control_video:
+            first = pipeline._resolve_input_video_info("/tmp/control.mp4")
+            second = pipeline._resolve_input_video_info("/tmp/control.mp4")
+
+        self.assertIs(first, fake_video_info)
+        self.assertIs(second, fake_video_info)
+        self.assertIs(first, second)
+        mock_load_control_video.assert_called_once_with("/tmp/control.mp4")
+
     def test_temporal_windowed_forward_uses_unbound_step_profile_helper(self):
         params = self._make_vividvr_params(
             num_frames=4,
@@ -460,9 +515,8 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         )
         pipeline.denoising_stage = dummy_denoising_stage
         pipeline.decoding_stage = SimpleNamespace(
-            decode_latents=lambda _latents, _padding_frames, _server_args: (
-                torch.zeros(4, 3, 4, 4),
-                True,
+            decode_latents=lambda _latents, _padding_frames, _server_args: torch.zeros(
+                4, 3, 4, 4
             )
         )
         pipeline.video_processor = SimpleNamespace()
@@ -535,7 +589,7 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             dummy_denoising_stage.last_call["latent_shape"],
         )
         self.assertEqual(batch.output.shape, (3, 4, 4, 4))
-        self.assertTrue(batch.extra["vividvr_debug"]["vae_tiling_enabled"])
+        self.assertFalse(batch.extra["vividvr_debug"]["vae_tiling_enabled"])
         self.assertEqual(batch.sampling_params.runtime_progress, 1.0)
 
 

@@ -36,6 +36,7 @@
 8. [08_stage7_execution_roadmap.md](./08_stage7_execution_roadmap.md)
 9. [09_code_mod_order.md](./09_code_mod_order.md)
 10. [10_grouped_stage_acceptance.md](./10_grouped_stage_acceptance.md)
+11. [11_phase_e_acceleration_implementation.md](./11_phase_e_acceleration_implementation.md)
 
 ## 推荐执行分组（5 个大阶段）
 
@@ -97,6 +98,7 @@
   - [07_stage6_risk_analysis.md](./07_stage6_risk_analysis.md)
   - [08_stage7_execution_roadmap.md](./08_stage7_execution_roadmap.md)
   - [09_code_mod_order.md](./09_code_mod_order.md)
+  - [11_phase_e_acceleration_implementation.md](./11_phase_e_acceleration_implementation.md)
 
 ## 实施原则
 

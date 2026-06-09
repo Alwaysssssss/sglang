@@ -11,7 +11,7 @@
 - 当前工作的主线不是从零设计一个新模型，而是把原版 `/home/zhiheng/Vivid-VR` 以原生、可维护的方式集成到 `sglang.multimodal_gen` 中。
 - 这条线经历过一次仓库误清空和恢复；`Phase A / B / C` 已恢复并建立了稳定基线，当前继续推进的是 `Phase D` 和 `Phase E`。
 - 当前稳定基线是 `Phase C` 单 clip 路径；后续所有改动默认都要保护这条基线，避免回归。
-- `Phase D` 的重点是长视频 `clip split / merge / temporal orchestration` 以及公平 benchmark；截至目前，这部分代码和 benchmark 流程已具备，但公平验收尚未完全通过。
+- `Phase D` 的重点是长视频 `clip split / merge / temporal orchestration` 以及公平 benchmark；截至目前，这部分代码和 benchmark 流程已具备，并已完成正式验收，作为 `Phase E` 的长视频语义基线。
 - `Phase E` 的重点不是再发明新语义，而是在 `Phase D` 语义对齐基础上做性能收口、默认配置收口和回归验收，逐步进入 release gate。
 - `Vivid-VR` 在 `sglang` 中必须作为原生模型集成运行；推理时不要依赖原版仓库的运行时代码。
 - 允许继续复用原版仓库中的外部资源，例如：
@@ -39,7 +39,7 @@
   - clip trim / stitch
   - 使用原版 caption sidecar 的公平 benchmark
 - 对 `Phase D` 的默认理解应是“补齐原版长视频语义”，不是随意做一个能跑的近似实现。
-- 目前 `Phase D` 代码路径、helper、测试和 benchmark 工具已经具备，但和原版的公平验收仍未通过；后续工作应优先继续查长视频 orchestration 语义，而不是破坏 `Phase C` 基线。
+- 目前 `Phase D` 代码路径、helper、测试和 benchmark 工具已经具备，且长视频公平验收已完成；后续默认应在该语义基线上推进 `Phase E`，不要破坏 `Phase C` 与 `Phase D` 的已验收结果。
 - 如果本轮任务没有明确要求推进 `Phase D`，默认仍应先保护 `Phase C` 已验收结果。
 - `Phase E` 代表“性能收口 + 回归验收”阶段，不应被理解成脱离语义基线的随意调参。
 - `Phase E` 的核心任务包括：
@@ -47,7 +47,8 @@
   - 基于稳定实现做 profile，形成可复用的性能结论
   - 建立可重复运行的 regression 套件
   - 让验收逐步从阶段性对齐进入 strict 或接近 strict 的 release gate
-- 推进 `Phase E` 时，默认前提是不能破坏 `Phase C` 已验收基线，也不要用性能优化掩盖 `Phase D` 尚未解决的长视频语义偏差。
+- 当前 `Phase E` 日常 benchmark 默认固定为与 `Phase D` 相同 reference 对象的 `130f / 20 step` 长视频口径；`50 step` 只保留给阶段性最终回归。
+- 推进 `Phase E` 时，默认前提是不能破坏 `Phase C` 已验收基线，也不要用性能优化引入新的长视频语义回归。
 - 如果任务明确属于 `Phase E`，先确认当前 benchmark 和验收口径是否已经固定；如果默认参数、后端或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
 
 ## 文档入口与实现指引
@@ -61,10 +62,13 @@
   - `docs_xzh/add_strategy/05_stage4_component_migration.md`：组件迁移范围
   - `docs_xzh/add_strategy/09_code_mod_order.md`：推荐改动顺序
   - `docs_xzh/add_strategy/10_grouped_stage_acceptance.md`：分阶段验收要求
+- 新增或更新交接文档时，统一保存在 `/home/zhiheng/sglang/docs_xzh/hand_over` 下；不要把 handover 文档散落到仓库根目录、`docs_xzh/add_strategy` 或临时目录。
 - 如果任务与当前实现状态、恢复背景或上一轮未完成问题有关，优先查看 `/home/zhiheng/sglang/docs_xzh/hand_over` 下最新的交接文档，不要忽略历史上下文。
 - 当前最重要的交接文档包括：
   - `docs_xzh/hand_over/phase_abc_restore_and_next_stage_handover.md`
   - `docs_xzh/hand_over/phase_d_modular_refactor_and_fair_benchmark_handover.md`
+  - `docs_xzh/hand_over/phase_d_acceptance_completion_and_phase_e_benchmark_handover.md`
+  - `docs_xzh/hand_over/phase_e_e0_e3_acceptance_and_single_gpu_combo_handover.md`
 - 如果任务涉及 modular 化方向，额外参考：
   - `docs_xzh/modular_style/vividvr_modular_refactor_plan.md`
 - 如果任务涉及 `Phase D` 长视频对齐，优先参考：
@@ -75,6 +79,7 @@
 - 如果任务涉及 `Phase E` 性能收口、默认配置、compile / offload / backend 选择或回归门槛，优先参考：
   - `docs_xzh/add_strategy/08_stage7_execution_roadmap.md`
   - `docs_xzh/add_strategy/10_grouped_stage_acceptance.md`
+  - `docs_xzh/add_strategy/11_phase_e_acceleration_implementation.md`
   - `docs_xzh/run_vivid_benchmark.md`
 - 如果任务涉及 benchmark、原版公平对比、caption sidecar 或验收命令，额外参考：
   - `docs_xzh/run_vivid_benchmark.md`

@@ -12,7 +12,9 @@ from torch import nn
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
     CogVideoXFlashAttnProcessor,
     CogVideoXNativeAttnProcessor,
+    enable_cogvideox_qk_norm_rope_fusion,
     _prepare_cogvideox_qkv,
+    inspect_cogvideox_qk_norm_rope_fusion,
     enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
     inspect_cogvideox_qkv_fusion,
@@ -78,6 +80,23 @@ class _DummyCogVideoXBlockModule(nn.Module):
 
 
 class TestVividVRAttentionBackend(unittest.TestCase):
+    @staticmethod
+    def _make_image_rotary_emb(
+        seq_len: int = 8, head_dim: int = 64
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half_dim = head_dim // 2
+        positions = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)
+        frequencies = torch.linspace(
+            0.0,
+            1.0,
+            half_dim,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+        phase = positions * frequencies
+        return phase.cos().repeat_interleave(2, dim=1), phase.sin().repeat_interleave(
+            2, dim=1
+        )
+
     def test_normalize_attention_backend_aliases(self):
         self.assertEqual(normalize_cogvideox_attention_backend("fa3"), "fa")
         self.assertEqual(normalize_cogvideox_attention_backend("flash"), "fa")
@@ -148,6 +167,38 @@ class TestVividVRAttentionBackend(unittest.TestCase):
 
         self.assertEqual(inspect_cogvideox_qkv_fusion(module), "diffusers_fused_linear")
         self.assertIsInstance(attn.to_qkv, nn.Linear)
+        self.assertEqual(expected[0], actual[0])
+        torch.testing.assert_close(actual[1], expected[1])
+        torch.testing.assert_close(actual[2], expected[2])
+        torch.testing.assert_close(actual[3], expected[3])
+
+    def test_qk_norm_rope_fusion_matches_unfused_path(self):
+        module = _DummyCogVideoXAttentionModule()
+        attn = module.attn.eval()
+
+        hidden_states = torch.randn(1, 8, 128)
+        encoder_hidden_states = torch.randn(1, 4, 128)
+        image_rotary_emb = self._make_image_rotary_emb()
+
+        expected = _prepare_cogvideox_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        enable_cogvideox_qk_norm_rope_fusion(module)
+        actual = _prepare_cogvideox_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        self.assertEqual(
+            inspect_cogvideox_qk_norm_rope_fusion(module),
+            "sglang_layernorm+rope_accel",
+        )
         self.assertEqual(expected[0], actual[0])
         torch.testing.assert_close(actual[1], expected[1])
         torch.testing.assert_close(actual[2], expected[2])
@@ -231,6 +282,47 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         self.assertEqual(
             debug["qkv_fusion_targets"], ["transformer", "controlnet"]
         )
+
+    def test_vividvr_pipeline_applies_qk_norm_rope_fusion_to_requested_runtime_modules(self):
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        controlnet = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+
+        pipeline._apply_qk_norm_rope_fusion(
+            SimpleNamespace(
+                enable_cogvideox_qk_norm_rope_fusion=True,
+                attention_backend="fa",
+                cogvideox_qk_norm_rope_fusion_targets="transformer",
+            )
+        )
+        debug = pipeline._build_runtime_acceleration_debug(
+            SimpleNamespace(
+                attention_backend="fa",
+                enable_torch_compile=False,
+                enable_cogvideox_qk_norm_rope_fusion=True,
+                cogvideox_qk_norm_rope_fusion_targets="transformer",
+                enable_cogvideox_qkv_fusion=False,
+                cogvideox_qkv_fusion_targets="transformer",
+                enable_cogvideox_modulation_fusion=False,
+                cogvideox_modulation_fusion_targets="transformer",
+            )
+        )
+
+        self.assertEqual(
+            inspect_cogvideox_qk_norm_rope_fusion(transformer),
+            "sglang_layernorm+rope_accel",
+        )
+        self.assertIsNone(inspect_cogvideox_qk_norm_rope_fusion(controlnet))
+        self.assertEqual(
+            debug["qk_norm_rope_fusion_transformer"],
+            "sglang_layernorm+rope_accel",
+        )
+        self.assertIsNone(debug["qk_norm_rope_fusion_controlnet"])
+        self.assertEqual(debug["qk_norm_rope_fusion_targets"], ["transformer"])
 
     def test_modulation_fused_block_matches_reference(self):
         torch.manual_seed(0)
@@ -353,9 +445,50 @@ class TestVividVRAttentionBackend(unittest.TestCase):
 
         hidden_states = torch.randn(1, 8, 128, device=device, dtype=dtype)
         encoder_hidden_states = torch.randn(1, 4, 128, device=device, dtype=dtype)
-        image_rotary_emb = (
-            torch.ones(8, 64, device=device, dtype=torch.float32),
-            torch.zeros(8, 64, device=device, dtype=torch.float32),
+        image_rotary_emb = tuple(
+            tensor.to(device=device) for tensor in self._make_image_rotary_emb()
+        )
+
+        native_hidden, native_encoder = CogVideoXNativeAttnProcessor()(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+        flash_hidden, flash_encoder = CogVideoXFlashAttnProcessor()(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        torch.testing.assert_close(
+            flash_hidden.float(),
+            native_hidden.float(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        torch.testing.assert_close(
+            flash_encoder.float(),
+            native_encoder.float(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(), "CUDA is required for flash attention parity"
+    )
+    def test_flash_attention_processor_matches_native_with_qk_norm_rope_fusion(self):
+        device = torch.device("cuda:0")
+        dtype = torch.bfloat16
+        module = _DummyCogVideoXAttentionModule().to(device=device, dtype=dtype).eval()
+        enable_cogvideox_qk_norm_rope_fusion(module)
+        attn = module.attn
+
+        hidden_states = torch.randn(1, 8, 128, device=device, dtype=dtype)
+        encoder_hidden_states = torch.randn(1, 4, 128, device=device, dtype=dtype)
+        image_rotary_emb = tuple(
+            tensor.to(device=device) for tensor in self._make_image_rotary_emb()
         )
 
         native_hidden, native_encoder = CogVideoXNativeAttnProcessor()(

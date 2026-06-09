@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from diffusers.models.attention import Attention
 from diffusers.models.attention_processor import CogVideoXAttnProcessor2_0
 from diffusers.models.embeddings import apply_rotary_emb
 from torch import nn
 
+from sglang.jit_kernel.diffusion.triton.norm import norm_infer
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     flash_attn_func,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_COGVIDEOX_FLASHINFER_ROPE_CACHE: dict[tuple[object, ...], torch.Tensor | None] = {}
+_COGVIDEOX_LAYERNORM_KERNEL_CACHE: dict[tuple[int, torch.dtype, str], bool] = {}
 
 
 def normalize_cogvideox_attention_backend(backend: str | None) -> str | None:
@@ -73,23 +80,252 @@ def _prepare_cogvideox_qkv(
     key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
     value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-    if attn.norm_q is not None:
-        query = attn.norm_q(query)
-    if attn.norm_k is not None:
-        key = attn.norm_k(key)
+    use_qk_norm_rope_fusion = bool(
+        getattr(attn, "_sglang_enable_qk_norm_rope_fusion", False)
+    )
 
-    if image_rotary_emb is not None:
-        query[:, :, text_seq_length:] = apply_rotary_emb(
-            query[:, :, text_seq_length:],
-            image_rotary_emb,
-        )
-        if not attn.is_cross_attention:
-            key[:, :, text_seq_length:] = apply_rotary_emb(
-                key[:, :, text_seq_length:],
+    if not use_qk_norm_rope_fusion:
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+        if image_rotary_emb is not None:
+            query[:, :, text_seq_length:] = apply_rotary_emb(
+                query[:, :, text_seq_length:],
                 image_rotary_emb,
             )
+            if not attn.is_cross_attention:
+                key[:, :, text_seq_length:] = apply_rotary_emb(
+                    key[:, :, text_seq_length:],
+                    image_rotary_emb,
+                )
+        return text_seq_length, query, key, value
+
+    if attn.norm_q is not None:
+        query = _apply_cogvideox_qk_norm(
+            query,
+            attn.norm_q,
+            prefer_sglang_kernel=True,
+        )
+    if attn.norm_k is not None:
+        key = _apply_cogvideox_qk_norm(
+            key,
+            attn.norm_k,
+            prefer_sglang_kernel=True,
+        )
+
+    if image_rotary_emb is not None:
+        query, key = _apply_cogvideox_image_rope(
+            attn=attn,
+            query=query,
+            key=key,
+            text_seq_length=text_seq_length,
+            image_rotary_emb=image_rotary_emb,
+            prefer_sglang_kernel=True,
+        )
 
     return text_seq_length, query, key, value
+
+
+def _apply_cogvideox_qk_norm(
+    x: torch.Tensor,
+    norm: nn.Module,
+    *,
+    prefer_sglang_kernel: bool,
+) -> torch.Tensor:
+    if not isinstance(norm, nn.LayerNorm):
+        return norm(x)
+
+    hidden_size = int(norm.normalized_shape[-1])
+    if (
+        not prefer_sglang_kernel
+        or not current_platform.is_cuda()
+        or x.shape[-1] != hidden_size
+        or norm.weight is None
+        or not _can_use_cogvideox_layernorm_kernel(
+            hidden_size=hidden_size,
+            dtype=x.dtype,
+            device_type=x.device.type,
+        )
+    ):
+        return norm(x)
+
+    try:
+        return norm_infer(
+            x.reshape(-1, hidden_size),
+            norm.weight,
+            norm.bias,
+            eps=norm.eps,
+            is_rms_norm=False,
+        ).view_as(x)
+    except Exception:
+        return norm(x)
+
+
+def _can_use_cogvideox_layernorm_kernel(
+    *,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device_type: str,
+) -> bool:
+    cache_key = (hidden_size, dtype, device_type)
+    cached = _COGVIDEOX_LAYERNORM_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if device_type != "cuda":
+        return False
+
+    probe_device = torch.device(device_type)
+    probe_input = torch.zeros((1, hidden_size), device=probe_device, dtype=dtype)
+    probe_weight = torch.ones(hidden_size, device=probe_device, dtype=dtype)
+    probe_bias = torch.zeros(hidden_size, device=probe_device, dtype=dtype)
+    try:
+        norm_infer(
+            probe_input,
+            probe_weight,
+            probe_bias,
+            eps=1e-6,
+            is_rms_norm=False,
+        )
+        torch.cuda.synchronize(probe_device)
+        _COGVIDEOX_LAYERNORM_KERNEL_CACHE[cache_key] = True
+        return True
+    except Exception:
+        _COGVIDEOX_LAYERNORM_KERNEL_CACHE[cache_key] = False
+        return False
+
+
+def _can_use_cogvideox_flashinfer_rope(
+    attn: Attention,
+    query: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    prefer_sglang_kernel: bool,
+) -> bool:
+    if (
+        not prefer_sglang_kernel
+        or not current_platform.is_cuda()
+        or getattr(attn, "is_cross_attention", False)
+        or query.dtype not in (torch.float16, torch.bfloat16)
+        or query.dim() != 4
+    ):
+        return False
+
+    if not (
+        isinstance(image_rotary_emb, tuple)
+        and len(image_rotary_emb) == 2
+        and isinstance(image_rotary_emb[0], torch.Tensor)
+        and isinstance(image_rotary_emb[1], torch.Tensor)
+    ):
+        return False
+
+    cos_sin_cache = _build_cogvideox_flashinfer_cos_sin_cache(image_rotary_emb)
+    return (
+        cos_sin_cache is not None
+        and cos_sin_cache.dim() == 2
+        and cos_sin_cache.shape[-1] <= query.shape[-1]
+    )
+
+
+def _build_cogvideox_flashinfer_cos_sin_cache(
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor | None:
+    cos, sin = image_rotary_emb
+    cache_key = (
+        int(cos.data_ptr()),
+        int(cos.storage_offset()),
+        tuple(cos.shape),
+        tuple(cos.stride()),
+        str(cos.device),
+        str(cos.dtype),
+        int(sin.data_ptr()),
+        int(sin.storage_offset()),
+        tuple(sin.shape),
+        tuple(sin.stride()),
+        str(sin.device),
+        str(sin.dtype),
+    )
+    if cache_key in _COGVIDEOX_FLASHINFER_ROPE_CACHE:
+        return _COGVIDEOX_FLASHINFER_ROPE_CACHE[cache_key]
+
+    if (
+        cos.dim() != 2
+        or sin.dim() != 2
+        or cos.shape != sin.shape
+        or cos.shape[-1] % 2 != 0
+    ):
+        _COGVIDEOX_FLASHINFER_ROPE_CACHE[cache_key] = None
+        return None
+
+    # CogVideoX uses diffusers' repeat_interleave_real=True RoPE layout where
+    # each rotary frequency appears twice: [c0, c0, c1, c1, ...]. FlashInfer
+    # and SGLang rotary kernels expect [cos_half, sin_half].
+    cos_pairs = cos.reshape(cos.shape[0], -1, 2)
+    sin_pairs = sin.reshape(sin.shape[0], -1, 2)
+    if not torch.equal(cos_pairs[..., 0], cos_pairs[..., 1]):
+        _COGVIDEOX_FLASHINFER_ROPE_CACHE[cache_key] = None
+        return None
+    if not torch.equal(sin_pairs[..., 0], sin_pairs[..., 1]):
+        _COGVIDEOX_FLASHINFER_ROPE_CACHE[cache_key] = None
+        return None
+
+    cache = torch.cat(
+        [
+            cos_pairs[..., 0].to(dtype=torch.float32).contiguous(),
+            sin_pairs[..., 0].to(dtype=torch.float32).contiguous(),
+        ],
+        dim=-1,
+    )
+    _COGVIDEOX_FLASHINFER_ROPE_CACHE[cache_key] = cache
+    return cache
+
+
+def _apply_cogvideox_image_rope(
+    attn: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    text_seq_length: int,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    *,
+    prefer_sglang_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if query.size(2) <= text_seq_length:
+        return query, key
+
+    q_image = query[:, :, text_seq_length:]
+    k_image = key[:, :, text_seq_length:]
+    if _can_use_cogvideox_flashinfer_rope(
+        attn,
+        q_image.transpose(1, 2),
+        image_rotary_emb,
+        prefer_sglang_kernel=prefer_sglang_kernel,
+    ):
+        cos_sin_cache = _build_cogvideox_flashinfer_cos_sin_cache(image_rotary_emb)
+        if cos_sin_cache is None:
+            raise RuntimeError(
+                "FlashInfer RoPE fast path was selected without a compatible CogVideoX cos/sin cache."
+            )
+        q_image, k_image = apply_flashinfer_rope_qk_inplace(
+            q_image.transpose(1, 2),
+            k_image.transpose(1, 2),
+            cos_sin_cache,
+            is_neox=False,
+        )
+        query[:, :, text_seq_length:] = q_image.transpose(1, 2)
+        key[:, :, text_seq_length:] = k_image.transpose(1, 2)
+        return query, key
+
+    query[:, :, text_seq_length:] = apply_rotary_emb(
+        q_image,
+        image_rotary_emb,
+    )
+    if not attn.is_cross_attention:
+        key[:, :, text_seq_length:] = apply_rotary_emb(
+            k_image,
+            image_rotary_emb,
+        )
+    return query, key
 
 
 class CogVideoXNativeAttnProcessor:
@@ -261,6 +497,19 @@ def _enable_attention_qkv_fusion(attn: Attention) -> bool:
     return True
 
 
+def _enable_attention_qk_norm_rope_fusion(attn: Attention) -> bool:
+    if getattr(attn, "_sglang_enable_qk_norm_rope_fusion", False):
+        return True
+
+    norms = (getattr(attn, "norm_q", None), getattr(attn, "norm_k", None))
+    if not all(norm is None or isinstance(norm, nn.LayerNorm) for norm in norms):
+        return False
+
+    attn._sglang_enable_qk_norm_rope_fusion = True
+    attn._sglang_qk_norm_rope_fusion_impl = "sglang_layernorm+rope_accel"
+    return True
+
+
 def enable_cogvideox_qkv_fusion(module: nn.Module) -> int:
     applied = 0
     for child in module.modules():
@@ -275,12 +524,36 @@ def enable_cogvideox_qkv_fusion(module: nn.Module) -> int:
     return applied
 
 
+def enable_cogvideox_qk_norm_rope_fusion(module: nn.Module) -> int:
+    applied = 0
+    for child in module.modules():
+        if isinstance(child, Attention) and _enable_attention_qk_norm_rope_fusion(child):
+            applied += 1
+
+    if applied == 0:
+        raise ValueError(
+            "No compatible diffusers Attention modules were found while enabling CogVideoX QK-norm/RoPE fusion."
+        )
+
+    return applied
+
+
 def inspect_cogvideox_qkv_fusion(module: nn.Module) -> str | None:
     for child in module.modules():
         if not isinstance(child, Attention):
             continue
         if getattr(child, "use_fused_qkv", False) and hasattr(child, "to_qkv"):
             return str(getattr(child, "_sglang_qkv_fusion_impl", "diffusers_fused_linear"))
+    return None
+
+
+def inspect_cogvideox_qk_norm_rope_fusion(module: nn.Module) -> str | None:
+    for child in module.modules():
+        if not isinstance(child, Attention):
+            continue
+        impl = getattr(child, "_sglang_qk_norm_rope_fusion_impl", None)
+        if impl is not None:
+            return str(impl)
     return None
 
 

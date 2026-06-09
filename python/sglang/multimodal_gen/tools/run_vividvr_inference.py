@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.pipelines_core import build_pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.videoedit.compare import compare_videos
-from sglang.multimodal_gen.runtime.videoedit.preprocess import load_video_frames
 
 VIVIDVR_ROOT = Path("/home/zhiheng/Vivid-VR")
 COGVIDEOX_ROOT = VIVIDVR_ROOT / "ckpts" / "CogVideoX1.5-5B"
@@ -53,10 +52,19 @@ def build_runtime_config_snapshot(
     debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     debug = debug or {}
+    runai_streamer_env = os.environ.get("SGLANG_USE_RUNAI_MODEL_STREAMER")
     return {
         "attention_backend_requested": args.attention_backend,
         "attention_backend_effective": server_args.attention_backend,
         "attention_backend_config": _json_ready(dict(server_args.attention_backend_config)),
+        "runai_model_streamer_requested": getattr(
+            args, "use_runai_model_streamer", None
+        ),
+        "runai_model_streamer_enabled": (
+            None
+            if runai_streamer_env is None
+            else runai_streamer_env.strip().lower() in {"1", "true", "yes", "on"}
+        ),
         "enable_torch_compile": bool(server_args.enable_torch_compile),
         "torch_compile_mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE")
         if server_args.enable_torch_compile
@@ -89,6 +97,25 @@ def build_runtime_config_snapshot(
         ),
         "qkv_fusion_transformer": debug.get("qkv_fusion_transformer"),
         "qkv_fusion_controlnet": debug.get("qkv_fusion_controlnet"),
+        "enable_cogvideox_qk_norm_rope_fusion": bool(
+            getattr(server_args, "enable_cogvideox_qk_norm_rope_fusion", False)
+        ),
+        "cogvideox_qk_norm_rope_fusion_targets": _json_ready(
+            debug.get(
+                "qk_norm_rope_fusion_targets",
+                getattr(
+                    server_args,
+                    "cogvideox_qk_norm_rope_fusion_targets",
+                    "transformer",
+                ),
+            )
+        ),
+        "qk_norm_rope_fusion_transformer": debug.get(
+            "qk_norm_rope_fusion_transformer"
+        ),
+        "qk_norm_rope_fusion_controlnet": debug.get(
+            "qk_norm_rope_fusion_controlnet"
+        ),
         "dit_cpu_offload": bool(server_args.dit_cpu_offload),
         "text_encoder_cpu_offload": bool(server_args.text_encoder_cpu_offload),
         "vae_cpu_offload": bool(server_args.vae_cpu_offload),
@@ -103,6 +130,10 @@ def build_runtime_config_snapshot(
         "attn_metadata_enabled": bool(debug.get("attn_metadata_enabled", False)),
         "attn_metadata_backend": debug.get("attn_metadata_backend"),
         "attn_metadata_builder": debug.get("attn_metadata_builder"),
+        "vividvr_vae_decode_tiling_requested": getattr(
+            args, "use_vividvr_vae_decode_tiling", None
+        ),
+        "vividvr_vae_decode_tiling_config": bool(server_args.pipeline_config.vae_tiling),
         "vae_tiling_enabled": bool(debug.get("vae_tiling_enabled", False)),
         "num_gpus": int(server_args.num_gpus),
         "tp_size": int(server_args.tp_size),
@@ -158,10 +189,14 @@ def build_recorded_command() -> str:
 
 
 def build_server_args(args: argparse.Namespace) -> ServerArgs:
+    pipeline_config = VividVRPipelineConfig()
+    if getattr(args, "use_vividvr_vae_decode_tiling", None) is not None:
+        pipeline_config.vae_tiling = bool(args.use_vividvr_vae_decode_tiling)
+
     server_args = ServerArgs(
         model_path=str(args.cogvideox_ckpt_path),
         pipeline_class_name="CogVideoXVividVRControlNetPipeline",
-        pipeline_config=VividVRPipelineConfig(),
+        pipeline_config=pipeline_config,
         component_paths={"vividvr": str(args.vividvr_ckpt_path)},
         num_gpus=1,
         tp_size=1,
@@ -178,6 +213,12 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         cogvideox_modulation_fusion_targets=args.cogvideox_modulation_fusion_targets,
         enable_cogvideox_qkv_fusion=args.enable_cogvideox_qkv_fusion,
         cogvideox_qkv_fusion_targets=args.cogvideox_qkv_fusion_targets,
+        enable_cogvideox_qk_norm_rope_fusion=(
+            args.enable_cogvideox_qk_norm_rope_fusion
+        ),
+        cogvideox_qk_norm_rope_fusion_targets=(
+            args.cogvideox_qk_norm_rope_fusion_targets
+        ),
         warmup=args.warmup,
         warmup_steps=args.warmup_steps,
         disable_autocast=args.disable_autocast,
@@ -393,6 +434,18 @@ def parse_args() -> argparse.Namespace:
         help="Optional attention backend config string or JSON path.",
     )
     parser.add_argument(
+        "--use-runai-model-streamer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional override for SGLANG_USE_RUNAI_MODEL_STREAMER during this run.",
+    )
+    parser.add_argument(
+        "--use-vividvr-vae-decode-tiling",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional override for VividVR decode-side pipeline_config.vae_tiling.",
+    )
+    parser.add_argument(
         "--enable-cogvideox-modulation-fusion",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -415,6 +468,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="transformer",
         help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
+    )
+    parser.add_argument(
+        "--enable-cogvideox-qk-norm-rope-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable CogVideoX/VividVR QK LayerNorm + image RoPE acceleration on the native pipeline.",
+    )
+    parser.add_argument(
+        "--cogvideox-qk-norm-rope-fusion-targets",
+        type=str,
+        default="transformer",
+        help="Comma-separated VividVR components to accelerate for Phase E3. Supported: transformer,controlnet.",
     )
     parser.add_argument(
         "--dit-cpu-offload",
@@ -608,6 +673,8 @@ def build_dry_run_payload(
         "tile_stride": args.tile_stride,
         "attention_backend": args.attention_backend,
         "attention_backend_config": args.attention_backend_config,
+        "use_runai_model_streamer": args.use_runai_model_streamer,
+        "use_vividvr_vae_decode_tiling": args.use_vividvr_vae_decode_tiling,
         "dit_cpu_offload": args.dit_cpu_offload,
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
@@ -638,6 +705,10 @@ def main() -> int:
 
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("SGLANG_DIFFUSION_STAGE_LOGGING", "1")
+    if args.use_runai_model_streamer is not None:
+        os.environ["SGLANG_USE_RUNAI_MODEL_STREAMER"] = (
+            "1" if args.use_runai_model_streamer else "0"
+        )
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_file_name = build_output_file_name(args, run_id)
@@ -787,8 +858,8 @@ def main() -> int:
             max_failed_frame_ratio=args.max_failed_frame_ratio,
         )
         summary = report["summary"]
-        ref_frames, _ = load_video_frames(str(args.reference_video))
-        cand_frames, _ = load_video_frames(str(candidate_path))
+        reference_frame_count = int(summary["reference_frame_count"])
+        candidate_frame_count = int(summary["candidate_frame_count"])
         failed_frame_ratio = (
             len(summary["failed_frames"]) / summary["compared_frames"]
             if summary["compared_frames"] > 0
@@ -799,9 +870,11 @@ def main() -> int:
             {
                 "summary": summary,
                 "frames": report["frames"],
-                "reference_frame_count": len(ref_frames),
-                "candidate_frame_count": len(cand_frames),
-                "frame_count_delta": abs(len(ref_frames) - len(cand_frames)),
+                "reference_frame_count": reference_frame_count,
+                "candidate_frame_count": candidate_frame_count,
+                "frame_count_delta": abs(
+                    reference_frame_count - candidate_frame_count
+                ),
                 "failed_frame_ratio": failed_frame_ratio,
                 "pass_compare": bool(summary["pass_compare"]),
             }

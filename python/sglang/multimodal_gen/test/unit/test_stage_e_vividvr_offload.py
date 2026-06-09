@@ -266,7 +266,7 @@ class _DummyDecodeVAE(torch.nn.Module):
 
 
 class TestStageEVividVRDecoding(unittest.TestCase):
-    def test_decode_latents_enables_vae_tiling_when_requested(self):
+    def test_decode_latents_keeps_e2_decode_path_without_explicit_tiling(self):
         with patch(_GLOBAL_ARGS_PATCH, return_value=SimpleNamespace()):
             stage = VividVRDecodingStage(vae=_DummyDecodeVAE())
         server_args = SimpleNamespace(
@@ -274,15 +274,14 @@ class TestStageEVividVRDecoding(unittest.TestCase):
             vae_cpu_offload=False,
         )
 
-        decoded, vae_tiling_enabled = stage.decode_latents(
+        decoded = stage.decode_latents(
             torch.zeros(1, 3, 16, 4, 4),
             0,
             server_args,
         )
 
         self.assertEqual(tuple(decoded.shape), (1, 16, 3, 4, 4))
-        self.assertTrue(vae_tiling_enabled)
-        self.assertEqual(stage.vae.enable_tiling_calls, 1)
+        self.assertEqual(stage.vae.enable_tiling_calls, 0)
 
 
 if __name__ == "__main__":
