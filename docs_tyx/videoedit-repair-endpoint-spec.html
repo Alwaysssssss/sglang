@@ -993,26 +993,32 @@ Content-Type: application/json</code></pre>
             </div>
 
             <h3 id="callback">5.2 回调请求</h3>
-            <p>请求中提供 <code>callbackUrl</code> 时，任务完成或失败后，服务会向该地址发送 POST 请求；未提供时不发送回调。</p>
+            <p>请求中提供 <code>callbackUrl</code> 时，服务会在任务运行中周期性上报进度，并在任务完成或失败后向该地址发送最终 POST 请求；未提供时不发送回调。</p>
 <pre><code>POST {callbackUrl}
 Content-Type: application/json</code></pre>
 
             <p><strong>成功回调示例</strong></p>
 <pre><code>{
-  <span class="json-key">"taskId"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
-  <span class="json-key">"status"</span>: <span class="json-string">"completed"</span>,
-  <span class="json-key">"outputUrl"</span>: <span class="json-string">"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/outputs/ubuntu-minio-videoedit-008.mp4"</span>,
-  <span class="json-key">"message"</span>: <span class="json-string">"ok"</span>,
-  <span class="json-key">"reason"</span>: <span class="json-string">""</span>
+  <span class="json-key">"status"</span>: <span class="json-string">"succeeded"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">100</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">""</span>,
+  <span class="json-key">"output"</span>: <span class="json-string">"{\"result_url\":\"https://sites-hurricane-substantial-really.trycloudflare.com/flowcut/outputs/ubuntu-minio-videoedit-008.mp4\",\"duration\":45}"</span>
 }</code></pre>
 
             <p><strong>失败回调示例</strong></p>
 <pre><code>{
-  <span class="json-key">"taskId"</span>: <span class="json-string">"ubuntu-minio-videoedit-008"</span>,
   <span class="json-key">"status"</span>: <span class="json-string">"failed"</span>,
-  <span class="json-key">"outputUrl"</span>: <span class="json-bool">null</span>,
-  <span class="json-key">"message"</span>: <span class="json-string">"task timeout"</span>,
-  <span class="json-key">"reason"</span>: <span class="json-string">"task timeout"</span>
+  <span class="json-key">"progress"</span>: <span class="json-number">37</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">"task timeout"</span>,
+  <span class="json-key">"output"</span>: <span class="json-string">""</span>
+}</code></pre>
+
+            <p><strong>运行中进度回调示例</strong></p>
+<pre><code>{
+  <span class="json-key">"status"</span>: <span class="json-string">"running"</span>,
+  <span class="json-key">"progress"</span>: <span class="json-number">52</span>,
+  <span class="json-key">"reason"</span>: <span class="json-string">""</span>,
+  <span class="json-key">"output"</span>: <span class="json-string">""</span>
 }</code></pre>
 
             <h2 id="checklist-table">六、自检</h2>

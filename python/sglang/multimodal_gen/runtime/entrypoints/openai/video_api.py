@@ -65,6 +65,9 @@ router = APIRouter(prefix="/v1/videos", tags=["videos"])
 
 _VIDEOEDIT_QUEUE_CAPACITY = max(1, int(os.environ.get("VIDEOEDIT_QUEUE_CAPACITY", "1")))
 _VIDEOEDIT_SEMAPHORE = asyncio.Semaphore(_VIDEOEDIT_QUEUE_CAPACITY)
+_VIDEOEDIT_CALLBACK_PROGRESS_INTERVAL_SECONDS = max(
+    1.0, float(os.environ.get("VIDEOEDIT_CALLBACK_PROGRESS_INTERVAL_SECONDS", "5"))
+)
 
 CallbackPayloadBuilder = Callable[[str, Dict[str, Any]], Dict[str, Any]]
 
@@ -153,26 +156,126 @@ def _job_reason(job: Dict[str, Any]) -> str | None:
     return _job_error_message(job)
 
 
+def _task_id_from_video_repair_body(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    task_id = body.get("task_id") or body.get("taskId")
+    if task_id is None:
+        return None
+    task_id = str(task_id).strip()
+    return task_id or None
+
+
+def _failed_video_repair_submission_job(
+    request_id: str,
+    reason: str,
+    *,
+    req: VideoRepairRequest | None = None,
+    body: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    callback_url = req.callback_url if req is not None else None
+    output_object_key = req.output_object_key if req is not None else None
+    timeout = req.timeout if req is not None else None
+    model = req.model if req is not None else None
+
+    if body is not None:
+        callback_url = callback_url or body.get("callback_url") or body.get(
+            "callbackUrl"
+        )
+        output_object_key = output_object_key or body.get(
+            "output_object_key"
+        ) or body.get("outputObjectKey")
+        timeout = timeout if timeout is not None else body.get("timeout")
+        model = model or body.get("model")
+
+    return {
+        "id": request_id,
+        "object": "video",
+        "model": model or "videoedit",
+        "status": "failed",
+        "progress": 0,
+        "created_at": int(time.time()),
+        "size": "",
+        "seconds": "",
+        "quality": "standard",
+        "file_path": None,
+        "url": None,
+        "error": {"message": reason},
+        "reason": reason,
+        "callback_url": callback_url,
+        "callback_status": None,
+        "callback_error": None,
+        "timeout": timeout,
+        "output_object_key": output_object_key,
+    }
+
+
 def _build_video_repair_callback_payload(
     task_id: str, job: Dict[str, Any]
 ) -> Dict[str, Any]:
     status = job.get("status")
+    progress = _current_video_progress(job)
     if status == "completed":
+        result_url = job.get("url") or job.get("file_path") or ""
+        duration = job.get("inference_time_s")
+        if duration is None and job.get("completed_at") and job.get("created_at"):
+            duration = max(0, int(job["completed_at"] - job["created_at"]))
+        output = {"result_url": result_url}
+        if duration is not None:
+            output["duration"] = duration
         return {
-            "taskId": task_id,
-            "status": "completed",
-            "outputUrl": job.get("url"),
-            "message": "ok",
+            "status": "succeeded",
+            "progress": 100,
             "reason": "",
+            "output": json.dumps(output, ensure_ascii=False),
         }
-    reason = _job_error_message(job)
+    if status == "failed":
+        return {
+            "status": "failed",
+            "progress": progress,
+            "reason": _job_error_message(job),
+            "output": "",
+        }
     return {
-        "taskId": task_id,
-        "status": "failed",
-        "outputUrl": None,
-        "message": reason,
-        "reason": reason,
+        "status": "running",
+        "progress": progress,
+        "reason": "",
+        "output": "",
     }
+
+
+async def _post_video_repair_progress_callbacks(
+    job_id: str,
+    callback_url: str | None,
+    *,
+    interval: float = _VIDEOEDIT_CALLBACK_PROGRESS_INTERVAL_SECONDS,
+) -> None:
+    if not callback_url:
+        return
+
+    last_progress = None
+    while True:
+        job = await VIDEO_STORE.get(job_id)
+        if not job:
+            return
+        if job.get("status") in {"completed", "failed", "deleted"}:
+            return
+
+        progress = _current_video_progress(job)
+        if progress != last_progress:
+            await VIDEO_STORE.update_fields(job_id, {"progress": progress})
+            job = await VIDEO_STORE.get(job_id) or job
+            payload = _build_video_repair_callback_payload(job_id, job)
+            await _post_video_callback(
+                job_id,
+                callback_url,
+                payload,
+                timeout=5.0,
+                max_retries=1,
+            )
+            last_progress = progress
+
+        await asyncio.sleep(interval)
 
 
 def _validate_video_repair_request(req: VideoRepairRequest) -> None:
@@ -399,10 +502,13 @@ async def _dispatch_job_async(
             )
     except Exception as e:
         logger.error(f"{e}")
+        existing_job = await VIDEO_STORE.get(job_id)
+        progress = _current_video_progress(existing_job or {})
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
+                "progress": progress,
                 "error": {"message": str(e)},
                 "reason": str(e),
             },
@@ -501,8 +607,13 @@ async def _dispatch_video_repair_job_async(
     output_bucket: str | None = None,
     timeout: int = -1,
 ) -> None:
+    progress_callback_task = None
     try:
         await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
+        if callback_url:
+            progress_callback_task = asyncio.create_task(
+                _post_video_repair_progress_callbacks(job_id, callback_url)
+            )
         dispatch_coro = _dispatch_job_async(
             job_id,
             batch,
@@ -519,10 +630,13 @@ async def _dispatch_video_repair_job_async(
         else:
             await asyncio.wait_for(dispatch_coro, timeout=timeout)
     except asyncio.TimeoutError:
+        existing_job = await VIDEO_STORE.get(job_id)
+        progress = _current_video_progress(existing_job or {})
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
+                "progress": progress,
                 "error": {"message": "task timeout"},
                 "reason": "task timeout",
             },
@@ -537,6 +651,12 @@ async def _dispatch_video_repair_job_async(
                 )
             )
     finally:
+        if progress_callback_task is not None:
+            progress_callback_task.cancel()
+            try:
+                await progress_callback_task
+            except asyncio.CancelledError:
+                pass
         _VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
@@ -547,15 +667,25 @@ async def create_video_repair(request: Request):
     if _VIDEOEDIT_SEMAPHORE.locked():
         return _video_repair_submit_response(2, "A task is running.")
 
+    body = None
     try:
         body = await request.json()
         payload = _normalize_video_repair_payload(body)
         req = VideoRepairRequest(**payload)
         _validate_video_repair_request(req)
     except Exception as e:
-        return _video_repair_submit_response(
-            1, f"Invalid request body: {_exception_message(e)}"
-        )
+        reason = f"Invalid request body: {_exception_message(e)}"
+        task_id = _task_id_from_video_repair_body(body)
+        if task_id is not None:
+            await VIDEO_STORE.upsert(
+                task_id,
+                _failed_video_repair_submission_job(
+                    task_id,
+                    reason,
+                    body=body if isinstance(body, dict) else None,
+                ),
+            )
+        return _video_repair_submit_response(1, reason)
 
     if _VIDEOEDIT_SEMAPHORE.locked():
         return _video_repair_submit_response(2, "A task is running.")
@@ -722,8 +852,13 @@ async def create_video_repair(request: Request):
         _VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
-        logger.warning("Video repair request failed: %s", _exception_message(e))
-        return _video_repair_submit_response(1, _exception_message(e))
+        reason = _exception_message(e)
+        await VIDEO_STORE.upsert(
+            request_id,
+            _failed_video_repair_submission_job(request_id, reason, req=req),
+        )
+        logger.warning("Video repair request failed: %s", reason)
+        return _video_repair_submit_response(1, reason)
 
 
 # TODO: support image to video generation
@@ -942,7 +1077,12 @@ async def list_videos(
 
     if limit is not None:
         jobs = jobs[:limit]
-    items = [VideoResponse(**j) for j in jobs]
+    items = []
+    for job in jobs:
+        response_job = dict(job)
+        response_job["progress"] = _current_video_progress(job)
+        response_job["reason"] = _job_reason(response_job)
+        items.append(VideoResponse(**response_job))
     return VideoListResponse(data=items)
 
 

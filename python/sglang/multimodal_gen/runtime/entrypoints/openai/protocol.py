@@ -132,7 +132,7 @@ def default_video_repair_output_object_key(
     request_id: str, now: datetime | None = None
 ) -> str:
     now = now or datetime.now()
-    return f"{now:%Y%m%d}/{now:%H%M%S}_{request_id}.mp4"
+    return f"{now:%Y/%m/%d}/{now:%H%M%S}_{request_id}.mp4"
 
 
 class VideoRepairRequest(BaseModel):

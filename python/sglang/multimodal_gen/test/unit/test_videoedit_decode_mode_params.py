@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime
 
@@ -11,7 +12,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_repair_callback_payload,
+    _failed_video_repair_submission_job,
     _job_reason,
+    _task_id_from_video_repair_body,
     _video_repair_submit_response,
 )
 from sglang.multimodal_gen.runtime.videoedit.cli import build_parser
@@ -64,7 +67,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             default_video_repair_output_object_key(
                 "task-1", datetime(2026, 6, 8, 9, 10, 11)
             ),
-            "20260608/091011_task-1.mp4",
+            "2026/06/08/091011_task-1.mp4",
         )
 
     def test_video_repair_request_accepts_stream(self):
@@ -120,13 +123,72 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             "task-1",
             {"status": "failed", "error": {"message": "task timeout"}},
         )
-        self.assertEqual(payload["message"], "task timeout")
+        self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["reason"], "task timeout")
+        self.assertEqual(payload["output"], "")
+
+    def test_video_repair_running_callback_includes_current_progress(self):
+        payload = _build_video_repair_callback_payload(
+            "task-1",
+            {"status": "running", "progress": 37},
+        )
+        self.assertEqual(payload["status"], "running")
+        self.assertEqual(payload["progress"], 37)
+        self.assertEqual(payload["reason"], "")
+        self.assertEqual(payload["output"], "")
+
+    def test_video_repair_success_callback_uses_downstream_output_format(self):
+        payload = _build_video_repair_callback_payload(
+            "task-1",
+            {
+                "status": "completed",
+                "url": "https://minio.example.com/outputs/result.mp4",
+                "created_at": 10,
+                "completed_at": 55,
+            },
+        )
+        self.assertEqual(payload["status"], "succeeded")
+        self.assertEqual(payload["progress"], 100)
+        self.assertEqual(payload["reason"], "")
+        self.assertEqual(
+            json.loads(payload["output"]),
+            {
+                "result_url": "https://minio.example.com/outputs/result.mp4",
+                "duration": 45,
+            },
+        )
 
     def test_video_repair_submit_failure_includes_reason(self):
         payload = _video_repair_submit_response(1, "videoUrl is required")
         self.assertEqual(payload["message"], "videoUrl is required")
         self.assertEqual(payload["reason"], "videoUrl is required")
+
+    def test_video_repair_submit_failure_task_id_from_camel_case_body(self):
+        self.assertEqual(
+            _task_id_from_video_repair_body({"taskId": "task-1"}),
+            "task-1",
+        )
+
+    def test_failed_video_repair_submission_job_exposes_reason(self):
+        job = _failed_video_repair_submission_job(
+            "task-1",
+            "Invalid request body: timeout must be positive or -1",
+            body={
+                "taskId": "task-1",
+                "callbackUrl": "http://127.0.0.1/callback",
+                "timeout": 0,
+            },
+        )
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(
+            job["reason"], "Invalid request body: timeout must be positive or -1"
+        )
+        self.assertEqual(
+            job["error"]["message"],
+            "Invalid request body: timeout must be positive or -1",
+        )
+        self.assertEqual(job["callback_url"], "http://127.0.0.1/callback")
+        self.assertEqual(job["timeout"], 0)
 
     def test_video_response_accepts_reason(self):
         response = VideoResponse(

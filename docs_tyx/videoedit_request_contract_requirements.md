@@ -86,7 +86,7 @@
 | `maskUrl` | string | 是 | 无 | 输入 mask 地址。 |
 | `referenceImageUrl` | string | 否 | `null` | 参考图地址。存在时服务端插入为视频首帧。 |
 | `minioConfig` | object | 是 | 无 | 本次请求使用的 MinIO/S3 配置。 |
-| `outputObjectKey` | string | 否 | `YYYYMMDD/HHMMSS_{taskId}.mp4` | 输出对象 key。调用方传入时按传入值输出。 |
+| `outputObjectKey` | string | 否 | `YYYY/MM/DD/HHMMSS_{taskId}.mp4` | 输出对象 key。调用方传入时按传入值输出。 |
 
 ### 3.3 MinIO 配置字段
 
@@ -160,7 +160,7 @@
 | `use_repaired_context` | `true` | 默认使用已修复上下文。 |
 | `vary_seed_by_window` | `false` | 默认窗口之间不改变 seed。 |
 | `enable_teacache` | `false` | 默认不开启 TeaCache。 |
-| `outputObjectKey` | `YYYYMMDD/HHMMSS_{taskId}.mp4` | 默认输出对象 key，按日期目录和时间命名。 |
+| `outputObjectKey` | `YYYY/MM/DD/HHMMSS_{taskId}.mp4` | 默认输出对象 key，按年/月/日目录和时间命名。 |
 
 如果调用方传入高级参数，服务端可覆盖默认值，但基础调用不需要填写。
 
@@ -230,17 +230,16 @@ HTTP/1.1 200 OK
 
 ## 7. 回调规范
 
-如果请求中提供了 `callbackUrl`，任务完成或失败后，服务端向 `callbackUrl` 发起 HTTP POST；未提供时不发送回调。
+如果请求中提供了 `callbackUrl`，服务端会在任务运行中周期性上报进度，并在任务完成或失败后向 `callbackUrl` 发起最终 HTTP POST；未提供时不发送回调。
 
 回调 payload 建议至少包含：
 
 ```json
 {
-  "taskId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "status": "completed",
-  "outputUrl": "http://minio.example.com:9000/flowcut/a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4",
-  "message": "ok",
-  "reason": ""
+  "status": "succeeded",
+  "progress": 100,
+  "reason": "",
+  "output": "{\"result_url\":\"http://minio.example.com:9000/flowcut/a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4\",\"duration\":45}"
 }
 ```
 
@@ -248,11 +247,21 @@ HTTP/1.1 200 OK
 
 ```json
 {
-  "taskId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "failed",
-  "outputUrl": null,
-  "message": "invalid mask image format",
-  "reason": "invalid mask image format"
+  "progress": 37,
+  "reason": "invalid mask image format",
+  "output": ""
+}
+```
+
+进度上报示例：
+
+```json
+{
+  "status": "running",
+  "progress": 52,
+  "reason": "",
+  "output": ""
 }
 ```
 
@@ -274,5 +283,5 @@ HTTP/1.1 200 OK
 - `videoUrl` 和 `maskUrl` 是否一定都是 MinIO/S3 HTTP 地址，还是也需要支持本地路径。
 - `referenceImageUrl` 是否只支持图片 URL，还是也需要支持 base64 或本地路径。
 - 全 1 mask 的业务语义是否固定为像素值 `255`，以及是否需要兼容内部 mask 反转逻辑。
-- 输出对象 key 默认按 `YYYYMMDD/HHMMSS_{taskId}.mp4` 生成；调用方传 `outputObjectKey` 时使用调用方指定值。
+- 输出对象 key 默认按 `YYYY/MM/DD/HHMMSS_{taskId}.mp4` 生成；调用方传 `outputObjectKey` 时使用调用方指定值。
 - 是否需要在提交成功响应中返回 `taskId`。当前示例只要求 `code` 和 `message`。
