@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -6,6 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.activations import get_activation
 from diffusers.models.resnet import ResnetBlock2D
+
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 
 
 def zero_module(module: nn.Module) -> nn.Module:
@@ -83,6 +91,105 @@ class Connector(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v)
         out = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, hidden_size)
         return h + self.out_layer(out) + self.c_mlp(c)
+
+
+@dataclass(frozen=True)
+class VividVRSequenceShardState:
+    enabled: bool
+    original_seq_len: int
+    local_seq_len: int
+    seq_pad: int
+
+
+def vividvr_sequence_shard_enabled() -> bool:
+    try:
+        forward_batch = get_forward_context().forward_batch
+        sp_world_size = get_sp_world_size()
+    except AssertionError:
+        return False
+
+    return bool(
+        forward_batch is not None
+        and getattr(forward_batch, "enable_sequence_shard", False)
+        and sp_world_size > 1
+    )
+
+
+def shard_vividvr_video_tokens(
+    hidden_states: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor] | None,
+    VividVRSequenceShardState,
+]:
+    original_seq_len = hidden_states.shape[1]
+    if not vividvr_sequence_shard_enabled():
+        return (
+            hidden_states,
+            image_rotary_emb,
+            VividVRSequenceShardState(
+                enabled=False,
+                original_seq_len=original_seq_len,
+                local_seq_len=original_seq_len,
+                seq_pad=0,
+            ),
+        )
+
+    sp_world_size = get_sp_world_size()
+    sp_rank = get_sp_parallel_rank()
+    seq_pad = (-original_seq_len) % sp_world_size
+    if seq_pad:
+        pad = hidden_states.new_zeros(
+            (hidden_states.shape[0], seq_pad, hidden_states.shape[2])
+        )
+        hidden_states = torch.cat([hidden_states, pad], dim=1)
+
+    local_seq_len = hidden_states.shape[1] // sp_world_size
+    hidden_states = (
+        hidden_states.view(
+            hidden_states.shape[0],
+            sp_world_size,
+            local_seq_len,
+            hidden_states.shape[2],
+        )[:, sp_rank]
+        .contiguous()
+    )
+
+    local_image_rotary_emb = image_rotary_emb
+    if image_rotary_emb is not None:
+        cos, sin = image_rotary_emb
+        if seq_pad:
+            rope_pad_shape = (seq_pad, *cos.shape[1:])
+            cos = torch.cat([cos, cos.new_zeros(rope_pad_shape)], dim=0)
+            sin = torch.cat([sin, sin.new_zeros(rope_pad_shape)], dim=0)
+        cos = cos.view(sp_world_size, local_seq_len, *cos.shape[1:])[sp_rank].contiguous()
+        sin = sin.view(sp_world_size, local_seq_len, *sin.shape[1:])[sp_rank].contiguous()
+        local_image_rotary_emb = (cos, sin)
+
+    return (
+        hidden_states,
+        local_image_rotary_emb,
+        VividVRSequenceShardState(
+            enabled=True,
+            original_seq_len=original_seq_len,
+            local_seq_len=local_seq_len,
+            seq_pad=seq_pad,
+        ),
+    )
+
+
+def gather_vividvr_video_tokens(
+    hidden_states: torch.Tensor,
+    shard_state: VividVRSequenceShardState,
+) -> torch.Tensor:
+    if not shard_state.enabled:
+        return hidden_states
+
+    hidden_states = sequence_model_parallel_all_gather(hidden_states.contiguous(), dim=1)
+    if shard_state.seq_pad:
+        hidden_states = hidden_states[:, : shard_state.original_seq_len, :].contiguous()
+    return hidden_states
 
 
 class TemporalResnetBlock(nn.Module):

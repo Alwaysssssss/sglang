@@ -137,6 +137,22 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual(params.prompt_file_path, DEFAULT_VIVIDVR_PROMPT_FILE_PATH)
         self.assertFalse(params.enable_sequence_shard)
 
+    def test_vividvr_from_user_kwargs_auto_enables_sequence_shard_on_multi_gpu(self):
+        server_args = SimpleNamespace(
+            pipeline_config=VividVRPipelineConfig(),
+            output_path=None,
+            num_gpus=2,
+            comfyui_mode=False,
+            prompt_file_path=None,
+        )
+
+        params = VividVRSamplingParams.from_user_kwargs(
+            server_args,
+            video_input_path="/tmp/input.mp4",
+        )
+
+        self.assertTrue(params.enable_sequence_shard)
+
     def test_vividvr_from_user_kwargs_allows_server_prompt_file_override(self):
         server_args = SimpleNamespace(
             pipeline_config=VividVRPipelineConfig(),

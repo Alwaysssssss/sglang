@@ -2,6 +2,7 @@ import unittest
 from copy import deepcopy
 from os import environ
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from diffusers.models.attention import Attention
@@ -12,8 +13,10 @@ from torch import nn
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
     CogVideoXFlashAttnProcessor,
     CogVideoXNativeAttnProcessor,
+    enable_cogvideox_qk_norm_fusion,
     enable_cogvideox_qk_norm_rope_fusion,
     _prepare_cogvideox_qkv,
+    inspect_cogvideox_qk_norm_fusion,
     inspect_cogvideox_qk_norm_rope_fusion,
     enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
@@ -21,6 +24,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
     normalize_cogvideox_attention_backend,
     set_cogvideox_attention_backend,
 )
+from sglang.multimodal_gen.runtime.distributed import cleanup_dist_env_and_memory
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import (
     CogVideoXModulationFusedBlock,
     enable_cogvideox_modulation_fusion,
@@ -80,6 +84,12 @@ class _DummyCogVideoXBlockModule(nn.Module):
 
 
 class TestVividVRAttentionBackend(unittest.TestCase):
+    def tearDown(self):
+        try:
+            cleanup_dist_env_and_memory()
+        except Exception:
+            pass
+
     @staticmethod
     def _make_image_rotary_emb(
         seq_len: int = 8, head_dim: int = 64
@@ -165,8 +175,10 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             encoder_hidden_states=encoder_hidden_states,
         )
 
-        self.assertEqual(inspect_cogvideox_qkv_fusion(module), "diffusers_fused_linear")
-        self.assertIsInstance(attn.to_qkv, nn.Linear)
+        self.assertEqual(
+            inspect_cogvideox_qkv_fusion(module),
+            "sglang_merged_column_linear",
+        )
         self.assertEqual(expected[0], actual[0])
         torch.testing.assert_close(actual[1], expected[1])
         torch.testing.assert_close(actual[2], expected[2])
@@ -204,6 +216,38 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         torch.testing.assert_close(actual[2], expected[2])
         torch.testing.assert_close(actual[3], expected[3])
 
+    def test_qk_norm_fusion_matches_unfused_path_with_exact_rope(self):
+        module = _DummyCogVideoXAttentionModule()
+        attn = module.attn.eval()
+
+        hidden_states = torch.randn(1, 8, 128)
+        encoder_hidden_states = torch.randn(1, 4, 128)
+        image_rotary_emb = self._make_image_rotary_emb()
+
+        expected = _prepare_cogvideox_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        enable_cogvideox_qk_norm_fusion(module)
+        actual = _prepare_cogvideox_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+        self.assertEqual(
+            inspect_cogvideox_qk_norm_fusion(module),
+            "sglang_layernorm",
+        )
+        self.assertEqual(expected[0], actual[0])
+        torch.testing.assert_close(actual[1], expected[1])
+        torch.testing.assert_close(actual[2], expected[2])
+        torch.testing.assert_close(actual[3], expected[3])
+
     def test_vividvr_pipeline_applies_qkv_fusion_to_requested_runtime_modules(self):
         pipeline = object.__new__(VividVRPipeline)
         transformer = _PipelineHookModule()
@@ -231,14 +275,57 @@ class TestVividVRAttentionBackend(unittest.TestCase):
 
         self.assertEqual(
             inspect_cogvideox_qkv_fusion(transformer),
-            "diffusers_fused_linear",
+            "sglang_merged_column_linear",
         )
         self.assertIsNone(inspect_cogvideox_qkv_fusion(controlnet))
         self.assertEqual(
-            debug["qkv_fusion_transformer"], "diffusers_fused_linear"
+            debug["qkv_fusion_transformer"], "sglang_merged_column_linear"
         )
         self.assertIsNone(debug["qkv_fusion_controlnet"])
         self.assertEqual(debug["qkv_fusion_targets"], ["transformer"])
+
+    def test_vividvr_pipeline_applies_qk_norm_fusion_to_requested_runtime_modules(self):
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        controlnet = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+
+        pipeline._apply_qk_norm_fusion(
+            SimpleNamespace(
+                enable_cogvideox_qk_norm_fusion=True,
+                attention_backend="fa",
+                cogvideox_qk_norm_fusion_targets="transformer",
+            )
+        )
+        debug = pipeline._build_runtime_acceleration_debug(
+            SimpleNamespace(
+                attention_backend="fa",
+                enable_torch_compile=False,
+                enable_cogvideox_qkv_fusion=False,
+                cogvideox_qkv_fusion_targets="transformer",
+                enable_cogvideox_qk_norm_fusion=True,
+                cogvideox_qk_norm_fusion_targets="transformer",
+                enable_cogvideox_qk_norm_rope_fusion=False,
+                cogvideox_qk_norm_rope_fusion_targets="transformer",
+                enable_cogvideox_modulation_fusion=False,
+                cogvideox_modulation_fusion_targets="transformer",
+            )
+        )
+
+        self.assertEqual(
+            inspect_cogvideox_qk_norm_fusion(transformer),
+            "sglang_layernorm",
+        )
+        self.assertIsNone(inspect_cogvideox_qk_norm_fusion(controlnet))
+        self.assertEqual(
+            debug["qk_norm_fusion_transformer"],
+            "sglang_layernorm",
+        )
+        self.assertIsNone(debug["qk_norm_fusion_controlnet"])
+        self.assertEqual(debug["qk_norm_fusion_targets"], ["transformer"])
 
     def test_vividvr_pipeline_can_apply_qkv_fusion_to_both_runtime_modules(self):
         pipeline = object.__new__(VividVRPipeline)
@@ -267,20 +354,60 @@ class TestVividVRAttentionBackend(unittest.TestCase):
 
         self.assertEqual(
             inspect_cogvideox_qkv_fusion(transformer),
-            "diffusers_fused_linear",
+            "sglang_merged_column_linear",
         )
         self.assertEqual(
             inspect_cogvideox_qkv_fusion(controlnet),
-            "diffusers_fused_linear",
+            "sglang_merged_column_linear",
         )
         self.assertEqual(
-            debug["qkv_fusion_transformer"], "diffusers_fused_linear"
+            debug["qkv_fusion_transformer"], "sglang_merged_column_linear"
         )
         self.assertEqual(
-            debug["qkv_fusion_controlnet"], "diffusers_fused_linear"
+            debug["qkv_fusion_controlnet"], "sglang_merged_column_linear"
         )
         self.assertEqual(
             debug["qkv_fusion_targets"], ["transformer", "controlnet"]
+        )
+
+    def test_vividvr_pipeline_initializes_single_process_parallel_env_for_qkv_fusion(self):
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": None,
+        }
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.model_parallel_is_initialized",
+            return_value=False,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.maybe_init_distributed_environment_and_model_parallel"
+        ) as init_parallel:
+            pipeline._apply_qkv_fusion(
+                SimpleNamespace(
+                    enable_cogvideox_qkv_fusion=True,
+                    attention_backend="fa",
+                    cogvideox_qkv_fusion_targets="transformer",
+                    master_port=30005,
+                    tp_size=1,
+                    sp_degree=1,
+                    dp_size=1,
+                    enable_cfg_parallel=False,
+                    ulysses_degree=1,
+                    ring_degree=1,
+                    dist_timeout=3600,
+                )
+            )
+
+        init_parallel.assert_called_once_with(
+            tp_size=1,
+            sp_size=1,
+            enable_cfg_parallel=False,
+            ulysses_degree=1,
+            ring_degree=1,
+            dp_size=1,
+            dist_timeout=3600,
         )
 
     def test_vividvr_pipeline_applies_qk_norm_rope_fusion_to_requested_runtime_modules(self):

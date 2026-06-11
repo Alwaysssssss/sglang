@@ -15,7 +15,11 @@ from sglang.multimodal_gen.configs.models.dits.cogvideox import CogVideoXConfig
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipelineConfig
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    maybe_init_distributed_environment_and_model_parallel,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_quant_load_spec,
@@ -26,9 +30,11 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
     CogVideoXVividVRTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    enable_cogvideox_qk_norm_fusion,
     enable_cogvideox_qk_norm_rope_fusion,
     enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
+    inspect_cogvideox_qk_norm_fusion,
     inspect_cogvideox_qk_norm_rope_fusion,
     inspect_cogvideox_qkv_fusion,
     normalize_cogvideox_attention_backend,
@@ -151,6 +157,12 @@ def _inspect_module_qk_norm_rope_fusion(module: nn.Module | None) -> str | None:
     return inspect_cogvideox_qk_norm_rope_fusion(module)
 
 
+def _inspect_module_qk_norm_fusion(module: nn.Module | None) -> str | None:
+    if module is None:
+        return None
+    return inspect_cogvideox_qk_norm_fusion(module)
+
+
 def _inspect_module_modulation_fusion(module: nn.Module | None) -> str | None:
     if module is None:
         return None
@@ -186,8 +198,77 @@ def _normalize_qk_norm_rope_fusion_targets(value: object) -> tuple[str, ...]:
     return _normalize_component_targets(value)
 
 
+def _normalize_qk_norm_fusion_targets(value: object) -> tuple[str, ...]:
+    return _normalize_component_targets(value)
+
+
 def _normalize_modulation_fusion_targets(value: object) -> tuple[str, ...]:
     return _normalize_component_targets(value)
+
+
+def _ensure_single_process_model_parallel_env(server_args: ServerArgs) -> None:
+    if model_parallel_is_initialized():
+        return
+
+    master_port = int(getattr(server_args, "master_port", 30005))
+    tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+    sp_degree = int(getattr(server_args, "sp_degree", 1) or 1)
+    dp_size = int(getattr(server_args, "dp_size", 1) or 1)
+    ulysses_degree = int(getattr(server_args, "ulysses_degree", 1) or 1)
+    ring_degree = int(getattr(server_args, "ring_degree", 1) or 1)
+    dist_timeout = getattr(server_args, "dist_timeout", 3600)
+    enable_cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", str(master_port))
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=tp_size,
+        sp_size=sp_degree,
+        enable_cfg_parallel=enable_cfg_parallel,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        dp_size=dp_size,
+        dist_timeout=dist_timeout,
+    )
+
+
+def _requires_model_parallel_runtime(server_args: ServerArgs) -> bool:
+    return any(
+        (
+            int(getattr(server_args, "num_gpus", 1) or 1) > 1,
+            int(getattr(server_args, "tp_size", 1) or 1) > 1,
+            int(getattr(server_args, "sp_degree", 1) or 1) > 1,
+            int(getattr(server_args, "dp_size", 1) or 1) > 1,
+            bool(getattr(server_args, "enable_cfg_parallel", False)),
+        )
+    )
+
+
+def _maybe_initialize_model_parallel_runtime(server_args: ServerArgs) -> None:
+    if model_parallel_is_initialized():
+        return
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if not (world_size > 1 or _requires_model_parallel_runtime(server_args)):
+        return
+
+    if world_size == 1:
+        _ensure_single_process_model_parallel_env(server_args)
+        return
+
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=int(getattr(server_args, "tp_size", 1) or 1),
+        sp_size=int(getattr(server_args, "sp_degree", 1) or 1),
+        enable_cfg_parallel=bool(getattr(server_args, "enable_cfg_parallel", False)),
+        ulysses_degree=int(getattr(server_args, "ulysses_degree", 1) or 1),
+        ring_degree=int(getattr(server_args, "ring_degree", 1) or 1),
+        dp_size=int(getattr(server_args, "dp_size", 1) or 1),
+        dist_timeout=getattr(server_args, "dist_timeout", 3600),
+    )
 
 
 def _maybe_torch_compile_module(
@@ -309,6 +390,22 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "qkv_fusion_transformer": _inspect_module_qkv_fusion(transformer),
             "qkv_fusion_controlnet": _inspect_module_qkv_fusion(controlnet),
+            "qk_norm_fusion_requested": bool(
+                getattr(server_args, "enable_cogvideox_qk_norm_fusion", False)
+            ),
+            "qk_norm_fusion_targets": list(
+                _normalize_qk_norm_fusion_targets(
+                    getattr(
+                        server_args,
+                        "cogvideox_qk_norm_fusion_targets",
+                        "transformer",
+                    )
+                )
+            ),
+            "qk_norm_fusion_transformer": _inspect_module_qk_norm_fusion(
+                transformer
+            ),
+            "qk_norm_fusion_controlnet": _inspect_module_qk_norm_fusion(controlnet),
             "qk_norm_rope_fusion_requested": bool(
                 getattr(server_args, "enable_cogvideox_qk_norm_rope_fusion", False)
             ),
@@ -419,6 +516,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         if not getattr(server_args, "enable_cogvideox_qkv_fusion", False):
             return
 
+        _ensure_single_process_model_parallel_env(server_args)
         resolved_backend = normalize_cogvideox_attention_backend(
             server_args.attention_backend
         )
@@ -462,6 +560,55 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 component_name,
                 fused_modules,
                 _inspect_module_qkv_fusion(component),
+            )
+
+    def _apply_qk_norm_fusion(self, server_args: ServerArgs) -> None:
+        if not getattr(server_args, "enable_cogvideox_qk_norm_fusion", False):
+            return
+
+        resolved_backend = normalize_cogvideox_attention_backend(
+            server_args.attention_backend
+        )
+        if resolved_backend != "fa":
+            logger.warning(
+                "CogVideoX QK-norm fusion is enabled, but the requested backend resolves to %s. "
+                "Phase E3 acceleration is currently consumed by the custom flash-attention path.",
+                resolved_backend,
+            )
+        target_components = set(
+            _normalize_qk_norm_fusion_targets(
+                getattr(
+                    server_args,
+                    "cogvideox_qk_norm_fusion_targets",
+                    "transformer",
+                )
+            )
+        )
+
+        components = {
+            "transformer": self.get_module("transformer"),
+            "controlnet": self.get_module("controlnet"),
+        }
+        for component_name, component in components.items():
+            if component_name not in target_components:
+                logger.info(
+                    "Skipping CogVideoX QK-norm fusion for VividVR %s because it is not in the requested targets=%s.",
+                    component_name,
+                    sorted(target_components),
+                )
+                continue
+            if component is None:
+                logger.warning(
+                    "Skipping CogVideoX QK-norm fusion for %s because the component is not loaded.",
+                    component_name,
+                )
+                continue
+            fused_modules = enable_cogvideox_qk_norm_fusion(component)
+            logger.info(
+                "Enabled CogVideoX QK-norm fusion on VividVR %s; attention_modules=%s, effective_impl=%s.",
+                component_name,
+                fused_modules,
+                _inspect_module_qk_norm_fusion(component),
             )
 
     def _apply_qk_norm_rope_fusion(self, server_args: ServerArgs) -> None:
@@ -572,6 +719,8 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             self.add_module(component_name, compiled_component)
 
     def initialize_pipeline(self, server_args: ServerArgs):
+        _maybe_initialize_model_parallel_runtime(server_args)
+
         vivid_root = Path(
             server_args.component_paths.get(
                 "vividvr",
@@ -671,6 +820,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_module("transformer", transformer)
         self.add_module("controlnet", controlnet)
         self._apply_attention_backend(server_args)
+        self._apply_qk_norm_fusion(server_args)
         self._apply_qk_norm_rope_fusion(server_args)
         self._apply_modulation_fusion(server_args)
         self._apply_qkv_fusion(server_args)

@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import sys
+import sysconfig
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     prepare_request,
 )
+from sglang.multimodal_gen.runtime.distributed import cleanup_dist_env_and_memory
 from sglang.multimodal_gen.runtime.pipelines_core import build_pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.videoedit.compare import compare_videos
@@ -31,6 +33,133 @@ DEFAULT_PROMPT_FILE = VIVIDVR_ROOT / "input" / "720p" / "prompt.txt"
 ACCEPTANCE_ROOT = Path("/home/zhiheng/sglang/Vivid_Acceptance")
 DEFAULT_REPORT_DIR = ACCEPTANCE_ROOT / "indicator"
 DEFAULT_OUTPUT_DIR = ACCEPTANCE_ROOT / "result_videos"
+
+
+def _cleanup_local_distributed_runtime() -> None:
+    try:
+        cleanup_dist_env_and_memory()
+    except Exception:
+        # Best-effort teardown avoids leaked single-process NCCL groups after QKV fusion setup.
+        pass
+
+
+def _synchronize_ranks_before_cleanup() -> None:
+    if not torch.distributed.is_available():
+        return
+    if not torch.distributed.is_initialized():
+        return
+
+    try:
+        if torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
+    except Exception as exc:
+        print(
+            "[VividVR] warning: distributed barrier before cleanup failed: "
+            f"{exc}"
+        )
+
+
+def _distributed_rank_snapshot() -> dict[str, int]:
+    return {
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "rank": int(os.environ.get("RANK", "0")),
+        "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+    }
+
+
+def _is_primary_rank() -> bool:
+    return _distributed_rank_snapshot()["rank"] == 0
+
+
+def _prepend_env_path(env_name: str, value: Path) -> None:
+    value_str = str(value)
+    existing = os.environ.get(env_name)
+    if existing is None or existing == "":
+        os.environ[env_name] = value_str
+        return
+
+    segments = [segment for segment in existing.split(os.pathsep) if segment]
+    if value_str not in segments:
+        os.environ[env_name] = os.pathsep.join([value_str, *segments])
+
+
+def _candidate_python_dev_include_dirs() -> list[Path]:
+    version_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"{sys.version_info.major}{sys.version_info.minor}"
+    home = Path.home()
+    candidates: list[Path] = []
+
+    env_override = os.environ.get("SGLANG_PYTHON_DEV_INCLUDE")
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+
+    for value in (
+        sysconfig.get_config_var("INCLUDEPY"),
+        sysconfig.get_path("include"),
+        sysconfig.get_path("platinclude"),
+    ):
+        if value:
+            candidates.append(Path(value))
+
+    candidates.extend(
+        [
+            Path(sys.prefix) / "include" / version_tag,
+            Path(sys.base_prefix) / "include" / version_tag,
+            home / f"tmp_py{compact_version}dev" / "extracted" / "usr" / "include" / version_tag,
+            home
+            / f"tmp_py{compact_version}_headers"
+            / "extracted"
+            / f"libpython{major_minor}-dev"
+            / "usr"
+            / "include"
+            / version_tag,
+        ]
+    )
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str not in seen:
+            seen.add(candidate_str)
+            deduped.append(candidate)
+    return deduped
+
+
+def _python_dev_extra_include_dirs(include_dir: Path) -> list[Path]:
+    extras = [include_dir]
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    if multiarch:
+        multiarch_dir = include_dir.parent / multiarch / include_dir.name
+        if multiarch_dir.is_dir() and (multiarch_dir / "pyconfig.h").is_file():
+            extras.append(include_dir.parent)
+    return extras
+
+
+def _ensure_python_dev_headers_for_torch_compile() -> Path | None:
+    configured_include = sysconfig.get_config_var("INCLUDEPY")
+    if configured_include:
+        configured_path = Path(configured_include)
+        if configured_path.is_dir() and (configured_path / "Python.h").is_file():
+            return configured_path
+
+    for candidate in _candidate_python_dev_include_dirs():
+        if candidate.is_dir() and (candidate / "Python.h").is_file():
+            for include_dir in _python_dev_extra_include_dirs(candidate):
+                _prepend_env_path("CPATH", include_dir)
+                _prepend_env_path("C_INCLUDE_PATH", include_dir)
+            print(
+                "[VividVR] torch.compile_python_include="
+                f"{os.environ.get('CPATH')}"
+            )
+            return candidate
+
+    print(
+        "[VividVR] warning: torch.compile Python headers were not found; "
+        "Triton compilation may fail."
+    )
+    return None
 
 
 def _json_ready(value: Any) -> Any:
@@ -97,6 +226,21 @@ def build_runtime_config_snapshot(
         ),
         "qkv_fusion_transformer": debug.get("qkv_fusion_transformer"),
         "qkv_fusion_controlnet": debug.get("qkv_fusion_controlnet"),
+        "enable_cogvideox_qk_norm_fusion": bool(
+            getattr(server_args, "enable_cogvideox_qk_norm_fusion", False)
+        ),
+        "cogvideox_qk_norm_fusion_targets": _json_ready(
+            debug.get(
+                "qk_norm_fusion_targets",
+                getattr(
+                    server_args,
+                    "cogvideox_qk_norm_fusion_targets",
+                    "transformer",
+                ),
+            )
+        ),
+        "qk_norm_fusion_transformer": debug.get("qk_norm_fusion_transformer"),
+        "qk_norm_fusion_controlnet": debug.get("qk_norm_fusion_controlnet"),
         "enable_cogvideox_qk_norm_rope_fusion": bool(
             getattr(server_args, "enable_cogvideox_qk_norm_rope_fusion", False)
         ),
@@ -130,6 +274,11 @@ def build_runtime_config_snapshot(
         "attn_metadata_enabled": bool(debug.get("attn_metadata_enabled", False)),
         "attn_metadata_backend": debug.get("attn_metadata_backend"),
         "attn_metadata_builder": debug.get("attn_metadata_builder"),
+        "enable_sequence_shard": bool(debug.get("enable_sequence_shard", False)),
+        "sp_sequence_shard_strategy": debug.get("sp_sequence_shard_strategy"),
+        "sp_sequence_tokens_global": debug.get("sp_sequence_tokens_global"),
+        "sp_sequence_tokens_local": debug.get("sp_sequence_tokens_local"),
+        "sp_sequence_tokens_pad": debug.get("sp_sequence_tokens_pad"),
         "vividvr_vae_decode_tiling_requested": getattr(
             args, "use_vividvr_vae_decode_tiling", None
         ),
@@ -198,11 +347,16 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         pipeline_class_name="CogVideoXVividVRControlNetPipeline",
         pipeline_config=pipeline_config,
         component_paths={"vividvr": str(args.vividvr_ckpt_path)},
-        num_gpus=1,
-        tp_size=1,
-        dp_size=1,
-        dp_degree=1,
-        sp_degree=1,
+        num_gpus=args.num_gpus,
+        tp_size=args.tp_size,
+        dp_size=args.dp_size,
+        dp_degree=args.dp_degree,
+        sp_degree=args.sp_degree,
+        ulysses_degree=args.ulysses_degree,
+        ring_degree=args.ring_degree,
+        enable_cfg_parallel=args.enable_cfg_parallel,
+        master_port=args.master_port,
+        dist_timeout=args.dist_timeout,
         attention_backend=args.attention_backend,
         attention_backend_config=args.attention_backend_config,
         dit_cpu_offload=args.dit_cpu_offload,
@@ -213,6 +367,8 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         cogvideox_modulation_fusion_targets=args.cogvideox_modulation_fusion_targets,
         enable_cogvideox_qkv_fusion=args.enable_cogvideox_qkv_fusion,
         cogvideox_qkv_fusion_targets=args.cogvideox_qkv_fusion_targets,
+        enable_cogvideox_qk_norm_fusion=args.enable_cogvideox_qk_norm_fusion,
+        cogvideox_qk_norm_fusion_targets=args.cogvideox_qk_norm_fusion_targets,
         enable_cogvideox_qk_norm_rope_fusion=(
             args.enable_cogvideox_qk_norm_rope_fusion
         ),
@@ -434,6 +590,66 @@ def parse_args() -> argparse.Namespace:
         help="Optional attention backend config string or JSON path.",
     )
     parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Total GPU count for the VividVR runtime. Under torchrun this should match WORLD_SIZE.",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=None,
+        help="Tensor parallel degree. E4.1 formal runs should keep this at 1.",
+    )
+    parser.add_argument(
+        "--sp-degree",
+        type=int,
+        default=None,
+        help="Sequence parallel degree. Defaults to remaining GPUs after TP/DP accounting.",
+    )
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=None,
+        help="Ulysses sequence-parallel degree. Defaults to sp_degree when ring_degree is unset.",
+    )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=None,
+        help="Ring sequence-parallel degree. E4.1 formal runs should keep this at 1.",
+    )
+    parser.add_argument(
+        "--enable-cfg-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable classifier-free-guidance parallelism.",
+    )
+    parser.add_argument(
+        "--dp-size",
+        type=int,
+        default=1,
+        help="Data parallel degree. DP is not supported for VividVR E4.1 and should remain 1.",
+    )
+    parser.add_argument(
+        "--dp-degree",
+        type=int,
+        default=1,
+        help="Legacy DP degree field mirrored into ServerArgs for runtime snapshots.",
+    )
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=30005,
+        help="torch.distributed master port. Under torchrun this should match MASTER_PORT if explicitly set.",
+    )
+    parser.add_argument(
+        "--dist-timeout",
+        type=int,
+        default=3600,
+        help="torch.distributed timeout in seconds.",
+    )
+    parser.add_argument(
         "--use-runai-model-streamer",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -476,7 +692,19 @@ def parse_args() -> argparse.Namespace:
         help="Enable CogVideoX/VividVR QK LayerNorm + image RoPE acceleration on the native pipeline.",
     )
     parser.add_argument(
+        "--enable-cogvideox-qk-norm-fusion",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable CogVideoX/VividVR QK LayerNorm acceleration while preserving exact image RoPE.",
+    )
+    parser.add_argument(
         "--cogvideox-qk-norm-rope-fusion-targets",
+        type=str,
+        default="transformer",
+        help="Comma-separated VividVR components to accelerate for Phase E3. Supported: transformer,controlnet.",
+    )
+    parser.add_argument(
+        "--cogvideox-qk-norm-fusion-targets",
         type=str,
         default="transformer",
         help="Comma-separated VividVR components to accelerate for Phase E3. Supported: transformer,controlnet.",
@@ -612,6 +840,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--num-temporal-process-frames must be positive")
     if args.allow_frame_count_delta < 0:
         raise SystemExit("--allow-frame-count-delta must be >= 0")
+    if args.num_gpus <= 0:
+        raise SystemExit("--num-gpus must be positive")
+    if args.dp_size <= 0:
+        raise SystemExit("--dp-size must be positive")
+    if args.dp_degree <= 0:
+        raise SystemExit("--dp-degree must be positive")
+    if args.tp_size is not None and args.tp_size <= 0:
+        raise SystemExit("--tp-size must be positive when provided")
+    if args.sp_degree is not None and args.sp_degree <= 0:
+        raise SystemExit("--sp-degree must be positive when provided")
+    if args.ulysses_degree is not None and args.ulysses_degree <= 0:
+        raise SystemExit("--ulysses-degree must be positive when provided")
+    if args.ring_degree is not None and args.ring_degree <= 0:
+        raise SystemExit("--ring-degree must be positive when provided")
+    if args.dist_timeout <= 0:
+        raise SystemExit("--dist-timeout must be positive")
+
+    rank_snapshot = _distributed_rank_snapshot()
+    if rank_snapshot["world_size"] > 1 and args.num_gpus != rank_snapshot["world_size"]:
+        raise SystemExit(
+            "--num-gpus must match WORLD_SIZE under torchrun: "
+            f"num_gpus={args.num_gpus}, WORLD_SIZE={rank_snapshot['world_size']}"
+        )
 
 
 def build_artifact_prefix(args: argparse.Namespace) -> str:
@@ -683,14 +934,25 @@ def build_dry_run_payload(
         "cogvideox_modulation_fusion_targets": args.cogvideox_modulation_fusion_targets,
         "enable_cogvideox_qkv_fusion": args.enable_cogvideox_qkv_fusion,
         "cogvideox_qkv_fusion_targets": args.cogvideox_qkv_fusion_targets,
-        "num_gpus": 1,
-        "tp_size": 1,
-        "dp_size": 1,
-        "dp_degree": 1,
-        "sp_degree": 1,
-        "ulysses_degree": 1,
-        "ring_degree": 1,
-        "enable_cfg_parallel": False,
+        "enable_cogvideox_qk_norm_fusion": args.enable_cogvideox_qk_norm_fusion,
+        "cogvideox_qk_norm_fusion_targets": args.cogvideox_qk_norm_fusion_targets,
+        "enable_cogvideox_qk_norm_rope_fusion": (
+            args.enable_cogvideox_qk_norm_rope_fusion
+        ),
+        "cogvideox_qk_norm_rope_fusion_targets": (
+            args.cogvideox_qk_norm_rope_fusion_targets
+        ),
+        "num_gpus": args.num_gpus,
+        "tp_size": args.tp_size,
+        "dp_size": args.dp_size,
+        "dp_degree": args.dp_degree,
+        "sp_degree": args.sp_degree,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "enable_cfg_parallel": args.enable_cfg_parallel,
+        "master_port": args.master_port,
+        "dist_timeout": args.dist_timeout,
+        "distributed_env": _distributed_rank_snapshot(),
         "warmup": args.warmup,
         "warmup_steps": args.warmup_steps,
         "disable_autocast": args.disable_autocast,
@@ -699,205 +961,222 @@ def build_dry_run_payload(
 
 
 def main() -> int:
-    total_start_time = time.perf_counter()
-    args = parse_args()
-    validate_args(args)
+    try:
+        total_start_time = time.perf_counter()
+        args = parse_args()
+        validate_args(args)
 
-    os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    os.environ.setdefault("SGLANG_DIFFUSION_STAGE_LOGGING", "1")
-    if args.use_runai_model_streamer is not None:
-        os.environ["SGLANG_USE_RUNAI_MODEL_STREAMER"] = (
-            "1" if args.use_runai_model_streamer else "0"
-        )
+        os.environ.setdefault("PYTHONUNBUFFERED", "1")
+        os.environ.setdefault("SGLANG_DIFFUSION_STAGE_LOGGING", "1")
+        if args.use_runai_model_streamer is not None:
+            os.environ["SGLANG_USE_RUNAI_MODEL_STREAMER"] = (
+                "1" if args.use_runai_model_streamer else "0"
+            )
+        if args.enable_torch_compile:
+            _ensure_python_dev_headers_for_torch_compile()
 
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output_file_name = build_output_file_name(args, run_id)
-    candidate_path = args.output_dir / output_file_name
-    report_path = build_report_path(args, run_id)
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_file_name = build_output_file_name(args, run_id)
+        candidate_path = args.output_dir / output_file_name
+        report_path = build_report_path(args, run_id)
 
-    print(f"[VividVR] run_id={run_id}")
-    print(f"[VividVR] input_video={args.input_video}")
-    print(
-        "[VividVR] caption_source="
-        f"{'caption_file' if args.caption_file is not None else 'prompt_file'}"
-    )
-    print(f"[VividVR] candidate_video={candidate_path}")
-    if report_path is not None:
-        print(f"[VividVR] report_path={report_path}")
-    if args.reference_video is not None:
-        print(f"[VividVR] reference_video={args.reference_video}")
-
-    if args.dry_run:
-        payload = build_dry_run_payload(
-            args,
-            candidate_path=candidate_path,
-            report_path=report_path,
-            run_id=run_id,
-        )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
-
-    if (
-        args.reference_video is not None
-        and not args.reference_video.exists()
-        and args.wait_for_reference_seconds <= 0
-    ):
-        raise SystemExit(
-            "Reference video does not exist and no wait window was provided: "
-            f"{args.reference_video}"
-        )
-
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required for VividVR inference")
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    if report_path is not None:
-        args.report_dir.mkdir(parents=True, exist_ok=True)
-
-    server_args = build_server_args(args)
-    pipeline = build_pipeline(server_args)
-    request = build_request(
-        server_args=server_args,
-        args=args,
-        output_file_name=output_file_name,
-    )
-
-    if args.warmup:
-        warmup_request = request.copy_as_warmup(args.warmup_steps)
+        print(f"[VividVR] run_id={run_id}")
+        print(f"[VividVR] input_video={args.input_video}")
         print(
-            "[VividVR] warmup_enabled=true "
-            f"warmup_steps={args.warmup_steps}"
-        )
-        pipeline.forward(warmup_request, server_args)
-
-    model_inference_start_time = time.perf_counter()
-    result = pipeline.forward(request, server_args)
-    model_inference_runtime_seconds = round(
-        time.perf_counter() - model_inference_start_time, 6
-    )
-    request_metrics = build_request_metrics_payload(
-        result, model_inference_runtime_seconds
-    )
-
-    reference_video_for_save = None
-    if args.reference_video is not None and args.reference_video.exists():
-        reference_video_for_save = str(args.reference_video)
-
-    post_process_sample(
-        result.output,
-        DataType.VIDEO,
-        int(result.fps),
-        save_output=True,
-        save_file_path=str(candidate_path),
-        video_reference_path=reference_video_for_save,
-    )
-
-    debug = result.extra.get("vividvr_debug", {})
-    runtime_config = build_runtime_config_snapshot(
-        args=args,
-        server_args=server_args,
-        debug=debug,
-    )
-    metrics_record: dict[str, Any] = {
-        "phase": args.phase_label,
-        "mode": args.mode_label,
-        "run_id": run_id,
-        "run_datetime_utc": datetime.now(timezone.utc).isoformat(),
-        "command": build_recorded_command(),
-        "total_runtime_seconds": round(time.perf_counter() - total_start_time, 6),
-        "model_inference_runtime_seconds": model_inference_runtime_seconds,
-        "seed": args.seed,
-        "num_inference_steps": args.num_inference_steps,
-        "guidance_scale": args.guidance_scale,
-        "restoration_guidance_scale": args.restoration_guidance_scale,
-        "num_temporal_process_frames": args.num_temporal_process_frames,
-        "dtype": args.dtype,
-        "prompt_path": str(args.prompt_file) if args.prompt_file is not None else None,
-        "caption_file_path": str(args.caption_file) if args.caption_file is not None else None,
-        "caption_source": "caption_file" if args.caption_file is not None else "prompt_file",
-        "input_video_path": str(args.input_video),
-        "reference_video_path": (
-            str(args.reference_video) if args.reference_video is not None else None
-        ),
-        "candidate_video_path": str(candidate_path),
-        "compare_enabled": args.reference_video is not None,
-        "runtime_config": runtime_config,
-        "request_metrics": request_metrics,
-        "stage_metrics_ms": None if request_metrics is None else request_metrics["stages"],
-        "denoising_step_metrics_ms": (
-            None if request_metrics is None else request_metrics["steps"]
-        ),
-        "request_metrics_total_duration_ms": (
-            None
-            if request_metrics is None
-            else request_metrics["total_duration_ms"]
-        ),
-        "summary": None,
-        "frames": None,
-        "reference_frame_count": None,
-        "candidate_frame_count": None,
-        "frame_count_delta": None,
-        "failed_frame_ratio": None,
-        "debug": debug,
-    }
-
-    exit_code = 0
-    if args.reference_video is not None:
-        wait_for_reference_video(
-            reference_video=args.reference_video,
-            wait_for_reference_seconds=args.wait_for_reference_seconds,
-            reference_poll_seconds=args.reference_poll_seconds,
-        )
-        report = compare_videos(
-            str(args.reference_video),
-            str(candidate_path),
-            min_ssim=args.min_ssim,
-            max_mse=args.max_mse,
-            max_mae=args.max_mae,
-            allow_frame_count_delta=args.allow_frame_count_delta,
-            max_failed_frame_ratio=args.max_failed_frame_ratio,
-        )
-        summary = report["summary"]
-        reference_frame_count = int(summary["reference_frame_count"])
-        candidate_frame_count = int(summary["candidate_frame_count"])
-        failed_frame_ratio = (
-            len(summary["failed_frames"]) / summary["compared_frames"]
-            if summary["compared_frames"] > 0
-            else 1.0
-        )
-
-        metrics_record.update(
-            {
-                "summary": summary,
-                "frames": report["frames"],
-                "reference_frame_count": reference_frame_count,
-                "candidate_frame_count": candidate_frame_count,
-                "frame_count_delta": abs(
-                    reference_frame_count - candidate_frame_count
-                ),
-                "failed_frame_ratio": failed_frame_ratio,
-                "pass_compare": bool(summary["pass_compare"]),
-            }
+            "[VividVR] distributed "
+            f"world_size={_distributed_rank_snapshot()['world_size']} "
+            f"rank={_distributed_rank_snapshot()['rank']} "
+            f"local_rank={_distributed_rank_snapshot()['local_rank']}"
         )
         print(
-            "[VividVR] summary "
-            f"pass_compare={summary['pass_compare']} "
-            f"ssim_min={summary['ssim_min']:.6f} "
-            f"mse_max={summary['mse_max']:.6f} "
-            f"mae_max={summary['mae_max']:.6f} "
-            f"failed_frame_ratio={failed_frame_ratio:.6f}"
+            "[VividVR] caption_source="
+            f"{'caption_file' if args.caption_file is not None else 'prompt_file'}"
         )
-        exit_code = 0 if summary["pass_compare"] else 1
-    else:
-        metrics_record["pass_compare"] = None
-        print("[VividVR] summary compare_disabled reference_video=None")
+        print(f"[VividVR] candidate_video={candidate_path}")
+        if report_path is not None:
+            print(f"[VividVR] report_path={report_path}")
+        if args.reference_video is not None:
+            print(f"[VividVR] reference_video={args.reference_video}")
 
-    if report_path is not None:
-        report_path.write_text(json.dumps(metrics_record, indent=2), encoding="utf-8")
-        print(f"[VividVR] report saved to {report_path}")
-    print(f"[VividVR] candidate saved to {candidate_path}")
+        if args.dry_run:
+            payload = build_dry_run_payload(
+                args,
+                candidate_path=candidate_path,
+                report_path=report_path,
+                run_id=run_id,
+            )
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
 
-    return exit_code
+        if (
+            args.reference_video is not None
+            and not args.reference_video.exists()
+            and args.wait_for_reference_seconds <= 0
+        ):
+            raise SystemExit(
+                "Reference video does not exist and no wait window was provided: "
+                f"{args.reference_video}"
+            )
+
+        if not torch.cuda.is_available():
+            raise SystemExit("CUDA is required for VividVR inference")
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        if report_path is not None:
+            args.report_dir.mkdir(parents=True, exist_ok=True)
+
+        server_args = build_server_args(args)
+        pipeline = build_pipeline(server_args)
+        request = build_request(
+            server_args=server_args,
+            args=args,
+            output_file_name=output_file_name,
+        )
+
+        if args.warmup:
+            warmup_request = request.copy_as_warmup(args.warmup_steps)
+            print(
+                "[VividVR] warmup_enabled=true "
+                f"warmup_steps={args.warmup_steps}"
+            )
+            pipeline.forward(warmup_request, server_args)
+
+        model_inference_start_time = time.perf_counter()
+        result = pipeline.forward(request, server_args)
+        model_inference_runtime_seconds = round(
+            time.perf_counter() - model_inference_start_time, 6
+        )
+        request_metrics = build_request_metrics_payload(
+            result, model_inference_runtime_seconds
+        )
+
+        reference_video_for_save = None
+        if args.reference_video is not None and args.reference_video.exists():
+            reference_video_for_save = str(args.reference_video)
+
+        if _is_primary_rank():
+            post_process_sample(
+                result.output,
+                DataType.VIDEO,
+                int(result.fps),
+                save_output=True,
+                save_file_path=str(candidate_path),
+                video_reference_path=reference_video_for_save,
+            )
+
+        debug = result.extra.get("vividvr_debug", {})
+        runtime_config = build_runtime_config_snapshot(
+            args=args,
+            server_args=server_args,
+            debug=debug,
+        )
+        metrics_record: dict[str, Any] = {
+            "phase": args.phase_label,
+            "mode": args.mode_label,
+            "run_id": run_id,
+            "run_datetime_utc": datetime.now(timezone.utc).isoformat(),
+            "command": build_recorded_command(),
+            "total_runtime_seconds": round(time.perf_counter() - total_start_time, 6),
+            "model_inference_runtime_seconds": model_inference_runtime_seconds,
+            "seed": args.seed,
+            "num_inference_steps": args.num_inference_steps,
+            "guidance_scale": args.guidance_scale,
+            "restoration_guidance_scale": args.restoration_guidance_scale,
+            "num_temporal_process_frames": args.num_temporal_process_frames,
+            "dtype": args.dtype,
+            "prompt_path": str(args.prompt_file) if args.prompt_file is not None else None,
+            "caption_file_path": str(args.caption_file) if args.caption_file is not None else None,
+            "caption_source": "caption_file" if args.caption_file is not None else "prompt_file",
+            "input_video_path": str(args.input_video),
+            "reference_video_path": (
+                str(args.reference_video) if args.reference_video is not None else None
+            ),
+            "candidate_video_path": str(candidate_path),
+            "compare_enabled": args.reference_video is not None,
+            "runtime_config": runtime_config,
+            "distributed_env": _distributed_rank_snapshot(),
+            "request_metrics": request_metrics,
+            "stage_metrics_ms": None if request_metrics is None else request_metrics["stages"],
+            "denoising_step_metrics_ms": (
+                None if request_metrics is None else request_metrics["steps"]
+            ),
+            "request_metrics_total_duration_ms": (
+                None
+                if request_metrics is None
+                else request_metrics["total_duration_ms"]
+            ),
+            "summary": None,
+            "frames": None,
+            "reference_frame_count": None,
+            "candidate_frame_count": None,
+            "frame_count_delta": None,
+            "failed_frame_ratio": None,
+            "debug": debug,
+        }
+
+        exit_code = 0
+        if _is_primary_rank() and args.reference_video is not None:
+            wait_for_reference_video(
+                reference_video=args.reference_video,
+                wait_for_reference_seconds=args.wait_for_reference_seconds,
+                reference_poll_seconds=args.reference_poll_seconds,
+            )
+            report = compare_videos(
+                str(args.reference_video),
+                str(candidate_path),
+                min_ssim=args.min_ssim,
+                max_mse=args.max_mse,
+                max_mae=args.max_mae,
+                allow_frame_count_delta=args.allow_frame_count_delta,
+                max_failed_frame_ratio=args.max_failed_frame_ratio,
+            )
+            summary = report["summary"]
+            reference_frame_count = int(summary["reference_frame_count"])
+            candidate_frame_count = int(summary["candidate_frame_count"])
+            failed_frame_ratio = (
+                len(summary["failed_frames"]) / summary["compared_frames"]
+                if summary["compared_frames"] > 0
+                else 1.0
+            )
+
+            metrics_record.update(
+                {
+                    "summary": summary,
+                    "frames": report["frames"],
+                    "reference_frame_count": reference_frame_count,
+                    "candidate_frame_count": candidate_frame_count,
+                    "frame_count_delta": abs(
+                        reference_frame_count - candidate_frame_count
+                    ),
+                    "failed_frame_ratio": failed_frame_ratio,
+                    "pass_compare": bool(summary["pass_compare"]),
+                }
+            )
+            print(
+                "[VividVR] summary "
+                f"pass_compare={summary['pass_compare']} "
+                f"ssim_min={summary['ssim_min']:.6f} "
+                f"mse_max={summary['mse_max']:.6f} "
+                f"mae_max={summary['mae_max']:.6f} "
+                f"failed_frame_ratio={failed_frame_ratio:.6f}"
+            )
+            exit_code = 0 if summary["pass_compare"] else 1
+        elif _is_primary_rank():
+            metrics_record["pass_compare"] = None
+            print("[VividVR] summary compare_disabled reference_video=None")
+        else:
+            metrics_record["pass_compare"] = None
+
+        if _is_primary_rank() and report_path is not None:
+            report_path.write_text(json.dumps(metrics_record, indent=2), encoding="utf-8")
+            print(f"[VividVR] report saved to {report_path}")
+        if _is_primary_rank():
+            print(f"[VividVR] candidate saved to {candidate_path}")
+
+        return exit_code
+    finally:
+        _synchronize_ranks_before_cleanup()
+        _cleanup_local_distributed_runtime()
 
 
 if __name__ == "__main__":

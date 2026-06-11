@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
     build_control_feat_proj,
+    shard_vividvr_video_tokens,
     zero_module,
 )
 
@@ -243,6 +244,10 @@ class CogVideoXVividVRControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin)
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
+        hidden_states, image_rotary_emb, _ = shard_vividvr_video_tokens(
+            hidden_states,
+            image_rotary_emb,
+        )
 
         controlnet_inter_states: tuple[torch.Tensor, ...] = ()
         for block in self.transformer_blocks:

@@ -14,6 +14,8 @@ from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
     Connector,
     build_control_feat_proj,
+    gather_vividvr_video_tokens,
+    shard_vividvr_video_tokens,
     zero_module,
 )
 
@@ -170,6 +172,9 @@ class CogVideoXVividVRTransformer3DModel(CogVideoXTransformer3DModel):
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
+        hidden_states, image_rotary_emb, sequence_shard_state = (
+            shard_vividvr_video_tokens(hidden_states, image_rotary_emb)
+        )
 
         for i, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -208,6 +213,10 @@ class CogVideoXVividVRTransformer3DModel(CogVideoXTransformer3DModel):
 
         hidden_states = self.norm_out(hidden_states, temb=emb)
         hidden_states = self.proj_out(hidden_states)
+        hidden_states = gather_vividvr_video_tokens(
+            hidden_states,
+            sequence_shard_state,
+        )
 
         p = self.config.patch_size
         p_t = self.config.patch_size_t

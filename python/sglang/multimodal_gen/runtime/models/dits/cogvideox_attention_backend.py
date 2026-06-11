@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 from diffusers.models.attention import Attention
 from diffusers.models.attention_processor import CogVideoXAttnProcessor2_0
@@ -7,6 +9,7 @@ from diffusers.models.embeddings import apply_rotary_emb
 from torch import nn
 
 from sglang.jit_kernel.diffusion.triton.norm import norm_infer
+from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     flash_attn_func,
 )
@@ -14,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.distributed import model_parallel_is_initialized
 
 _COGVIDEOX_FLASHINFER_ROPE_CACHE: dict[tuple[object, ...], torch.Tensor | None] = {}
 _COGVIDEOX_LAYERNORM_KERNEL_CACHE: dict[tuple[int, torch.dtype, str], bool] = {}
@@ -80,11 +84,12 @@ def _prepare_cogvideox_qkv(
     key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
     value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
+    use_qk_norm_fusion = bool(getattr(attn, "_sglang_enable_qk_norm_fusion", False))
     use_qk_norm_rope_fusion = bool(
         getattr(attn, "_sglang_enable_qk_norm_rope_fusion", False)
     )
 
-    if not use_qk_norm_rope_fusion:
+    if not use_qk_norm_fusion and not use_qk_norm_rope_fusion:
         if attn.norm_q is not None:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
@@ -114,7 +119,7 @@ def _prepare_cogvideox_qkv(
             prefer_sglang_kernel=True,
         )
 
-    if image_rotary_emb is not None:
+    if image_rotary_emb is not None and use_qk_norm_rope_fusion:
         query, key = _apply_cogvideox_image_rope(
             attn=attn,
             query=query,
@@ -123,6 +128,16 @@ def _prepare_cogvideox_qkv(
             image_rotary_emb=image_rotary_emb,
             prefer_sglang_kernel=True,
         )
+    elif image_rotary_emb is not None:
+        query[:, :, text_seq_length:] = apply_rotary_emb(
+            query[:, :, text_seq_length:],
+            image_rotary_emb,
+        )
+        if not attn.is_cross_attention:
+            key[:, :, text_seq_length:] = apply_rotary_emb(
+                key[:, :, text_seq_length:],
+                image_rotary_emb,
+            )
 
     return text_seq_length, query, key, value
 
@@ -454,6 +469,12 @@ def _can_fuse_attention_qkv(attn: Attention) -> bool:
     return all(isinstance(proj, nn.Linear) for proj in projections)
 
 
+def _resolve_single_process_tp_group() -> object | None:
+    if model_parallel_is_initialized():
+        return None
+    return SimpleNamespace(world_size=1, rank_in_group=0)
+
+
 def _enable_attention_qkv_fusion(attn: Attention) -> bool:
     if getattr(attn, "use_fused_qkv", False) and hasattr(attn, "to_qkv"):
         return True
@@ -482,18 +503,44 @@ def _enable_attention_qkv_fusion(attn: Attention) -> bool:
     if getattr(attn, "is_cross_attention", False):
         return False
 
-    attn.fuse_projections(fuse=True)
-    if not hasattr(attn, "to_qkv") or not isinstance(attn.to_qkv, nn.Linear):
-        return False
+    fused_qkv = MergedColumnParallelLinear(
+        input_size=int(attn.to_q.in_features),
+        output_sizes=list(output_sizes),
+        bias=has_bias,
+        gather_output=False,
+        params_dtype=attn.to_q.weight.dtype,
+        prefix="cogvideox_qkv_fusion",
+        tp_group=_resolve_single_process_tp_group(),
+    ).to(device=attn.to_q.weight.device, dtype=attn.to_q.weight.dtype)
 
-    attn.to_qkv = attn.to_qkv.to(
-        device=attn.to_q.weight.device,
-        dtype=attn.to_q.weight.dtype,
-    )
-    attn.to_qkv.eval()
+    with torch.no_grad():
+        fused_qkv.weight_loader(fused_qkv.weight, attn.to_q.weight.detach(), 0)
+        fused_qkv.weight_loader(fused_qkv.weight, attn.to_k.weight.detach(), 1)
+        fused_qkv.weight_loader(fused_qkv.weight, attn.to_v.weight.detach(), 2)
+        if has_bias and fused_qkv.bias is not None:
+            fused_qkv.weight_loader(fused_qkv.bias, attn.to_q.bias.detach(), 0)
+            fused_qkv.weight_loader(fused_qkv.bias, attn.to_k.bias.detach(), 1)
+            fused_qkv.weight_loader(fused_qkv.bias, attn.to_v.bias.detach(), 2)
+
+    attn.to_qkv = fused_qkv.eval()
     attn.use_fused_qkv = True
     attn._sglang_qkv_output_sizes = output_sizes
-    attn._sglang_qkv_fusion_impl = "diffusers_fused_linear"
+    attn._sglang_qkv_fusion_impl = "sglang_merged_column_linear"
+    return True
+
+
+def _enable_attention_qk_norm_fusion(attn: Attention) -> bool:
+    if getattr(attn, "_sglang_enable_qk_norm_fusion", False):
+        return True
+
+    norms = (getattr(attn, "norm_q", None), getattr(attn, "norm_k", None))
+    if all(norm is None for norm in norms):
+        return False
+    if not all(norm is None or isinstance(norm, nn.LayerNorm) for norm in norms):
+        return False
+
+    attn._sglang_enable_qk_norm_fusion = True
+    attn._sglang_qk_norm_fusion_impl = "sglang_layernorm"
     return True
 
 
@@ -524,6 +571,20 @@ def enable_cogvideox_qkv_fusion(module: nn.Module) -> int:
     return applied
 
 
+def enable_cogvideox_qk_norm_fusion(module: nn.Module) -> int:
+    applied = 0
+    for child in module.modules():
+        if isinstance(child, Attention) and _enable_attention_qk_norm_fusion(child):
+            applied += 1
+
+    if applied == 0:
+        raise ValueError(
+            "No compatible diffusers Attention modules were found while enabling CogVideoX QK-norm fusion."
+        )
+
+    return applied
+
+
 def enable_cogvideox_qk_norm_rope_fusion(module: nn.Module) -> int:
     applied = 0
     for child in module.modules():
@@ -543,7 +604,23 @@ def inspect_cogvideox_qkv_fusion(module: nn.Module) -> str | None:
         if not isinstance(child, Attention):
             continue
         if getattr(child, "use_fused_qkv", False) and hasattr(child, "to_qkv"):
-            return str(getattr(child, "_sglang_qkv_fusion_impl", "diffusers_fused_linear"))
+            return str(
+                getattr(
+                    child,
+                    "_sglang_qkv_fusion_impl",
+                    "sglang_merged_column_linear",
+                )
+            )
+    return None
+
+
+def inspect_cogvideox_qk_norm_fusion(module: nn.Module) -> str | None:
+    for child in module.modules():
+        if not isinstance(child, Attention):
+            continue
+        impl = getattr(child, "_sglang_qk_norm_fusion_impl", None)
+        if impl is not None:
+            return str(impl)
     return None
 
 

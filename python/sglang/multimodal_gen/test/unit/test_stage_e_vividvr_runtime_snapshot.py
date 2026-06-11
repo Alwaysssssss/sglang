@@ -35,6 +35,11 @@ class TestVividVRRuntimeSnapshot(unittest.TestCase):
                     "attn_metadata_enabled": True,
                     "attn_metadata_backend": "fa",
                     "attn_metadata_builder": "FlashAttentionMetadataBuilder",
+                    "enable_sequence_shard": True,
+                    "sp_sequence_shard_strategy": "model_native_video_token_shard",
+                    "sp_sequence_tokens_global": 17550,
+                    "sp_sequence_tokens_local": 8775,
+                    "sp_sequence_tokens_pad": 0,
                     "vae_tiling_enabled": True,
                 },
             )
@@ -60,6 +65,14 @@ class TestVividVRRuntimeSnapshot(unittest.TestCase):
             snapshot["attn_metadata_builder"],
             "FlashAttentionMetadataBuilder",
         )
+        self.assertTrue(snapshot["enable_sequence_shard"])
+        self.assertEqual(
+            snapshot["sp_sequence_shard_strategy"],
+            "model_native_video_token_shard",
+        )
+        self.assertEqual(snapshot["sp_sequence_tokens_global"], 17550)
+        self.assertEqual(snapshot["sp_sequence_tokens_local"], 8775)
+        self.assertEqual(snapshot["sp_sequence_tokens_pad"], 0)
         self.assertTrue(snapshot["vae_tiling_enabled"])
 
 

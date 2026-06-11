@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
+    get_sp_group,
     get_world_group,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
@@ -747,6 +748,7 @@ class VividVRDenoisingStage(PipelineStage):
         timesteps: torch.Tensor,
         tiling_infos: list[Any],
     ) -> dict[str, Any]:
+        params = _vividvr_params(batch)
         device = _runtime_compute_device()
         target_dtype = _module_dtype(
             self.transformer,
@@ -811,6 +813,54 @@ class VividVRDenoisingStage(PipelineStage):
                 "vae_tiling_enabled": False,
             }
         )
+        try:
+            sp_group = get_sp_group()
+        except AssertionError:
+            sp_group = None
+        try:
+            world_group = get_world_group()
+        except AssertionError:
+            world_group = None
+        total_video_tokens = (
+            None if image_rotary_emb is None else int(image_rotary_emb[0].shape[0])
+        )
+        sequence_shard_enabled = bool(getattr(params, "enable_sequence_shard", False))
+        sequence_shard_pad = 0
+        sequence_shard_local_tokens = None
+        if (
+            sequence_shard_enabled
+            and sp_group is not None
+            and int(sp_group.world_size) > 1
+            and total_video_tokens is not None
+        ):
+            sequence_shard_pad = (-total_video_tokens) % int(sp_group.world_size)
+            sequence_shard_local_tokens = (
+                total_video_tokens + sequence_shard_pad
+            ) // int(sp_group.world_size)
+        debug.update(
+            {
+                "distributed_world_size": (
+                    None if world_group is None else int(world_group.world_size)
+                ),
+                "distributed_rank": (
+                    None if world_group is None else int(world_group.rank)
+                ),
+                "distributed_local_rank": (
+                    None if world_group is None else int(world_group.local_rank)
+                ),
+                "sp_world_size": None if sp_group is None else int(sp_group.world_size),
+                "sp_rank": None if sp_group is None else int(sp_group.rank_in_group),
+                "enable_sequence_shard": sequence_shard_enabled,
+                "sp_sequence_shard_strategy": (
+                    "model_native_video_token_shard"
+                    if sequence_shard_enabled
+                    else None
+                ),
+                "sp_sequence_tokens_global": total_video_tokens,
+                "sp_sequence_tokens_local": sequence_shard_local_tokens,
+                "sp_sequence_tokens_pad": sequence_shard_pad,
+            }
+        )
 
         return {
             "latents": latents,
@@ -856,9 +906,14 @@ class VividVRDenoisingStage(PipelineStage):
         image_rotary_emb = denoising_state["image_rotary_emb"]
         old_pred_original_sample = denoising_state["old_pred_original_sample"]
         target_dtype = denoising_state["target_dtype"]
-        del server_args
 
         timestep = timesteps[timestep_index]
+        attn_metadata = self._build_runtime_attn_metadata(
+            batch,
+            server_args,
+            timestep_index=timestep_index,
+        )
+        del server_args
         latents_meshgrid = torch.zeros_like(latents)
         old_pred_original_sample_meshgrid = torch.zeros_like(latents)
         weights_meshgrid = torch.zeros_like(latents)
@@ -907,7 +962,7 @@ class VividVRDenoisingStage(PipelineStage):
             )
             with set_forward_context(
                 current_timestep=timestep_index,
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 forward_batch=batch,
             ):
                 control_hidden_states = self.controlnet(
