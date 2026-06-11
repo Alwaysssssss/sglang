@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
@@ -192,6 +193,80 @@ class VideoEditTextEncodingStage(PipelineStage):
         return batch
 
 
+class VideoEditImageEncodingStage(PipelineStage):
+    def __init__(
+        self,
+        image_encoder: torch.nn.Module | None,
+        transformer: torch.nn.Module,
+    ):
+        super().__init__()
+        self.image_encoder = image_encoder
+        self.transformer = transformer
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        params.runtime_image_embeds = None
+        if not params.use_clip:
+            return batch
+        if self.image_encoder is None:
+            raise ValueError(
+                "VideoEdit use_clip=True requires an image_encoder component. "
+                "Provide --image-encoder-path/--component_paths.image_encoder or set use_clip=False."
+            )
+        if params.runtime_window_frames is None or not params.runtime_window_frames:
+            raise ValueError("VideoEdit window frames must be materialized before image encoding")
+        if params.runtime_height is None or params.runtime_width is None:
+            raise ValueError("VideoEdit window must be validated before image encoding")
+
+        device = get_local_torch_device()
+        if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
+            self.image_encoder = self.image_encoder.to(device)
+
+        image = params.runtime_window_frames[0].convert("RGB")
+        image = image.resize((params.runtime_width, params.runtime_height))
+        pixel_values = (
+            torch.from_numpy(np.array(image).astype(np.float32) / 255.0)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
+        pixel_values = pixel_values.mul(2.0).sub(1.0).to(device=device, dtype=torch.float32)
+        pixel_values = F.interpolate(
+            pixel_values,
+            size=(224, 224),
+            mode="bicubic",
+            align_corners=False,
+        )
+        pixel_values = pixel_values.mul(0.5).add(0.5)
+        mean = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 3, 1, 1)
+        std = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 3, 1, 1)
+        pixel_values = (pixel_values - mean) / std
+
+        image_dtype = _module_dtype(self.image_encoder, torch.float32)
+        target_dtype = _module_dtype(
+            self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        )
+        try:
+            outputs = self.image_encoder(
+                pixel_values=pixel_values.to(dtype=image_dtype),
+                **server_args.pipeline_config.image_encoder_extra_args,
+            )
+            image_embeds = server_args.pipeline_config.postprocess_image(outputs)
+            params.runtime_image_embeds = image_embeds.to(device=device, dtype=target_dtype)
+        finally:
+            if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
+                self.image_encoder = self.image_encoder.to("cpu")
+        return batch
+
+
 class VideoEditConditionEncodingStage(PipelineStage):
     def __init__(self, vae: torch.nn.Module):
         super().__init__()
@@ -227,6 +302,7 @@ class VideoEditConditionEncodingStage(PipelineStage):
             params.runtime_window_masks,
             device=device,
             dtype=tensor_dtype,
+            mask_downsample_mode=params.mask_downsample_mode,
         )
         params.runtime_masked_video_tensor = prepared["masked_video_tensor"]
         params.runtime_raw_video_tensor = prepared["video_tensor"]
@@ -254,23 +330,39 @@ class VideoEditConditionEncodingStage(PipelineStage):
 
 class VideoEditLatentPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        del server_args
         params = _videoedit_params(batch)
-        if params.runtime_video_latents is None:
-            raise ValueError("VideoEdit video latents must be prepared before noise")
-        device = params.runtime_video_latents.device
+        shape_source = (
+            params.runtime_video_latents
+            if params.runtime_video_latents is not None
+            else params.runtime_cond_latents
+        )
+        if shape_source is None:
+            raise ValueError("VideoEdit latent shape source must be prepared before noise")
+        device = shape_source.device
         seed = int(params.seed)
         if params.vary_seed_by_window and params.runtime_window_index is not None:
             seed += int(params.runtime_window_index)
-        generator_device = params.generator_device or device.type
+        generator_device = (
+            params.generator_device
+            or getattr(server_args.pipeline_config, "generator_device", None)
+            or device.type
+        )
         generator = torch.Generator(device=generator_device).manual_seed(seed)
         params.runtime_generator = generator
-        params.runtime_noise = torch.randn(
-            params.runtime_video_latents.shape,
-            generator=generator,
-            device=device,
-            dtype=torch.float32,
-        )
+        if generator_device == "cpu":
+            params.runtime_noise = torch.randn(
+                shape_source.shape,
+                generator=generator,
+                device="cpu",
+                dtype=torch.float32,
+            ).to(device=device)
+        else:
+            params.runtime_noise = torch.randn(
+                shape_source.shape,
+                generator=generator,
+                device=device,
+                dtype=torch.float32,
+            )
         params.runtime_latents = params.runtime_noise
         batch.generator = generator
         batch.latents = params.runtime_latents
@@ -317,6 +409,13 @@ class VideoEditLatentInitStage(PipelineStage):
         if params.runtime_timesteps is None:
             raise ValueError("VideoEdit timesteps must be prepared before latent init")
         params.runtime_initial_timestep = params.runtime_timesteps[:1]
+        if params.init_latent_mode == "noise":
+            params.runtime_latents = params.runtime_noise
+            batch.latents = params.runtime_latents
+            batch.raw_latent_shape = tuple(params.runtime_latents.shape)
+            return batch
+        if params.runtime_video_latents is None:
+            raise ValueError("VideoEdit video latents are required for add_noise init")
         params.runtime_latents = self.scheduler.add_noise(
             params.runtime_video_latents.to(dtype=torch.float32),
             params.runtime_noise,
@@ -356,6 +455,11 @@ class VideoEditDenoisingStage(DenoisingStage):
             [V.is_tensor, V.with_dims(5)],
         )
         result.add_check("runtime_prompt_embeds", params.runtime_prompt_embeds, V.is_tensor)
+        result.add_check(
+            "runtime_image_embeds",
+            params.runtime_image_embeds,
+            lambda value: (not params.use_clip) or V.is_tensor(value),
+        )
         result.add_check("runtime_generator", params.runtime_generator, V.generator_or_list_generators)
         result.add_check("runtime_do_cfg", params.runtime_do_cfg, V.bool_value)
         result.add_check(
@@ -383,6 +487,7 @@ class VideoEditDenoisingStage(DenoisingStage):
         timesteps = params.runtime_timesteps
         timesteps_cpu = timesteps.detach().cpu()
         latents = params.runtime_latents
+        image_embeds = params.runtime_image_embeds
 
         self._manage_device_placement(self.transformer, None, server_args)
         batch.do_classifier_free_guidance = bool(params.runtime_do_cfg)
@@ -432,6 +537,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                             hidden_states=latent_model_input,
                             timestep=timestep,
                             encoder_hidden_states=params.runtime_prompt_embeds,
+                            encoder_hidden_states_image=image_embeds,
                         )
 
                     if do_cfg:
@@ -447,6 +553,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                                 hidden_states=latent_model_input,
                                 timestep=timestep,
                                 encoder_hidden_states=params.runtime_negative_prompt_embeds,
+                                encoder_hidden_states_image=image_embeds,
                             )
                         noise_pred = noise_uncond + current_cfg * (
                             noise_pred - noise_uncond

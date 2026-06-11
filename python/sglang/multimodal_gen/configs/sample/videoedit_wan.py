@@ -4,13 +4,17 @@ from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
-from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_1_3b_coefficients
+from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_14b_coefficients
 
 
 DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 VIDEOEDIT_DECODE_MODES = ("eager", "stream")
+VIDEOEDIT_INIT_LATENT_MODES = ("noise", "add_noise")
+VIDEOEDIT_MASK_DOWNSAMPLE_MODES = ("nearest", "nearest-exact")
+VIDEOEDIT_OVERLAP_COMMIT_MODES = ("native_skip", "weighted")
+VIDEOEDIT_TAIL_PADDING_MODES = ("native_reverse_mirror", "reflect")
 
 
 @dataclass
@@ -20,7 +24,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     mask_input_path: str | None = None
     reference_image_path: str | None = None
     infer_len: int = 81
-    overlap: int = 0
+    overlap: int = 9
     strength: float = 1.0
     dtype: str = "bf16"
 
@@ -29,17 +33,23 @@ class WanVideoEditSamplingParams(SamplingParams):
     dynamic_cfg_min: float = 1.0
 
     bbox_padding: int = 0
-    dilate_px: int = 15
-    mask_scale: float = 1.2
-    feather_px: int = 12
-    adain_boundary_dilate: int = 15
+    bbox_expand_scale: float = 0.3
+    dilate_px: int = 0
+    mask_scale: float = 1.0
+    feather_px: int = 0
+    adain_boundary_dilate: int = 0
 
     enable_paste_back: bool = True
     save_crop_only: bool = False
     drop_reference_frame: bool = True
     keep_intermediate_windows: bool = False
-    use_repaired_context: bool = True
+    use_clip: bool = True
+    use_repaired_context: bool = False
     vary_seed_by_window: bool = False
+    init_latent_mode: str = "noise"
+    mask_downsample_mode: str = "nearest"
+    overlap_commit_mode: str = "native_skip"
+    tail_padding_mode: str = "native_reverse_mirror"
     decode_mode: str = "stream"
     progress_path: str | None = None
 
@@ -51,9 +61,9 @@ class WanVideoEditSamplingParams(SamplingParams):
     negative_prompt: str | None = DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.08,
+            teacache_thresh=0.3,
             use_ret_steps=True,
-            coefficients_callback=_wan_1_3b_coefficients,
+            coefficients_callback=_wan_14b_coefficients,
             start_skipping=5,
             end_skipping=1.0,
         )
@@ -69,6 +79,8 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_window_specs: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_accum_frames: Any | None = field(default=None, init=False, repr=False)
     runtime_accum_weights: Any | None = field(default=None, init=False, repr=False)
+    runtime_prev_window_output_frames: list[Any] | None = field(default=None, init=False, repr=False)
+    runtime_prev_window_index: int | None = field(default=None, init=False, repr=False)
     runtime_bbox: tuple[int, int, int, int] | None = field(default=None, init=False, repr=False)
     runtime_crop_h: int | None = field(default=None, init=False, repr=False)
     runtime_crop_w: int | None = field(default=None, init=False, repr=False)
@@ -90,6 +102,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     # Stage runtime tensors
     runtime_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
     runtime_negative_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
+    runtime_image_embeds: Any | None = field(default=None, init=False, repr=False)
     runtime_do_cfg: bool = field(default=False, init=False, repr=False)
     runtime_masked_video_tensor: Any | None = field(default=None, init=False, repr=False)
     runtime_raw_video_tensor: Any | None = field(default=None, init=False, repr=False)
@@ -150,6 +163,26 @@ class WanVideoEditSamplingParams(SamplingParams):
                 "decode_mode must be one of "
                 f"{'/'.join(VIDEOEDIT_DECODE_MODES)}, got {self.decode_mode!r}"
             )
+        if self.init_latent_mode not in VIDEOEDIT_INIT_LATENT_MODES:
+            raise ValueError(
+                "init_latent_mode must be one of "
+                f"{'/'.join(VIDEOEDIT_INIT_LATENT_MODES)}, got {self.init_latent_mode!r}"
+            )
+        if self.mask_downsample_mode not in VIDEOEDIT_MASK_DOWNSAMPLE_MODES:
+            raise ValueError(
+                "mask_downsample_mode must be one of "
+                f"{'/'.join(VIDEOEDIT_MASK_DOWNSAMPLE_MODES)}, got {self.mask_downsample_mode!r}"
+            )
+        if self.overlap_commit_mode not in VIDEOEDIT_OVERLAP_COMMIT_MODES:
+            raise ValueError(
+                "overlap_commit_mode must be one of "
+                f"{'/'.join(VIDEOEDIT_OVERLAP_COMMIT_MODES)}, got {self.overlap_commit_mode!r}"
+            )
+        if self.tail_padding_mode not in VIDEOEDIT_TAIL_PADDING_MODES:
+            raise ValueError(
+                "tail_padding_mode must be one of "
+                f"{'/'.join(VIDEOEDIT_TAIL_PADDING_MODES)}, got {self.tail_padding_mode!r}"
+            )
 
     def _validate_with_pipeline_config(self, pipeline_config):
         super()._validate_with_pipeline_config(pipeline_config)
@@ -180,6 +213,7 @@ class WanVideoEditSamplingParams(SamplingParams):
         self.runtime_num_frames = None
         self.runtime_prompt_embeds = None
         self.runtime_negative_prompt_embeds = None
+        self.runtime_image_embeds = None
         self.runtime_do_cfg = False
         self.runtime_masked_video_tensor = None
         self.runtime_raw_video_tensor = None

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import html
+import re
 
 import torch
 
@@ -8,7 +10,10 @@ from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAECo
 from sglang.multimodal_gen.configs.models.dits.wan_videoedit import (
     WanVideoEditConfig,
 )
-from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.encoders import (
+    BaseEncoderOutput,
+    CLIPVisionConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
@@ -16,6 +21,18 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import t5_postprocess_text
+
+
+def videoedit_prompt_clean(text: str) -> str:
+    try:
+        import ftfy
+
+        text = ftfy.fix_text(text)
+    except ImportError:
+        pass
+    text = html.unescape(html.unescape(text))
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 @dataclass
@@ -28,15 +45,27 @@ class WanVideoEditPipelineConfig(PipelineConfig):
     precision: str = "bf16"
     dit_precision: str = "bf16"
     vae_precision: str = "bf16"
+    generator_device: str | None = "cpu"
     vae_tiling: bool = True
     vae_sp: bool = False
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (T5Config(),)
     )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    image_encoder_config: EncoderConfig = field(default_factory=CLIPVisionConfig)
+    image_encoder_precision: str = "fp32"
+    image_encoder_extra_args: dict = field(
+        default_factory=lambda: dict(output_hidden_states=True)
+    )
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (videoedit_prompt_clean,)
+    )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (t5_postprocess_text,))
     )
+
+    def postprocess_image(self, image):
+        return image.hidden_states[-2]
 
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True

@@ -157,7 +157,7 @@ class VideoRepairRequest(BaseModel):
 
     num_frames: int = -1
     infer_len: int = 81
-    overlap: int = 0
+    overlap: int = 9
     strength: float = 1.0
     num_inference_steps: int = 20
     guidance_scale: float = 5.0
@@ -169,16 +169,24 @@ class VideoRepairRequest(BaseModel):
     dynamic_cfg_min: float = 1.0
 
     bbox_padding: int = 0
-    dilate_px: int = 15
-    mask_scale: float = 1.2
-    feather_px: int = 12
-    adain_boundary_dilate: int = 15
+    bbox_expand_scale: float = 0.3
+    dilate_px: int = 0
+    mask_scale: float = 1.0
+    feather_px: int = 0
+    adain_boundary_dilate: int = 0
     enable_paste_back: bool = True
     save_crop_only: bool = False
     drop_reference_frame: Optional[bool] = None
     keep_intermediate_windows: bool = False
-    use_repaired_context: bool = True
+    use_clip: bool = True
+    use_repaired_context: bool = False
     vary_seed_by_window: bool = False
+    init_latent_mode: Literal["noise", "add_noise"] = "noise"
+    mask_downsample_mode: Literal["nearest", "nearest-exact"] = "nearest"
+    overlap_commit_mode: Literal["native_skip", "weighted"] = "native_skip"
+    tail_padding_mode: Literal["native_reverse_mirror", "reflect"] = (
+        "native_reverse_mirror"
+    )
     decode_mode: Literal["eager", "stream"] = "stream"
     enable_teacache: bool = False
     enable_frame_interpolation: bool = False

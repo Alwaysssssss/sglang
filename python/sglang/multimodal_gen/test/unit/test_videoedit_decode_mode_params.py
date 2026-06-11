@@ -3,10 +3,11 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
+import sglang.multimodal_gen.runtime.entrypoints.openai.video_api as video_api_mod
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
-import sglang.multimodal_gen.runtime.entrypoints.openai.video_api as video_api_mod
+from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_14b_coefficients
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoResponse,
     VideoRepairRequest,
@@ -27,6 +28,30 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
     def test_sampling_params_accept_default_stream_decode_mode(self):
         params = WanVideoEditSamplingParams()
         self.assertEqual(params.decode_mode, "stream")
+        self.assertEqual(params.overlap, 9)
+        self.assertEqual(params.dilate_px, 0)
+        self.assertEqual(params.mask_scale, 1.0)
+        self.assertEqual(params.feather_px, 0)
+        self.assertEqual(params.bbox_expand_scale, 0.3)
+        self.assertTrue(params.use_clip)
+        self.assertFalse(params.use_repaired_context)
+        self.assertEqual(params.init_latent_mode, "noise")
+        self.assertEqual(params.mask_downsample_mode, "nearest")
+        self.assertEqual(params.overlap_commit_mode, "native_skip")
+        self.assertEqual(params.tail_padding_mode, "native_reverse_mirror")
+
+    def test_sampling_params_default_teacache_matches_wan_i2v_14b_720p(self):
+        params = WanVideoEditSamplingParams()
+        teacache_params = params.teacache_params
+
+        self.assertEqual(teacache_params.teacache_thresh, 0.3)
+        self.assertTrue(teacache_params.use_ret_steps)
+        self.assertEqual(teacache_params.start_skipping, 5)
+        self.assertEqual(teacache_params.end_skipping, 1.0)
+        self.assertEqual(
+            teacache_params.get_coefficients(),
+            _wan_14b_coefficients(teacache_params),
+        )
 
     def test_sampling_params_accept_stream_decode_mode(self):
         params = WanVideoEditSamplingParams(decode_mode="stream")
@@ -35,6 +60,16 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
     def test_sampling_params_reject_unknown_decode_mode(self):
         with self.assertRaisesRegex(ValueError, "decode_mode must be one of"):
             WanVideoEditSamplingParams(decode_mode="invalid")
+
+    def test_sampling_params_reject_unknown_native_alignment_modes(self):
+        with self.assertRaisesRegex(ValueError, "init_latent_mode must be one of"):
+            WanVideoEditSamplingParams(init_latent_mode="bad")
+        with self.assertRaisesRegex(ValueError, "mask_downsample_mode must be one of"):
+            WanVideoEditSamplingParams(mask_downsample_mode="linear")
+        with self.assertRaisesRegex(ValueError, "overlap_commit_mode must be one of"):
+            WanVideoEditSamplingParams(overlap_commit_mode="blend")
+        with self.assertRaisesRegex(ValueError, "tail_padding_mode must be one of"):
+            WanVideoEditSamplingParams(tail_padding_mode="pad_last")
 
     def test_video_repair_request_defaults_to_stream(self):
         request = VideoRepairRequest(
@@ -45,6 +80,17 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             mask_input_path="/tmp/mask.mp4",
         )
         self.assertEqual(request.decode_mode, "stream")
+        self.assertEqual(request.overlap, 9)
+        self.assertEqual(request.dilate_px, 0)
+        self.assertEqual(request.mask_scale, 1.0)
+        self.assertEqual(request.feather_px, 0)
+        self.assertEqual(request.bbox_expand_scale, 0.3)
+        self.assertTrue(request.use_clip)
+        self.assertFalse(request.use_repaired_context)
+        self.assertEqual(request.init_latent_mode, "noise")
+        self.assertEqual(request.mask_downsample_mode, "nearest")
+        self.assertEqual(request.overlap_commit_mode, "native_skip")
+        self.assertEqual(request.tail_padding_mode, "native_reverse_mirror")
 
     def test_video_repair_request_defaults_timeout_to_no_limit(self):
         request = VideoRepairRequest(
@@ -104,6 +150,16 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             ]
         )
         self.assertEqual(args.decode_mode, "stream")
+        self.assertEqual(args.overlap, 9)
+        self.assertEqual(args.dilate_px, 0)
+        self.assertEqual(args.mask_scale, 1.0)
+        self.assertEqual(args.bbox_expand_scale, 0.3)
+        self.assertTrue(args.use_clip)
+        self.assertFalse(args.use_repaired_context)
+        self.assertEqual(args.init_latent_mode, "noise")
+        self.assertEqual(args.mask_downsample_mode, "nearest")
+        self.assertEqual(args.overlap_commit_mode, "native_skip")
+        self.assertEqual(args.tail_padding_mode, "native_reverse_mirror")
 
     def test_failed_job_reason_uses_error_message(self):
         job = {"status": "failed", "error": {"message": "mask file not found"}}

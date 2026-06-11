@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.sample.videoedit_wan import (
 from sglang.multimodal_gen.runtime.models.schedulers.videoedit_flow_match import (
     VideoEditFlowMatchScheduler,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    PipelineComponentLoader,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -27,6 +30,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VideoEditConditionEncodingStage,
     VideoEditDecodingStage,
     VideoEditDenoisingStage,
+    VideoEditImageEncodingStage,
     VideoEditLatentInitStage,
     VideoEditLatentPreparationStage,
     VideoEditTextEncodingStage,
@@ -100,6 +104,28 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             sigma_min=0.0,
             extra_one_step=True,
         )
+        self._maybe_load_image_encoder(server_args)
+
+    def _maybe_load_image_encoder(self, server_args: ServerArgs) -> None:
+        if self.modules.get("image_encoder") is not None:
+            return
+        override_path = server_args.component_paths.get("image_encoder")
+        default_path = os.path.join(self.model_path, "image_encoder")
+        image_encoder_path = override_path or default_path
+        if not os.path.isdir(image_encoder_path):
+            logger.warning(
+                "VideoEdit image_encoder was not found at %s; requests with use_clip=True will fail.",
+                image_encoder_path,
+            )
+            return
+        module, memory_usage = PipelineComponentLoader.load_component(
+            component_name="image_encoder",
+            component_model_path=image_encoder_path,
+            transformers_or_diffusers="transformers",
+            server_args=server_args,
+        )
+        self.modules["image_encoder"] = module
+        self.memory_usages["image_encoder"] = memory_usage
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.videoedit_stages = [
@@ -107,6 +133,10 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             VideoEditTextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
+                transformer=self.get_module("transformer"),
+            ),
+            VideoEditImageEncodingStage(
+                image_encoder=self.get_module("image_encoder", None),
                 transformer=self.get_module("transformer"),
             ),
             VideoEditConditionEncodingStage(vae=self.get_module("vae")),
@@ -136,6 +166,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 bbox_padding=params.bbox_padding,
                 dilate_px=params.dilate_px,
                 mask_scale=params.mask_scale,
+                bbox_expand_scale=params.bbox_expand_scale,
                 align=16,
             )
             provider = WindowFrameProvider.from_scanned_geometry(
@@ -169,6 +200,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 bbox_padding=params.bbox_padding,
                 dilate_px=params.dilate_px,
                 mask_scale=params.mask_scale,
+                bbox_expand_scale=params.bbox_expand_scale,
                 align=16,
             )
             params.runtime_original_frames = data["original_frames"]
@@ -189,6 +221,8 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         params.runtime_accum_weights = np.zeros(
             (params.runtime_num_input_frames,), dtype=np.float32
         )
+        params.runtime_prev_window_output_frames = None
+        params.runtime_prev_window_index = None
         batch.height = params.runtime_aligned_h
         batch.width = params.runtime_aligned_w
         batch.fps = max(1, int(round(params.runtime_fps or batch.fps)))
@@ -218,6 +252,23 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 frames.append(_float_array_to_image(repaired))
             else:
                 frames.append(source_frame)
+        if (
+            params.overlap_commit_mode == "native_skip"
+            and int(params.overlap) > 0
+            and window_spec.window_index > 0
+        ):
+            if (
+                params.runtime_prev_window_index == window_spec.window_index - 1
+                and params.runtime_prev_window_output_frames is not None
+            ):
+                stride = params.infer_len - int(params.overlap)
+                if 0 <= stride < len(params.runtime_prev_window_output_frames):
+                    frames[0] = params.runtime_prev_window_output_frames[stride]
+            if masks:
+                w, h = masks[0].size
+                black = Image.new("L", (w, h), 0)
+                for i in range(min(int(params.overlap), len(masks))):
+                    masks[i] = black.copy()
         params.runtime_window_frames = frames
         params.runtime_window_masks = masks
 
@@ -253,11 +304,23 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         for local_idx, global_idx in window_spec.commit_local_to_global.items():
             if global_idx >= params.runtime_num_input_frames:
                 continue
-            weight = self._commit_weight(params, window_spec, local_idx)
+            if (
+                params.overlap_commit_mode == "native_skip"
+                and window_spec.window_index > 0
+                and local_idx < int(params.overlap)
+            ):
+                continue
+            weight = (
+                1.0
+                if params.overlap_commit_mode == "native_skip"
+                else self._commit_weight(params, window_spec, local_idx)
+            )
             params.runtime_accum_frames[global_idx] += (
                 _image_to_float_array(frames[local_idx]) * weight
             )
             params.runtime_accum_weights[global_idx] += weight
+        params.runtime_prev_window_output_frames = frames
+        params.runtime_prev_window_index = window_spec.window_index
 
     def _finalize_crop_frames(self, params: WanVideoEditSamplingParams) -> list[Image.Image]:
         crop_frames: list[Image.Image] = []
@@ -273,7 +336,10 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         return crop_frames
 
     def _write_metadata(
-        self, params: WanVideoEditSamplingParams, output_video_path: str | None
+        self,
+        params: WanVideoEditSamplingParams,
+        output_video_path: str | None,
+        num_output_frames: int | None = None,
     ) -> None:
         if output_video_path is None:
             return
@@ -289,7 +355,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             "aligned_w": params.runtime_aligned_w,
             "fps": params.runtime_fps,
             "num_input_frames": params.runtime_num_input_frames,
-            "num_output_frames": None,
+            "num_output_frames": num_output_frames,
             "drop_reference_frame": params.drop_reference_frame,
             "enable_paste_back": params.enable_paste_back,
             "window_specs": [
@@ -297,6 +363,8 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     "window_index": spec.window_index,
                     "start_index": spec.start_index,
                     "end_index": spec.end_index,
+                    "valid_len": spec.valid_len,
+                    "input_indices": spec.input_indices,
                     "reflected_count": spec.reflected_count,
                 }
                 for spec in (params.runtime_window_specs or [])
@@ -353,7 +421,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
 
         if params.drop_reference_frame and len(frames) > 0:
             frames = frames[1:]
-        self._write_metadata(params, output_video_path)
+        self._write_metadata(params, output_video_path, num_output_frames=len(frames))
         return frames
 
     def _cleanup_videoedit_context(self, params: WanVideoEditSamplingParams) -> None:
@@ -387,6 +455,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     num_frames=params.runtime_num_input_frames,
                     infer_len=params.infer_len,
                     overlap=params.overlap,
+                    tail_padding_mode=params.tail_padding_mode,
                 )
                 params.runtime_window_specs = window_specs
                 write_videoedit_progress(

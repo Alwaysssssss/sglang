@@ -63,6 +63,16 @@ logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
 
+def _normalize_encoder_hidden_states_image(
+    encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None,
+) -> torch.Tensor | None:
+    if isinstance(encoder_hidden_states_image, list):
+        if len(encoder_hidden_states_image) == 0:
+            return None
+        return encoder_hidden_states_image[0]
+    return encoder_hidden_states_image
+
+
 class WanImageEmbedding(torch.nn.Module):
 
     def __init__(
@@ -1008,13 +1018,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
             encoder_hidden_states = encoder_hidden_states[0]
-        if (
-            isinstance(encoder_hidden_states_image, list)
-            and len(encoder_hidden_states_image) > 0
-        ):
-            encoder_hidden_states_image = encoder_hidden_states_image[0]
-        else:
-            encoder_hidden_states_image = None
+        encoder_hidden_states_image = _normalize_encoder_hidden_states_image(
+            encoder_hidden_states_image
+        )
 
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
 

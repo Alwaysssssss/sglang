@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.utils.common import (
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
+    fp8_max,
+    fp8_min,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
 )
@@ -70,8 +73,26 @@ if _use_aiter or _use_hip_int4:
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+FAKE_W8A8_DEQUANT_ENV = "SGLANG_DIFFUSION_FAKE_FP8_W8A8_DEQUANT"
 
 logger = logging.getLogger(__name__)
+
+
+def _fake_quant_dequant_fp8_per_token(x: torch.Tensor) -> torch.Tensor:
+    x_2d = x.reshape(-1, x.shape[-1])
+    x_fp32 = x_2d.float()
+    scale = x_fp32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / fp8_max
+    q_x = torch.clamp(x_fp32 / scale, fp8_min, fp8_max).to(fp8_dtype)
+    return (q_x.float() * scale).to(x.dtype).reshape_as(x)
+
+
+def _fake_quant_fp8_weight_per_channel(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    weight_fp32 = weight.float()
+    scale = weight_fp32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / fp8_max
+    qweight = torch.clamp(weight_fp32 / scale, fp8_min, fp8_max).to(fp8_dtype)
+    return qweight, scale.t().contiguous()
 
 
 class Fp8Config(QuantizationConfig):
@@ -363,7 +384,11 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported:
+                if get_bool_env_var(FAKE_W8A8_DEQUANT_ENV):
+                    qweight, weight_scale = _fake_quant_fp8_weight_per_channel(
+                        layer.weight
+                    )
+                elif self.cutlass_fp8_supported:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel supports per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
@@ -457,6 +482,8 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_dequant_fallback and not self.block_quant:
+            if get_bool_env_var(FAKE_W8A8_DEQUANT_ENV):
+                x = _fake_quant_dequant_fp8_per_token(x)
             weight = layer.weight.float() * layer.weight_scale.float()
             output = torch.matmul(x, weight.to(x.dtype))
             if bias is not None:

@@ -247,16 +247,39 @@ def expand_bbox_for_small(
     return max(0, x_min), max(0, y_min), min(width, x_max), min(height, y_max)
 
 
+def expand_bbox(
+    bbox: tuple[int, int, int, int],
+    height: int,
+    width: int,
+    scale: float = 0.3,
+) -> tuple[int, int, int, int]:
+    if scale <= 0:
+        return bbox
+    x_min, y_min, x_max, y_max = bbox
+    crop_w = x_max - x_min
+    crop_h = y_max - y_min
+    return (
+        max(0, int(x_min - crop_w * scale)),
+        max(0, int(y_min - crop_h * scale)),
+        min(width, int(x_max + crop_w * scale)),
+        min(height, int(y_max + crop_h * scale)),
+    )
+
+
 def _finalize_bbox_geometry(
     bbox: tuple[int, int, int, int],
     *,
     height: int,
     width: int,
     align: int,
+    bbox_expand_scale: float,
 ) -> dict[str, int | tuple[int, int, int, int]]:
+    bbox = expand_bbox(bbox, height, width, scale=bbox_expand_scale)
     x_min, y_min, x_max, y_max = bbox
     crop_w, crop_h = x_max - x_min, y_max - y_min
-    if (crop_w * crop_h) / float(height * width) < 0.2:
+    area_ratio = (crop_w * crop_h) / float(height * width)
+    short_side = min(crop_w, crop_h)
+    if area_ratio < 0.2 and short_side < 480:
         bbox = expand_bbox_for_small(bbox, height, width)
         x_min, y_min, x_max, y_max = bbox
         crop_w, crop_h = x_max - x_min, y_max - y_min
@@ -322,8 +345,9 @@ def scan_global_bbox(
     num_frames: int | None = None,
     reference_image: str | None = None,
     bbox_padding: int = 0,
-    dilate_px: int = 15,
-    mask_scale: float = 1.2,
+    dilate_px: int = 0,
+    mask_scale: float = 1.0,
+    bbox_expand_scale: float = 0.3,
     align: int = 16,
 ) -> dict:
     from sglang.multimodal_gen.runtime.videoedit.stream_decoder import (
@@ -395,6 +419,7 @@ def scan_global_bbox(
         height=height,
         width=width,
         align=align,
+        bbox_expand_scale=bbox_expand_scale,
     )
     geometry.update(
         {
@@ -414,8 +439,9 @@ def prepare_global_inputs(
     num_frames: int | None = None,
     reference_image: str | None = None,
     bbox_padding: int = 0,
-    dilate_px: int = 15,
-    mask_scale: float = 1.2,
+    dilate_px: int = 0,
+    mask_scale: float = 1.0,
+    bbox_expand_scale: float = 0.3,
     align: int = 16,
     debug_dir: str | None = None,
     scanned_geometry: dict | None = None,
@@ -453,6 +479,7 @@ def prepare_global_inputs(
             height=height,
             width=width,
             align=align,
+            bbox_expand_scale=bbox_expand_scale,
         )
     else:
         bbox = tuple(scanned_geometry["bbox"])
@@ -502,16 +529,24 @@ def prepare_window_inputs(
     window_masks: list[Image.Image],
     device: str | torch.device,
     dtype: torch.dtype,
+    mask_downsample_mode: str = "nearest",
 ) -> dict:
     if len(window_video) != len(window_masks):
         raise ValueError("Window video and mask length mismatch")
+    if mask_downsample_mode not in {"nearest", "nearest-exact"}:
+        raise ValueError(
+            "mask_downsample_mode must be one of nearest/nearest-exact, "
+            f"got {mask_downsample_mode!r}"
+        )
     masked_video = create_masked_video(window_video, window_masks)
     processed_masks = create_mask_video(window_masks)
     masked_video_tensor = frames_to_tensor(masked_video, normalize=True).to(device=device, dtype=dtype)
     mask_video_tensor = frames_to_tensor(processed_masks, normalize=False).to(device=device, dtype=torch.float32)
     first_frame_mask = mask_video_tensor[0:1].repeat(4, 1, 1, 1)
     expanded_masks = torch.cat([first_frame_mask, mask_video_tensor[1:]], dim=0)
-    cond_masks = F.interpolate(expanded_masks, scale_factor=1 / 8, mode="nearest-exact")
+    cond_masks = F.interpolate(
+        expanded_masks, scale_factor=1 / 8, mode=mask_downsample_mode
+    )
     cond_masks = (cond_masks < 0.5).float()
     num_mask_frames, _, latent_height, latent_width = cond_masks.shape
     if num_mask_frames % 4 != 0:
