@@ -48,6 +48,7 @@ _QUANTIZED_DTYPES = (
     torch.int8,
 )
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
+_UNUSED_KEY_EXAMPLE_LIMIT = 8
 
 
 def _format_dtype_mismatch_summary(
@@ -62,6 +63,20 @@ def _format_dtype_mismatch_summary(
             part += f" (e.g. {', '.join(examples)})"
         parts.append(part)
     return "; ".join(parts)
+
+
+def _format_unused_key_summary(unused_keys: set[str]) -> str:
+    if not unused_keys:
+        return "0 keys"
+
+    keys = sorted(unused_keys)
+    examples = keys[:_UNUSED_KEY_EXAMPLE_LIMIT]
+    summary = f"{len(keys)} keys"
+    if examples:
+        summary += f" (e.g. {', '.join(examples)})"
+    if len(keys) > _UNUSED_KEY_EXAMPLE_LIMIT:
+        summary += f", +{len(keys) - _UNUSED_KEY_EXAMPLE_LIMIT} more"
+    return summary
 
 
 def _make_param_like(
@@ -450,7 +465,11 @@ def load_model_from_full_model_state_dict(
     # parameters in nn.Module that doesn't exist in safetensor files
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
     if unused_keys:
-        logger.warning("Found unloaded parameters in meta state dict: %s", unused_keys)
+        logger.info(
+            "Meta state dict contains parameters not loaded from checkpoint; "
+            "they will be validated and synthesized if supported: %s",
+            _format_unused_key_summary(unused_keys),
+        )
 
     # Legacy allowlist for parameter families synthesized after loading.
     # New formats should declare missing_param_init on the parameter instead.

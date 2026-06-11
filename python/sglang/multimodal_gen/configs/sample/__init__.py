@@ -7,9 +7,11 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 
 __all__ = [
     "SamplingParams",
     "DiffusersGenericSamplingParams",
     "WanVideoEditSamplingParams",
+    "VividVRSamplingParams",
 ]

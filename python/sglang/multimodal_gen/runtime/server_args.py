@@ -176,6 +176,14 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_cogvideox_modulation_fusion: bool = False
+    cogvideox_modulation_fusion_targets: str = "transformer"
+    enable_cogvideox_qkv_fusion: bool = False
+    cogvideox_qkv_fusion_targets: str = "transformer"
+    enable_cogvideox_qk_norm_fusion: bool = False
+    cogvideox_qk_norm_fusion_targets: str = "transformer"
+    enable_cogvideox_qk_norm_rope_fusion: bool = False
+    cogvideox_qk_norm_rope_fusion_targets: str = "transformer"
 
     # warmup
     warmup: bool = False
@@ -697,6 +705,54 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-cogvideox-qkv-fusion",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cogvideox_qkv_fusion,
+            help="Fuse CogVideoX/VividVR attention Q/K/V projections with a fused linear path.",
+        )
+        parser.add_argument(
+            "--enable-cogvideox-qk-norm-rope-fusion",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cogvideox_qk_norm_rope_fusion,
+            help="Accelerate CogVideoX/VividVR attention Q/K LayerNorm and image RoPE with existing sglang kernels.",
+        )
+        parser.add_argument(
+            "--enable-cogvideox-qk-norm-fusion",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cogvideox_qk_norm_fusion,
+            help="Accelerate CogVideoX/VividVR attention Q/K LayerNorm with an existing sglang kernel while preserving exact RoPE.",
+        )
+        parser.add_argument(
+            "--enable-cogvideox-modulation-fusion",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cogvideox_modulation_fusion,
+            help="Fuse CogVideoX/VividVR block modulation with existing sglang norm/residual kernels.",
+        )
+        parser.add_argument(
+            "--cogvideox-modulation-fusion-targets",
+            type=str,
+            default=ServerArgs.cogvideox_modulation_fusion_targets,
+            help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
+        )
+        parser.add_argument(
+            "--cogvideox-qkv-fusion-targets",
+            type=str,
+            default=ServerArgs.cogvideox_qkv_fusion_targets,
+            help="Comma-separated VividVR components to fuse for Phase E3. Supported: transformer,controlnet.",
+        )
+        parser.add_argument(
+            "--cogvideox-qk-norm-rope-fusion-targets",
+            type=str,
+            default=ServerArgs.cogvideox_qk_norm_rope_fusion_targets,
+            help="Comma-separated VividVR components to accelerate for Phase E3. Supported: transformer,controlnet.",
+        )
+        parser.add_argument(
+            "--cogvideox-qk-norm-fusion-targets",
+            type=str,
+            default=ServerArgs.cogvideox_qk_norm_fusion_targets,
+            help="Comma-separated VividVR components to accelerate for Phase E3. Supported: transformer,controlnet.",
         )
 
         # warmup

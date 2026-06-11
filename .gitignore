@@ -192,6 +192,16 @@ work_dirs/
 
 !logo.png
 
+# Large binary artifacts
+Vivid_Acceptance/indicator/
+Vivid_Acceptance/logs/
+Vivid_Acceptance/result_videos/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+
 # Prerequisites
 *.d
 

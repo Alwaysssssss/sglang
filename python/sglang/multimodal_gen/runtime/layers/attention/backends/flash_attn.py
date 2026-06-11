@@ -319,9 +319,9 @@ def set_fa_ver(ver: int) -> None:
 class FlashAttentionMetadata:
     # Sequence lengths for the forward batch
     # Maximum sequence length for query
-    max_seqlen_q: int = 1
+    max_seqlen_q: int | None = 0
     # Maximum sequence length for key
-    max_seqlen_k: int = 0
+    max_seqlen_k: int | None = 0
     # Cumulative sequence lengths for query
     cu_seqlens_q: torch.Tensor = None
     # Cumulative sequence lengths for key
@@ -340,8 +340,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
         raw_latent_shape=list,
         **kwargs: dict[str, Any],
     ) -> FlashAttentionMetadata:
-        # TODO: put empty values here to be set at first-run, since the q_len calculation can be complicated
-        return FlashAttentionMetadata(max_seqlen_q=None, max_seqlen_k=None)
+        # FA can derive sequence lengths directly from query/key tensors, so
+        # a stable sentinel keeps the metadata path enabled without per-tile
+        # mutable state.
+        return FlashAttentionMetadata(max_seqlen_q=0, max_seqlen_k=0)
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -395,15 +397,14 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
-            max_seqlen_q = attn_metadata.max_seqlen_q
-            max_seqlen_k = attn_metadata.max_seqlen_k
-        else:
-            max_seqlen_q = query.shape[1]
-            max_seqlen_k = key.shape[1]
+        attn_metadata = attn_metadata or get_forward_context().attn_metadata
+        max_seqlen_q = query.shape[1]
+        max_seqlen_k = key.shape[1]
+        if attn_metadata is not None:
+            if attn_metadata.max_seqlen_q not in (None, 0):
+                max_seqlen_q = attn_metadata.max_seqlen_q
+            if attn_metadata.max_seqlen_k not in (None, 0):
+                max_seqlen_k = attn_metadata.max_seqlen_k
 
         # FA version selection:
         # - fa_ver == 3: call python function (can return Tensor or (Tensor, Tensor) depending on flag)

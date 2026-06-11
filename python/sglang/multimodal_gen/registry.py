@@ -40,6 +40,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanT2V480PConfig,
     WanT2V720PConfig,
     WanVideoEditPipelineConfig,
+    VividVRPipelineConfig,
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
@@ -117,6 +118,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
     ZImageTurboSamplingParams,
@@ -723,6 +725,14 @@ def _register_configs():
         model_detectors=[
             lambda hf_id: "videoedit" in hf_id.lower(),
             lambda hf_id: "wanvideoeditpipeline" in hf_id.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=VividVRSamplingParams,
+        pipeline_config_cls=VividVRPipelineConfig,
+        model_detectors=[
+            lambda hf_id: "vivid-vr" in hf_id.lower(),
+            lambda hf_id: "vividvr" in hf_id.lower(),
         ],
     )
     # MOVA
