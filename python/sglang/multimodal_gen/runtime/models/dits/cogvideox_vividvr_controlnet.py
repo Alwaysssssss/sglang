@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
     set_cogvideox_attention_backend,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
+    build_vividvr_connector_control_states,
     build_control_feat_proj,
     shard_vividvr_video_tokens,
     zero_module,
@@ -244,7 +245,7 @@ class CogVideoXVividVRControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin)
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
-        hidden_states, image_rotary_emb, _ = shard_vividvr_video_tokens(
+        hidden_states, image_rotary_emb, sequence_shard_state = shard_vividvr_video_tokens(
             hidden_states,
             image_rotary_emb,
         )
@@ -270,8 +271,10 @@ class CogVideoXVividVRControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin)
                 )
             controlnet_inter_states = controlnet_inter_states + (hidden_states,)
 
-        controlnet_hidden_states = tuple(
-            [state * conditioning_scale] for state in controlnet_inter_states
+        controlnet_hidden_states = build_vividvr_connector_control_states(
+            controlnet_inter_states,
+            sequence_shard_state,
+            conditioning_scale=conditioning_scale,
         )
 
         if USE_PEFT_BACKEND:

@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
+    get_vividvr_connector_sp_context_mode,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -859,6 +862,23 @@ class VividVRDenoisingStage(PipelineStage):
                 "sp_sequence_tokens_global": total_video_tokens,
                 "sp_sequence_tokens_local": sequence_shard_local_tokens,
                 "sp_sequence_tokens_pad": sequence_shard_pad,
+                "sp_video_token_layout": "contiguous_flat_video_token_sequence",
+                "runtime_num_timesteps": len(timesteps),
+                "connector_context_mode": (
+                    (
+                        "sp_exact_local_attention"
+                        if get_vividvr_connector_sp_context_mode() == "deferred_global"
+                        else (
+                            "sp_exact_global_control_attention"
+                            if get_vividvr_connector_sp_context_mode() == "eager_global"
+                            else "sp_exact_distributed_control_attention"
+                        )
+                    )
+                    if sequence_shard_enabled
+                    else "single_rank_full_sequence"
+                ),
+                "control_context_shape_local": None,
+                "control_context_shape_global": None,
             }
         )
 
@@ -906,6 +926,8 @@ class VividVRDenoisingStage(PipelineStage):
         image_rotary_emb = denoising_state["image_rotary_emb"]
         old_pred_original_sample = denoising_state["old_pred_original_sample"]
         target_dtype = denoising_state["target_dtype"]
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        sequence_shard_enabled = bool(debug.get("enable_sequence_shard", False))
 
         timestep = timesteps[timestep_index]
         attn_metadata = self._build_runtime_attn_metadata(
@@ -981,6 +1003,30 @@ class VividVRDenoisingStage(PipelineStage):
                     )
                     for state in control_hidden_states
                 )
+                if control_hidden_states:
+                    first_control_state = control_hidden_states[0]
+                    debug["connector_context_mode"] = (
+                        "sp_exact_global_control_attention"
+                        if len(first_control_state) >= 2
+                        else (
+                            (
+                                "sp_exact_local_attention"
+                                if get_vividvr_connector_sp_context_mode()
+                                == "deferred_global"
+                                else "sp_exact_distributed_control_attention"
+                            )
+                            if sequence_shard_enabled
+                            else "single_rank_full_sequence"
+                        )
+                    )
+                    debug["control_context_shape_local"] = tuple(
+                        first_control_state[0].shape
+                    )
+                    debug["control_context_shape_global"] = (
+                        tuple(first_control_state[-1].shape)
+                        if len(first_control_state) >= 2
+                        else None
+                    )
                 noise_pred = self.transformer(
                     hidden_states=concat_latent_model_input,
                     encoder_hidden_states=tile_prompt_embeds,

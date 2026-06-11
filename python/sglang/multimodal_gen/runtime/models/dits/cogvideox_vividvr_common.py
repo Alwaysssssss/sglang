@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,7 +15,20 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    flash_attn_func,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_ENV = "SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE"
+_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DEFERRED_GLOBAL = "deferred_global"
+_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_EAGER_GLOBAL = "eager_global"
+_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DISTRIBUTED_LOCAL = "distributed_local"
+_VIVIDVR_CONNECTOR_SEQUENCE_PARALLEL_ATTENTION_BACKENDS = frozenset(
+    {AttentionBackendEnum.FA, AttentionBackendEnum.FA2}
+)
 
 
 def zero_module(module: nn.Module) -> nn.Module:
@@ -64,33 +79,49 @@ class Connector(nn.Module):
         )
 
     def forward(self, c, h: torch.Tensor) -> torch.Tensor:
-        c = c[0]
+        local_control, global_control = unpack_vividvr_connector_context(c)
         batch_size, seq_len, hidden_size = h.shape
-        control_seq_len = c.shape[1]
+        control_for_attention = global_control
+        control_seq_len = control_for_attention.shape[1]
+        connector_sp_context_mode = get_vividvr_connector_sp_context_mode()
 
         q = self.to_q(h).view(
             batch_size, seq_len, self.num_attention_heads, self.attention_head_dim
         )
-        k = self.to_k(c).view(
+        k = self.to_k(control_for_attention).view(
             batch_size,
             control_seq_len,
             self.num_attention_heads,
             self.attention_head_dim,
         )
-        v = c.view(
+        v = control_for_attention.view(
             batch_size,
             control_seq_len,
             self.num_attention_heads,
             self.attention_head_dim,
         )
 
-        q = self.norm_q(q).permute(0, 2, 1, 3)
-        k = self.norm_k(k).permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+        q = self.norm_q(q)
+        k = self.norm_k(k)
 
-        out = F.scaled_dot_product_attention(q, k, v)
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, hidden_size)
-        return h + self.out_layer(out) + self.c_mlp(c)
+        if (
+            connector_sp_context_mode
+            == _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DISTRIBUTED_LOCAL
+            and _vividvr_connector_can_use_sequence_parallel_attention(
+                query_dtype=q.dtype
+            )
+            and control_for_attention.shape[1] == local_control.shape[1]
+        ):
+            out = run_vividvr_connector_sequence_parallel_attention(q, k, v)
+        else:
+            out = run_vividvr_connector_attention(q, k, v)
+        out = out.reshape(batch_size, seq_len, hidden_size)
+        if local_control.shape[1] != seq_len:
+            raise ValueError(
+                "VividVR connector local control sequence length must match local "
+                f"hidden states: {local_control.shape[1]} != {seq_len}"
+            )
+        return h + self.out_layer(out) + self.c_mlp(local_control)
 
 
 @dataclass(frozen=True)
@@ -99,6 +130,47 @@ class VividVRSequenceShardState:
     original_seq_len: int
     local_seq_len: int
     seq_pad: int
+
+
+def get_vividvr_connector_sp_context_mode() -> str:
+    mode = (
+        os.environ.get(
+            _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_ENV,
+            _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DEFERRED_GLOBAL,
+        )
+        .strip()
+        .lower()
+    )
+    if mode not in {
+        _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DEFERRED_GLOBAL,
+        _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_EAGER_GLOBAL,
+        _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DISTRIBUTED_LOCAL,
+    }:
+        raise ValueError(
+            "Unsupported VividVR connector SP context mode "
+            f"{mode!r}. Expected one of: deferred_global, eager_global, distributed_local."
+        )
+    return mode
+
+
+def unpack_vividvr_connector_context(
+    control_context: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(control_context, torch.Tensor):
+        return control_context, control_context
+
+    if isinstance(control_context, (tuple, list)):
+        if len(control_context) == 0:
+            raise ValueError("VividVR connector context must not be empty")
+        if len(control_context) == 1:
+            local_control = control_context[0]
+            return local_control, local_control
+        if len(control_context) == 2:
+            return control_context[0], control_context[1]
+
+    raise TypeError(
+        "VividVR connector context must be a tensor or a sequence of one/two tensors"
+    )
 
 
 def vividvr_sequence_shard_enabled() -> bool:
@@ -112,6 +184,82 @@ def vividvr_sequence_shard_enabled() -> bool:
         forward_batch is not None
         and getattr(forward_batch, "enable_sequence_shard", False)
         and sp_world_size > 1
+    )
+
+
+def _vividvr_connector_can_use_sequence_parallel_attention(
+    *,
+    query_dtype: torch.dtype,
+) -> bool:
+    return vividvr_sequence_shard_enabled() and query_dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
+
+
+def run_vividvr_connector_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    if not vividvr_sequence_shard_enabled() or query.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        out = F.scaled_dot_product_attention(
+            query.permute(0, 2, 1, 3),
+            key.permute(0, 2, 1, 3),
+            value.permute(0, 2, 1, 3),
+        )
+        return out.permute(0, 2, 1, 3).contiguous()
+
+    return flash_attn_func(
+        q=query.contiguous(),
+        k=key.contiguous(),
+        v=value.contiguous(),
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=query.shape[1],
+        max_seqlen_k=key.shape[1],
+        softmax_scale=None,
+        causal=False,
+    ).contiguous()
+
+
+def run_vividvr_connector_sequence_parallel_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    if not _vividvr_connector_can_use_sequence_parallel_attention(
+        query_dtype=query.dtype
+    ):
+        return run_vividvr_connector_attention(query, key, value)
+
+    sp_attn = _get_vividvr_connector_sequence_parallel_attention(
+        num_heads=query.shape[2],
+        head_size=query.shape[3],
+    )
+    return sp_attn(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+    ).contiguous()
+
+
+@lru_cache(maxsize=8)
+def _get_vividvr_connector_sequence_parallel_attention(
+    *,
+    num_heads: int,
+    head_size: int,
+) -> USPAttention:
+    return USPAttention(
+        num_heads=num_heads,
+        head_size=head_size,
+        softmax_scale=None,
+        causal=False,
+        supported_attention_backends=_VIVIDVR_CONNECTOR_SEQUENCE_PARALLEL_ATTENTION_BACKENDS,
+        prefix=f"vividvr_connector_sp_{num_heads}_{head_size}",
     )
 
 
@@ -190,6 +338,82 @@ def gather_vividvr_video_tokens(
     if shard_state.seq_pad:
         hidden_states = hidden_states[:, : shard_state.original_seq_len, :].contiguous()
     return hidden_states
+
+
+def restore_vividvr_connector_global_control_state(
+    local_control_state: torch.Tensor,
+    shard_state: VividVRSequenceShardState,
+) -> torch.Tensor:
+    if not shard_state.enabled:
+        return local_control_state.contiguous()
+
+    global_control_state = sequence_model_parallel_all_gather(
+        local_control_state.contiguous(),
+        dim=1,
+    )
+    if shard_state.seq_pad:
+        global_control_state = global_control_state[
+            :, : shard_state.original_seq_len, :
+        ].contiguous()
+    return global_control_state
+
+
+def restore_vividvr_connector_global_control_states(
+    local_control_states: tuple[torch.Tensor, ...],
+    shard_state: VividVRSequenceShardState,
+) -> tuple[torch.Tensor, ...]:
+    if len(local_control_states) == 0:
+        return ()
+
+    if not shard_state.enabled:
+        return tuple(state.contiguous() for state in local_control_states)
+
+    stacked_local_states = torch.stack(
+        tuple(state.contiguous() for state in local_control_states),
+        dim=0,
+    )
+    gathered_states = sequence_model_parallel_all_gather(
+        stacked_local_states,
+        dim=2,
+    )
+    if shard_state.seq_pad:
+        gathered_states = gathered_states[
+            :, :, : shard_state.original_seq_len, :
+        ].contiguous()
+    return tuple(gathered_states[index].contiguous() for index in range(gathered_states.shape[0]))
+
+
+def build_vividvr_connector_control_states(
+    control_states: tuple[torch.Tensor, ...],
+    shard_state: VividVRSequenceShardState,
+    *,
+    conditioning_scale: float = 1.0,
+) -> tuple[tuple[torch.Tensor, ...], ...]:
+    if len(control_states) == 0:
+        return ()
+
+    scaled_local_states = tuple(state * conditioning_scale for state in control_states)
+    if not shard_state.enabled:
+        return tuple((state,) for state in scaled_local_states)
+
+    context_mode = get_vividvr_connector_sp_context_mode()
+    if context_mode == _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DISTRIBUTED_LOCAL:
+        return tuple((state.contiguous(),) for state in scaled_local_states)
+
+    if context_mode == _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DEFERRED_GLOBAL:
+        return tuple((state.contiguous(),) for state in scaled_local_states)
+
+    global_control_states = restore_vividvr_connector_global_control_states(
+        scaled_local_states,
+        shard_state,
+    )
+    return tuple(
+        (
+            scaled_local_states[index].contiguous(),
+            global_control_states[index],
+        )
+        for index in range(len(scaled_local_states))
+    )
 
 
 class TemporalResnetBlock(nn.Module):

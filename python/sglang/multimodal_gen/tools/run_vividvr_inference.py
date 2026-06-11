@@ -279,6 +279,15 @@ def build_runtime_config_snapshot(
         "sp_sequence_tokens_global": debug.get("sp_sequence_tokens_global"),
         "sp_sequence_tokens_local": debug.get("sp_sequence_tokens_local"),
         "sp_sequence_tokens_pad": debug.get("sp_sequence_tokens_pad"),
+        "sp_video_token_layout": debug.get("sp_video_token_layout"),
+        "runtime_num_timesteps": debug.get("runtime_num_timesteps"),
+        "connector_context_mode": debug.get("connector_context_mode"),
+        "control_context_shape_local": _json_ready(
+            debug.get("control_context_shape_local")
+        ),
+        "control_context_shape_global": _json_ready(
+            debug.get("control_context_shape_global")
+        ),
         "vividvr_vae_decode_tiling_requested": getattr(
             args, "use_vividvr_vae_decode_tiling", None
         ),

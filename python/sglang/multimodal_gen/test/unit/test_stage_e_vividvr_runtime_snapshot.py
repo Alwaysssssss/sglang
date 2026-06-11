@@ -40,6 +40,11 @@ class TestVividVRRuntimeSnapshot(unittest.TestCase):
                     "sp_sequence_tokens_global": 17550,
                     "sp_sequence_tokens_local": 8775,
                     "sp_sequence_tokens_pad": 0,
+                    "sp_video_token_layout": "contiguous_flat_video_token_sequence",
+                    "runtime_num_timesteps": 20,
+                    "connector_context_mode": "sp_exact_local_attention",
+                    "control_context_shape_local": (2, 8775, 3072),
+                    "control_context_shape_global": None,
                     "vae_tiling_enabled": True,
                 },
             )
@@ -73,6 +78,20 @@ class TestVividVRRuntimeSnapshot(unittest.TestCase):
         self.assertEqual(snapshot["sp_sequence_tokens_global"], 17550)
         self.assertEqual(snapshot["sp_sequence_tokens_local"], 8775)
         self.assertEqual(snapshot["sp_sequence_tokens_pad"], 0)
+        self.assertEqual(
+            snapshot["sp_video_token_layout"],
+            "contiguous_flat_video_token_sequence",
+        )
+        self.assertEqual(snapshot["runtime_num_timesteps"], 20)
+        self.assertEqual(
+            snapshot["connector_context_mode"],
+            "sp_exact_local_attention",
+        )
+        self.assertEqual(
+            snapshot["control_context_shape_local"],
+            [2, 8775, 3072],
+        )
+        self.assertIsNone(snapshot["control_context_shape_global"])
         self.assertTrue(snapshot["vae_tiling_enabled"])
 
 
