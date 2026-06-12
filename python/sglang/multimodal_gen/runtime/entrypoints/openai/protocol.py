@@ -159,7 +159,7 @@ class VideoRepairRequest(BaseModel):
     infer_len: int = 81
     overlap: int = 9
     strength: float = 1.0
-    num_inference_steps: int = 20
+    num_inference_steps: int = 40
     guidance_scale: float = 5.0
     seed: int = 42
     generator_device: Optional[str] = None

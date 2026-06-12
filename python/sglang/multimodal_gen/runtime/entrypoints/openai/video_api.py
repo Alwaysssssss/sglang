@@ -224,13 +224,13 @@ def _build_video_repair_callback_payload(
     status = job.get("status")
     progress = _current_video_progress(job)
     if status == "completed":
-        result_url = (
+        gen_video_url = (
             job.get("output_object_key") or job.get("url") or job.get("file_path") or ""
         )
         duration = job.get("inference_time_s")
         if duration is None and job.get("completed_at") and job.get("created_at"):
             duration = max(0, int(job["completed_at"] - job["created_at"]))
-        output = {"result_url": result_url}
+        output = {"gen_video_url": gen_video_url}
         if duration is not None:
             output["duration"] = duration
         return {

@@ -829,7 +829,7 @@ Content-Type: application/json</code></pre>
   <span class="json-key">"status"</span>:   <span class="json-string">"succeeded"</span>,
   <span class="json-key">"progress"</span>: <span class="json-number">100</span>,
   <span class="json-key">"reason"</span>:   <span class="json-string">""</span>,
-  <span class="json-key">"output"</span>:   <span class="json-string">"{\"result_url\":\"https://minio.example.com/outputs/result.jpg\",\"duration\":45}"</span>
+  <span class="json-key">"output"</span>:   <span class="json-string">"{\"gen_video_url\":\"https://minio.example.com/outputs/result.jpg\",\"duration\":45}"</span>
 }</code></pre>
 
             <h4>字段说明</h4>
@@ -880,7 +880,7 @@ Content-Type: application/json</code></pre>
   <span class="json-key">"status"</span>:   <span class="json-string">"succeeded"</span>,
   <span class="json-key">"progress"</span>: <span class="json-number">100</span>,
   <span class="json-key">"reason"</span>:   <span class="json-string">""</span>,
-  <span class="json-key">"output"</span>:   <span class="json-string">"{\"result_url\":\"https://storage.example.com/out/result.jpg\"}"</span>
+  <span class="json-key">"output"</span>:   <span class="json-string">"{\"gen_video_url\":\"https://storage.example.com/out/result.jpg\"}"</span>
 }</code></pre>
 
             <p><strong>2) 处理失败</strong></p>
@@ -1013,7 +1013,7 @@ func processTaskAsync(taskID string, timeout int) {
     body := map[string]interface{}{
         <span class="json-key">"status"</span>:   <span class="json-string">"succeeded"</span>,
         <span class="json-key">"progress"</span>: 100,
-        <span class="json-key">"output"</span>:   `<span class="json-string">{"result_url":"https://..."}</span>`,
+        <span class="json-key">"output"</span>:   `<span class="json-string">{"gen_video_url":"https://..."}</span>`,
     }
     data, _ := json.Marshal(body)
     http.Post(callbackURL, <span class="json-string">"application/json"</span>, bytes.NewBuffer(data))

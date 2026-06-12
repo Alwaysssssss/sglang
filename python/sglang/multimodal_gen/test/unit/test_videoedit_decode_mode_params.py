@@ -28,6 +28,10 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
     def test_sampling_params_accept_default_stream_decode_mode(self):
         params = WanVideoEditSamplingParams()
         self.assertEqual(params.decode_mode, "stream")
+
+    def test_sampling_params_default_num_inference_steps_is_40(self):
+        params = WanVideoEditSamplingParams()
+        self.assertEqual(params.num_inference_steps, 40)
         self.assertEqual(params.overlap, 9)
         self.assertEqual(params.dilate_px, 0)
         self.assertEqual(params.mask_scale, 1.0)
@@ -101,6 +105,16 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             mask_input_path="/tmp/mask.mp4",
         )
         self.assertEqual(request.timeout, -1)
+
+    def test_video_repair_request_defaults_num_inference_steps_to_40(self):
+        request = VideoRepairRequest(
+            task_id="task-1",
+            callback_url="http://127.0.0.1/callback",
+            prompt="repair video",
+            video_input_path="/tmp/video.mp4",
+            mask_input_path="/tmp/mask.mp4",
+        )
+        self.assertEqual(request.num_inference_steps, 40)
 
     def test_video_repair_request_accepts_missing_callback_url(self):
         request = VideoRepairRequest(
@@ -213,7 +227,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(
             json.loads(payload["output"]),
             {
-                "result_url": "2026/06/09/060635_task-1.mp4",
+                "gen_video_url": "2026/06/09/060635_task-1.mp4",
                 "duration": 45,
             },
         )

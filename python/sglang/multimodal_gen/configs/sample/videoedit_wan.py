@@ -57,7 +57,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     num_frames: int = 81
     fps: int = 16
     guidance_scale: float = 5.0
-    num_inference_steps: int = 20
+    num_inference_steps: int = 40
     negative_prompt: str | None = DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
