@@ -176,6 +176,7 @@ benchmark/mmlu/data
 benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
+/logs/
 *.jsonl
 tmp*.txt
 
@@ -275,3 +276,5 @@ sgl-kernel/csrc/**/*_musa/
 
 # mgtv
 wheel/
+
+tmp/

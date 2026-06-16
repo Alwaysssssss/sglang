@@ -380,3 +380,14 @@ sglang serve \
 
 
   python -m sglang.multimodal_gen.runtime.videoedit.cli repair   --model-path "$MODEL_PATH"   --transformer-path "$TRANSFORMER_PATH"   --prompt "$PROMPT"   --video-input-path "$INPUT_VIDEO"   --mask-input-path "$INPUT_MASK"   --output-path "$OUT_DIR"   --output-file-name 15108907_3840_2160_50fps_sp2_no_offload.mp4   --num-gpus 2   --sp-degree 2   --ulysses-degree 2   --ring-degree 1   --num-frames 81   --infer-len 81   --overlap 0   --num-inference-steps 20   --guidance-scale 5.0   --seed 42   --dtype bf16   --enable-paste-back   --drop-reference-frame   --perf-dump-path "$OUT_DIR/videoedit_perf_sp2r_no_offload.json"
+
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers
