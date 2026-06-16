@@ -12,7 +12,7 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-def test_agent_start_dry_run_uses_256k_context_and_memory_based_concurrency(tmp_path):
+def test_agent_start_dry_run_uses_256k_context_six_request_cap_and_observability(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     model_dir = tmp_path / "model"
@@ -65,13 +65,25 @@ def test_agent_start_dry_run_uses_256k_context_and_memory_based_concurrency(tmp_
     assert "CONTEXT_LENGTH=262144" in output
     assert "MAX_OUTPUT_TOKENS=128000" in output
     assert "MEMORY_TARGET_FRACTION=0.90" in output
-    assert "MAX_RUNNING_REQUESTS=8" in output
+    assert "MAX_RUNNING_REQUESTS_CAP=6" in output
+    assert "MAX_RUNNING_REQUESTS_SOURCE=auto_estimate_capped" in output
+    assert "MAX_RUNNING_REQUESTS=6" in output
+    assert "MAX_QUEUED_REQUESTS=48" in output
+    assert "PREFILL_MAX_REQUESTS=6" in output
+    assert "REASONING_PARSER=qwen3" in output
     assert "--context-length 262144" in output
     assert "--mem-fraction-static 0.900" in output
-    assert "--max-running-requests 8" in output
+    assert "--max-running-requests 6" in output
+    assert "--max-queued-requests 48" in output
+    assert "--prefill-max-requests 6" in output
+    assert "--tool-call-parser qwen3_coder" in output
+    assert "--reasoning-parser qwen3" in output
     assert "--log-requests" in output
-    assert "--log-requests-level 1" in output
+    assert "--log-requests-level 3" in output
     assert "--log-requests-format json" in output
+    assert "--enable-request-time-stats-logging" in output
+    assert "--enable-metrics" in output
+    assert "--export-metrics-to-file" in output
 
 
 def test_agent_start_dry_run_respects_existing_gpu_usage(tmp_path):
@@ -125,5 +137,66 @@ def test_agent_start_dry_run_respects_existing_gpu_usage(tmp_path):
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "MAX_RUNNING_REQUESTS=1" in output
+    assert "MAX_RUNNING_REQUESTS_SOURCE=auto_estimate" in output
+    assert "MAX_QUEUED_REQUESTS=8" in output
+    assert "PREFILL_MAX_REQUESTS=1" in output
     assert "--mem-fraction-static 0.216" in output
     assert "--max-running-requests 1" in output
+    assert "--max-queued-requests 8" in output
+    assert "--prefill-max-requests 1" in output
+
+
+def test_agent_start_dry_run_can_disable_reasoning_parser(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    fake_python = bin_dir / "python3"
+
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "generation_config.json").write_text("{}", encoding="utf-8")
+    _write_executable(fake_python, "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        bin_dir / "nvidia-smi",
+        """\
+        #!/usr/bin/env bash
+        if [[ "$*" == *"--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu"* ]]; then
+          printf '0, NVIDIA A100-SXM4-80GB, 81920, 0, 81920, 0\\n'
+          printf '1, NVIDIA A100-SXM4-80GB, 81920, 0, 81920, 0\\n'
+          printf '2, NVIDIA A100-SXM4-80GB, 81920, 0, 81920, 0\\n'
+          printf '3, NVIDIA A100-SXM4-80GB, 81920, 0, 81920, 0\\n'
+          exit 0
+        fi
+        exit 1
+        """,
+    )
+
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "ROOT_DIR": str(root_dir),
+        "SGLANG_PY": str(fake_python),
+        "MODEL_PATH": str(model_dir),
+        "MODEL_SIZE_MIB": "53012",
+        "ALLOW_EMPTY_API_KEY": "1",
+        "DRY_RUN": "1",
+        "WAIT_FOR_READY": "0",
+        "REASONING_PARSER": "",
+    }
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=SCRIPT.parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "REASONING_PARSER=<disabled>" in output
+    assert "--tool-call-parser qwen3_coder" in output
+    assert "--reasoning-parser" not in output
