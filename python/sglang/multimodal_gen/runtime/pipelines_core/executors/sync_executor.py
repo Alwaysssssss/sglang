@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -31,7 +32,9 @@ class SyncExecutor(PipelineExecutor):
         Execute all pipeline stages sequentially.
         """
         for stage in stages:
+            check_request_timeout(batch)
             batch = stage(batch, server_args)
+            check_request_timeout(batch)
             profiler = SGLDiffusionProfiler.get_instance()
             if profiler:
                 profiler.step_stage()

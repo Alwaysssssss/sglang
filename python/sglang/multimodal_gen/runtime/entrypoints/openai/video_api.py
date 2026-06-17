@@ -53,6 +53,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.request_timeout import (
+    TASK_TIMEOUT_MESSAGE,
+    TaskTimeoutError,
+    check_request_timeout,
+    is_task_timeout_error,
+    remaining_request_timeout,
+    request_timeout_deadline,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
@@ -162,6 +170,14 @@ def _job_reason(job: Dict[str, Any]) -> str | None:
     if reason:
         return str(reason)
     return _job_error_message(job)
+
+
+def _job_is_task_timeout(job: Dict[str, Any] | None) -> bool:
+    if not job or job.get("status") != "failed":
+        return False
+    return is_task_timeout_error(job.get("reason")) or is_task_timeout_error(
+        _job_error_message(job)
+    )
 
 
 def _task_id_from_video_repair_body(body: Any) -> str | None:
@@ -497,6 +513,7 @@ async def _dispatch_job_async(
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
         )
+        check_request_timeout(batch)
         save_file_path = save_file_path_list[0]
 
         if request_storage is not None:
@@ -526,6 +543,9 @@ async def _dispatch_job_async(
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
         )
+        existing_job = await VIDEO_STORE.get(job_id)
+        if _job_is_task_timeout(existing_job):
+            return
         await VIDEO_STORE.update_fields(job_id, update_fields)
         job = await VIDEO_STORE.get(job_id)
         if job and callback_url:
@@ -539,14 +559,17 @@ async def _dispatch_job_async(
     except Exception as e:
         logger.error(f"{e}")
         existing_job = await VIDEO_STORE.get(job_id)
+        if _job_is_task_timeout(existing_job):
+            return
         progress = _current_video_progress(existing_job or {})
+        reason = TASK_TIMEOUT_MESSAGE if is_task_timeout_error(e) else str(e)
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
                 "progress": progress,
-                "error": {"message": str(e)},
-                "reason": str(e),
+                "error": {"message": reason},
+                "reason": reason,
             },
         )
         job = await VIDEO_STORE.get(job_id)
@@ -641,7 +664,7 @@ async def _dispatch_video_repair_job_async(
     request_storage: RequestCloudStorage | None = None,
     output_object_key: str | None = None,
     output_bucket: str | None = None,
-    timeout: int = -1,
+    timeout_deadline: float | None = None,
 ) -> None:
     progress_callback_task = None
     try:
@@ -661,11 +684,12 @@ async def _dispatch_video_repair_job_async(
             output_object_key=output_object_key,
             output_bucket=output_bucket,
         )
-        if timeout == -1:
+        timeout_remaining = remaining_request_timeout(timeout_deadline)
+        if timeout_remaining is None:
             await dispatch_coro
         else:
-            await asyncio.wait_for(dispatch_coro, timeout=timeout)
-    except asyncio.TimeoutError:
+            await asyncio.wait_for(dispatch_coro, timeout=timeout_remaining)
+    except (asyncio.TimeoutError, TaskTimeoutError):
         existing_job = await VIDEO_STORE.get(job_id)
         progress = _current_video_progress(existing_job or {})
         await VIDEO_STORE.update_fields(
@@ -673,8 +697,8 @@ async def _dispatch_video_repair_job_async(
             {
                 "status": "failed",
                 "progress": progress,
-                "error": {"message": "task timeout"},
-                "reason": "task timeout",
+                "error": {"message": TASK_TIMEOUT_MESSAGE},
+                "reason": TASK_TIMEOUT_MESSAGE,
             },
         )
         job = await VIDEO_STORE.get(job_id)
@@ -727,6 +751,7 @@ async def create_video_repair(request: Request):
 
     server_args = get_global_server_args()
     request_id = req.task_id or generate_request_id()
+    timeout_deadline = request_timeout_deadline(req.timeout)
     temp_dirs: list[str] = []
 
     try:
@@ -805,6 +830,7 @@ async def create_video_repair(request: Request):
         sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
             server_args,
             request_id=request_id,
+            request_timeout_deadline=timeout_deadline,
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             video_input_path=video_input_path,
@@ -883,7 +909,7 @@ async def create_video_repair(request: Request):
                 request_storage=request_storage,
                 output_object_key=output_object_key,
                 output_bucket=req.output_bucket,
-                timeout=req.timeout,
+                timeout_deadline=timeout_deadline,
             )
         )
         return _video_repair_submit_response(0, "ok")

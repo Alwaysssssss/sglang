@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.preprocess import prepare_window_inputs
 from sglang.multimodal_gen.runtime.videoedit.progress import (
@@ -503,6 +504,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                 total=params.runtime_effective_num_inference_steps
             ) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
+                    check_request_timeout(batch)
                     t_device = timesteps[i]
                     current_cfg, do_cfg = calc_current_cfg(
                         max_cfg=float(params.guidance_scale),
@@ -539,6 +541,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                             encoder_hidden_states=params.runtime_prompt_embeds,
                             encoder_hidden_states_image=image_embeds,
                         )
+                    check_request_timeout(batch)
 
                     if do_cfg:
                         if params.runtime_negative_prompt_embeds is None:
@@ -555,6 +558,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                                 encoder_hidden_states=params.runtime_negative_prompt_embeds,
                                 encoder_hidden_states_image=image_embeds,
                             )
+                        check_request_timeout(batch)
                         noise_pred = noise_uncond + current_cfg * (
                             noise_pred - noise_uncond
                         )

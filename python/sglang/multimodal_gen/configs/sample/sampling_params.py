@@ -93,6 +93,7 @@ class SamplingParams:
     data_type: DataType = DataType.VIDEO
 
     request_id: str | None = None
+    request_timeout_deadline: float | None = None
 
     # All fields below are copied from ForwardBatch
 

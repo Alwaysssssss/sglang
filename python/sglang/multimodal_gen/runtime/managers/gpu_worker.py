@@ -43,6 +43,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.request_timeout import (
+    TaskTimeoutError,
+    check_request_timeout,
+)
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
@@ -216,6 +220,7 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
+            check_request_timeout(req)
             if self.rank == 0:
                 torch.get_device_module().reset_peak_memory_stats()
 
@@ -226,8 +231,10 @@ class GPUWorker:
                 baseline_snapshot = capture_memory_snapshot()
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
+            check_request_timeout(req)
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
+            check_request_timeout(req)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -263,6 +270,7 @@ class GPUWorker:
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
+                check_request_timeout(req)
                 if self.rank == 0 and output_batch.output is not None:
                     output_paths = save_outputs(
                         output_batch.output,
@@ -311,6 +319,17 @@ class GPUWorker:
                     meta={"model": self.server_args.model_path},
                     tag="server_perf_dump",
                 )
+        except TaskTimeoutError as e:
+            logger.info("Request %s timed out", req.request_id)
+            if output_batch is None:
+                output_batch = OutputBatch(metrics=req.metrics)
+            output_batch.error = str(e)
+            output_batch.output = None
+            output_batch.audio = None
+            output_batch.audio_sample_rate = None
+            output_batch.output_file_paths = None
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True

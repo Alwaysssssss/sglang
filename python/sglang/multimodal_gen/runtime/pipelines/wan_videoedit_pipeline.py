@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VideoEditWindowPostprocessStage,
     VideoEditWindowValidationStage,
 )
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.frame_provider import (
     WindowFrameProvider,
@@ -449,7 +450,9 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             )
 
         with self.executor.profile_execution(batch, dump_rank=0):
+            check_request_timeout(batch)
             self._prepare_global_videoedit_context(params, batch)
+            check_request_timeout(batch)
             try:
                 window_specs = build_videoedit_window_specs(
                     num_frames=params.runtime_num_input_frames,
@@ -469,6 +472,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     ),
                 )
                 for window_spec in window_specs:
+                    check_request_timeout(batch)
                     params.reset_window_runtime(window_spec)
                     write_videoedit_progress(
                         params.progress_path,
@@ -483,8 +487,11 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                         ),
                     )
                     self._materialize_window_inputs(params, window_spec)
+                    check_request_timeout(batch)
                     self.executor.execute_with_profiling(self.stages, batch, server_args)
+                    check_request_timeout(batch)
                     self._commit_window_output(params, window_spec)
+                    check_request_timeout(batch)
                     write_videoedit_progress(
                         params.progress_path,
                         build_window_progress_payload(
@@ -502,7 +509,9 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                         ),
                     )
 
+                check_request_timeout(batch)
                 output_frames = self._finalize_long_video_output(params, batch)
+                check_request_timeout(batch)
                 batch.output = _pil_frames_to_video_tensor(output_frames)
             finally:
                 self._cleanup_videoedit_context(params)
