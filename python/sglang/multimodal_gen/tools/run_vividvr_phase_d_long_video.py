@@ -10,8 +10,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import imageio
-import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipelineConfig
@@ -29,17 +27,10 @@ from sglang.multimodal_gen.runtime.videoedit.preprocess import load_video_frames
 VIVIDVR_ROOT = Path("/home/zhiheng/Vivid-VR")
 COGVIDEOX_ROOT = VIVIDVR_ROOT / "ckpts" / "CogVideoX1.5-5B"
 VIVIDVR_CKPT_ROOT = VIVIDVR_ROOT / "ckpts" / "Vivid-VR"
-SOURCE_INPUT_VIDEO = VIVIDVR_ROOT / "input" / "720p" / "test_video_960x720.mp4"
 PROMPT_FILE = VIVIDVR_ROOT / "input" / "720p" / "prompt.txt"
 ACCEPTANCE_ROOT = Path("/home/zhiheng/sglang/Vivid_Acceptance")
 INDICATOR_DIR = ACCEPTANCE_ROOT / "indicator"
 RESULT_VIDEOS_DIR = ACCEPTANCE_ROOT / "result_videos"
-PREPARED_INPUT_DIR = ACCEPTANCE_ROOT / "input_videos" / "phase_d_x3_up1"
-PREPARED_INPUT_VIDEO = PREPARED_INPUT_DIR / "test_video_960x720_x3.mp4"
-ORIGINAL_REFERENCE_DIR = RESULT_VIDEOS_DIR / "phase_d_original_up1_x3"
-ORIGINAL_REFERENCE_VIDEO = ORIGINAL_REFERENCE_DIR / "videos" / PREPARED_INPUT_VIDEO.name
-CAPTION_DIR = VIVIDVR_ROOT / "input" / "captions"
-DEFAULT_CAPTION_FILE = CAPTION_DIR / f"{PREPARED_INPUT_VIDEO.stem}.txt"
 PHASE_D_130F_INPUT_VIDEO = (
     VIVIDVR_ROOT / "input" / "720p_long" / "test_video_long_960x720_130f.mp4"
 )
@@ -64,20 +55,18 @@ PHASE_D_130F_REFERENCE_VIDEO_50STEP = (
     / PHASE_D_130F_INPUT_VIDEO.name
 )
 
-PHASE_D_PRESETS: dict[str, dict[str, Path | int | bool]] = {
+PHASE_D_PRESETS: dict[str, dict[str, Path | int]] = {
     "phase_d_130f_20step": {
         "prepared_input_video": PHASE_D_130F_INPUT_VIDEO,
         "reference_video": PHASE_D_130F_REFERENCE_VIDEO_20STEP,
         "caption_file": PHASE_D_130F_CAPTION_FILE,
         "num_inference_steps": 20,
-        "skip_input_preparation": True,
     },
     "phase_d_130f_50step": {
         "prepared_input_video": PHASE_D_130F_INPUT_VIDEO,
         "reference_video": PHASE_D_130F_REFERENCE_VIDEO_50STEP,
         "caption_file": PHASE_D_130F_CAPTION_FILE_50STEP,
         "num_inference_steps": 50,
-        "skip_input_preparation": True,
     },
 }
 
@@ -155,78 +144,6 @@ def make_request(
     return prepare_request(server_args, params)
 
 
-def prepare_long_input_video(
-    *,
-    source_video_path: Path,
-    output_video_path: Path,
-    duplicate_factor: int,
-    force_rebuild: bool,
-) -> dict[str, int | float | str]:
-    if duplicate_factor < 2:
-        raise ValueError(f"duplicate_factor must be >= 2, got {duplicate_factor}")
-
-    source_frames, fps = load_video_frames(str(source_video_path))
-    if not source_frames:
-        raise ValueError(f"No frames found in source video: {source_video_path}")
-
-    source_frame_count = len(source_frames)
-    width, height = source_frames[0].size
-    expected_frame_count = source_frame_count * duplicate_factor
-
-    if output_video_path.exists() and not force_rebuild:
-        prepared_frames, prepared_fps = load_video_frames(str(output_video_path))
-        if (
-            len(prepared_frames) == expected_frame_count
-            and prepared_frames[0].size == (width, height)
-            and int(round(prepared_fps)) == int(round(fps))
-        ):
-            return {
-                "source_frame_count": source_frame_count,
-                "prepared_frame_count": len(prepared_frames),
-                "fps": float(prepared_fps),
-                "height": height,
-                "width": width,
-                "duplicate_factor": duplicate_factor,
-                "prepared_video_path": str(output_video_path),
-            }
-
-    output_video_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = imageio.get_writer(
-        str(output_video_path),
-        fps=fps,
-        codec="libx264",
-        quality=8,
-    )
-    try:
-        for _ in range(duplicate_factor):
-            for frame in source_frames:
-                writer.append_data(np.asarray(frame.convert("RGB"), dtype=np.uint8))
-    finally:
-        writer.close()
-
-    prepared_frames, prepared_fps = load_video_frames(str(output_video_path))
-    if len(prepared_frames) != expected_frame_count:
-        raise RuntimeError(
-            "Prepared long video frame count mismatch: "
-            f"expected {expected_frame_count}, got {len(prepared_frames)}"
-        )
-    if prepared_frames[0].size != (width, height):
-        raise RuntimeError(
-            "Prepared long video resolution mismatch: "
-            f"expected {(width, height)}, got {prepared_frames[0].size}"
-        )
-
-    return {
-        "source_frame_count": source_frame_count,
-        "prepared_frame_count": len(prepared_frames),
-        "fps": float(prepared_fps),
-        "height": height,
-        "width": width,
-        "duplicate_factor": duplicate_factor,
-        "prepared_video_path": str(output_video_path),
-    }
-
-
 def probe_existing_input_video(input_video_path: Path) -> dict[str, int | float | str]:
     frames, fps = load_video_frames(str(input_video_path))
     if not frames:
@@ -239,7 +156,6 @@ def probe_existing_input_video(input_video_path: Path) -> dict[str, int | float 
         "fps": float(fps),
         "height": height,
         "width": width,
-        "duplicate_factor": 1,
         "prepared_video_path": str(input_video_path),
     }
 
@@ -271,49 +187,22 @@ def parse_args() -> argparse.Namespace:
         help="Apply a predefined Phase D benchmark configuration.",
     )
     parser.add_argument(
-        "--source-input-video",
-        type=Path,
-        default=SOURCE_INPUT_VIDEO,
-        help="Short source video used to build the duplicated long-video input.",
-    )
-    parser.add_argument(
         "--prepared-input-video",
         type=Path,
-        default=PREPARED_INPUT_VIDEO,
+        default=PHASE_D_130F_INPUT_VIDEO,
         help="Path of the long-video input consumed by both benchmarks.",
     )
     parser.add_argument(
         "--reference-video",
         type=Path,
-        default=ORIGINAL_REFERENCE_VIDEO,
+        default=PHASE_D_130F_REFERENCE_VIDEO_20STEP,
         help="Original Vivid-VR long-video output used as the Phase D reference.",
     )
     parser.add_argument(
         "--caption-file",
         type=Path,
-        default=DEFAULT_CAPTION_FILE,
+        default=PHASE_D_130F_CAPTION_FILE,
         help="Caption sidecar extracted from the original Vivid-VR run and replayed by SGLang.",
-    )
-    parser.add_argument(
-        "--duplicate-factor",
-        type=int,
-        default=3,
-        help="How many times to repeat the short source video in time.",
-    )
-    parser.add_argument(
-        "--force-rebuild-input",
-        action="store_true",
-        help="Rebuild the duplicated long-video input even if it already exists.",
-    )
-    parser.add_argument(
-        "--skip-input-preparation",
-        action="store_true",
-        help="Use --prepared-input-video directly and skip the legacy x3 input build step.",
-    )
-    parser.add_argument(
-        "--prepare-input-only",
-        action="store_true",
-        help="Only prepare the duplicated long-video input and print its path.",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -364,23 +253,13 @@ def main() -> int:
     total_start_time = time.perf_counter()
     args = parse_args()
 
-    if args.skip_input_preparation:
-        prepared_input = probe_existing_input_video(args.prepared_input_video)
-    else:
-        prepared_input = prepare_long_input_video(
-            source_video_path=args.source_input_video,
-            output_video_path=args.prepared_input_video,
-            duplicate_factor=args.duplicate_factor,
-            force_rebuild=bool(args.force_rebuild_input),
-        )
+    prepared_input = probe_existing_input_video(args.prepared_input_video)
     print(
         "[PhaseD] prepared_input "
         f"path={prepared_input['prepared_video_path']} "
         f"frames={prepared_input['prepared_frame_count']} "
         f"fps={prepared_input['fps']}"
     )
-    if args.prepare_input_only:
-        return 0
     if not args.caption_file.exists():
         raise SystemExit(
             "Phase D acceptance requires an extracted caption file from the original "
@@ -471,10 +350,8 @@ def main() -> int:
         "model_inference_runtime_seconds": model_inference_runtime_seconds,
         "seed": 42,
         "num_inference_steps": args.num_inference_steps,
-        "duplicate_factor": args.duplicate_factor,
         "prompt_path": str(PROMPT_FILE),
         "caption_file_path": str(args.caption_file),
-        "source_input_video_path": str(args.source_input_video),
         "input_video_path": str(args.prepared_input_video),
         "reference_video_path": str(args.reference_video),
         "candidate_video_path": str(candidate_path),

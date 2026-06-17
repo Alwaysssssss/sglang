@@ -48,6 +48,7 @@
   - 建立可重复运行的 regression 套件
   - 让验收逐步从阶段性对齐进入 strict 或接近 strict 的 release gate
 - 当前 `Phase E` 日常 benchmark 默认固定为与 `Phase D` 相同 reference 对象的 `130f / 20 step` 长视频口径；`50 step` 只保留给阶段性最终回归。
+- 当前双卡 `SP` 默认质量口径要求 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`，也就是默认不启用 control pooling；只有在明确做性能实验时才显式打开 pool 压缩。
 - 推进 `Phase E` 时，默认前提是不能破坏 `Phase C` 已验收基线，也不要用性能优化引入新的长视频语义回归。
 - 如果任务明确属于 `Phase E`，先确认当前 benchmark 和验收口径是否已经固定；如果默认参数、后端或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
 
@@ -116,7 +117,7 @@
 - 这样做是为了让用户可以实时 attach 查看进度，这条规则是强制的。
 - 当 `tmux` 可用时，不要只用普通阻塞式 shell 命令直接跑推理验收。
 - `tmux` session 名称要清晰，能够反映任务，例如 `vividvr_phase_c` 或 `sglang_eval`。
-- 启动后要告知用户 session 名和准确的 attach 命令，例如 `tmux attach -t vividvr_phase_c`。
+- 启动后要告知用户 session 名和准确的 attach 命令；默认优先给只读查看命令，例如 `tmux attach -r -t vividvr_phase_c`，避免终端误发 `Ctrl-C` 中断推理。
 - 如果验证会写日志或产物，放在仓库内可预测的位置，并在最终总结里说明路径。
 
 ## 验收产物与标准格式
@@ -142,7 +143,7 @@ tmux new-session -d -s vividvr_phase_c \
 - attach 命令：
 
 ```bash
-tmux attach -t vividvr_phase_c
+tmux attach -r -t vividvr_phase_c
 ```
 
 - 如果后续推理参数、脚本路径、环境路径或日志路径发生变化，必须同步修改本文件中的标准推理命令，避免继续引用过时命令。

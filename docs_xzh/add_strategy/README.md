@@ -38,6 +38,7 @@
 10. [10_grouped_stage_acceptance.md](./10_grouped_stage_acceptance.md)
 11. [11_phase_e_acceleration_implementation.md](./11_phase_e_acceleration_implementation.md)
 12. [12_phase_e_sp_native_acceleration_plan.md](./12_phase_e_sp_native_acceleration_plan.md)
+13. [13_phase_e_sp_quality_closure_plan.md](./13_phase_e_sp_quality_closure_plan.md)
 
 ## 推荐执行分组（5 个大阶段）
 
@@ -101,6 +102,7 @@
   - [09_code_mod_order.md](./09_code_mod_order.md)
   - [11_phase_e_acceleration_implementation.md](./11_phase_e_acceleration_implementation.md)
   - [12_phase_e_sp_native_acceleration_plan.md](./12_phase_e_sp_native_acceleration_plan.md)
+  - [13_phase_e_sp_quality_closure_plan.md](./13_phase_e_sp_quality_closure_plan.md)
 
 ## 实施原则
 

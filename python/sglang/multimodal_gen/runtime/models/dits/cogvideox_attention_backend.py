@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from types import SimpleNamespace
 
 import torch
@@ -13,11 +14,16 @@ from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLine
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     flash_attn_func,
 )
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.distributed import model_parallel_is_initialized
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+)
 
 _COGVIDEOX_FLASHINFER_ROPE_CACHE: dict[tuple[object, ...], torch.Tensor | None] = {}
 _COGVIDEOX_LAYERNORM_KERNEL_CACHE: dict[tuple[int, torch.dtype, str], bool] = {}
@@ -36,6 +42,9 @@ def normalize_cogvideox_attention_backend(backend: str | None) -> str | None:
         "flash": "fa",
         "flash_attn": "fa",
         "flash_attention": "fa",
+        "fa_sp": "fa_sp",
+        "sp_fa": "fa_sp",
+        "usp": "fa_sp",
         "native": "native",
         "torch_native": "native",
         "torch_sdpa": "native",
@@ -430,16 +439,130 @@ class CogVideoXFlashAttnProcessor:
         return hidden_states, encoder_hidden_states
 
 
+class CogVideoXSPFlashAttnProcessor:
+    """SP-aware CogVideoX joint-attention processor using Ulysses all-to-all.
+
+    When sequence parallelism (SP) is enabled (sp_world_size > 1), text tokens
+    are treated as a *replicated prefix* and video tokens as an *SP-sharded
+    suffix*.  Joint attention is dispatched through
+    ``USPAttention._forward_with_replicated_prefix`` which performs the
+    all-to-all shuffle on the sharded suffix only, yielding mathematically
+    equivalent results to single-GPU joint attention.
+
+    When SP is not active the processor transparently delegates to the standard
+    flash-attention path so single-GPU and non-SP deployments are unaffected.
+    """
+
+    _attention_backend = "fa_sp"
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ---- SP not active → delegate to standard flash path ---------------
+        sp_size = (
+            get_sp_world_size() if model_parallel_is_initialized() else 1
+        )
+        if sp_size <= 1:
+            return CogVideoXFlashAttnProcessor()(
+                attn=attn,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=image_rotary_emb,
+            )
+
+        # ---- SP path: text = replicated prefix, video = sharded suffix ----
+        text_seq_length = encoder_hidden_states.size(1)
+        batch_size = hidden_states.shape[0]
+        num_heads = attn.heads
+
+        # Reuse the existing QKV preparation pipeline (projection + QK norm +
+        # RoPE).  Returns [B, H, S_total, D] layout.
+        _, query, key, value = _prepare_cogvideox_qkv(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+        )
+        # query/key/value:  [B, H, S_total, D]   S_total = text + video
+        head_dim = query.shape[-1]
+
+        # Get or create a cached USPAttention instance configured for CogVideoX
+        # joint attention.  Built lazily so single-GPU runs never pay the cost.
+        usp_attn = _get_cogvideox_sp_usp_attention(
+            num_heads=num_heads,
+            head_size=head_dim,
+        )
+
+        # USPAttention expects [B, S_local, H, D] input.
+        q = query.transpose(1, 2).contiguous()
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+
+        # num_replicated_prefix informs USPAttention to skip the all-to-all on
+        # the first *text_seq_length* tokens (identical across ranks) and only
+        # shuffle the video suffix — exactly what CogVideoX joint attention needs.
+        out = usp_attn(
+            q,
+            k,
+            v,
+            num_replicated_prefix=text_seq_length,
+        )
+        # out:  [B, S_local, H, D]
+
+        # Output projection + split back to text / video
+        out = out.reshape(batch_size, -1, num_heads * head_dim)
+        out = attn.to_out[0](out)
+        out = attn.to_out[1](out)
+
+        encoder_hidden_states, hidden_states = out.split(
+            [text_seq_length, out.size(1) - text_seq_length], dim=1
+        )
+        return hidden_states, encoder_hidden_states
+
+
+@lru_cache(maxsize=4)
+def _get_cogvideox_sp_usp_attention(
+    *,
+    num_heads: int,
+    head_size: int,
+) -> USPAttention:
+    """Create a cached USPAttention instance for CogVideoX SP joint attention.
+
+    Uses ``skip_sequence_parallel=False`` (the default) so that the full
+    Ulysses all-to-all pipeline runs when SP is active.  When SP is not active
+    (world_size == 1), USPAttention internally degrades to local attention.
+    """
+    return USPAttention(
+        num_heads=num_heads,
+        head_size=head_size,
+        softmax_scale=None,
+        causal=False,
+        supported_attention_backends={
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.FA2,
+        },
+        prefix=f"cogvideox_sp_attn_{num_heads}_{head_size}",
+    )
+
+
 def build_cogvideox_attention_processor(backend: str) -> object:
     normalized_backend = normalize_cogvideox_attention_backend(backend)
     if normalized_backend == "native":
         return CogVideoXNativeAttnProcessor()
     if normalized_backend == "fa":
         return CogVideoXFlashAttnProcessor()
+    if normalized_backend == "fa_sp":
+        return CogVideoXSPFlashAttnProcessor()
 
     raise ValueError(
         "CogVideoX/VividVR attention backend "
-        f"{backend!r} is not supported yet. Supported backends: fa, torch_sdpa."
+        f"{backend!r} is not supported yet. Supported backends: native, fa, fa_sp."
     )
 
 

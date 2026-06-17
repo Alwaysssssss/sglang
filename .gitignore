@@ -177,6 +177,7 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+*.json
 tmp*.txt
 
 # Torch Compile logs

@@ -39,16 +39,27 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import (
     randn_tensor_with_generator_device,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.vividvr import (
     apply_reference_color_fix,
+    build_vividvr_caption_prompt_lists,
+    build_vividvr_temporal_latent_merge_plan,
+    build_vividvr_temporal_window_plan,
+    build_vividvr_tiled_prompt_lists,
     decoded_video_to_frame_tensor,
     load_control_video,
+    merge_vividvr_temporal_latent_states,
     prepare_rotary_positional_embeddings,
     prepare_tiling_infos_generator,
     prepare_vividvr_prompt_context,
     run_optional_postprocess_modules,
+    stitch_vividvr_temporal_output_clips,
+    trim_vividvr_temporal_output_clip,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+logger = init_logger(__name__)
 
 
 def _vividvr_params(batch: Req) -> VividVRSamplingParams:
@@ -107,6 +118,56 @@ def _prepare_extra_step_kwargs(
     if "generator" in params:
         extra_step_kwargs["generator"] = generator
     return extra_step_kwargs
+
+
+def _clip_spec_record(clip_spec) -> dict[str, int]:
+    return {
+        "clip_index": int(clip_spec.clip_index),
+        "start_frame": int(clip_spec.start_frame),
+        "end_frame": int(clip_spec.end_frame),
+        "original_num_frames": int(clip_spec.original_num_frames),
+        "padded_num_frames": int(clip_spec.padded_num_frames),
+        "num_padding_frames": int(clip_spec.num_padding_frames),
+        "trim_front_frames": int(clip_spec.trim_front_frames),
+        "trim_back_frames": int(clip_spec.trim_back_frames),
+    }
+
+
+def _require_vividvr_input_video_info(batch: Req) -> dict[str, Any]:
+    input_video_info = batch.extra.get("vividvr_input_video_info")
+    if input_video_info is None:
+        raise ValueError("VividVR input video info must be prepared before long-video stages")
+    return input_video_info
+
+
+def _get_long_video_runtime(batch: Req) -> dict[str, Any]:
+    return batch.extra.setdefault("vividvr_long_video_runtime", {})
+
+
+def _build_temporal_clip_video_info(
+    input_video_info: dict[str, Any],
+    clip_spec,
+) -> dict[str, Any]:
+    reference_video = input_video_info["reference_video"]
+    clip_reference_video = reference_video[clip_spec.start_frame : clip_spec.end_frame]
+    clip_video = clip_reference_video
+    if clip_spec.num_padding_frames > 0:
+        padding = clip_reference_video[-1:].repeat(
+            clip_spec.num_padding_frames,
+            1,
+            1,
+            1,
+        )
+        clip_video = torch.cat([clip_reference_video, padding], dim=0)
+    return {
+        "video": clip_video,
+        "reference_video": clip_reference_video,
+        "fps": input_video_info["fps"],
+        "original_height": input_video_info["original_height"],
+        "original_width": input_video_info["original_width"],
+        "original_num_frames": clip_spec.original_num_frames,
+        "num_padding_frames": clip_spec.num_padding_frames,
+    }
 
 
 class _VividVRLatentMixin:
@@ -1223,4 +1284,366 @@ class VividVROutputPostprocessStage(PipelineStage):
         batch.fps = int(params.runtime_fps or batch.fps)
         debug["output_shape"] = tuple(batch.output.shape)
         debug["output_num_frames"] = int(batch.output.shape[1])
+        return batch
+
+
+class VividVRTemporalWindowPlanningStage(PipelineStage):
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _vividvr_params(batch)
+        input_video_info = _require_vividvr_input_video_info(batch)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        long_runtime = _get_long_video_runtime(batch)
+
+        original_num_frames = int(input_video_info["original_num_frames"])
+        window_plan = build_vividvr_temporal_window_plan(
+            original_num_frames,
+            params.num_temporal_process_frames,
+        )
+        long_runtime["window_plan"] = window_plan
+
+        params.runtime_execution_mode = "temporal_windowed"
+        params.runtime_clip_specs = list(window_plan.clip_specs)
+        params.runtime_num_temporal_overlapped_frames = (
+            window_plan.num_temporal_overlapped_frames
+        )
+        params.runtime_temporal_frame_stride = window_plan.temporal_frame_stride
+        params.runtime_reference_video = input_video_info["reference_video"]
+        params.runtime_original_height = int(input_video_info["original_height"])
+        params.runtime_original_width = int(input_video_info["original_width"])
+        params.runtime_original_num_frames = original_num_frames
+        params.runtime_fps = max(1, int(round(float(input_video_info["fps"]))))
+        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+
+        batch.height = int(params.height)
+        batch.width = int(params.width)
+        batch.num_frames = original_num_frames
+        batch.fps = params.runtime_fps
+        batch.do_classifier_free_guidance = bool(params.runtime_do_cfg)
+
+        debug["execution_mode"] = params.runtime_execution_mode
+        debug["num_clips"] = int(window_plan.num_clips)
+        debug["clip_specs"] = [_clip_spec_record(clip_spec) for clip_spec in window_plan.clip_specs]
+        return batch
+
+
+class VividVRLongClipPreparationStage(PipelineStage):
+    def __init__(
+        self,
+        *,
+        text_encoding_stage: VividVRTextEncodingStage,
+        condition_encoding_stage: VividVRConditionEncodingStage,
+        latent_preparation_stage: VividVRLatentPreparationStage,
+        tiling_preparation_stage: VividVRTilingPreparationStage,
+    ):
+        super().__init__()
+        self.text_encoding_stage = text_encoding_stage
+        self.condition_encoding_stage = condition_encoding_stage
+        self.latent_preparation_stage = latent_preparation_stage
+        self.tiling_preparation_stage = tiling_preparation_stage
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        input_video_info = _require_vividvr_input_video_info(batch)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        long_runtime = _get_long_video_runtime(batch)
+        window_plan = long_runtime.get("window_plan")
+        if window_plan is None:
+            raise ValueError("VividVR temporal window plan must be prepared before clip setup")
+
+        generator = torch.Generator(device=get_local_torch_device().type).manual_seed(
+            int(params.seed)
+        )
+        params.runtime_generator = generator
+        batch.generator = generator
+
+        clip_states: list[dict[str, Any]] = []
+        clip_caption_records: list[dict[str, Any]] = []
+        clip_latent_lengths: list[int] = []
+        clip_tile_counts: list[int] = []
+        caption_cursor = 0
+        for clip_spec in window_plan.clip_specs:
+            clip_video_info = _build_temporal_clip_video_info(input_video_info, clip_spec)
+            prepared_condition = self.condition_encoding_stage.prepare_condition_inputs(
+                batch,
+                server_args,
+                control_video_info=clip_video_info,
+                generator=generator,
+            )
+            latents, control_latents, num_latent_padding_frames = (
+                self.latent_preparation_stage.prepare_latents(
+                    control_video=prepared_condition["control_video"],
+                    control_latents=prepared_condition["control_latents"],
+                    generator=prepared_condition["generator"],
+                    height=params.height,
+                    width=params.width,
+                )
+            )
+            tiling_infos = self.tiling_preparation_stage.build_tiling_infos(
+                latents=latents,
+                enable_spatial_tiling=params.enable_spatial_tiling,
+                enable_temporal_tiling=params.enable_temporal_tiling,
+                tile_size=params.tile_size,
+                tile_stride=params.tile_stride,
+            )
+            if params.runtime_caption_texts is not None:
+                tiled_prompts = build_vividvr_caption_prompt_lists(
+                    caption_texts=params.runtime_caption_texts,
+                    start_index=caption_cursor,
+                    tile_count=len(tiling_infos),
+                    negative_prompt_text=params.runtime_negative_prompt_text,
+                    pipeline_config=server_args.pipeline_config,
+                )
+                caption_cursor = int(tiled_prompts["next_index"])
+                clip_caption_records.append(
+                    {
+                        "clip_index": int(clip_spec.clip_index),
+                        "caption_texts": list(tiled_prompts["caption_texts"]),
+                    }
+                )
+            else:
+                tiled_prompts = build_vividvr_tiled_prompt_lists(
+                    model_prompt_text=params.runtime_model_prompt_text or "",
+                    negative_prompt_text=params.runtime_negative_prompt_text,
+                    tile_count=len(tiling_infos),
+                )
+            encoded_prompts = self.text_encoding_stage.encode_prompt_pair(
+                prompt=tiled_prompts["prompt_list"],
+                negative_prompt=tiled_prompts["negative_prompt_list"],
+                do_classifier_free_guidance=bool(params.runtime_do_cfg),
+                server_args=server_args,
+            )
+            tiling_state = self.tiling_preparation_stage.prepare_tiling_state(
+                latents=latents,
+                prompt_embeds=encoded_prompts["prompt_embeds"],
+                negative_prompt_embeds=encoded_prompts["negative_prompt_embeds"],
+                enable_spatial_tiling=params.enable_spatial_tiling,
+                enable_temporal_tiling=params.enable_temporal_tiling,
+                tile_size=params.tile_size,
+                tile_stride=params.tile_stride,
+                tiling_infos=tiling_infos,
+            )
+
+            clip_state = {
+                "clip_spec": clip_spec,
+                "control_latents": control_latents,
+                "latents": latents,
+                "num_latent_padding_frames": num_latent_padding_frames,
+                "tiling_infos": tiling_state["tiling_infos"],
+                "tiled_prompt_embeds": tiling_state["tiled_prompt_embeds"],
+                "tiled_negative_prompt_embeds": tiling_state[
+                    "tiled_negative_prompt_embeds"
+                ],
+                "prompt_embeds": encoded_prompts["prompt_embeds"],
+                "negative_prompt_embeds": encoded_prompts["negative_prompt_embeds"],
+                "do_classifier_free_guidance": bool(params.runtime_do_cfg),
+            }
+            clip_states.append(clip_state)
+            clip_latent_lengths.append(int(latents.shape[1]))
+            clip_tile_counts.append(int(tiling_state["tile_count"]))
+
+        if params.runtime_caption_texts is not None:
+            if caption_cursor != len(params.runtime_caption_texts):
+                raise ValueError(
+                    "caption file entry count does not match temporal clip consumption: "
+                    f"consumed {caption_cursor}, available {len(params.runtime_caption_texts)}"
+                )
+            debug["clip_caption_texts"] = clip_caption_records
+
+        long_runtime["clip_states"] = clip_states
+        long_runtime["clip_caption_records"] = clip_caption_records
+        long_runtime["clip_latent_lengths"] = clip_latent_lengths
+        long_runtime["clip_tile_counts"] = clip_tile_counts
+
+        params.runtime_prompt_embeds = clip_states[0]["prompt_embeds"]
+        params.runtime_negative_prompt_embeds = clip_states[0]["negative_prompt_embeds"]
+        params.runtime_tiled_prompt_embeds = clip_states[0]["tiled_prompt_embeds"]
+        params.runtime_tiled_negative_prompt_embeds = clip_states[0][
+            "tiled_negative_prompt_embeds"
+        ]
+        params.runtime_tiling_infos = clip_states[0]["tiling_infos"]
+        params.runtime_tile_count = max(clip_tile_counts)
+
+        debug["padded_input_frames"] = max(
+            int(clip_spec.padded_num_frames) for clip_spec in window_plan.clip_specs
+        )
+        debug["prompt_embed_shape"] = tuple(clip_states[0]["tiled_prompt_embeds"].shape)
+        debug["control_latent_shape"] = tuple(clip_states[0]["control_latents"].shape)
+        debug["tile_count"] = params.runtime_tile_count
+        debug["clip_latent_lengths"] = clip_latent_lengths
+        debug["clip_tile_counts"] = clip_tile_counts
+        return batch
+
+
+class VividVRMultiClipDenoisingStage(PipelineStage):
+    def __init__(
+        self,
+        *,
+        denoising_stage: VividVRDenoisingStage,
+        vae_scale_factor_temporal: int,
+    ):
+        super().__init__()
+        self.denoising_stage = denoising_stage
+        self.vae_scale_factor_temporal = vae_scale_factor_temporal
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        long_runtime = _get_long_video_runtime(batch)
+        clip_states = long_runtime.get("clip_states")
+        if not clip_states:
+            raise ValueError("VividVR clip states must be prepared before denoising")
+        if params.runtime_timesteps is None:
+            raise ValueError("VividVR timesteps must be prepared before denoising")
+
+        clip_latent_lengths = long_runtime.get("clip_latent_lengths")
+        if clip_latent_lengths is None:
+            clip_latent_lengths = [int(clip_state["latents"].shape[1]) for clip_state in clip_states]
+            long_runtime["clip_latent_lengths"] = clip_latent_lengths
+
+        merge_plan = build_vividvr_temporal_latent_merge_plan(
+            clip_latent_lengths,
+            num_temporal_process_frames=params.num_temporal_process_frames,
+            vae_scale_factor_temporal=self.vae_scale_factor_temporal,
+        )
+        params.runtime_temporal_merge_plan = merge_plan
+
+        denoising_states: list[dict[str, Any]] = []
+        for clip_state in clip_states:
+            denoising_state = self.denoising_stage.prepare_denoising_state(
+                batch,
+                server_args,
+                latents=clip_state["latents"],
+                control_latents=clip_state["control_latents"],
+                prompt_embeds=clip_state["tiled_prompt_embeds"],
+                negative_prompt_embeds=clip_state["tiled_negative_prompt_embeds"],
+                do_classifier_free_guidance=bool(
+                    clip_state["do_classifier_free_guidance"]
+                ),
+                timesteps=params.runtime_timesteps,
+                tiling_infos=clip_state["tiling_infos"],
+            )
+            denoising_states.append(denoising_state)
+        long_runtime["denoising_states"] = denoising_states
+
+        with self.denoising_stage.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
+            for timestep_index, _ in enumerate(params.runtime_timesteps):
+                with StageProfiler(
+                    f"denoising_step_{timestep_index}",
+                    logger=logger,
+                    metrics=batch.metrics,
+                    perf_dump_path_provided=batch.perf_dump_path is not None,
+                    record_as_step=True,
+                ):
+                    for denoising_state in denoising_states:
+                        batch.raw_latent_shape = tuple(denoising_state["latents"].shape)
+                        self.denoising_stage.run_denoising_step(
+                            batch,
+                            server_args,
+                            denoising_state,
+                            timestep_index,
+                            guidance_scale=float(params.guidance_scale),
+                            restoration_guidance_scale=float(
+                                params.restoration_guidance_scale
+                            ),
+                        )
+                    merge_vividvr_temporal_latent_states(denoising_states, merge_plan)
+                params.runtime_progress = float(timestep_index + 1) / float(
+                    len(params.runtime_timesteps)
+                )
+                if progress_bar is not None:
+                    progress_bar.update()
+
+        debug["latents_shape"] = tuple(denoising_states[0]["latents"].shape)
+        return batch
+
+
+class VividVRMultiClipDecodeTrimStage(PipelineStage):
+    def __init__(
+        self,
+        *,
+        decoding_stage: VividVRDecodingStage,
+        video_processor: VideoProcessor,
+    ):
+        super().__init__()
+        self.decoding_stage = decoding_stage
+        self.video_processor = video_processor
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _vividvr_params(batch)
+        input_video_info = _require_vividvr_input_video_info(batch)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        long_runtime = _get_long_video_runtime(batch)
+        clip_states = long_runtime.get("clip_states")
+        denoising_states = long_runtime.get("denoising_states")
+        if not clip_states or not denoising_states:
+            raise ValueError("VividVR denoising states must be prepared before decode/trim")
+
+        trimmed_clips: list[torch.Tensor] = []
+        for clip_state, denoising_state in zip(clip_states, denoising_states, strict=True):
+            decoded_video = self.decoding_stage.decode_latents(
+                denoising_state["latents"],
+                int(clip_state["num_latent_padding_frames"]),
+                server_args,
+            )
+            output_video = decoded_video_to_frame_tensor(
+                decoded_video,
+                video_processor=self.video_processor,
+                original_height=int(input_video_info["original_height"]),
+                original_width=int(input_video_info["original_width"]),
+            )
+            trimmed_clips.append(
+                trim_vividvr_temporal_output_clip(
+                    output_video,
+                    clip_state["clip_spec"],
+                )
+            )
+
+        long_runtime["trimmed_clips"] = trimmed_clips
+        long_runtime["denoising_states"] = None
+        debug["vae_tiling_enabled"] = bool(getattr(self.decoding_stage.vae, "use_tiling", False))
+        return batch
+
+
+class VividVRTemporalStitchPostprocessStage(PipelineStage):
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
+        params = _vividvr_params(batch)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        long_runtime = _get_long_video_runtime(batch)
+        trimmed_clips = long_runtime.get("trimmed_clips")
+        if trimmed_clips is None:
+            raise ValueError("VividVR trimmed clips must be prepared before final stitch")
+
+        final_output_video = stitch_vividvr_temporal_output_clips(trimmed_clips)
+        final_output_video = apply_reference_color_fix(
+            final_output_video,
+            params.runtime_reference_video,
+        )
+        final_output_video = run_optional_postprocess_modules(
+            final_output_video,
+            reference_video=params.runtime_reference_video,
+            enabled=bool(params.enable_optional_postprocess_module),
+            allow_fallback=bool(params.allow_optional_module_fallback),
+            debug=debug,
+            processor=None,
+        )
+        if "optional_module_warnings" in debug:
+            params.runtime_optional_module_warnings = list(
+                debug["optional_module_warnings"]
+            )
+
+        params.runtime_num_padding_frames = 0
+        params.runtime_output_video = final_output_video
+        batch.output = final_output_video.permute(1, 0, 2, 3).contiguous()
+        batch.fps = int(params.runtime_fps or batch.fps)
+
+        debug["output_shape"] = tuple(batch.output.shape)
+        debug["output_num_frames"] = int(batch.output.shape[1])
+        batch.extra.pop("vividvr_long_video_runtime", None)
         return batch
