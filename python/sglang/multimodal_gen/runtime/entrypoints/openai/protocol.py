@@ -119,7 +119,7 @@ class VideoGenerationsRequest(BaseModel):
 
 class VideoRepairRequest(BaseModel):
     task_id: Optional[str] = None
-    prompt: str
+    prompt: Optional[str] = None
     negative_prompt: Optional[str] = None
     model: Optional[str] = None
 
@@ -134,15 +134,17 @@ class VideoRepairRequest(BaseModel):
     output_bucket: Optional[str] = None
     output_object_key: Optional[str] = None
 
-    num_frames: int = 81
+    num_frames: Optional[int] = None
     infer_len: int = 81
     overlap: int = 0
     strength: float = 1.0
-    num_inference_steps: int = 20
-    guidance_scale: float = 5.0
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
     seed: int = 42
     generator_device: Optional[str] = None
     dtype: str = "bf16"
+    num_temporal_process_frames: Optional[int] = None
+    restoration_guidance_scale: Optional[float] = None
     dynamic_cfg: bool = True
     dynamic_cfg_max_step: int = 15
     dynamic_cfg_min: float = 1.0

@@ -613,16 +613,23 @@ class PipelineConfig:
         )
         from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
-        # If model_path is a safetensors file and pipeline_class_name is specified,
-        # try to get PipelineConfig from the registry first
-        if is_safetensors_file and pipeline_class_name:
+        # If pipeline_class_name is explicitly provided and registered, prefer its
+        # native PipelineConfig instead of inferring from a generic local diffusers
+        # directory. VividVR service startup relies on this path.
+        if pipeline_class_name:
             config_classes = get_pipeline_config_classes(pipeline_class_name)
             if config_classes is not None:
                 pipeline_config_cls, _ = config_classes
-                logger.info(
-                    f"Detected safetensors file with {pipeline_class_name}, "
-                    f"using {pipeline_config_cls.__name__} directly without model_index.json"
-                )
+                if is_safetensors_file:
+                    logger.info(
+                        f"Detected safetensors file with {pipeline_class_name}, "
+                        f"using {pipeline_config_cls.__name__} directly without model_index.json"
+                    )
+                else:
+                    logger.info(
+                        f"Using explicit pipeline_class_name {pipeline_class_name}, "
+                        f"selecting {pipeline_config_cls.__name__} from registry"
+                    )
             else:
                 model_info = get_model_info(
                     model_path,

@@ -330,6 +330,44 @@ def attach_audio_to_video_sample(
     return sample
 
 
+def _split_outputs_into_samples(outputs: Any, data_type: DataType) -> list[Any]:
+    """Normalize generator outputs into a per-sample list."""
+    if isinstance(outputs, torch.Tensor):
+        if data_type == DataType.VIDEO:
+            if outputs.dim() == 4:
+                return [outputs]
+            if outputs.dim() == 5:
+                return [outputs[idx] for idx in range(outputs.shape[0])]
+        elif data_type == DataType.IMAGE:
+            if outputs.dim() == 3:
+                return [outputs]
+            if outputs.dim() == 4:
+                return [outputs[idx] for idx in range(outputs.shape[0])]
+        return [outputs]
+
+    if isinstance(outputs, np.ndarray):
+        if data_type == DataType.VIDEO:
+            if outputs.ndim == 4:
+                return [outputs]
+            if outputs.ndim == 5:
+                return [outputs[idx] for idx in range(outputs.shape[0])]
+        elif data_type == DataType.IMAGE:
+            if outputs.ndim == 3:
+                return [outputs]
+            if outputs.ndim == 4 and outputs.shape[-1] in (1, 3, 4):
+                return [outputs]
+            if outputs.ndim == 4:
+                return [outputs[idx] for idx in range(outputs.shape[0])]
+            if outputs.ndim == 5:
+                return [outputs[idx] for idx in range(outputs.shape[0])]
+        return [outputs]
+
+    if isinstance(outputs, Sequence) and not isinstance(outputs, (str, bytes)):
+        return list(outputs)
+
+    return [outputs]
+
+
 def save_outputs(
     outputs: Sequence[Any],
     data_type: DataType,
@@ -354,7 +392,8 @@ def save_outputs(
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
-    for idx, output in enumerate(outputs):
+    normalized_outputs = _split_outputs_into_samples(outputs, data_type)
+    for idx, output in enumerate(normalized_outputs):
         save_file_path = build_output_path(idx)
         sample = output
         if data_type == DataType.VIDEO:

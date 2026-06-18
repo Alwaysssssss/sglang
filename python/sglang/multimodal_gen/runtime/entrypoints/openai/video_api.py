@@ -25,8 +25,12 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
+    VividVRPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
@@ -49,6 +53,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.vividvr.preprocess import read_prompt_file
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resolve_videoedit_num_frames,
 )
@@ -298,6 +303,47 @@ def _split_output_path(output_path: str | None, job_id: str, server_output_path:
     return output_dir, f"{job_id}.mp4"
 
 
+def _is_vividvr_video_repair_pipeline(server_args) -> bool:
+    if isinstance(server_args.pipeline_config, VividVRPipelineConfig):
+        return True
+
+    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+    if pipeline_class_name == "CogVideoXVividVRControlNetPipeline":
+        return True
+
+    model_id = getattr(server_args, "model_id", None)
+    if isinstance(model_id, str) and model_id.lower().replace("-", "") == "vividvr":
+        return True
+
+    return False
+
+
+def _resolve_video_repair_model_name(
+    req: VideoRepairRequest, server_args, default_model_name: str
+) -> str:
+    return (
+        req.model
+        or getattr(server_args, "model_id", None)
+        or default_model_name
+    )
+
+
+def _resolve_vividvr_prompt_file_path(server_args) -> str:
+    prompt_file_path = getattr(server_args, "prompt_file_path", None) or getattr(
+        server_args.pipeline_config, "default_prompt_file_path", None
+    )
+    if not prompt_file_path:
+        raise HTTPException(
+            status_code=500,
+            detail="vividvr_prompt_file_path is not configured",
+        )
+    if not os.path.exists(prompt_file_path):
+        raise HTTPException(
+            status_code=500,
+            detail=f"vividvr_prompt_file_path does not exist: {prompt_file_path}",
+        )
+    return prompt_file_path
+
 def _video_repair_job_from_sampling(
     request_id: str, req: VideoRepairRequest, sampling: SamplingParams
 ) -> Dict[str, Any]:
@@ -359,25 +405,12 @@ async def create_video_repair(req: VideoRepairRequest):
         os.makedirs(uploads_dir, exist_ok=True)
 
         video_input_path = req.video_input_path
-        mask_input_path = req.mask_input_path
         if req.video_url:
             video_input_path = await _save_video_source_to_path(
                 req.video_url, os.path.join(uploads_dir, f"{request_id}_video")
             )
-        if req.mask_url:
-            mask_input_path = await _save_video_source_to_path(
-                req.mask_url, os.path.join(uploads_dir, f"{request_id}_mask")
-            )
         if not video_input_path:
             raise HTTPException(status_code=400, detail="video_input_path or video_url is required")
-        if not mask_input_path:
-            raise HTTPException(status_code=400, detail="mask_input_path or mask_url is required")
-
-        resolved_num_frames = resolve_videoedit_num_frames(
-            req.num_frames,
-            video_input_path,
-            mask_input_path,
-        )
 
         output_dir, output_file_name = _split_output_path(
             req.output_path, request_id, server_args.output_path
@@ -388,51 +421,132 @@ async def create_video_repair(req: VideoRepairRequest):
             temp_dirs.append(output_dir)
             output_persistent = False
 
-        sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
-            server_args,
-            request_id=request_id,
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            video_input_path=video_input_path,
-            mask_input_path=mask_input_path,
-            output_path=output_dir,
-            output_file_name=output_file_name,
-            num_frames=resolved_num_frames,
-            infer_len=req.infer_len,
-            overlap=req.overlap,
-            strength=req.strength,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            generator_device=req.generator_device,
-            dtype=req.dtype,
-            dynamic_cfg=req.dynamic_cfg,
-            dynamic_cfg_max_step=req.dynamic_cfg_max_step,
-            dynamic_cfg_min=req.dynamic_cfg_min,
-            bbox_padding=req.bbox_padding,
-            dilate_px=req.dilate_px,
-            mask_scale=req.mask_scale,
-            feather_px=req.feather_px,
-            adain_boundary_dilate=req.adain_boundary_dilate,
-            enable_paste_back=req.enable_paste_back,
-            save_crop_only=req.save_crop_only,
-            drop_reference_frame=req.drop_reference_frame,
-            keep_intermediate_windows=req.keep_intermediate_windows,
-            use_repaired_context=req.use_repaired_context,
-            vary_seed_by_window=req.vary_seed_by_window,
-            enable_teacache=req.enable_teacache,
-            enable_frame_interpolation=req.enable_frame_interpolation,
-            frame_interpolation_exp=req.frame_interpolation_exp,
-            frame_interpolation_scale=req.frame_interpolation_scale,
-            frame_interpolation_model_path=req.frame_interpolation_model_path,
-            enable_upscaling=req.enable_upscaling,
-            upscaling_model_path=req.upscaling_model_path,
-            upscaling_scale=req.upscaling_scale,
-            output_quality=req.output_quality,
-            output_compression=req.output_compression,
-            perf_dump_path=req.perf_dump_path,
-        )
+        if _is_vividvr_video_repair_pipeline(server_args):
+            vividvr_prompt_file_path = _resolve_vividvr_prompt_file_path(server_args)
+            vividvr_kwargs = {
+                "request_id": request_id,
+                "video_input_path": video_input_path,
+                "prompt": read_prompt_file(vividvr_prompt_file_path),
+                "prompt_file_path": vividvr_prompt_file_path,
+                "output_path": output_dir,
+                "output_file_name": output_file_name,
+                "seed": req.seed,
+                "dtype": req.dtype,
+                "enable_teacache": req.enable_teacache,
+                "enable_frame_interpolation": req.enable_frame_interpolation,
+                "frame_interpolation_exp": req.frame_interpolation_exp,
+                "frame_interpolation_scale": req.frame_interpolation_scale,
+                "enable_upscaling": req.enable_upscaling,
+                "upscaling_scale": req.upscaling_scale,
+                "output_quality": req.output_quality,
+                "perf_dump_path": req.perf_dump_path,
+            }
+            if req.negative_prompt is not None:
+                vividvr_kwargs["negative_prompt"] = req.negative_prompt
+            if req.num_frames is not None:
+                vividvr_kwargs["num_frames"] = req.num_frames
+            if req.num_inference_steps is not None:
+                vividvr_kwargs["num_inference_steps"] = req.num_inference_steps
+            if req.guidance_scale is not None:
+                vividvr_kwargs["guidance_scale"] = req.guidance_scale
+            if req.generator_device is not None:
+                vividvr_kwargs["generator_device"] = req.generator_device
+            if req.num_temporal_process_frames is not None:
+                vividvr_kwargs["num_temporal_process_frames"] = (
+                    req.num_temporal_process_frames
+                )
+            if req.restoration_guidance_scale is not None:
+                vividvr_kwargs["restoration_guidance_scale"] = (
+                    req.restoration_guidance_scale
+                )
+            if req.frame_interpolation_model_path is not None:
+                vividvr_kwargs["frame_interpolation_model_path"] = (
+                    req.frame_interpolation_model_path
+                )
+            if req.upscaling_model_path is not None:
+                vividvr_kwargs["upscaling_model_path"] = req.upscaling_model_path
+            if req.output_compression is not None:
+                vividvr_kwargs["output_compression"] = req.output_compression
+
+            sampling_params = VividVRSamplingParams.from_user_kwargs(
+                server_args,
+                **vividvr_kwargs,
+            )
+            default_model_name = "VividVR"
+        else:
+            mask_input_path = req.mask_input_path
+            if req.mask_url:
+                mask_input_path = await _save_video_source_to_path(
+                    req.mask_url, os.path.join(uploads_dir, f"{request_id}_mask")
+                )
+            if not req.prompt:
+                raise HTTPException(status_code=400, detail="prompt is required")
+            if not mask_input_path:
+                raise HTTPException(
+                    status_code=400, detail="mask_input_path or mask_url is required"
+                )
+
+            resolved_num_frames = resolve_videoedit_num_frames(
+                req.num_frames if req.num_frames is not None else 81,
+                video_input_path,
+                mask_input_path,
+            )
+
+            sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
+                server_args,
+                request_id=request_id,
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt,
+                video_input_path=video_input_path,
+                mask_input_path=mask_input_path,
+                output_path=output_dir,
+                output_file_name=output_file_name,
+                num_frames=resolved_num_frames,
+                infer_len=req.infer_len,
+                overlap=req.overlap,
+                strength=req.strength,
+                num_inference_steps=(
+                    req.num_inference_steps
+                    if req.num_inference_steps is not None
+                    else 20
+                ),
+                guidance_scale=(
+                    req.guidance_scale if req.guidance_scale is not None else 5.0
+                ),
+                seed=req.seed,
+                generator_device=req.generator_device,
+                dtype=req.dtype,
+                dynamic_cfg=req.dynamic_cfg,
+                dynamic_cfg_max_step=req.dynamic_cfg_max_step,
+                dynamic_cfg_min=req.dynamic_cfg_min,
+                bbox_padding=req.bbox_padding,
+                dilate_px=req.dilate_px,
+                mask_scale=req.mask_scale,
+                feather_px=req.feather_px,
+                adain_boundary_dilate=req.adain_boundary_dilate,
+                enable_paste_back=req.enable_paste_back,
+                save_crop_only=req.save_crop_only,
+                drop_reference_frame=req.drop_reference_frame,
+                keep_intermediate_windows=req.keep_intermediate_windows,
+                use_repaired_context=req.use_repaired_context,
+                vary_seed_by_window=req.vary_seed_by_window,
+                enable_teacache=req.enable_teacache,
+                enable_frame_interpolation=req.enable_frame_interpolation,
+                frame_interpolation_exp=req.frame_interpolation_exp,
+                frame_interpolation_scale=req.frame_interpolation_scale,
+                frame_interpolation_model_path=req.frame_interpolation_model_path,
+                enable_upscaling=req.enable_upscaling,
+                upscaling_model_path=req.upscaling_model_path,
+                upscaling_scale=req.upscaling_scale,
+                output_quality=req.output_quality,
+                output_compression=req.output_compression,
+                perf_dump_path=req.perf_dump_path,
+            )
+            default_model_name = "videoedit"
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)
+        job["model"] = _resolve_video_repair_model_name(
+            req, server_args, default_model_name
+        )
         await VIDEO_STORE.upsert(request_id, job)
         batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
         asyncio.create_task(

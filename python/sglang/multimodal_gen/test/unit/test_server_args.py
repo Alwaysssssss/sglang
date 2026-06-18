@@ -1,11 +1,15 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
+    VividVRPipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -100,6 +104,18 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.pipeline_config.resolution, 768)
+
+    def test_explicit_pipeline_class_name_uses_registered_pipeline_config(self):
+        with tempfile.TemporaryDirectory(prefix="generic-cogvideox-") as model_dir:
+            pipeline_config = PipelineConfig.from_kwargs(
+                {
+                    "model_path": model_dir,
+                    "model_id": "VividVR",
+                    "pipeline_class_name": "CogVideoXVividVRControlNetPipeline",
+                }
+            )
+
+        self.assertIsInstance(pipeline_config, VividVRPipelineConfig)
 
 
 class TestComponentPathParsing(unittest.TestCase):
