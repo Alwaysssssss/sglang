@@ -13,10 +13,9 @@ ALLOW_EMPTY_API_KEY="${ALLOW_EMPTY_API_KEY:-0}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 TP_SIZE="${TP_SIZE:-4}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
-MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-128000}"
-MEMORY_TARGET_FRACTION="${MEMORY_TARGET_FRACTION:-0.65}"
+MEMORY_TARGET_FRACTION="${MEMORY_TARGET_FRACTION:-0.9}"
 RESPECT_CURRENT_GPU_USAGE="${RESPECT_CURRENT_GPU_USAGE:-1}"
-MAX_RUNNING_REQUESTS_CAP="${MAX_RUNNING_REQUESTS_CAP:-4}"
+MAX_RUNNING_REQUESTS_CAP="${MAX_RUNNING_REQUESTS_CAP:-8}"
 KV_BYTES_PER_TOKEN_PER_GPU="${KV_BYTES_PER_TOKEN_PER_GPU:-16384}"
 STATIC_OVERHEAD_MIB="${STATIC_OVERHEAD_MIB:-2048}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
@@ -43,9 +42,9 @@ LOG_REQUESTS_LEVEL="${LOG_REQUESTS_LEVEL:-2}"
 LOG_REQUESTS_FORMAT="${LOG_REQUESTS_FORMAT:-json}"
 DECODE_LOG_INTERVAL="${DECODE_LOG_INTERVAL:-16}"
 ENABLE_REQUEST_TIME_STATS_LOGGING="${ENABLE_REQUEST_TIME_STATS_LOGGING:-1}"
-ENABLE_METRICS="${ENABLE_METRICS:-1}"
+ENABLE_METRICS="${ENABLE_METRICS:-0}"
 ENABLE_MFU_METRICS="${ENABLE_MFU_METRICS:-0}"
-EXPORT_METRICS_TO_FILE="${EXPORT_METRICS_TO_FILE:-1}"
+EXPORT_METRICS_TO_FILE="${EXPORT_METRICS_TO_FILE:-0}"
 DISABLE_PIECEWISE_CUDA_GRAPH="${DISABLE_PIECEWISE_CUDA_GRAPH:-1}"
 SHOW_TIME_COST="${SHOW_TIME_COST:-0}"
 
@@ -142,10 +141,6 @@ if [[ "$OPENAI_API_KEY" == "EMPTY" ]]; then
     die "OPENAI_API_KEY is EMPTY. Create $API_KEY_FILE or set OPENAI_API_KEY. For local-only testing, set ALLOW_EMPTY_API_KEY=1 explicitly."
   fi
   log "Warning: OPENAI_API_KEY is EMPTY. This is only appropriate for local testing."
-fi
-
-if (( MAX_OUTPUT_TOKENS >= CONTEXT_LENGTH )); then
-  die "MAX_OUTPUT_TOKENS (${MAX_OUTPUT_TOKENS}) must be smaller than CONTEXT_LENGTH (${CONTEXT_LENGTH})."
 fi
 
 gpu_query_output=""
@@ -274,16 +269,6 @@ else
   log "DRY_RUN=1; skipping PID and port checks."
 fi
 
-cat > "$CLIENT_DEFAULTS_FILE" <<EOF
-{
-  "base_url": "http://${SGLANG_HOST}:${SGLANG_PORT}/v1",
-  "model": "${SERVED_MODEL_NAME}",
-  "context_length": ${CONTEXT_LENGTH},
-  "max_tokens": ${MAX_OUTPUT_TOKENS},
-  "max_completion_tokens": ${MAX_OUTPUT_TOKENS}
-}
-EOF
-
 server_cmd=(
   "$SGLANG_PY" -m sglang.launch_server
   --model-path "$MODEL_PATH"
@@ -312,6 +297,7 @@ server_cmd=(
   --crash-dump-folder "$CRASH_DUMP_FOLDER"
   --api-key "$OPENAI_API_KEY"
   --reasoning-parser "$REASONING_PARSER"
+  --allow-auto-truncate
 )
 
 # if [[ -n "$REASONING_PARSER" ]]; then
@@ -367,7 +353,6 @@ log "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
 log "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 log "TP_SIZE=${TP_SIZE}"
 log "CONTEXT_LENGTH=${CONTEXT_LENGTH}"
-log "MAX_OUTPUT_TOKENS=${MAX_OUTPUT_TOKENS}"
 log "MEMORY_TARGET_FRACTION=${MEMORY_TARGET_FRACTION}"
 log "RESPECT_CURRENT_GPU_USAGE=${RESPECT_CURRENT_GPU_USAGE}"
 log "MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC}"
@@ -405,7 +390,6 @@ if [[ -n "$gpu_query_output" ]]; then
 else
   log "GPU snapshot unavailable; nvidia-smi did not return usable data."
 fi
-log "Note: SGLang enforces per-request completion <= context length. Use ${CLIENT_DEFAULTS_FILE} or pass max_tokens/max_completion_tokens=${MAX_OUTPUT_TOKENS} from clients to apply the requested agent output cap."
 log "Launch command:"
 quote_redacted_command | tee -a "$START_LOG_FILE"
 
