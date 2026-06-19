@@ -29,7 +29,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    resolve_video_encoding_mode,
+    resolve_video_encoding_quality,
+    resolve_video_reference_path,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -280,7 +285,18 @@ class GPUWorker:
                         enable_upscaling=req.enable_upscaling,
                         upscaling_model_path=req.upscaling_model_path,
                         upscaling_scale=req.upscaling_scale,
-                        video_reference_path=getattr(req, "video_input_path", None),
+                        video_reference_path=resolve_video_reference_path(
+                            request_like=req,
+                            server_args=self.server_args,
+                            explicit_path=getattr(req, "reference_video_path", None),
+                        ),
+                        video_encoding_mode=resolve_video_encoding_mode(
+                            self.server_args
+                        ),
+                        default_video_quality=resolve_video_encoding_quality(
+                            server_args=self.server_args,
+                            output_compression=req.output_compression,
+                        ),
                     )
                     output_batch.output_file_paths = output_paths
 

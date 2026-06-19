@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from fractions import Fraction
 from typing import Any
@@ -78,6 +79,7 @@ def probe_video_profile(video_path: str) -> dict[str, Any]:
         "color_primaries": stream.get("color_primaries"),
         "field_order": stream.get("field_order"),
         "profile": stream.get("profile"),
+        "level": stream.get("level"),
     }
 
 
@@ -90,6 +92,29 @@ def _encoder_for_codec(codec_name: str | None) -> str:
 def _quality_to_crf(quality: int | float) -> int:
     quality = max(0.0, min(10.0, float(quality)))
     return int(round(51 - quality * 5.1))
+
+
+def _normalize_profile_name(profile: str | None) -> str | None:
+    if not profile:
+        return None
+    normalized = re.sub(r"[^a-z0-9]", "", profile.lower())
+    return normalized or None
+
+
+def _normalize_level(level: Any) -> str | None:
+    if level is None:
+        return None
+    try:
+        level_int = int(level)
+    except (TypeError, ValueError):
+        level_text = str(level).strip()
+        return level_text or None
+
+    if level_int >= 10:
+        major = level_int // 10
+        minor = level_int % 10
+        return f"{major}.{minor}"
+    return str(level_int)
 
 
 def _as_rgb24_array(frame: Image.Image | np.ndarray) -> np.ndarray:
@@ -122,6 +147,8 @@ def _build_ffmpeg_cmd(
 ) -> list[str]:
     encoder = _encoder_for_codec(profile.get("codec_name"))
     pix_fmt = profile.get("pix_fmt") or "yuv420p"
+    normalized_profile = _normalize_profile_name(profile.get("profile"))
+    normalized_level = _normalize_level(profile.get("level"))
     cmd = [
         "ffmpeg",
         "-y",
@@ -149,7 +176,12 @@ def _build_ffmpeg_cmd(
     if quality is not None and encoder in {"libx264", "libx265"}:
         cmd.extend(["-crf", str(_quality_to_crf(quality))])
     elif profile.get("bit_rate"):
-        cmd.extend(["-b:v", str(profile["bit_rate"])])
+        bit_rate = str(profile["bit_rate"])
+        cmd.extend(["-b:v", bit_rate])
+        if encoder in {"libx264", "libx265"}:
+            cmd.extend(["-minrate", bit_rate, "-maxrate", bit_rate, "-bufsize", bit_rate])
+            if encoder == "libx264":
+                cmd.extend(["-x264-params", "nal-hrd=cbr:force-cfr=1"])
 
     if profile.get("color_space") and profile["color_space"] != "unknown":
         cmd.extend(["-colorspace", profile["color_space"]])
@@ -161,6 +193,11 @@ def _build_ffmpeg_cmd(
     field_order = profile.get("field_order")
     if field_order in {"progressive", "tt", "bb", "tb", "bt"}:
         cmd.extend(["-field_order", field_order])
+
+    if encoder in {"libx264", "libx265"} and normalized_profile:
+        cmd.extend(["-profile:v", normalized_profile])
+    if encoder in {"libx264", "libx265"} and normalized_level:
+        cmd.extend(["-level:v", normalized_level])
 
     cmd.append(output_path)
     return cmd

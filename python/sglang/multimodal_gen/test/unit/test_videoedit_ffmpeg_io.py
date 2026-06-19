@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import (
+    _build_ffmpeg_cmd,
     probe_video_profile,
     save_video_frames_like_reference,
 )
@@ -60,6 +61,40 @@ class TestVideoEditFfmpegIO(unittest.TestCase):
             self.assertEqual(round(out_profile["fps"]), round(ref_profile["fps"]))
             self.assertEqual(out_profile["width"], 8)
             self.assertEqual(out_profile["height"], 8)
+
+    def test_build_ffmpeg_cmd_preserves_h264_profile_level_and_rate_control(self):
+        cmd = _build_ffmpeg_cmd(
+            output_path="/tmp/out.mp4",
+            width=960,
+            height=720,
+            fps=25.0,
+            profile={
+                "codec_name": "h264",
+                "pix_fmt": "yuv420p",
+                "bit_rate": 17019260,
+                "color_space": None,
+                "color_transfer": None,
+                "color_primaries": None,
+                "field_order": None,
+                "profile": "High",
+                "level": 31,
+            },
+            quality=None,
+            loglevel="warning",
+        )
+
+        self.assertIn("libx264", cmd)
+        self.assertIn("-profile:v", cmd)
+        self.assertIn("high", cmd)
+        self.assertIn("-level:v", cmd)
+        self.assertIn("3.1", cmd)
+        self.assertIn("-b:v", cmd)
+        self.assertIn("17019260", cmd)
+        self.assertIn("-minrate", cmd)
+        self.assertIn("-maxrate", cmd)
+        self.assertIn("-bufsize", cmd)
+        self.assertIn("-x264-params", cmd)
+        self.assertIn("nal-hrd=cbr:force-cfr=1", cmd)
 
 
 if __name__ == "__main__":

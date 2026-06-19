@@ -15,8 +15,10 @@ class VividVRSamplingParams(SamplingParams):
     """Sampling contract for the Stage A/C VividVR integration."""
 
     video_input_path: str | None = None
+    output_quality: str | None = None
     prompt_file_path: str | None = DEFAULT_VIVIDVR_PROMPT_FILE_PATH
     caption_file_path: str | None = None
+    reference_video_path: str | None = None
     caption_source: str = "prompt_file"
     use_live_cogvlm2_caption: bool = False
     cogvlm2_model_path: str | None = None

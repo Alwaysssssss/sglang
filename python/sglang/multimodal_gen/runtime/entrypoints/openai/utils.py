@@ -15,6 +15,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
+    VividVRPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -22,6 +25,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
     format_lora_message,
+    resolve_video_encoding_mode,
+    resolve_video_encoding_quality,
+    resolve_video_reference_path,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -103,6 +109,12 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     output_quality = kwargs.pop("output_quality", None)
 
     has_explicit_compression = kwargs.get("output_compression") is not None
+    if (
+        isinstance(server_args.pipeline_config, VividVRPipelineConfig)
+        and not has_explicit_compression
+        and output_quality == "default"
+    ):
+        output_quality = None
 
     # parse "WxH" size string if provided
     size = kwargs.pop("size", None)
@@ -289,7 +301,18 @@ async def process_generation_batch(
                 enable_upscaling=batch.enable_upscaling,
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=batch.upscaling_scale,
-                video_reference_path=getattr(batch, "video_input_path", None),
+                video_reference_path=resolve_video_reference_path(
+                    request_like=batch,
+                    server_args=get_global_server_args(),
+                    explicit_path=getattr(batch, "reference_video_path", None),
+                ),
+                video_encoding_mode=resolve_video_encoding_mode(
+                    get_global_server_args()
+                ),
+                default_video_quality=resolve_video_encoding_quality(
+                    server_args=get_global_server_args(),
+                    output_compression=batch.output_compression,
+                ),
             )
 
     total_time = time.perf_counter() - total_start_time

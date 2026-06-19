@@ -94,6 +94,8 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual(params.width, 960)
         self.assertEqual(params.height, 720)
         self.assertEqual(params.num_frames, 121)
+        self.assertIsNone(params.output_quality)
+        self.assertIsNone(params.output_compression)
 
     def test_vividvr_prompt_file_alias_populates_prompt_path(self):
         params = VividVRSamplingParams(prompt_file_path="/tmp/custom_prompt.txt")

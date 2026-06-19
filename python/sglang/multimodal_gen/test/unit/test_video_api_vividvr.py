@@ -28,6 +28,10 @@ class TestVideoRepairAPI(unittest.TestCase):
         self.override_prompt_file.write_text("override prompt\n", encoding="utf-8")
         self.video_file = Path(self.input_dir.name) / "input.mp4"
         self.video_file.write_bytes(b"fake mp4 data")
+        self.caption_file = Path(self.input_dir.name) / "captions.txt"
+        self.caption_file.write_text("clip one\nclip two\n", encoding="utf-8")
+        self.reference_video_file = Path(self.input_dir.name) / "reference.mp4"
+        self.reference_video_file.write_bytes(b"fake reference mp4 data")
 
         self.app = FastAPI()
         self.app.include_router(video_api.router)
@@ -120,7 +124,46 @@ class TestVideoRepairAPI(unittest.TestCase):
         self.assertNotIn("num_frames", captured_kwargs)
         self.assertNotIn("num_inference_steps", captured_kwargs)
         self.assertNotIn("guidance_scale", captured_kwargs)
+        self.assertNotIn("output_quality", captured_kwargs)
+        self.assertNotIn("output_compression", captured_kwargs)
         self.assertIn(body["id"], video_api.VIDEO_STORE._items)
+
+    def test_vividvr_repair_preserves_explicit_output_quality_override(self):
+        pipeline_config = VividVRPipelineConfig()
+        pipeline_config.default_prompt_file_path = str(self.prompt_file)
+        set_global_server_args(self._make_server_args(pipeline_config, model_id="VividVR"))
+
+        captured_kwargs = {}
+
+        def fake_from_user_kwargs(_server_args, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return SimpleNamespace(
+                prompt=kwargs.get("prompt"),
+                output_file_path=lambda: str(Path(self.output_dir.name) / "job.mp4"),
+            )
+
+        with patch.object(video_api, "prepare_request", return_value="fake-batch"):
+            with patch.object(
+                video_api,
+                "_dispatch_video_repair_job_async",
+                side_effect=self._fake_dispatch_video_repair_job_async,
+            ):
+                with patch.object(
+                    video_api.VividVRSamplingParams,
+                    "from_user_kwargs",
+                    side_effect=fake_from_user_kwargs,
+                ):
+                    with TestClient(self.app) as client:
+                        response = client.post(
+                            "/v1/videos/repairs",
+                            json={
+                                "video_input_path": str(self.video_file),
+                                "output_quality": "high",
+                            },
+                        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured_kwargs["output_quality"], "high")
 
     def test_vividvr_repair_prefers_server_prompt_file_override(self):
         pipeline_config = VividVRPipelineConfig()
@@ -159,6 +202,54 @@ class TestVideoRepairAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             captured_kwargs["prompt_file_path"], str(self.override_prompt_file)
+        )
+
+    def test_vividvr_repair_forwards_caption_and_reference_overrides(self):
+        pipeline_config = VividVRPipelineConfig()
+        pipeline_config.default_prompt_file_path = str(self.prompt_file)
+        set_global_server_args(
+            self._make_server_args(
+                pipeline_config,
+                model_id="served-vividvr",
+            )
+        )
+
+        captured_kwargs = {}
+        original_from_user_kwargs = video_api.VividVRSamplingParams.from_user_kwargs
+
+        def capture_from_user_kwargs(server_args, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return original_from_user_kwargs(server_args, *args, **kwargs)
+
+        with patch.object(video_api, "prepare_request", return_value="fake-batch"):
+            with patch.object(
+                video_api,
+                "_dispatch_video_repair_job_async",
+                side_effect=self._fake_dispatch_video_repair_job_async,
+            ):
+                with patch.object(
+                    video_api.VividVRSamplingParams,
+                    "from_user_kwargs",
+                    side_effect=capture_from_user_kwargs,
+                ):
+                    with TestClient(self.app) as client:
+                        response = client.post(
+                            "/v1/videos/repairs",
+                            json={
+                                "video_input_path": str(self.video_file),
+                                "caption_file_path": str(self.caption_file),
+                                "reference_video_path": str(
+                                    self.reference_video_file
+                                ),
+                            },
+                        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured_kwargs["caption_source"], "caption_file")
+        self.assertEqual(captured_kwargs["caption_file_path"], str(self.caption_file))
+        self.assertEqual(
+            captured_kwargs["reference_video_path"],
+            str(self.reference_video_file),
         )
 
     def test_vividvr_repair_accepts_explicit_vividvr_pipeline_class(self):

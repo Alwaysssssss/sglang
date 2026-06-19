@@ -33,11 +33,17 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
+    VividVRPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
 logger = init_logger(__name__)
+
+VIDEO_ENCODING_MODE_REFERENCE_PROFILE = "reference_profile"
+VIDEO_ENCODING_MODE_VIVIDVR_ORIGINAL = "vividvr_original"
 
 
 @dataclass
@@ -67,6 +73,59 @@ class ListLorasReq:
 @dataclass
 class ShutdownReq:
     pass
+
+
+def resolve_video_reference_path(
+    *,
+    request_like: Any = None,
+    server_args: Optional[ServerArgs] = None,
+    explicit_path: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the reference video profile used when saving generated videos.
+
+    Prefer a request-level reference override when one is available. This keeps
+    long-video VividVR service requests aligned with the correct reference
+    profile instead of always reusing the single-clip default.
+    """
+    if explicit_path:
+        return explicit_path
+
+    request_reference_path = getattr(request_like, "reference_video_path", None)
+    if request_reference_path:
+        return request_reference_path
+
+    if server_args is not None and isinstance(
+        server_args.pipeline_config, VividVRPipelineConfig
+    ):
+        reference_video_path = getattr(
+            server_args.pipeline_config, "reference_video_path", None
+        )
+        if reference_video_path:
+            return reference_video_path
+
+    return getattr(request_like, "video_input_path", None)
+
+
+def is_vividvr_pipeline(server_args: Optional[ServerArgs]) -> bool:
+    return server_args is not None and isinstance(
+        getattr(server_args, "pipeline_config", None), VividVRPipelineConfig
+    )
+
+
+def resolve_video_encoding_mode(server_args: Optional[ServerArgs]) -> str:
+    return VIDEO_ENCODING_MODE_REFERENCE_PROFILE
+
+
+def resolve_video_encoding_quality(
+    *,
+    server_args: Optional[ServerArgs],
+    output_compression: Optional[int],
+) -> float:
+    if output_compression is not None:
+        return output_compression / 10
+    if is_vividvr_pipeline(server_args):
+        return 8
+    return 5
 
 
 def format_lora_message(
@@ -389,6 +448,8 @@ def save_outputs(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
     video_reference_path: Optional[str] = None,
+    video_encoding_mode: str = VIDEO_ENCODING_MODE_REFERENCE_PROFILE,
+    default_video_quality: Optional[float] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -415,6 +476,8 @@ def save_outputs(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
             video_reference_path=video_reference_path,
+            video_encoding_mode=video_encoding_mode,
+            default_video_quality=default_video_quality,
         )
 
         if samples_out is not None:
@@ -451,6 +514,8 @@ def post_process_sample(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
     video_reference_path: Optional[str] = None,
+    video_encoding_mode: str = VIDEO_ENCODING_MODE_REFERENCE_PROFILE,
+    default_video_quality: Optional[float] = None,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
@@ -522,10 +587,19 @@ def post_process_sample(
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
                 imageio_quality = (
-                    output_compression / 10 if output_compression is not None else 5
+                    default_video_quality
+                    if default_video_quality is not None
+                    else (
+                        output_compression / 10
+                        if output_compression is not None
+                        else 5
+                    )
                 )
                 saved_with_reference = False
-                if video_reference_path:
+                if (
+                    video_encoding_mode == VIDEO_ENCODING_MODE_REFERENCE_PROFILE
+                    and video_reference_path
+                ):
                     try:
                         from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import (
                             save_video_frames_like_reference,
@@ -552,14 +626,26 @@ def post_process_sample(
                         )
 
                 if not saved_with_reference:
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                        codec="libx264",
-                        quality=imageio_quality,
-                    )
+                    if video_encoding_mode == VIDEO_ENCODING_MODE_VIVIDVR_ORIGINAL:
+                        from sglang.multimodal_gen.runtime.videoedit.io import (
+                            save_video_frames,
+                        )
+
+                        save_video_frames(
+                            frames,
+                            save_file_path,
+                            fps=fps,
+                            quality=imageio_quality,
+                        )
+                    else:
+                        imageio.mimsave(
+                            save_file_path,
+                            frames,
+                            fps=fps,
+                            format=data_type.get_default_extension(),
+                            codec="libx264",
+                            quality=imageio_quality,
+                        )
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,

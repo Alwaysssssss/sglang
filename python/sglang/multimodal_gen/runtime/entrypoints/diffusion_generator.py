@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     UnmergeLoraWeightsReq,
     format_lora_message,
     prepare_request,
+    resolve_video_encoding_mode,
+    resolve_video_encoding_quality,
+    resolve_video_reference_path,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.launch_server import launch_server
@@ -306,7 +309,18 @@ class DiffGenerator:
                         enable_upscaling=req.enable_upscaling,
                         upscaling_model_path=req.upscaling_model_path,
                         upscaling_scale=req.upscaling_scale,
-                        video_reference_path=getattr(req, "video_input_path", None),
+                        video_reference_path=resolve_video_reference_path(
+                            request_like=req,
+                            server_args=self.server_args,
+                            explicit_path=getattr(req, "reference_video_path", None),
+                        ),
+                        video_encoding_mode=resolve_video_encoding_mode(
+                            self.server_args
+                        ),
+                        default_video_quality=resolve_video_encoding_quality(
+                            server_args=self.server_args,
+                            output_compression=req.output_compression,
+                        ),
                     )
 
                     for idx in range(len(samples_out)):

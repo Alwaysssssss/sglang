@@ -19,6 +19,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_samplin
 from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
+    resolve_video_encoding_mode,
+    resolve_video_encoding_quality,
+    resolve_video_reference_path,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -206,7 +209,18 @@ async def forward_to_scheduler(
                 enable_upscaling=sp.enable_upscaling,
                 upscaling_model_path=sp.upscaling_model_path,
                 upscaling_scale=sp.upscaling_scale,
-                video_reference_path=getattr(sp, "video_input_path", None),
+                video_reference_path=resolve_video_reference_path(
+                    request_like=sp,
+                    server_args=get_global_server_args(),
+                    explicit_path=getattr(sp, "reference_video_path", None),
+                ),
+                video_encoding_mode=resolve_video_encoding_mode(
+                    get_global_server_args()
+                ),
+                default_video_quality=resolve_video_encoding_quality(
+                    server_args=get_global_server_args(),
+                    output_compression=sp.output_compression,
+                ),
             )
 
         if hasattr(response, "model_dump"):

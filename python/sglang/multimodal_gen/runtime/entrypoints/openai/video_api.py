@@ -438,11 +438,17 @@ async def create_video_repair(req: VideoRepairRequest):
                 "frame_interpolation_scale": req.frame_interpolation_scale,
                 "enable_upscaling": req.enable_upscaling,
                 "upscaling_scale": req.upscaling_scale,
-                "output_quality": req.output_quality,
                 "perf_dump_path": req.perf_dump_path,
             }
+            if req.output_quality not in (None, "default"):
+                vividvr_kwargs["output_quality"] = req.output_quality
             if req.negative_prompt is not None:
                 vividvr_kwargs["negative_prompt"] = req.negative_prompt
+            if req.caption_file_path is not None:
+                vividvr_kwargs["caption_source"] = "caption_file"
+                vividvr_kwargs["caption_file_path"] = req.caption_file_path
+            if req.reference_video_path is not None:
+                vividvr_kwargs["reference_video_path"] = req.reference_video_path
             if req.num_frames is not None:
                 vividvr_kwargs["num_frames"] = req.num_frames
             if req.num_inference_steps is not None:

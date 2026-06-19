@@ -127,6 +127,8 @@ class VideoRepairRequest(BaseModel):
     mask_input_path: Optional[str] = None
     video_url: Optional[str] = None
     mask_url: Optional[str] = None
+    caption_file_path: Optional[str] = None
+    reference_video_path: Optional[str] = None
 
     callback_url: Optional[str] = None
     output_storage: str = "local"
