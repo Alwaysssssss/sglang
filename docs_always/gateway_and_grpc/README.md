@@ -44,6 +44,7 @@
 1. [01_rust_sglang_grpc.md](./01_rust_sglang_grpc.md) — `rust/sglang-grpc` 的定位、构建与生命周期
 2. [02_sgl_model_gateway.md](./02_sgl_model_gateway.md) — `sgl-model-gateway` 的整体架构、控制面 / 数据面、运维要点
 3. [03_two_modules_relationship.md](./03_two_modules_relationship.md) — 二者如何在一次请求中协作
+4. [04_nginx_vs_gateway_for_qwen36.md](./04_nginx_vs_gateway_for_qwen36.md) — Qwen3.6-27B runbook 里 Nginx 与 `sgl-model-gateway` 的关系和取舍
 
 ## 关键事实速查
 
