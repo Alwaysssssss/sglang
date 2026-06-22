@@ -175,6 +175,34 @@ class VideoRepairRequest(BaseModel):
     perf_dump_path: Optional[str] = None
 
 
+class FlowCutMinIOConfig(BaseModel):
+    endpoint: str
+    bucket_name: str
+    access_key: str
+    secret_key: str
+    secure: bool = False
+    region: Optional[str] = None
+
+
+class FlowCutVideoRepairRequest(VideoRepairRequest):
+    task_id: Optional[str] = Field(default=None, alias="taskId")
+    timeout: int = -1
+    callback_url: Optional[str] = Field(default=None, alias="callbackUrl")
+    minio_config: Optional[FlowCutMinIOConfig] = Field(
+        default=None, alias="minioConfig"
+    )
+
+    model_config = {
+        "populate_by_name": True,
+        "extra": "allow",
+    }
+
+
+class FlowCutResponse(BaseModel):
+    code: int
+    message: str = "ok"
+
+
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"

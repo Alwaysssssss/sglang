@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
     Connector,
     VividVRSequenceShardState,
     build_vividvr_connector_control_states,
+    get_vividvr_connector_sp_context_mode,
     restore_vividvr_connector_global_control_state,
     restore_vividvr_connector_global_control_states,
     gather_vividvr_video_tokens,
@@ -22,6 +23,13 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
 
 
 class TestVividVRSequenceShardHelpers(unittest.TestCase):
+    def test_get_vividvr_connector_sp_context_mode_defaults_to_eager_global(self):
+        with patch.dict(environ, {}, clear=True):
+            self.assertEqual(
+                get_vividvr_connector_sp_context_mode(),
+                "eager_global",
+            )
+
     def test_sequence_shard_enabled_requires_forward_batch_and_sp_world(self):
         context = SimpleNamespace(
             forward_batch=SimpleNamespace(enable_sequence_shard=True)
@@ -153,19 +161,26 @@ class TestVividVRSequenceShardHelpers(unittest.TestCase):
             )
         )
 
-    def test_build_connector_control_states_uses_deferred_global_restore_by_default(
+    def test_build_connector_control_states_restores_global_states_by_default(
         self,
     ):
         local_states = (
             torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
             torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
         )
+        gathered_states = torch.tensor(
+            [
+                [[[0.5, 1.0], [1.5, 2.0], [9.0, 9.5], [10.0, 10.5]]],
+                [[[2.5, 3.0], [3.5, 4.0], [11.0, 11.5], [12.0, 12.5]]],
+            ]
+        )
 
         with (
             patch(
                 "sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common.sequence_model_parallel_all_gather",
+                return_value=gathered_states,
             ) as gather_mock,
-            patch.dict(environ, {}, clear=False),
+            patch.dict(environ, {}, clear=True),
         ):
             connector_states = build_vividvr_connector_control_states(
                 local_states,
@@ -179,8 +194,8 @@ class TestVividVRSequenceShardHelpers(unittest.TestCase):
             )
 
         self.assertEqual(len(connector_states), 2)
-        self.assertEqual(len(connector_states[0]), 1)
-        gather_mock.assert_not_called()
+        self.assertEqual(len(connector_states[0]), 2)
+        gather_mock.assert_called_once()
         self.assertTrue(
             torch.equal(
                 connector_states[0][0],
@@ -189,10 +204,17 @@ class TestVividVRSequenceShardHelpers(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(
+                connector_states[0][1],
+                gathered_states[0],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
                 connector_states[1][0],
                 torch.tensor([[[2.5, 3.0], [3.5, 4.0]]]),
             )
         )
+        self.assertTrue(torch.equal(connector_states[1][1], gathered_states[1]))
 
     def test_build_connector_control_states_restores_global_states_in_eager_mode(self):
         local_states = (

@@ -193,7 +193,7 @@ tmux attach -r -t vividvr_phase_d_20step
 
 ### 2.4 Phase E4.1 native SP 多卡 formal 命令
 
-下面三条命令用于当前 `Phase E4.1` 的双卡 `SP` 正式 benchmark。三条命令共用同一套输入、caption、prompt、reference、`20 step` 和 `FA + compile` 口径，只改变 `native fast path / v1 / v2` 的 connector 语义入口。
+下面三条命令用于当前 `Phase E4.1` 的双卡 `SP` 正式 benchmark。三条命令共用同一套输入、caption、prompt、reference、`20 step` 和 `FA + compile` 口径，只改变默认 `eager_global / v1 / 显式 v2` 的 connector 语义入口。
 
 共同约束：
 
@@ -204,15 +204,15 @@ tmux attach -r -t vividvr_phase_d_20step
   - `sp_degree=2`
   - `ulysses_degree=2`
   - `ring_degree=1`
-- `v1 / v2` 通过环境变量 `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE` 选择语义
+- `deferred_global / eager_global` 通过环境变量 `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE` 选择语义；未设置时默认走 `eager_global`
 - `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE` 默认值固定为 `1`，也就是 SP 默认不做 control pooling；只有显式设置 `=2` 等值时才启用池化压缩
-- `native` fast path 不额外设置该环境变量，使用当前默认 native `SP` 快路径
+- 默认双卡质量口径不额外设置该环境变量，直接使用当前默认的 `eager_global` 路径；只有做历史 `v1` 回归或性能实验时才显式切到 `deferred_global`
 
-`native` fast path：
+默认双卡质量口径（不额外设置 env，等价于 `eager_global`）：
 
 ```bash
-tmux new-session -d -s vividvr_e41_native_sp_fast \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && /home/zhiheng/sglang/.venv/bin/torchrun --nproc_per_node=2 --master_port=30062 python/sglang/multimodal_gen/tools/run_vividvr_inference.py --input-video /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 --caption-file /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt --prompt-file /home/zhiheng/Vivid-VR/input/720p/prompt.txt --reference-video /home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4 --num-inference-steps 20 --seed 42 --num-gpus 2 --tp-size 1 --sp-degree 2 --ulysses-degree 2 --ring-degree 1 --dist-timeout 3600 --master-port 30062 --attention-backend fa --enable-torch-compile --warmup --warmup-steps 1 --artifact-prefix phase_e41_native_sp_only_130f_20step_compile 2>&1 | tee Vivid_Acceptance/logs/phase_e41_native_sp_formal_$(date -u +%Y%m%dT%H%M%SZ).log'
+tmux new-session -d -s vividvr_e41_sp_default \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && /home/zhiheng/sglang/.venv/bin/torchrun --nproc_per_node=2 --master_port=30062 python/sglang/multimodal_gen/tools/run_vividvr_inference.py --input-video /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 --caption-file /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt --prompt-file /home/zhiheng/Vivid-VR/input/720p/prompt.txt --reference-video /home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4 --num-inference-steps 20 --seed 42 --num-gpus 2 --tp-size 1 --sp-degree 2 --ulysses-degree 2 --ring-degree 1 --dist-timeout 3600 --master-port 30062 --attention-backend fa --enable-torch-compile --warmup --warmup-steps 1 --artifact-prefix phase_e41_sp_default_130f_20step_compile 2>&1 | tee Vivid_Acceptance/logs/phase_e41_sp_default_formal_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
 `v1`：
@@ -232,20 +232,22 @@ tmux new-session -d -s vividvr_e41_v2_recheck \
 查看进度：
 
 ```bash
-tmux attach -r -t vividvr_e41_native_sp_fast
+tmux attach -r -t vividvr_e41_sp_default
 tmux attach -r -t vividvr_e41_v1_recheck
 tmux attach -r -t vividvr_e41_v2_recheck
 ```
 
 对应语义标签：
 
-- `native` fast path：
-  - 当前默认 native `SP` 快路径，不恢复 full global control context
+- 默认双卡质量口径：
+  - 未设置 `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE`
+  - runtime snapshot 中应表现为 `connector_context_mode = sp_exact_global_control_attention`
 - `v1`：
   - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=deferred_global`
   - runtime snapshot 中应表现为 `connector_context_mode = sp_exact_local_attention`
 - `v2`：
   - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`
+  - 用于显式钉死默认质量口径
   - runtime snapshot 中应表现为 `connector_context_mode = sp_exact_global_control_attention`
 
 ## 3. 对比时必须保持一致的关键参数

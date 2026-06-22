@@ -13,6 +13,10 @@
 - 当前稳定基线是 `Phase C` 单 clip 路径；后续所有改动默认都要保护这条基线，避免回归。
 - `Phase D` 的重点是长视频 `clip split / merge / temporal orchestration` 以及公平 benchmark；截至目前，这部分代码和 benchmark 流程已具备，并已完成正式验收，作为 `Phase E` 的长视频语义基线。
 - `Phase E` 的重点不是再发明新语义，而是在 `Phase D` 语义对齐基础上做性能收口、默认配置收口和回归验收，逐步进入 release gate。
+- 当前 `Phase E` 的 `130f / 20 step` 长视频 `serve` benchmark 与加速消融已经完成，默认配置已经收口到单卡 `single_gpu_fa_compile` 和双卡 `dual_gpu_fa_eager_compile`。
+- 当前仍未完成的主问题有两条：
+  - 原版 `/home/zhiheng/Vivid-VR` 的 caption 目前只能在原版环境中稳定正确产出；在 `sglang` 的 `.venv` 中会因依赖版本差异导致 caption 输出异常，后续可能需要补一条“通信交换生成 caption”的桥接路径。
+  - `serve` 服务接口的部分输入参数契约仍需按需求继续收口，当前不能默认视为已经完全稳定。
 - `Vivid-VR` 在 `sglang` 中必须作为原生模型集成运行；推理时不要依赖原版仓库的运行时代码。
 - 允许继续复用原版仓库中的外部资源，例如：
   - checkpoint
@@ -48,7 +52,10 @@
   - 建立可重复运行的 regression 套件
   - 让验收逐步从阶段性对齐进入 strict 或接近 strict 的 release gate
 - 当前 `Phase E` 日常 benchmark 默认固定为与 `Phase D` 相同 reference 对象的 `130f / 20 step` 长视频口径；`50 step` 只保留给阶段性最终回归。
-- 当前双卡 `SP` 默认质量口径要求 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`，也就是默认不启用 control pooling；只有在明确做性能实验时才显式打开 pool 压缩。
+- 当前 `Phase E` 单卡默认正式配置固定为 `single_gpu_fa_compile`，也就是 `--attention-backend fa` + `--enable-torch-compile`。
+- 当前双卡 `SP` 默认质量口径要求 connector context mode 走 `eager_global`，并保持 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`；也就是默认恢复 full global control context，且默认不启用 control pooling。只有在明确做历史 `v1` 对比或性能实验时，才显式切回 `deferred_global` 或打开 pool 压缩。
+- 当前 `Phase E` 双卡默认正式配置固定为 `dual_gpu_fa_eager_compile`，也就是 `--attention-backend fa` + `SP=2` + `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` + `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1` + `--enable-torch-compile`；在双卡 `SP` 下运行时有效 backend 记为 `fa_sp`。
+- 单卡正式 benchmark 或正式对比时，必须保证同一时刻只有一个单卡推理进程在跑，避免并发占用把单卡耗时拉长，造成不公平对比。
 - 推进 `Phase E` 时，默认前提是不能破坏 `Phase C` 已验收基线，也不要用性能优化引入新的长视频语义回归。
 - 如果任务明确属于 `Phase E`，先确认当前 benchmark 和验收口径是否已经固定；如果默认参数、后端或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
 
@@ -132,7 +139,11 @@
 
 ## 标准推理命令
 
-- 当前项目默认以 `Phase C` 单次验收命令作为标准推理命令，后续 Codex 进行 `Vivid-VR` 推理或基线验收时，默认从这条命令开始。
+- `Phase C` 单 clip 回归仍以这条单次验收命令作为标准回归入口。
+- 当前 `Phase E` 长视频默认配置已经固定为：
+  - 单卡：`single_gpu_fa_compile`
+  - 双卡：`dual_gpu_fa_eager_compile`
+- 对应的单卡/双卡直接运行命令、`serve` 拉起命令和 `curl` 请求命令统一维护在 `/home/zhiheng/sglang/docs_xzh/run_command/vividvr_default_run_and_serve_commands.md`。
 - 在 `tmux` 中启动的推荐命令如下：
 
 ```bash

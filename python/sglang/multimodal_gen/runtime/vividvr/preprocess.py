@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipelineConfig
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
-from sglang.multimodal_gen.runtime.videoedit.preprocess import load_video_frames
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_prompt_file_path(
@@ -55,8 +59,52 @@ def resolve_negative_prompt(
     return pipeline_config.default_negative_prompt
 
 
+def _load_control_video_frames_cv2(video_path: str) -> tuple[list[Image.Image], float]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video file: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frames: list[Image.Image] = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    cap.release()
+    return frames, float(fps)
+
+
+def _load_control_video_frames_decord(video_path: str) -> tuple[list[Image.Image], float]:
+    import decord
+
+    # Match the original Vivid-VR control-video decode path so the model sees
+    # the same RGB frames as the upstream implementation.
+    video_reader = decord.VideoReader(uri=video_path, num_threads=1)
+    total_frames = len(video_reader)
+    if total_frames <= 0:
+        raise RuntimeError(f"No frames found in video file: {video_path}")
+
+    batch = video_reader.get_batch(list(range(total_frames)))
+    arrays = batch.asnumpy() if hasattr(batch, "asnumpy") else np.asarray(batch)
+    frames = [Image.fromarray(frame) for frame in arrays]
+    fps = video_reader.get_avg_fps() or 24.0
+    return frames, float(fps)
+
+
+def load_control_video_frames(video_path: str) -> tuple[list[Image.Image], float]:
+    try:
+        return _load_control_video_frames_decord(video_path)
+    except Exception as exc:
+        logger.warning(
+            "VividVR decord control-video decode failed for %s; falling back to OpenCV: %s",
+            video_path,
+            exc,
+        )
+        return _load_control_video_frames_cv2(video_path)
+
+
 def load_control_video(video_path: str) -> dict[str, object]:
-    frames, fps = load_video_frames(video_path)
+    frames, fps = load_control_video_frames(video_path)
     if not frames:
         raise ValueError(f"No frames found in control video: {video_path}")
 

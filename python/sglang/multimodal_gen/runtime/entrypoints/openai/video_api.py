@@ -32,7 +32,17 @@ from sglang.multimodal_gen.configs.sample.videoedit_wan import (
 from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
     VividVRPipelineConfig,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.flowcut import (
+    build_flowcut_final_callback_payload,
+    build_flowcut_running_callback_payload,
+    post_flowcut_callback,
+    report_flowcut_running_until_done,
+    upload_to_flowcut_minio,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    FlowCutMinIOConfig,
+    FlowCutResponse,
+    FlowCutVideoRepairRequest,
     VideoGenerationsRequest,
     VideoListResponse,
     VideoRepairRequest,
@@ -213,6 +223,16 @@ async def _post_video_callback(
     )
 
 
+async def _log_video_task_not_found(video_id: str, endpoint: str) -> None:
+    jobs = await VIDEO_STORE.list_values()
+    logger.info(
+        "Video task not found task_id=%s endpoint=%s store_size=%s",
+        video_id,
+        endpoint,
+        len(jobs),
+    )
+
+
 async def _dispatch_job_async(
     job_id: str,
     batch: Req,
@@ -344,6 +364,66 @@ def _resolve_vividvr_prompt_file_path(server_args) -> str:
         )
     return prompt_file_path
 
+
+def _build_vividvr_repair_kwargs(
+    *,
+    request_id: str,
+    req: VideoRepairRequest,
+    server_args,
+    video_input_path: str,
+    output_dir: str,
+    output_file_name: str,
+) -> Dict[str, Any]:
+    vividvr_prompt_file_path = _resolve_vividvr_prompt_file_path(server_args)
+    vividvr_kwargs = {
+        "request_id": request_id,
+        "video_input_path": video_input_path,
+        "prompt": read_prompt_file(vividvr_prompt_file_path),
+        "prompt_file_path": vividvr_prompt_file_path,
+        "output_path": output_dir,
+        "output_file_name": output_file_name,
+        "seed": req.seed,
+        "dtype": req.dtype,
+        "enable_teacache": req.enable_teacache,
+        "enable_frame_interpolation": req.enable_frame_interpolation,
+        "frame_interpolation_exp": req.frame_interpolation_exp,
+        "frame_interpolation_scale": req.frame_interpolation_scale,
+        "enable_upscaling": req.enable_upscaling,
+        "upscaling_scale": req.upscaling_scale,
+        "perf_dump_path": req.perf_dump_path,
+    }
+    if req.output_quality not in (None, "default"):
+        vividvr_kwargs["output_quality"] = req.output_quality
+    if req.negative_prompt is not None:
+        vividvr_kwargs["negative_prompt"] = req.negative_prompt
+    if req.caption_file_path is not None:
+        vividvr_kwargs["caption_source"] = "caption_file"
+        vividvr_kwargs["caption_file_path"] = req.caption_file_path
+    if req.reference_video_path is not None:
+        vividvr_kwargs["reference_video_path"] = req.reference_video_path
+    if req.num_frames is not None:
+        vividvr_kwargs["num_frames"] = req.num_frames
+    if req.num_inference_steps is not None:
+        vividvr_kwargs["num_inference_steps"] = req.num_inference_steps
+    if req.guidance_scale is not None:
+        vividvr_kwargs["guidance_scale"] = req.guidance_scale
+    if req.generator_device is not None:
+        vividvr_kwargs["generator_device"] = req.generator_device
+    if req.num_temporal_process_frames is not None:
+        vividvr_kwargs["num_temporal_process_frames"] = req.num_temporal_process_frames
+    if req.restoration_guidance_scale is not None:
+        vividvr_kwargs["restoration_guidance_scale"] = req.restoration_guidance_scale
+    if req.frame_interpolation_model_path is not None:
+        vividvr_kwargs["frame_interpolation_model_path"] = (
+            req.frame_interpolation_model_path
+        )
+    if req.upscaling_model_path is not None:
+        vividvr_kwargs["upscaling_model_path"] = req.upscaling_model_path
+    if req.output_compression is not None:
+        vividvr_kwargs["output_compression"] = req.output_compression
+    return vividvr_kwargs
+
+
 def _video_repair_job_from_sampling(
     request_id: str, req: VideoRepairRequest, sampling: SamplingParams
 ) -> Dict[str, Any]:
@@ -387,6 +467,203 @@ async def _dispatch_video_repair_job_async(
             shutil.rmtree(td, ignore_errors=True)
 
 
+async def _dispatch_flowcut_video_repair_job_async(
+    job_id: str,
+    batch: Req,
+    *,
+    callback_url: str,
+    minio_config: FlowCutMinIOConfig | None = None,
+    temp_dirs: list[str] | None = None,
+    output_persistent: bool = True,
+) -> None:
+    done_event = asyncio.Event()
+    try:
+        await post_flowcut_callback(
+            callback_url,
+            build_flowcut_running_callback_payload(
+                task_id=job_id,
+                progress=1,
+                reason="accepted",
+            ),
+        )
+    except Exception as e:
+        logger.warning("FlowCut initial running callback failed for job=%s: %s", job_id, e)
+    reporter_task = asyncio.create_task(
+        report_flowcut_running_until_done(
+            task_id=job_id,
+            callback_url=callback_url,
+            done_event=done_event,
+            send_initial=False,
+        )
+    )
+    try:
+        await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
+        await _dispatch_job_async(
+            job_id,
+            batch,
+            temp_dirs=None,
+            output_persistent=output_persistent,
+            callback_url=None,
+        )
+        job = await VIDEO_STORE.get(job_id) or {}
+        if job.get("status") == "completed":
+            try:
+                result_url = job.get("url")
+                file_path = job.get("file_path")
+                if minio_config is not None and file_path:
+                    object_key = f"outputs/{job_id}.mp4"
+                    result_url = await upload_to_flowcut_minio(
+                        local_path=file_path,
+                        object_key=object_key,
+                        config=minio_config,
+                    )
+                payload = build_flowcut_final_callback_payload(
+                    status="succeeded",
+                    progress=100,
+                    reason="",
+                    output={
+                        "result_url": result_url,
+                        "file_path": file_path,
+                        "duration": job.get("inference_time_s"),
+                    },
+                )
+            except Exception as e:
+                payload = build_flowcut_final_callback_payload(
+                    status="failed",
+                    progress=0,
+                    reason=str(e),
+                    output=None,
+                )
+        else:
+            error = job.get("error") or {}
+            payload = build_flowcut_final_callback_payload(
+                status="failed",
+                progress=0,
+                reason=error.get("message") or "video repair failed",
+                output=None,
+            )
+        await post_flowcut_callback(callback_url, payload)
+    finally:
+        done_event.set()
+        reporter_task.cancel()
+        try:
+            await reporter_task
+        except asyncio.CancelledError:
+            pass
+        _VIDEOEDIT_SEMAPHORE.release()
+        for td in temp_dirs or []:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+@router.post("/repairs/flowcut", response_model=FlowCutResponse)
+async def create_flowcut_video_repair(request: Request):
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return FlowCutResponse(code=1, message=f"invalid request: {e}")
+    if not isinstance(payload, dict):
+        return FlowCutResponse(code=1, message="invalid request: JSON object required")
+    try:
+        req = FlowCutVideoRepairRequest.model_validate(payload)
+    except Exception as e:
+        return FlowCutResponse(code=1, message=f"invalid request: {e}")
+
+    if _VIDEOEDIT_SEMAPHORE.locked():
+        return FlowCutResponse(code=2, message="A task is running.")
+
+    if not req.task_id:
+        return FlowCutResponse(code=1, message="taskId is required")
+    if not req.callback_url:
+        return FlowCutResponse(code=1, message="callbackUrl is required")
+    if not req.video_input_path and not req.video_url:
+        return FlowCutResponse(
+            code=1,
+            message="video_input_path or video_url is required",
+        )
+
+    await _VIDEOEDIT_SEMAPHORE.acquire()
+    server_args = get_global_server_args()
+    request_id = req.task_id
+    temp_dirs: list[str] = []
+    scheduled = False
+
+    try:
+        uploads_dir = server_args.input_save_path
+        if uploads_dir is None:
+            uploads_dir = tempfile.mkdtemp(prefix="sglang_flowcut_input_")
+            temp_dirs.append(uploads_dir)
+        os.makedirs(uploads_dir, exist_ok=True)
+
+        video_input_path = req.video_input_path
+        if req.video_url:
+            video_input_path = await _save_video_source_to_path(
+                req.video_url, os.path.join(uploads_dir, f"{request_id}_video")
+            )
+        if not video_input_path:
+            return FlowCutResponse(
+                code=1,
+                message="video_input_path or video_url is required",
+            )
+
+        output_dir, output_file_name = _split_output_path(
+            req.output_path, request_id, server_args.output_path
+        )
+        output_persistent = output_dir is not None
+        if output_dir is None:
+            output_dir = tempfile.mkdtemp(prefix="sglang_flowcut_output_")
+            temp_dirs.append(output_dir)
+            output_persistent = False
+
+        if not _is_vividvr_video_repair_pipeline(server_args):
+            return FlowCutResponse(
+                code=1,
+                message="FlowCut repair endpoint requires Vivid-VR pipeline",
+            )
+
+        vividvr_kwargs = _build_vividvr_repair_kwargs(
+            request_id=request_id,
+            req=req,
+            server_args=server_args,
+            video_input_path=video_input_path,
+            output_dir=output_dir,
+            output_file_name=output_file_name,
+        )
+        sampling_params = VividVRSamplingParams.from_user_kwargs(
+            server_args,
+            **vividvr_kwargs,
+        )
+        job = _video_repair_job_from_sampling(request_id, req, sampling_params)
+        job["model"] = _resolve_video_repair_model_name(req, server_args, "VividVR")
+        await VIDEO_STORE.upsert(request_id, job)
+        logger.info(
+            "FlowCut video repair accepted task_id=%s output_path=%s callback_url=%s",
+            request_id,
+            job.get("file_path"),
+            req.callback_url,
+        )
+        batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
+        asyncio.create_task(
+            _dispatch_flowcut_video_repair_job_async(
+                request_id,
+                batch,
+                temp_dirs=temp_dirs or None,
+                output_persistent=output_persistent,
+                callback_url=req.callback_url,
+                minio_config=req.minio_config,
+            )
+        )
+        scheduled = True
+        return FlowCutResponse(code=0, message="ok")
+    except Exception as e:
+        detail = e.detail if isinstance(e, HTTPException) else str(e)
+        return FlowCutResponse(code=1, message=detail)
+    finally:
+        if not scheduled:
+            _VIDEOEDIT_SEMAPHORE.release()
+            for td in temp_dirs:
+                shutil.rmtree(td, ignore_errors=True)
+
+
 @router.post("/repairs", response_model=VideoResponse)
 async def create_video_repair(req: VideoRepairRequest):
     if _VIDEOEDIT_SEMAPHORE.locked():
@@ -422,58 +699,14 @@ async def create_video_repair(req: VideoRepairRequest):
             output_persistent = False
 
         if _is_vividvr_video_repair_pipeline(server_args):
-            vividvr_prompt_file_path = _resolve_vividvr_prompt_file_path(server_args)
-            vividvr_kwargs = {
-                "request_id": request_id,
-                "video_input_path": video_input_path,
-                "prompt": read_prompt_file(vividvr_prompt_file_path),
-                "prompt_file_path": vividvr_prompt_file_path,
-                "output_path": output_dir,
-                "output_file_name": output_file_name,
-                "seed": req.seed,
-                "dtype": req.dtype,
-                "enable_teacache": req.enable_teacache,
-                "enable_frame_interpolation": req.enable_frame_interpolation,
-                "frame_interpolation_exp": req.frame_interpolation_exp,
-                "frame_interpolation_scale": req.frame_interpolation_scale,
-                "enable_upscaling": req.enable_upscaling,
-                "upscaling_scale": req.upscaling_scale,
-                "perf_dump_path": req.perf_dump_path,
-            }
-            if req.output_quality not in (None, "default"):
-                vividvr_kwargs["output_quality"] = req.output_quality
-            if req.negative_prompt is not None:
-                vividvr_kwargs["negative_prompt"] = req.negative_prompt
-            if req.caption_file_path is not None:
-                vividvr_kwargs["caption_source"] = "caption_file"
-                vividvr_kwargs["caption_file_path"] = req.caption_file_path
-            if req.reference_video_path is not None:
-                vividvr_kwargs["reference_video_path"] = req.reference_video_path
-            if req.num_frames is not None:
-                vividvr_kwargs["num_frames"] = req.num_frames
-            if req.num_inference_steps is not None:
-                vividvr_kwargs["num_inference_steps"] = req.num_inference_steps
-            if req.guidance_scale is not None:
-                vividvr_kwargs["guidance_scale"] = req.guidance_scale
-            if req.generator_device is not None:
-                vividvr_kwargs["generator_device"] = req.generator_device
-            if req.num_temporal_process_frames is not None:
-                vividvr_kwargs["num_temporal_process_frames"] = (
-                    req.num_temporal_process_frames
-                )
-            if req.restoration_guidance_scale is not None:
-                vividvr_kwargs["restoration_guidance_scale"] = (
-                    req.restoration_guidance_scale
-                )
-            if req.frame_interpolation_model_path is not None:
-                vividvr_kwargs["frame_interpolation_model_path"] = (
-                    req.frame_interpolation_model_path
-                )
-            if req.upscaling_model_path is not None:
-                vividvr_kwargs["upscaling_model_path"] = req.upscaling_model_path
-            if req.output_compression is not None:
-                vividvr_kwargs["output_compression"] = req.output_compression
-
+            vividvr_kwargs = _build_vividvr_repair_kwargs(
+                request_id=request_id,
+                req=req,
+                server_args=server_args,
+                video_input_path=video_input_path,
+                output_dir=output_dir,
+                output_file_name=output_file_name,
+            )
             sampling_params = VividVRSamplingParams.from_user_kwargs(
                 server_args,
                 **vividvr_kwargs,
@@ -796,6 +1029,7 @@ async def list_videos(
 async def retrieve_video(video_id: str = Path(...)):
     job = await VIDEO_STORE.get(video_id)
     if not job:
+        await _log_video_task_not_found(video_id, "retrieve_video")
         raise HTTPException(status_code=404, detail="Video not found")
     return VideoResponse(**job)
 
@@ -804,6 +1038,7 @@ async def retrieve_video(video_id: str = Path(...)):
 async def retrieve_video_progress(video_id: str = Path(...)):
     job = await VIDEO_STORE.get(video_id)
     if not job:
+        await _log_video_task_not_found(video_id, "retrieve_video_progress")
         raise HTTPException(status_code=404, detail="Video not found")
     return {
         "id": video_id,
