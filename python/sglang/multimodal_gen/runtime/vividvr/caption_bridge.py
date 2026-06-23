@@ -18,6 +18,13 @@ class VividVRCaptionBridgeConfig:
 class VividVRCaptionBridgeResult:
     caption_file_path: str
     caption_count: int
+    mode: str | None = None
+    worker_count: int | None = None
+    fallback_used: bool | None = None
+    request_id: str | None = None
+    total_clip_count: int | None = None
+    assigned_clip_indices_by_worker: dict[str, list[int]] | None = None
+    timing: dict[str, object] | None = None
 
 
 def validate_caption_sidecar_file(path: str | Path, *, expected_count: int) -> list[str]:
@@ -80,4 +87,11 @@ async def request_vividvr_caption_sidecar(
     return VividVRCaptionBridgeResult(
         caption_file_path=caption_file_path,
         caption_count=int(data.get("caption_count") or expected_caption_count),
+        mode=data.get("mode"),
+        worker_count=data.get("worker_count"),
+        fallback_used=data.get("fallback_used"),
+        request_id=data.get("request_id"),
+        total_clip_count=data.get("total_clip_count"),
+        assigned_clip_indices_by_worker=data.get("assigned_clip_indices_by_worker"),
+        timing=data.get("timing"),
     )

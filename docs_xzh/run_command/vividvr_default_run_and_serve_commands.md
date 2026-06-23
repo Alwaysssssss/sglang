@@ -24,6 +24,8 @@
 - 所有长时间推理都应放在 `tmux` 中启动。
 - 如果要让 `serve` 自动生成 caption sidecar，先启动 `vividvr_caption_sidecar`，再启动主服务。
 - caption sidecar 在原版 `/home/zhiheng/Vivid-VR/.venv` 下运行；如果宿主机缺少系统级 `/usr/include/python3.10/Python.h`，sidecar 会优先自动探测 `~/tmp_py310dev/extracted/usr/include/python3.10` 或 `~/tmp_py310_headers/extracted/libpython3.10-dev/usr/include/python3.10` 这类已解压 header 目录，并把它们注入 `CPATH` / `C_INCLUDE_PATH`。
+- 主推理和 `serve` 必须继续使用 `/home/zhiheng/sglang/.venv`；不要为了 caption 把主推理切回原版环境。
+- 当前 caption bridge 的 sidecar 文本契约是：`caption.txt` 一行对应一个 temporal clip，行数、顺序和文本内容都必须与单卡基线逐字一致。
 - 单卡正式 benchmark 时同一时刻只能有一个单卡推理进程，避免并发导致耗时失真。
 - 如果是 `serve` benchmark，必须先做一次 warmup，再记录第二次正式请求；warmup 不计入正式结果。
 - 本文默认 `serve` 命令使用 `--host 127.0.0.1`，只允许本机访问；如果要让其他服务器请求当前机器上的 Vivid-VR 服务，需要按“对外暴露端口”章节改为 `--host 0.0.0.0` 或指定网卡 IP。
@@ -102,8 +104,15 @@ tmux attach -r -t vividvr_dual_default
 
 ```bash
 tmux new-session -d -s vividvr_caption_sidecar \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && PYTHONPATH=python /home/zhiheng/Vivid-VR/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/Vivid-VR/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
+
+当前默认 sidecar 口径：
+
+- sidecar 运行环境固定为 `/home/zhiheng/Vivid-VR/.venv`。
+- 这是给当前双卡 `dual_gpu_fa_eager_compile` + caption bridge 验收配套的 dual-worker 配置，2 个 caption worker 分别绑定 `cuda:0` 和 `cuda:1`。
+- 主服务仍然运行在 `/home/zhiheng/sglang/.venv`，通过 `--vividvr-caption-bridge --vividvr-caption-sidecar-url http://127.0.0.1:31200 --vividvr-caption-work-dir ...` 消费 sidecar 输出。
+- sidecar 生成的 `caption.txt` 必须保持一行对应一个 temporal clip，并与单卡基线逐字一致；如果 benchmark 脚本比对失败，不要继续做正式 `serve` 验收。
 
 如果 sidecar 日志里出现：
 
@@ -158,6 +167,8 @@ tmux attach -r -t vividvr_serve_single_default
 
 ## 4. 双卡 `serve` 拉起命令
 
+正式双卡 `serve` 默认配置固定为 `dual_gpu_fa_eager_compile`，也就是 `FA + SP=2 + eager_global + control_pool_size=1 + compile`。在 bridge 模式下，先保证上面的 dual-worker sidecar 已就绪，再启动下面这条主服务命令。
+
 ```bash
 tmux new-session -d -s vividvr_serve_dual_default \
   'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
@@ -186,6 +197,12 @@ tmux new-session -d -s vividvr_serve_dual_default \
     --vividvr-caption-sidecar-timeout 1800 \
     2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_dual_default_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
+
+bridge 验收要点：
+
+- `--vividvr-caption-bridge`、`--vividvr-caption-sidecar-url http://127.0.0.1:31200` 和 `--vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars` 是当前正式双卡 `serve` 口径的一部分，不要省略。
+- `caption.txt` 必须按 temporal clip 对齐；对当前 `130f` 输入，sidecar 输出应与基线 clip 切分一致。
+- 如果需要先做独立 caption 预检，使用 `docs_xzh/run_vivid_benchmark.md` 里的 caption sidecar benchmark 命令，再做正式 `serve` benchmark。
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_default \

@@ -484,6 +484,7 @@ async def _ensure_vividvr_caption_file(
         tile_stride=tile_stride,
     )
     manifest.write_json(manifest_path)
+    bridge_start = time.perf_counter()
     result = await request_vividvr_caption_sidecar(
         config=VividVRCaptionBridgeConfig(
             enabled=True,
@@ -496,11 +497,22 @@ async def _ensure_vividvr_caption_file(
         output_caption_path=caption_path,
         expected_caption_count=manifest.expected_caption_count,
     )
+    bridge_elapsed_s = time.perf_counter() - bridge_start
     logger.info(
-        "VividVR caption bridge generated captions request_id=%s path=%s count=%s",
+        "VividVR caption bridge generated captions request_id=%s path=%s count=%s "
+        "mode=%s worker_count=%s fallback_used=%s total_clip_count=%s bridge_elapsed_s=%.3f "
+        "worker_assignments=%s sidecar_request_id=%s sidecar_timing=%s",
         request_id,
         result.caption_file_path,
         result.caption_count,
+        getattr(result, "mode", None),
+        getattr(result, "worker_count", None),
+        getattr(result, "fallback_used", None),
+        getattr(result, "total_clip_count", None),
+        bridge_elapsed_s,
+        getattr(result, "assigned_clip_indices_by_worker", None),
+        getattr(result, "request_id", None),
+        getattr(result, "timing", None),
     )
     return result.caption_file_path
 

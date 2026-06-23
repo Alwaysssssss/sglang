@@ -155,6 +155,7 @@ tmux new-session -d -s vividvr_ori_phase_d_20step \
 - 保存原始 caption 文本，不要把正向 prompt suffix 手工拼进去。
 - 当前这条 `130f` 基准的 caption 文件名必须与输入视频 stem 一致。
 - 当前这条 `test_video_long_960x720_130f.txt` 应包含 2 行 raw caption，对应 2 个 temporal clip。
+- 如果后续走 caption bridge，这份 sidecar 文本仍然必须作为逐字 gold；bridge 产物必须与这里的单卡基线逐字一致，不能只做到语义接近。
 
 `sglang` Phase D 验收：
 
@@ -191,7 +192,42 @@ tmux attach -r -t vividvr_phase_d_20step
 - `sglang` 命令里的 `--artifact-prefix` 改成 `phase_d_130f_50step`
 - `sglang` 命令里的 `--num-inference-steps` 改成 `50`
 
-### 2.4 Phase E4.1 native SP 多卡 formal 命令
+### 2.4 Caption sidecar 独立 benchmark
+
+当前 `Phase E` 的双卡 `serve` 正式口径是 `dual_gpu_fa_eager_compile + caption bridge`。在做正式 `serve` benchmark 前，先单独验证 caption sidecar 是否能稳定产出与基线一致的 `caption.txt`。
+
+环境约束：
+
+- caption sidecar 服务固定使用 `/home/zhiheng/Vivid-VR/.venv`。
+- 独立 benchmark 脚本固定使用 `/home/zhiheng/sglang/.venv`。
+- 不要为了让 caption 跑通去改坏 `sglang` 主推理环境；主推理和后续 `serve` 仍然必须留在 `/home/zhiheng/sglang/.venv`。
+
+先启动 dual-worker caption sidecar：
+
+```bash
+tmux new-session -d -s vividvr_caption_sidecar \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/Vivid-VR/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+查看 sidecar：
+
+```bash
+tmux attach -r -t vividvr_caption_sidecar
+```
+
+再运行独立 benchmark：
+
+```bash
+/home/zhiheng/sglang/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar_benchmark.py --video-path /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 --baseline-caption-path /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
+```
+
+通过标准：
+
+- 生成的 `caption.txt` 必须一行对应一个 temporal clip。
+- 对当前 `130f` 输入，输出应保持 2 行，并与 `/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt` 逐字一致。
+- 只有独立 benchmark 通过后，才继续做正式 `dual_gpu_fa_eager_compile` `serve` 验收。
+
+### 2.5 Phase E4.1 native SP 多卡 formal 命令
 
 下面三条命令用于当前 `Phase E4.1` 的双卡 `SP` 正式 benchmark。三条命令共用同一套输入、caption、prompt、reference、`20 step` 和 `FA + compile` 口径，只改变默认 `eager_global / v1 / 显式 v2` 的 connector 语义入口。
 
@@ -249,6 +285,12 @@ tmux attach -r -t vividvr_e41_v2_recheck
   - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`
   - 用于显式钉死默认质量口径
   - runtime snapshot 中应表现为 `connector_context_mode = sp_exact_global_control_attention`
+
+当前正式 `serve` bridge 验收补充要求：
+
+- 默认服务配置固定为 `dual_gpu_fa_eager_compile`，也就是 `--attention-backend fa`、`SP=2`、`SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`、`SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1` 和 `--enable-torch-compile`。
+- `serve` 启动时必须显式带上 `--vividvr-caption-bridge --vividvr-caption-sidecar-url http://127.0.0.1:31200 --vividvr-caption-work-dir ...`，由主服务消费独立 sidecar 产物。
+- caption sidecar 只负责生成 sidecar 文本；主推理语义仍以单卡基线 caption 文件为 gold，不允许放宽成「大致相同」。
 
 ## 3. 对比时必须保持一致的关键参数
 
