@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import importlib.util
 import json
+import logging
 import multiprocessing
 import os
 import sys
@@ -33,6 +35,41 @@ try:
     from fastapi import FastAPI
 except ImportError:  # pragma: no cover - exercised in the original Vivid-VR env
     FastAPI = None
+
+
+logger = logging.getLogger(__name__)
+
+
+def _load_caption_backend_factory():
+    try:
+        return importlib.import_module(
+            "sglang.multimodal_gen.runtime.vividvr.caption_sidecar_backend.captioner"
+        ).create_captioner
+    except ModuleNotFoundError:
+        backend_dir = (
+            Path(__file__).resolve().parents[1]
+            / "runtime"
+            / "vividvr"
+            / "caption_sidecar_backend"
+        )
+        package_path = backend_dir / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "vividvr_caption_sidecar_backend",
+            package_path,
+            submodule_search_locations=[str(backend_dir)],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                "Failed to load VividVR caption backend package: "
+                f"{package_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module.create_captioner
+
+
+create_captioner = _load_caption_backend_factory()
 
 
 def _load_manifest_contract():
@@ -157,7 +194,6 @@ class CaptionSidecarState:
     worker_devices: tuple[str, ...] = ()
     allow_serial_fallback: bool = True
     executors: tuple[ProcessPoolExecutor, ...] | None = None
-    vividvr_root: str = "/home/zhiheng/Vivid-VR"
     cogvlm2_ckpt_path: str = (
         "/home/zhiheng/Vivid-VR/ckpts/cogvlm2-llama3-caption"
     )
@@ -247,7 +283,7 @@ def _ensure_python_dev_headers_for_sidecar() -> Path | None:
     return None
 
 
-def _load_video_tensor(video_path: str) -> tuple[torch.Tensor, float]:
+def _load_video_tensor_cv2(video_path: str) -> tuple[torch.Tensor, float]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video file: {video_path}")
@@ -267,6 +303,37 @@ def _load_video_tensor(video_path: str) -> tuple[torch.Tensor, float]:
     array = np.stack(frames, axis=0).astype(np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(0, 3, 1, 2).contiguous()
     return tensor, fps
+
+
+def _load_video_tensor_decord(video_path: str) -> tuple[torch.Tensor, float]:
+    import decord
+
+    # Match the upstream Vivid-VR control-video decode path when available.
+    decord.bridge.set_bridge("torch")
+    video_reader = decord.VideoReader(uri=video_path, num_threads=1)
+    total_frames = len(video_reader)
+    if total_frames <= 0:
+        raise RuntimeError(f"No frames found in video file: {video_path}")
+
+    batch = video_reader.get_batch(list(range(total_frames)))
+    if not isinstance(batch, torch.Tensor):
+        arrays = batch.asnumpy() if hasattr(batch, "asnumpy") else np.asarray(batch)
+        batch = torch.from_numpy(arrays)
+    tensor = batch.float().div(255.0).permute(0, 3, 1, 2).contiguous()
+    fps = float(video_reader.get_avg_fps() or 24.0)
+    return tensor, fps
+
+
+def _load_video_tensor(video_path: str) -> tuple[torch.Tensor, float]:
+    try:
+        return _load_video_tensor_decord(video_path)
+    except Exception as exc:
+        logger.warning(
+            "VividVR caption decord decode failed for %s; falling back to OpenCV: %s",
+            video_path,
+            exc,
+        )
+        return _load_video_tensor_cv2(video_path)
 
 
 def _clip_tensor(video: torch.Tensor, *, start: int, end: int, padded_frames: int) -> torch.Tensor:
@@ -695,46 +762,17 @@ def _run_fallback_http_server(
         server.server_close()
 
 
-def _load_original_captioner_from_paths(
-    *,
-    vividvr_root: str,
-    cogvlm2_ckpt_path: str,
-):
-    vividvr_root_path = Path(vividvr_root).expanduser()
-    for path in (vividvr_root_path, vividvr_root_path / "src"):
-        path_str = str(path)
-        if path_str not in sys.path:
-            sys.path.insert(0, path_str)
-
-    from VRDiT.captioner import create_captioner
-
+def _build_cogvlm2_captioner(cogvlm2_ckpt_path: str):
     captioner_args = SimpleNamespace(
         caption_backend="cogvlm2",
         cogvlm2_ckpt_path=str(Path(cogvlm2_ckpt_path).expanduser()),
-        caption_sglang_base_url="http://127.0.0.1:30000/v1",
-        caption_sglang_model=None,
-        caption_sglang_api_key="None",
-        caption_sglang_max_tokens=256,
-        caption_sglang_timeout=300,
-        caption_sglang_max_frames=8,
-        caption_sglang_max_pixels=1280 * 720,
     )
     return create_captioner(captioner_args)
 
 
-def _load_original_captioner(args: argparse.Namespace):
-    return _load_original_captioner_from_paths(
-        vividvr_root=args.vividvr_root,
-        cogvlm2_ckpt_path=args.cogvlm2_ckpt_path,
-    )
-
-
 def _get_serial_captioner(state: CaptionSidecarState):
     if state.captioner is None:
-        state.captioner = _load_original_captioner_from_paths(
-            vividvr_root=state.vividvr_root,
-            cogvlm2_ckpt_path=state.cogvlm2_ckpt_path,
-        )
+        state.captioner = _build_cogvlm2_captioner(state.cogvlm2_ckpt_path)
     return state.captioner
 
 
@@ -755,16 +793,12 @@ def _release_cuda_memory(device: str | torch.device) -> None:
 
 
 def _init_worker_state(
-    vividvr_root: str,
     cogvlm2_ckpt_path: str,
     device: str,
 ) -> None:
     global _WORKER_STATE
     _WORKER_STATE = SimpleNamespace(
-        captioner=_load_original_captioner_from_paths(
-            vividvr_root=vividvr_root,
-            cogvlm2_ckpt_path=cogvlm2_ckpt_path,
-        ),
+        captioner=_build_cogvlm2_captioner(cogvlm2_ckpt_path),
         device=device,
     )
 
@@ -815,7 +849,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run VividVR caption sidecar service.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=31200)
-    parser.add_argument("--vividvr-root", default="/home/zhiheng/Vivid-VR")
     parser.add_argument(
         "--cogvlm2-ckpt-path",
         default="/home/zhiheng/Vivid-VR/ckpts/cogvlm2-llama3-caption",
@@ -841,7 +874,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _create_parallel_executors(
     *,
-    vividvr_root: str,
     cogvlm2_ckpt_path: str,
     worker_devices: tuple[str, ...],
 ) -> tuple[ProcessPoolExecutor, ...]:
@@ -851,7 +883,7 @@ def _create_parallel_executors(
             max_workers=1,
             mp_context=spawn_context,
             initializer=_init_worker_state,
-            initargs=(vividvr_root, cogvlm2_ckpt_path, worker_device),
+            initargs=(cogvlm2_ckpt_path, worker_device),
         )
         for worker_device in worker_devices
     )
@@ -863,7 +895,6 @@ def _ensure_parallel_executors(state: CaptionSidecarState) -> None:
     if state.executors is not None:
         return
     state.executors = _create_parallel_executors(
-        vividvr_root=state.vividvr_root,
         cogvlm2_ckpt_path=state.cogvlm2_ckpt_path,
         worker_devices=state.worker_devices,
     )
@@ -890,7 +921,7 @@ def main() -> None:
         worker_devices = tuple(args.device for _ in range(args.parallel_workers))
     state = CaptionSidecarState(
         captioner=(
-            _load_original_captioner(args)
+            _build_cogvlm2_captioner(args.cogvlm2_ckpt_path)
             if args.parallel_workers <= 1
             else None
         ),
@@ -898,12 +929,10 @@ def main() -> None:
         worker_count=args.parallel_workers,
         worker_devices=worker_devices,
         allow_serial_fallback=args.allow_serial_fallback,
-        vividvr_root=args.vividvr_root,
         cogvlm2_ckpt_path=args.cogvlm2_ckpt_path,
     )
     if args.parallel_workers > 1:
         state.executors = _create_parallel_executors(
-            vividvr_root=args.vividvr_root,
             cogvlm2_ckpt_path=args.cogvlm2_ckpt_path,
             worker_devices=worker_devices,
         )

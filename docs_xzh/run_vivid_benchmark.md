@@ -198,15 +198,17 @@ tmux attach -r -t vividvr_phase_d_20step
 
 环境约束：
 
-- caption sidecar 服务固定使用 `/home/zhiheng/Vivid-VR/.venv`。
+- caption sidecar 的代码和服务入口固定使用 `sglang` 仓库内的 `python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py`。
+- caption sidecar 服务固定使用 `/home/zhiheng/sglang/.venv-vividvr-caption`；`python/sglang/multimodal_gen/tools/setup_vividvr_caption_env.sh` 会把仓库 `python/` 路径写入 sidecar env 的 `.pth`，并在无 `PYTHONPATH` 的条件下自检导入。
 - 独立 benchmark 脚本固定使用 `/home/zhiheng/sglang/.venv`。
+- `/home/zhiheng/Vivid-VR` 当前只继续提供 checkpoint、输入视频、`prompt.txt`、reference 和基线 caption 文件等静态资源。
 - 不要为了让 caption 跑通去改坏 `sglang` 主推理环境；主推理和后续 `serve` 仍然必须留在 `/home/zhiheng/sglang/.venv`。
 
 先启动 dual-worker caption sidecar：
 
 ```bash
 tmux new-session -d -s vividvr_caption_sidecar \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/Vivid-VR/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
 查看 sidecar：
@@ -218,7 +220,14 @@ tmux attach -r -t vividvr_caption_sidecar
 再运行独立 benchmark：
 
 ```bash
-/home/zhiheng/sglang/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar_benchmark.py --video-path /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 --baseline-caption-path /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
+tmux new-session -d -s vividvr_caption_benchmark \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/caption_sidecar_benchmark && /home/zhiheng/sglang/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar_benchmark.py --video-path /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 --baseline-caption-path /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_benchmark_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+查看 benchmark：
+
+```bash
+tmux attach -r -t vividvr_caption_benchmark
 ```
 
 通过标准：

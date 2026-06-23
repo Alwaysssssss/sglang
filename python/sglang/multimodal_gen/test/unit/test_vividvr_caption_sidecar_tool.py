@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from concurrent.futures import Future
 from http import HTTPStatus
 from http.client import HTTPConnection
@@ -895,6 +896,178 @@ def test_parse_args_supports_parallel_worker_flags():
     assert args.allow_serial_fallback is False
 
 
+def test_parse_args_rejects_legacy_vividvr_root_flag():
+    with pytest.raises(SystemExit):
+        parse_args(["--vividvr-root", "/tmp/legacy"])
+
+
+def test_load_caption_backend_factory_falls_back_to_local_package(
+    monkeypatch, tmp_path
+):
+    original_import_module = sidecar_tool.importlib.import_module
+    package_root = (
+        tmp_path
+        / "python"
+        / "sglang"
+        / "multimodal_gen"
+        / "runtime"
+        / "vividvr"
+        / "caption_sidecar_backend"
+    )
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text(
+        "from .captioner import create_captioner\n",
+        encoding="utf-8",
+    )
+    (package_root / "captioner.py").write_text(
+        "def create_captioner(args):\n"
+        "    return {\n"
+        "        'caption_backend': args.caption_backend,\n"
+        "        'cogvlm2_ckpt_path': args.cogvlm2_ckpt_path,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+
+    def fake_import_module(name):
+        if name == (
+            "sglang.multimodal_gen.runtime.vividvr."
+            "caption_sidecar_backend.captioner"
+        ):
+            raise ModuleNotFoundError("No module named 'pybase64'")
+        return original_import_module(name)
+
+    monkeypatch.setattr(sidecar_tool.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        sidecar_tool,
+        "__file__",
+        str(
+            tmp_path
+            / "python"
+            / "sglang"
+            / "multimodal_gen"
+            / "tools"
+            / "run_vividvr_caption_sidecar.py"
+        ),
+        raising=False,
+    )
+    sys.modules.pop("vividvr_caption_sidecar_backend", None)
+
+    factory = sidecar_tool._load_caption_backend_factory()
+
+    assert factory(
+        argparse.Namespace(
+            caption_backend="cogvlm2",
+            cogvlm2_ckpt_path="/tmp/ckpt",
+        )
+    ) == {
+        "caption_backend": "cogvlm2",
+        "cogvlm2_ckpt_path": "/tmp/ckpt",
+    }
+
+
+def test_sidecar_uses_local_captioner_factory(monkeypatch):
+    calls = {}
+
+    class FakeCaptioner:
+        def to(self, device):
+            return self
+
+    def fake_build_cogvlm2_captioner(cogvlm2_ckpt_path):
+        calls["cogvlm2_ckpt_path"] = cogvlm2_ckpt_path
+        return FakeCaptioner()
+
+    monkeypatch.setattr(
+        sidecar_tool,
+        "_build_cogvlm2_captioner",
+        fake_build_cogvlm2_captioner,
+        raising=False,
+    )
+    state = CaptionSidecarState(
+        captioner=None,
+        device="cpu",
+        worker_count=1,
+        worker_devices=("cpu",),
+        cogvlm2_ckpt_path="/tmp/cogvlm2",
+    )
+
+    captioner = sidecar_tool._get_serial_captioner(state)
+
+    assert isinstance(captioner, FakeCaptioner)
+    assert calls["cogvlm2_ckpt_path"] == "/tmp/cogvlm2"
+    assert not hasattr(state, "vividvr_root")
+
+
+def test_load_video_tensor_prefers_decord(monkeypatch):
+    set_bridge_calls = []
+    fake_batch = torch.arange(2 * 4 * 5 * 3, dtype=torch.uint8).reshape(2, 4, 5, 3)
+
+    class FakeVideoReader:
+        def __init__(self, uri, num_threads):
+            assert uri == "/tmp/video.mp4"
+            assert num_threads == 1
+
+        def __len__(self):
+            return 2
+
+        def get_batch(self, indices):
+            assert indices == [0, 1]
+            return fake_batch
+
+        def get_avg_fps(self):
+            return 23.976
+
+    fake_decord = type(
+        "FakeDecord",
+        (),
+        {
+            "bridge": type(
+                "Bridge",
+                (),
+                {"set_bridge": staticmethod(lambda name: set_bridge_calls.append(name))},
+            )(),
+            "VideoReader": FakeVideoReader,
+        },
+    )()
+
+    monkeypatch.setitem(sys.modules, "decord", fake_decord)
+    monkeypatch.setattr(
+        sidecar_tool,
+        "_load_video_tensor_cv2",
+        lambda video_path: (_ for _ in ()).throw(
+            AssertionError("OpenCV fallback should not be used")
+        ),
+    )
+
+    tensor, fps = sidecar_tool._load_video_tensor("/tmp/video.mp4")
+
+    assert set_bridge_calls == ["torch"]
+    assert fps == pytest.approx(23.976)
+    assert tensor.dtype == torch.float32
+    assert tuple(tensor.shape) == (2, 3, 4, 5)
+    assert torch.equal(
+        tensor[:, :, 0, 0],
+        fake_batch[:, 0, 0, :].float().div(255.0),
+    )
+
+
+def test_load_video_tensor_falls_back_to_cv2_when_decord_decode_fails(monkeypatch):
+    monkeypatch.setattr(
+        sidecar_tool,
+        "_load_video_tensor_decord",
+        lambda video_path: (_ for _ in ()).throw(RuntimeError("decord boom")),
+    )
+    monkeypatch.setattr(
+        sidecar_tool,
+        "_load_video_tensor_cv2",
+        lambda video_path: (torch.ones(1, 3, 2, 2), 12.5),
+    )
+
+    tensor, fps = sidecar_tool._load_video_tensor("/tmp/video.mp4")
+
+    assert fps == pytest.approx(12.5)
+    assert tuple(tensor.shape) == (1, 3, 2, 2)
+
+
 def test_main_parallel_mode_does_not_eagerly_load_serial_captioner(monkeypatch):
     captured = {}
     load_calls = {"count": 0}
@@ -911,7 +1084,6 @@ def test_main_parallel_mode_does_not_eagerly_load_serial_captioner(monkeypatch):
         lambda argv=None: argparse.Namespace(
             host="127.0.0.1",
             port=31200,
-            vividvr_root="/tmp/Vivid-VR",
             cogvlm2_ckpt_path="/tmp/ckpt",
             device="cuda",
             parallel_workers=2,
@@ -922,8 +1094,9 @@ def test_main_parallel_mode_does_not_eagerly_load_serial_captioner(monkeypatch):
     monkeypatch.setattr(sidecar_tool, "_ensure_python_dev_headers_for_sidecar", lambda: None)
     monkeypatch.setattr(
         sidecar_tool,
-        "_load_original_captioner",
+        "_build_cogvlm2_captioner",
         lambda args: load_calls.__setitem__("count", load_calls["count"] + 1),
+        raising=False,
     )
     monkeypatch.setattr(
         sidecar_tool,
