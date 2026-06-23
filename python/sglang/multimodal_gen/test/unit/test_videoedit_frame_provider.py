@@ -205,6 +205,54 @@ class TestVideoEditFrameProvider(unittest.TestCase):
             if thread is not None:
                 self.assertFalse(thread.is_alive())
 
+    def test_reference_frame_materialize_matches_eager(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "video.avi"
+            mask_path = Path(temp_dir) / "mask.avi"
+            reference_path = Path(temp_dir) / "reference.png"
+            frames = _make_test_frames(frame_count=5, size=(32, 24))
+            masks = _make_mask_frames(frame_count=5, size=(32, 24))
+            _write_rgb_video(video_path, frames)
+            _write_rgb_video(mask_path, masks)
+            Image.new("RGB", (32, 24), (210, 40, 30)).save(reference_path)
+
+            eager = prepare_global_inputs(
+                str(video_path),
+                str(mask_path),
+                num_frames=5,
+                reference_image=str(reference_path),
+                dilate_px=0,
+                mask_scale=1.0,
+            )
+            scanned = scan_global_bbox(
+                str(video_path),
+                str(mask_path),
+                num_frames=5,
+                reference_image=str(reference_path),
+                dilate_px=0,
+                mask_scale=1.0,
+            )
+            provider = WindowFrameProvider.from_scanned_geometry(
+                video_input_path=str(video_path),
+                mask_input_path=str(mask_path),
+                reference_image_path=str(reference_path),
+                scanned_geometry=scanned,
+                dilate_px=0,
+                mask_scale=1.0,
+                infer_len=4,
+                enable_prefetch=False,
+            )
+            try:
+                frames_out, masks_out = provider.materialize_window([0, 1, 2])
+            finally:
+                provider.close()
+
+            for out, expected in zip(frames_out, eager["resized_video"][:3], strict=True):
+                self.assertTrue(np.array_equal(np.asarray(out), np.asarray(expected)))
+            for out, expected in zip(masks_out, eager["resized_masks"][:3], strict=True):
+                self.assertTrue(np.array_equal(np.asarray(out), np.asarray(expected)))
+            self.assertEqual(int(np.asarray(masks_out[0]).sum()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

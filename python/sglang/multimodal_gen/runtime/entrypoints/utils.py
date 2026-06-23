@@ -196,7 +196,8 @@ def _mux_audio_np_into_mp4(
     sample_rate: int,
     ffmpeg_exe: str,
 ) -> None:
-    merged_path = save_file_path.rsplit(".", 1)[0] + ".tmp_mux.mp4"
+    base, ext = os.path.splitext(save_file_path)
+    merged_path = f"{base}.tmp_mux{ext or '.mp4'}"
     tmp_wav_path = None
     try:
         if scipy_wavfile is None:
@@ -248,7 +249,7 @@ def _maybe_mux_audio_into_mp4(
     fps: int,
     audio_sample_rate: Optional[int],
 ) -> None:
-    """Best-effort mux audio into an already-written mp4 at save_file_path.
+    """Best-effort mux audio into an already-written video at save_file_path.
 
     Any failure should keep the silent video and only log a warning.
     """
@@ -492,16 +493,14 @@ def post_process_sample(
                             save_video_frames_like_reference,
                         )
 
+                        # Preserve the reference video's bitrate target. The default
+                        # output_compression would otherwise switch H.264/H.265 to CRF.
                         save_video_frames_like_reference(
                             frames,
                             save_file_path,
                             refer_file=video_reference_path,
                             fps=fps,
-                            quality=(
-                                imageio_quality
-                                if output_compression is not None
-                                else None
-                            ),
+                            quality=None,
                         )
                         saved_with_reference = True
                     except Exception as e:
@@ -513,14 +512,14 @@ def post_process_sample(
                         )
 
                 if not saved_with_reference:
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                        codec="libx264",
-                        quality=imageio_quality,
-                    )
+                    mimsave_kwargs = {
+                        "fps": fps,
+                        "codec": "libx264",
+                        "quality": imageio_quality,
+                    }
+                    if os.path.splitext(save_file_path)[1].lower() == ".mp4":
+                        mimsave_kwargs["format"] = data_type.get_default_extension()
+                    imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,

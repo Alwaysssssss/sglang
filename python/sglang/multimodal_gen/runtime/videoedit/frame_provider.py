@@ -160,7 +160,7 @@ class WindowFrameProvider:
         if global_index == 0 and self.reference_offset == 1:
             assert self._reference_frame is not None
             frame = self._reference_frame.copy()
-            raw_mask = Image.new("L", self.frame_size, 255)
+            raw_mask = Image.new("L", self.frame_size, 0)
         else:
             frame = self._video_decoder.read_next()
             raw_mask = self._mask_decoder.read_next()
@@ -218,7 +218,7 @@ class WindowFrameProvider:
                 if global_index == 0 and self.reference_offset == 1:
                     assert reference_frame is not None
                     frame = reference_frame
-                    raw_mask = Image.new("L", self.frame_size, 255)
+                    raw_mask = Image.new("L", self.frame_size, 0)
                 else:
                     frame = video_decoder.read_next()
                     raw_mask = mask_decoder.read_next()
@@ -290,7 +290,7 @@ class WindowFrameProvider:
                 if global_index == 0 and self.reference_offset == 1:
                     assert self._reference_frame is not None
                     original_frame = self._reference_frame.copy()
-                    raw_mask = Image.new("L", self.frame_size, 255)
+                    raw_mask = Image.new("L", self.frame_size, 0)
                 else:
                     original_frame = video_decoder.read_next()
                     raw_mask = mask_decoder.read_next()

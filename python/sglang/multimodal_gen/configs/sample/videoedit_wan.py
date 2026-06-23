@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    VIDEO_OUTPUT_EXTENSIONS,
+)
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_14b_coefficients
 
@@ -17,6 +21,28 @@ VIDEOEDIT_OVERLAP_COMMIT_MODES = ("native_skip", "weighted")
 VIDEOEDIT_TAIL_PADDING_MODES = ("native_reverse_mirror", "reflect")
 
 
+def build_videoedit_teacache_params(
+    teacache_thresh: float = 0.3,
+    start_skipping: int | float = 5,
+    end_skipping: int | float = 1.0,
+) -> TeaCacheParams:
+    return TeaCacheParams(
+        teacache_thresh=teacache_thresh,
+        use_ret_steps=True,
+        coefficients_callback=_wan_14b_coefficients,
+        start_skipping=start_skipping,
+        end_skipping=end_skipping,
+    )
+
+
+def _source_video_extension(video_path: str | None) -> str | None:
+    if not video_path:
+        return None
+    source = video_path.split("?", 1)[0]
+    ext = os.path.splitext(source)[1].lower()
+    return ext if ext in VIDEO_OUTPUT_EXTENSIONS else None
+
+
 @dataclass
 class WanVideoEditSamplingParams(SamplingParams):
     # Request fields
@@ -24,7 +50,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     mask_input_path: str | None = None
     reference_image_path: str | None = None
     infer_len: int = 81
-    overlap: int = 9
+    overlap: int = 10
     strength: float = 1.0
     dtype: str = "bf16"
 
@@ -48,8 +74,8 @@ class WanVideoEditSamplingParams(SamplingParams):
     vary_seed_by_window: bool = False
     init_latent_mode: str = "noise"
     mask_downsample_mode: str = "nearest"
-    overlap_commit_mode: str = "native_skip"
-    tail_padding_mode: str = "native_reverse_mirror"
+    overlap_commit_mode: str = "weighted"
+    tail_padding_mode: str = "reflect"
     decode_mode: str = "stream"
     progress_path: str | None = None
 
@@ -58,15 +84,10 @@ class WanVideoEditSamplingParams(SamplingParams):
     fps: int = 16
     guidance_scale: float = 5.0
     num_inference_steps: int = 40
+    enable_teacache: bool = True
     negative_prompt: str | None = DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT
     teacache_params: TeaCacheParams = field(
-        default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.3,
-            use_ret_steps=True,
-            coefficients_callback=_wan_14b_coefficients,
-            start_skipping=5,
-            end_skipping=1.0,
-        )
+        default_factory=build_videoedit_teacache_params
     )
 
     # Global runtime fields
@@ -77,6 +98,9 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_dilated_cropped_masks: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_frame_provider: Any | None = field(default=None, init=False, repr=False)
     runtime_window_specs: list[Any] | None = field(default=None, init=False, repr=False)
+    runtime_window_materialize_metadata: list[dict[str, Any]] | None = field(
+        default=None, init=False, repr=False
+    )
     runtime_accum_frames: Any | None = field(default=None, init=False, repr=False)
     runtime_accum_weights: Any | None = field(default=None, init=False, repr=False)
     runtime_prev_window_output_frames: list[Any] | None = field(default=None, init=False, repr=False)
@@ -128,6 +152,17 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_output_video_path: str | None = field(default=None, init=False, repr=False)
     runtime_crop_video_path: str | None = field(default=None, init=False, repr=False)
     runtime_metadata_path: str | None = field(default=None, init=False, repr=False)
+
+    def _set_output_file_ext(self):
+        base, current_ext = os.path.splitext(self.output_file_name)
+        current_ext = current_ext.lower()
+        source_ext = _source_video_extension(self.video_input_path)
+        if source_ext:
+            self.output_file_name = f"{base}{source_ext}"
+            return
+        if current_ext in VIDEO_OUTPUT_EXTENSIONS:
+            return
+        super()._set_output_file_ext()
 
     def __post_init__(self) -> None:
         if self.num_frames is not None and self.num_frames <= 0:

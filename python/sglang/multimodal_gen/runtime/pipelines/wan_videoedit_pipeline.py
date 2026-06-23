@@ -38,8 +38,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VideoEditWindowPostprocessStage,
     VideoEditWindowValidationStage,
 )
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import (
+    save_video_frames_like_reference,
+)
 from sglang.multimodal_gen.runtime.videoedit.frame_provider import (
     WindowFrameProvider,
 )
@@ -70,6 +74,13 @@ def _as_videoedit_params(batch: Req) -> WanVideoEditSamplingParams:
             f"got {type(params).__name__}"
         )
     return params
+
+
+def _is_output_rank() -> bool:
+    try:
+        return get_world_rank() == 0
+    except Exception:
+        return True
 
 
 def _image_to_float_array(frame: Image.Image) -> np.ndarray:
@@ -224,22 +235,30 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         )
         params.runtime_prev_window_output_frames = None
         params.runtime_prev_window_index = None
+        params.runtime_window_materialize_metadata = []
         batch.height = params.runtime_aligned_h
         batch.width = params.runtime_aligned_w
         batch.fps = max(1, int(round(params.runtime_fps or batch.fps)))
 
-    def _materialize_window_inputs(
+    def _load_window_source_frames_and_masks(
         self, params: WanVideoEditSamplingParams, window_spec: Any
-    ) -> None:
+    ) -> tuple[list[Image.Image], list[Image.Image]]:
         provider = params.runtime_frame_provider
         if provider is not None:
-            source_frames, masks = provider.materialize_window(window_spec.input_indices)
-        else:
-            source_frames = [params.runtime_resized_frames[idx] for idx in window_spec.input_indices]
-            masks = [params.runtime_resized_masks[idx] for idx in window_spec.input_indices]
+            return provider.materialize_window(window_spec.input_indices)
+        return (
+            [params.runtime_resized_frames[idx] for idx in window_spec.input_indices],
+            [params.runtime_resized_masks[idx] for idx in window_spec.input_indices],
+        )
 
+    def _apply_repaired_context_if_enabled(
+        self,
+        params: WanVideoEditSamplingParams,
+        input_indices: list[int],
+        source_frames: list[Image.Image],
+    ) -> list[Image.Image]:
         frames: list[Image.Image] = []
-        for idx, source_frame in zip(window_spec.input_indices, source_frames, strict=True):
+        for idx, source_frame in zip(input_indices, source_frames, strict=True):
             use_repaired = (
                 params.use_repaired_context
                 and params.runtime_accum_weights is not None
@@ -253,25 +272,99 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 frames.append(_float_array_to_image(repaired))
             else:
                 frames.append(source_frame)
-        if (
-            params.overlap_commit_mode == "native_skip"
+        return frames
+
+    def _uses_previous_window_reference(
+        self, params: WanVideoEditSamplingParams, window_spec: Any
+    ) -> bool:
+        return (
+            params.overlap_commit_mode in {"native_skip", "weighted"}
             and int(params.overlap) > 0
             and window_spec.window_index > 0
+        )
+
+    def _apply_previous_window_reference(
+        self,
+        params: WanVideoEditSamplingParams,
+        window_spec: Any,
+        frames: list[Image.Image],
+    ) -> tuple[bool, int | None]:
+        if not self._uses_previous_window_reference(params, window_spec):
+            return False, None
+        if not frames:
+            return False, None
+        if (
+            params.runtime_prev_window_index != window_spec.window_index - 1
+            or params.runtime_prev_window_output_frames is None
         ):
-            if (
-                params.runtime_prev_window_index == window_spec.window_index - 1
-                and params.runtime_prev_window_output_frames is not None
-            ):
-                stride = params.infer_len - int(params.overlap)
-                if 0 <= stride < len(params.runtime_prev_window_output_frames):
-                    frames[0] = params.runtime_prev_window_output_frames[stride]
-            if masks:
-                w, h = masks[0].size
-                black = Image.new("L", (w, h), 0)
-                for i in range(min(int(params.overlap), len(masks))):
-                    masks[i] = black.copy()
+            return False, None
+
+        ref_local_idx = getattr(window_spec, "reference_prev_local_idx", None)
+        if ref_local_idx is None:
+            ref_local_idx = params.infer_len - int(params.overlap)
+        if 0 <= ref_local_idx < len(params.runtime_prev_window_output_frames):
+            frames[0] = params.runtime_prev_window_output_frames[ref_local_idx]
+            return True, ref_local_idx
+        return False, ref_local_idx
+
+    def _zero_reference_context_masks(
+        self,
+        params: WanVideoEditSamplingParams,
+        window_spec: Any,
+        masks: list[Image.Image],
+    ) -> int:
+        if not self._uses_previous_window_reference(params, window_spec) or not masks:
+            return 0
+        zero_count = min(
+            int(getattr(window_spec, "overlap_mask_zero_count", 0)),
+            len(masks),
+        )
+        w, h = masks[0].size
+        black = Image.new("L", (w, h), 0)
+        for i in range(zero_count):
+            masks[i] = black.copy()
+        return zero_count
+
+    def _materialize_window_inputs(
+        self, params: WanVideoEditSamplingParams, window_spec: Any
+    ) -> None:
+        source_frames, masks = self._load_window_source_frames_and_masks(
+            params, window_spec
+        )
+        frames = self._apply_repaired_context_if_enabled(
+            params, window_spec.input_indices, source_frames
+        )
+        reference_from_previous_window, ref_local_idx = (
+            self._apply_previous_window_reference(params, window_spec, frames)
+        )
+        zeroed_overlap_mask_count = self._zero_reference_context_masks(
+            params, window_spec, masks
+        )
         params.runtime_window_frames = frames
         params.runtime_window_masks = masks
+        if params.runtime_window_materialize_metadata is not None:
+            params.runtime_window_materialize_metadata.append(
+                {
+                    "window_index": window_spec.window_index,
+                    "start_index": window_spec.start_index,
+                    "end_index": window_spec.end_index,
+                    "valid_len": window_spec.valid_len,
+                    "stride": getattr(window_spec, "stride", None),
+                    "reference_from_previous_window": reference_from_previous_window,
+                    "reference_prev_local_idx": ref_local_idx,
+                    "reference_global_index": getattr(
+                        window_spec, "reference_global_index", None
+                    )
+                    if reference_from_previous_window
+                    else None,
+                    "zeroed_overlap_mask_count": zeroed_overlap_mask_count,
+                    "commit_start_local_idx": getattr(
+                        window_spec, "commit_start_local_idx", 0
+                    ),
+                    "use_repaired_context": bool(params.use_repaired_context),
+                    "overlap_commit_mode": params.overlap_commit_mode,
+                }
+            )
 
     # overlap权重，越靠近窗口边缘权重越小，中心区域权重为1.0，边缘区域权重线性衰减到0.0，最小不低于1e-6
     def _commit_weight(
@@ -283,16 +376,23 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         overlap = int(params.overlap)
         if overlap <= 0:
             return 1.0
+        commit_start = (
+            int(getattr(window_spec, "commit_start_local_idx", 0))
+            if window_spec.window_index > 0
+            else 0
+        )
+        effective_idx = max(0, local_idx - commit_start)
+        effective_len = max(1, params.infer_len - commit_start)
         weight = 1.0
-        if window_spec.window_index > 0 and local_idx < overlap:
-            weight = min(weight, float(local_idx + 1) / float(overlap + 1))
+        if window_spec.window_index > 0 and effective_idx < overlap:
+            weight = min(weight, float(effective_idx + 1) / float(overlap + 1))
         if (
             params.runtime_window_specs is not None
             and window_spec.window_index < len(params.runtime_window_specs) - 1
-            and local_idx >= params.infer_len - overlap
+            and effective_idx >= effective_len - overlap
         ):
             weight = min(
-                weight, float(params.infer_len - local_idx) / float(overlap + 1)
+                weight, float(effective_len - effective_idx) / float(overlap + 1)
             )
         return max(weight, 1e-6)
 
@@ -302,13 +402,18 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         frames = params.runtime_window_output_frames
         if frames is None:
             raise ValueError("VideoEdit window output is missing")
+        commit_start = (
+            int(getattr(window_spec, "commit_start_local_idx", 0))
+            if window_spec.window_index > 0
+            else 0
+        )
         for local_idx, global_idx in window_spec.commit_local_to_global.items():
             if global_idx >= params.runtime_num_input_frames:
                 continue
             if (
-                params.overlap_commit_mode == "native_skip"
+                params.overlap_commit_mode in {"native_skip", "weighted"}
                 and window_spec.window_index > 0
-                and local_idx < int(params.overlap)
+                and local_idx < commit_start
             ):
                 continue
             weight = (
@@ -342,6 +447,8 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         output_video_path: str | None,
         num_output_frames: int | None = None,
     ) -> None:
+        if not _is_output_rank():
+            return
         if output_video_path is None:
             return
         metadata_path = os.path.splitext(output_video_path)[0] + ".videoedit.json"
@@ -367,9 +474,23 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     "valid_len": spec.valid_len,
                     "input_indices": spec.input_indices,
                     "reflected_count": spec.reflected_count,
+                    "stride": getattr(spec, "stride", None),
+                    "reference_prev_local_idx": getattr(
+                        spec, "reference_prev_local_idx", None
+                    ),
+                    "reference_global_index": getattr(
+                        spec, "reference_global_index", None
+                    ),
+                    "overlap_mask_zero_count": getattr(
+                        spec, "overlap_mask_zero_count", 0
+                    ),
+                    "commit_start_local_idx": getattr(
+                        spec, "commit_start_local_idx", 0
+                    ),
                 }
                 for spec in (params.runtime_window_specs or [])
             ],
+            "window_materialize": params.runtime_window_materialize_metadata or [],
         }
         os.makedirs(os.path.dirname(os.path.abspath(metadata_path)), exist_ok=True)
         with open(metadata_path, "w", encoding="utf-8") as f:
@@ -382,13 +503,26 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         crop_frames: list[Image.Image],
         output_video_path: str | None,
     ) -> None:
+        if not _is_output_rank():
+            return
         if not params.save_crop_only or output_video_path is None:
             return
-        crop_path = os.path.splitext(output_video_path)[0] + "_crop_only.mp4"
+        base, ext = os.path.splitext(output_video_path)
+        crop_ext = ext or ".mp4"
+        crop_path = f"{base}_crop_only{crop_ext}"
         frames = resize_frames(crop_frames, params.runtime_crop_h, params.runtime_crop_w)
         if params.drop_reference_frame and len(frames) > 0:
             frames = frames[1:]
-        save_video_frames(frames, crop_path, fps=params.runtime_fps or params.fps)
+        if params.video_input_path:
+            save_video_frames_like_reference(
+                frames,
+                crop_path,
+                refer_file=params.video_input_path,
+                fps=params.runtime_fps or params.fps,
+                quality=None,
+            )
+        else:
+            save_video_frames(frames, crop_path, fps=params.runtime_fps or params.fps)
         params.runtime_crop_video_path = crop_path
 
     def _finalize_long_video_output(
@@ -459,6 +593,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     infer_len=params.infer_len,
                     overlap=params.overlap,
                     tail_padding_mode=params.tail_padding_mode,
+                    overlap_commit_mode=params.overlap_commit_mode,
                 )
                 params.runtime_window_specs = window_specs
                 write_videoedit_progress(

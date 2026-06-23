@@ -24,10 +24,12 @@ from pydantic import ValidationError
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
+    VIDEO_OUTPUT_EXTENSIONS,
     generate_request_id,
 )
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
+    build_videoedit_teacache_params,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
@@ -94,6 +96,9 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
     "maskDownsampleMode": "mask_downsample_mode",
     "overlapCommitMode": "overlap_commit_mode",
     "tailPaddingMode": "tail_padding_mode",
+    "teacacheThresh": "teacache_thresh",
+    "teacacheStartSkipping": "teacache_start_skipping",
+    "teacacheEndSkipping": "teacache_end_skipping",
     "minioConfig": "minio_config",
     "outputObjectKey": "output_object_key",
 }
@@ -612,15 +617,41 @@ async def _save_video_source_to_path(
     return target_path
 
 
+def _source_video_extension(video_path: str | None) -> str | None:
+    if not video_path:
+        return None
+    source = video_path.split("?", 1)[0]
+    ext = os.path.splitext(source)[1].lower()
+    return ext if ext in VIDEO_OUTPUT_EXTENSIONS else None
+
+
+def _with_video_extension(path: str, extension: str | None) -> str:
+    if not extension:
+        return path
+    base, current_ext = os.path.splitext(path)
+    if current_ext:
+        return f"{base}{extension}"
+    return f"{path}{extension}"
+
+
 def _split_output_path(
-    output_path: str | None, job_id: str, server_output_path: str | None
+    output_path: str | None,
+    job_id: str,
+    server_output_path: str | None,
+    reference_path: str | None = None,
 ):
-    if output_path and os.path.splitext(output_path)[1].lower() == ".mp4":
-        return os.path.dirname(os.path.abspath(output_path)), os.path.basename(
-            output_path
-        )
+    source_ext = _source_video_extension(reference_path)
+    if (
+        output_path
+        and os.path.splitext(output_path)[1].lower() in VIDEO_OUTPUT_EXTENSIONS
+    ):
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        output_base, output_ext = os.path.splitext(os.path.basename(output_path))
+        output_file_name = f"{output_base}{source_ext or output_ext}"
+        return output_dir, output_file_name
     output_dir = output_path or server_output_path
-    return output_dir, f"{job_id}.mp4"
+    output_ext = source_ext or ".mp4"
+    return output_dir, f"{job_id}{output_ext}"
 
 
 def _current_video_progress(job: Dict[str, Any]) -> int:
@@ -817,7 +848,10 @@ async def create_video_repair(request: Request):
         )
 
         output_dir, output_file_name = _split_output_path(
-            req.output_path, request_id, server_args.output_path
+            req.output_path,
+            request_id,
+            server_args.output_path,
+            reference_path=video_input_path,
         )
         output_persistent = output_dir is not None
         if output_dir is None:
@@ -869,6 +903,11 @@ async def create_video_repair(request: Request):
             tail_padding_mode=req.tail_padding_mode,
             decode_mode=req.decode_mode,
             enable_teacache=req.enable_teacache,
+            teacache_params=build_videoedit_teacache_params(
+                teacache_thresh=req.teacache_thresh,
+                start_skipping=req.teacache_start_skipping,
+                end_skipping=req.teacache_end_skipping,
+            ),
             enable_frame_interpolation=req.enable_frame_interpolation,
             frame_interpolation_exp=req.frame_interpolation_exp,
             frame_interpolation_scale=req.frame_interpolation_scale,
@@ -888,9 +927,14 @@ async def create_video_repair(request: Request):
             or req.output_storage == "s3"
             or req.output_object_key is not None
         ):
+            output_ext = os.path.splitext(output_file_name)[1] or ".mp4"
             output_object_key = normalize_object_key(
-                req.output_object_key
-                or default_video_repair_output_object_key(request_id)
+                _with_video_extension(req.output_object_key, output_ext)
+                if req.output_object_key
+                else default_video_repair_output_object_key(
+                    request_id,
+                    extension=output_ext,
+                )
             )
         req.output_object_key = output_object_key
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)

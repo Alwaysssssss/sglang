@@ -14,13 +14,12 @@ def save_video_frames(
 ) -> str:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     arrays = [np.array(frame) if isinstance(frame, Image.Image) else frame for frame in frames]
-    imageio.mimsave(
-        path,
-        arrays,
-        fps=fps,
-        format="mp4",
-        codec="libx264",
-        quality=quality if quality is not None else 8,
-    )
+    mimsave_kwargs = {
+        "fps": fps,
+        "codec": "libx264",
+        "quality": quality if quality is not None else 8,
+    }
+    if os.path.splitext(path)[1].lower() == ".mp4":
+        mimsave_kwargs["format"] = "mp4"
+    imageio.mimsave(path, arrays, **mimsave_kwargs)
     return path
-

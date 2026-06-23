@@ -70,9 +70,15 @@ def probe_video_profile(video_path: str) -> dict[str, Any]:
         "width": int(stream["width"]),
         "height": int(stream["height"]),
         "fps": fps,
+        "format_name": fmt.get("format_name"),
+        "format_long_name": fmt.get("format_long_name"),
         "codec_name": stream.get("codec_name"),
+        "codec_tag_string": stream.get("codec_tag_string"),
         "pix_fmt": stream.get("pix_fmt"),
         "bit_rate": int(bit_rate) if bit_rate else None,
+        "bits_per_raw_sample": stream.get("bits_per_raw_sample"),
+        "bits_per_sample": stream.get("bits_per_sample"),
+        "color_range": stream.get("color_range"),
         "color_space": stream.get("color_space"),
         "color_transfer": stream.get("color_transfer"),
         "color_primaries": stream.get("color_primaries"),
@@ -122,6 +128,8 @@ def _build_ffmpeg_cmd(
 ) -> list[str]:
     encoder = _encoder_for_codec(profile.get("codec_name"))
     pix_fmt = profile.get("pix_fmt") or "yuv420p"
+    padded_width = width + (width % 2)
+    padded_height = height + (height % 2)
     cmd = [
         "ffmpeg",
         "-y",
@@ -138,19 +146,27 @@ def _build_ffmpeg_cmd(
         "-i",
         "pipe:0",
         "-an",
+    ]
+
+    if padded_width != width or padded_height != height:
+        cmd.extend(["-vf", f"pad={padded_width}:{padded_height}:0:0"])
+
+    cmd.extend([
         "-c:v",
         encoder,
         "-pix_fmt",
         pix_fmt,
         "-r",
         str(fps),
-    ]
+    ])
 
     if quality is not None and encoder in {"libx264", "libx265"}:
         cmd.extend(["-crf", str(_quality_to_crf(quality))])
     elif profile.get("bit_rate"):
         cmd.extend(["-b:v", str(profile["bit_rate"])])
 
+    if profile.get("color_range") and profile["color_range"] != "unknown":
+        cmd.extend(["-color_range", profile["color_range"]])
     if profile.get("color_space") and profile["color_space"] != "unknown":
         cmd.extend(["-colorspace", profile["color_space"]])
     if profile.get("color_transfer") and profile["color_transfer"] != "unknown":
@@ -200,6 +216,20 @@ def save_video_frames_like_reference(
         stderr=subprocess.PIPE,
     )
     assert process.stdin is not None
+
+    def _read_stderr() -> str:
+        stderr_bytes = process.stderr.read() if process.stderr is not None else b""
+        if process.stderr is not None:
+            process.stderr.close()
+        return stderr_bytes.decode("utf-8", errors="replace")
+
+    def _raise_ffmpeg_error(message: str, return_code: int, stderr: str) -> None:
+        details = stderr.strip() or "no ffmpeg stderr"
+        raise RuntimeError(
+            f"{message} (return code {return_code}): {details}. "
+            f"Command: {' '.join(cmd)}"
+        )
+
     try:
         process.stdin.write(first.tobytes())
         for frame in frames[1:]:
@@ -211,11 +241,16 @@ def save_video_frames_like_reference(
                 )
             process.stdin.write(arr.tobytes())
         process.stdin.close()
-        stderr_bytes = process.stderr.read() if process.stderr is not None else b""
-        if process.stderr is not None:
-            process.stderr.close()
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        stderr = _read_stderr()
         return_code = process.wait()
+    except BrokenPipeError as exc:
+        try:
+            process.stdin.close()
+        except Exception:
+            pass
+        stderr = _read_stderr()
+        return_code = process.wait()
+        _raise_ffmpeg_error("ffmpeg exited early while saving video", return_code, stderr)
     except Exception:
         process.kill()
         process.wait()
@@ -224,5 +259,5 @@ def save_video_frames_like_reference(
         raise
 
     if return_code != 0:
-        raise RuntimeError(f"ffmpeg failed while saving video: {stderr}")
+        _raise_ffmpeg_error("ffmpeg failed while saving video", return_code, stderr)
     return output_path

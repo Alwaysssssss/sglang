@@ -206,6 +206,11 @@ def test_content_type_detection(tmp_path):
         ("image.jpeg", "image/jpeg"),
         ("image.webp", "image/webp"),
         ("video.mp4", "video/mp4"),
+        ("video.mov", "video/quicktime"),
+        ("video.m4v", "video/x-m4v"),
+        ("video.avi", "video/x-msvideo"),
+        ("video.mkv", "video/x-matroska"),
+        ("video.webm", "video/webm"),
         ("file.bin", "application/octet-stream"),
     ]
 

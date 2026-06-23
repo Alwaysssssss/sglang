@@ -106,6 +106,7 @@ class TestVideoEditMaskSources(unittest.TestCase):
             self.assertEqual(np.asarray(data["original_frames"][0])[0, 0, 0], 200)
             self.assertEqual(np.asarray(data["original_frames"][1])[0, 0, 0], 0)
             self.assertEqual(int(np.asarray(data["dilated_cropped_masks"][0]).sum()), 0)
+            self.assertEqual(int(np.asarray(data["resized_masks"][0]).sum()), 0)
             self.assertGreater(int(np.asarray(data["dilated_cropped_masks"][1]).sum()), 0)
 
     def test_load_current_coco_rle_json(self):
