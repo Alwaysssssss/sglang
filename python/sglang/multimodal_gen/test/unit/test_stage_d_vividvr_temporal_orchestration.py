@@ -92,21 +92,218 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             pipeline_config=VividVRPipelineConfig(),
         )
 
-        self.assertEqual(prompt_lists["caption_texts"], ["clip 1", "clip 2"])
-        self.assertEqual(prompt_lists["next_index"], 3)
+        self.assertEqual(prompt_lists["clip_caption_text"], "clip 1")
+        self.assertEqual(prompt_lists["caption_texts"], ["clip 1"])
+        self.assertEqual(prompt_lists["next_index"], 2)
         self.assertTrue(prompt_lists["prompt_list"][0].startswith("clip 1 "))
-        self.assertTrue(prompt_lists["prompt_list"][1].startswith("clip 2 "))
+        self.assertTrue(prompt_lists["prompt_list"][1].startswith("clip 1 "))
         self.assertEqual(prompt_lists["negative_prompt_list"], ["negative", "negative"])
 
     def test_build_vividvr_caption_prompt_lists_rejects_insufficient_entries(self):
         with self.assertRaisesRegex(ValueError, "does not contain enough entries"):
             build_vividvr_caption_prompt_lists(
                 caption_texts=["only one"],
-                start_index=0,
+                start_index=1,
                 tile_count=2,
                 negative_prompt_text="negative",
                 pipeline_config=VividVRPipelineConfig(),
             )
+
+    def test_temporal_windowed_forward_repeats_one_clip_caption_across_tiles(self):
+        params = self._make_vividvr_params(
+            num_frames=130,
+            num_temporal_process_frames=121,
+            num_inference_steps=1,
+            height=4,
+            width=4,
+            seed=42,
+        )
+        batch = SimpleNamespace(
+            sampling_params=params,
+            perf_dump_path=None,
+            metrics={},
+            extra={},
+            output=None,
+            fps=None,
+        )
+
+        def _prompt_stage(current_batch, _server_args):
+            current_batch.sampling_params.runtime_model_prompt_text = "prompt"
+            current_batch.sampling_params.runtime_negative_prompt_text = ""
+            current_batch.sampling_params.runtime_caption_texts = ["clip 0", "clip 1"]
+            return current_batch
+
+        class _DummyProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def update(self):
+                return None
+
+        class _DummyDenoisingStage:
+            def prepare_denoising_state(self, _batch, _server_args, **kwargs):
+                return {
+                    "latents": kwargs["latents"],
+                    "autocast_enabled": False,
+                    "target_dtype": torch.float32,
+                }
+
+            def progress_bar(self, total):
+                self.total = total
+                return _DummyProgressBar()
+
+            def run_denoising_step(
+                self,
+                current_batch,
+                _server_args,
+                denoising_state,
+                timestep_index,
+                *,
+                guidance_scale,
+                restoration_guidance_scale,
+            ):
+                return None
+
+        encoded_prompt_calls = []
+
+        def _encode_prompt_pair(**kwargs):
+            encoded_prompt_calls.append(list(kwargs["prompt"]))
+            return {
+                "prompt_embeds": torch.zeros(len(kwargs["prompt"]), 226, 8),
+                "negative_prompt_embeds": torch.zeros(len(kwargs["prompt"]), 226, 8),
+            }
+
+        pipeline = object.__new__(VividVRPipeline)
+        pipeline.input_validation_stage = lambda current_batch, _server_args: current_batch
+        pipeline.prompt_preparation_stage = _prompt_stage
+        pipeline._attach_runtime_acceleration_debug = lambda _batch, _server_args: None
+        pipeline.condition_encoding_stage = SimpleNamespace(
+            prepare_condition_inputs=lambda *_args, **_kwargs: {
+                "control_video": torch.zeros(121, 3, 4, 4),
+                "control_latents": torch.zeros(1, 1, 1, 2, 2),
+                "generator": torch.Generator(device="cpu").manual_seed(42),
+            }
+        )
+        pipeline.latent_preparation_stage = SimpleNamespace(
+            prepare_latents=lambda **_kwargs: (
+                torch.zeros(1, 1, 1, 2, 2),
+                torch.zeros(1, 1, 1, 2, 2),
+                0,
+            )
+        )
+        pipeline.tiling_preparation_stage = SimpleNamespace(
+            build_tiling_infos=lambda **_kwargs: [
+                SimpleNamespace(tile_index=0),
+                SimpleNamespace(tile_index=1),
+            ],
+            prepare_tiling_state=lambda **kwargs: {
+                "tiling_infos": kwargs["tiling_infos"],
+                "tiled_prompt_embeds": kwargs["prompt_embeds"],
+                "tiled_negative_prompt_embeds": kwargs["negative_prompt_embeds"],
+                "tile_count": len(kwargs["tiling_infos"]),
+            },
+        )
+        pipeline.text_encoding_stage = SimpleNamespace(
+            encode_prompt_pair=_encode_prompt_pair
+        )
+        pipeline.timestep_preparation_stage = SimpleNamespace(
+            prepare_timesteps=lambda _steps: torch.tensor([1.0], dtype=torch.float32)
+        )
+        pipeline.denoising_stage = _DummyDenoisingStage()
+        pipeline.decoding_stage = SimpleNamespace(
+            decode_latents=lambda _latents, _padding_frames, _server_args: torch.zeros(
+                121, 3, 4, 4
+            )
+        )
+        pipeline.video_processor = SimpleNamespace()
+        pipeline.get_module = lambda _name: SimpleNamespace(
+            config=SimpleNamespace(temporal_compression_ratio=4)
+        )
+
+        clip_specs = [
+            SimpleNamespace(
+                clip_index=0,
+                start_frame=0,
+                end_frame=121,
+                original_num_frames=121,
+                padded_num_frames=121,
+                num_padding_frames=0,
+                trim_front_frames=0,
+                trim_back_frames=0,
+            ),
+            SimpleNamespace(
+                clip_index=1,
+                start_frame=60,
+                end_frame=130,
+                original_num_frames=70,
+                padded_num_frames=73,
+                num_padding_frames=3,
+                trim_front_frames=31,
+                trim_back_frames=0,
+            ),
+        ]
+        window_plan = SimpleNamespace(
+            clip_specs=clip_specs,
+            num_clips=2,
+            num_temporal_overlapped_frames=61,
+            temporal_frame_stride=60,
+        )
+        input_video_info = {
+            "reference_video": torch.zeros(130, 3, 4, 4),
+            "original_num_frames": 130,
+            "original_height": 4,
+            "original_width": 4,
+            "fps": 24,
+        }
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_window_plan",
+            return_value=window_plan,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_latent_merge_plan",
+            return_value=SimpleNamespace(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.merge_vividvr_temporal_latent_states"
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.decoded_video_to_frame_tensor",
+            side_effect=lambda video, **_kwargs: video,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.trim_vividvr_temporal_output_clip",
+            side_effect=lambda video, _clip_spec: video,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.stitch_vividvr_temporal_output_clips",
+            side_effect=lambda clips: clips[0],
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.apply_reference_color_fix",
+            side_effect=lambda video, _reference: video,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.run_optional_postprocess_modules",
+            side_effect=lambda video, **_kwargs: video,
+        ):
+            result = pipeline._forward_temporal_windowed(
+                batch,
+                SimpleNamespace(pipeline_config=VividVRPipelineConfig()),
+                input_video_info,
+            )
+
+        self.assertIs(result, batch)
+        self.assertEqual(len(encoded_prompt_calls), 2)
+        self.assertTrue(all(prompt.startswith("clip 0 ") for prompt in encoded_prompt_calls[0]))
+        self.assertTrue(all(prompt.startswith("clip 1 ") for prompt in encoded_prompt_calls[1]))
+        self.assertEqual([len(prompts) for prompts in encoded_prompt_calls], [2, 2])
+        self.assertEqual(
+            batch.extra["vividvr_debug"]["clip_caption_texts"],
+            [
+                {"clip_index": 0, "caption_text": "clip 0", "tile_count": 2},
+                {"clip_index": 1, "caption_text": "clip 1", "tile_count": 2},
+            ],
+        )
 
     def test_build_temporal_latent_merge_plan_matches_reference_math(self):
         plan = build_vividvr_temporal_latent_merge_plan(

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from sglang.multimodal_gen.tools.run_flowcut_vividvr_service_acceptance import (
     FlowCutAcceptanceError,
+    _FlowCutCallbackRecorder,
+    _LocalFlowCutCallbackServer,
+    _build_payload,
     poll_accepted_task,
+    parse_args,
     submit_flowcut_task_with_retry,
 )
 
@@ -56,12 +61,14 @@ def test_submit_flowcut_task_retries_code_2_before_polling(monkeypatch):
         client=client,
         base_url="http://127.0.0.1:31191",
         payload={"taskId": "task-1"},
+        submit_timeout_s=123.0,
         retry_interval_seconds=0.01,
         max_submit_attempts=2,
     )
 
     assert result == {"code": 0, "message": "ok"}
     assert len(client.posts) == 2
+    assert [kwargs["timeout"] for _, kwargs in client.posts] == [123.0, 123.0]
     assert client.gets == []
     assert sleeps == [0.01]
 
@@ -100,3 +107,77 @@ def test_poll_accepted_task_reports_404_as_stale_or_restarted_service():
     assert client.gets == [
         ("http://127.0.0.1:31191/v1/videos/old-task/progress", {"timeout": 60.0})
     ]
+
+
+def test_build_payload_omits_optional_caption_and_reference_for_bridge_path(tmp_path):
+    callback_log = tmp_path / "callback.jsonl"
+    args = parse_args(
+        [
+            "--task-id",
+            "task-bridge",
+            "--callback-log",
+            str(callback_log),
+            "--video-input-path",
+            "/tmp/input.mp4",
+            "--output-path",
+            "/tmp/output.mp4",
+            "--poll-timeout-s",
+            "2400",
+        ]
+    )
+
+    payload = _build_payload(
+        args,
+        callback_url="http://127.0.0.1:39090/tasks/task-bridge/callback",
+    )
+
+    assert payload["video_input_path"] == "/tmp/input.mp4"
+    assert payload["callbackUrl"].endswith("/tasks/task-bridge/callback")
+    assert "caption_file_path" not in payload
+    assert "reference_video_path" not in payload
+
+
+def test_parse_args_accepts_long_submit_timeout_for_caption_bridge(tmp_path):
+    callback_log = tmp_path / "callback.jsonl"
+    args = parse_args(
+        [
+            "--task-id",
+            "task-bridge",
+            "--callback-log",
+            str(callback_log),
+            "--video-input-path",
+            "/tmp/input.mp4",
+            "--submit-timeout-s",
+            "2400",
+        ]
+    )
+
+    assert args.submit_timeout_s == 2400.0
+
+
+def test_local_callback_server_records_final_payload(tmp_path):
+    callback_log = tmp_path / "callback.jsonl"
+    recorder = _FlowCutCallbackRecorder(str(callback_log))
+
+    with _LocalFlowCutCallbackServer(
+        host="127.0.0.1",
+        port=0,
+        task_id="task-1",
+        recorder=recorder,
+    ) as server:
+        with httpx.Client(trust_env=False) as client:
+            response = client.post(
+                server.callback_url,
+                json={
+                    "status": "succeeded",
+                    "progress": 100,
+                    "reason": "done",
+                    "output": "",
+                },
+            )
+            response.raise_for_status()
+
+        final_payload = recorder.wait_for_final(timeout=1.0)
+
+    assert final_payload["status"] == "succeeded"
+    assert callback_log.read_text(encoding="utf-8").strip()

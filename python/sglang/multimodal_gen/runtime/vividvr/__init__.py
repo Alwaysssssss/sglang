@@ -6,6 +6,19 @@ from sglang.multimodal_gen.runtime.vividvr.captioning import (
     read_caption_file,
     resolve_caption_file_path,
 )
+from sglang.multimodal_gen.runtime.vividvr.caption_bridge import (
+    VividVRCaptionBridgeConfig,
+    VividVRCaptionBridgeResult,
+    request_vividvr_caption_sidecar,
+    validate_caption_sidecar_file,
+)
+from sglang.multimodal_gen.runtime.vividvr.caption_manifest import (
+    VividVRCaptionClipSpec,
+    VividVRCaptionManifest,
+    VividVRCaptionTileSpec,
+    build_vividvr_caption_manifest_for_video_path,
+    build_vividvr_caption_manifest_from_video_info,
+)
 from sglang.multimodal_gen.runtime.vividvr.postprocess import (
     adaptive_instance_normalization,
     apply_reference_color_fix,
@@ -37,7 +50,11 @@ from sglang.multimodal_gen.runtime.vividvr.windowing import (
 __all__ = [
     "adaptive_instance_normalization",
     "apply_reference_color_fix",
+    "VividVRCaptionBridgeConfig",
+    "VividVRCaptionBridgeResult",
     "build_vividvr_caption_prompt_lists",
+    "build_vividvr_caption_manifest_for_video_path",
+    "build_vividvr_caption_manifest_from_video_info",
     "build_vividvr_tiled_prompt_lists",
     "compose_positive_prompt",
     "decoded_video_to_frame_tensor",
@@ -47,11 +64,16 @@ __all__ = [
     "prepare_tiling_infos_generator",
     "read_caption_file",
     "read_prompt_file",
+    "request_vividvr_caption_sidecar",
     "resolve_caption_file_path",
     "resolve_negative_prompt",
     "resolve_prompt_file_path",
     "run_optional_postprocess_modules",
+    "validate_caption_sidecar_file",
     "VividVRTemporalClipSpec",
+    "VividVRCaptionClipSpec",
+    "VividVRCaptionManifest",
+    "VividVRCaptionTileSpec",
     "VividVRTemporalLatentMergePlan",
     "VividVRTemporalWindowPlan",
     "build_vividvr_temporal_latent_merge_plan",

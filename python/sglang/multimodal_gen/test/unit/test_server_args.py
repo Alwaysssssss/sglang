@@ -138,6 +138,43 @@ class TestComponentPathParsing(unittest.TestCase):
         self.assertEqual(remaining, [])
 
 
+class TestVividVRCaptionBridgeArgs(unittest.TestCase):
+    def test_caption_bridge_cli_args_are_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/tmp/vividvr",
+            "--model-id",
+            "VividVR",
+            "--pipeline-class-name",
+            "CogVideoXVividVRControlNetPipeline",
+            "--vividvr-caption-bridge",
+            "--vividvr-caption-sidecar-url",
+            "http://127.0.0.1:31200",
+            "--vividvr-caption-work-dir",
+            "~/vividvr_caption_sidecars",
+            "--vividvr-caption-sidecar-timeout",
+            "120",
+        ]
+
+        with patch.object(
+            PipelineConfig,
+            "from_kwargs",
+            return_value=VividVRPipelineConfig(),
+        ), patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.vividvr_caption_bridge)
+        self.assertEqual(
+            server_args.vividvr_caption_sidecar_url,
+            "http://127.0.0.1:31200",
+        )
+        self.assertEqual(server_args.vividvr_caption_sidecar_timeout, 120.0)
+        self.assertFalse(server_args.vividvr_caption_work_dir.startswith("~"))
+
+
 class TestOffloadValidation(unittest.TestCase):
     def test_cache_dit_conflicts_with_dit_layerwise_offload(self):
         args = object.__new__(ServerArgs)

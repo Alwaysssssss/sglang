@@ -217,6 +217,13 @@ class ServerArgs:
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
 
+    # Vivid-VR caption sidecar bridge. The main service stays in the sglang
+    # environment and delegates CogVLM2 captioning to an external sidecar.
+    vividvr_caption_bridge: bool = False
+    vividvr_caption_sidecar_url: str | None = None
+    vividvr_caption_work_dir: str | None = None
+    vividvr_caption_sidecar_timeout: float = 1800.0
+
     # model paths for correct deallocation
     model_paths: dict[str, str] = field(default_factory=dict)
     model_loaded: dict[str, bool] = field(
@@ -276,6 +283,14 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_vividvr_caption_bridge()
+
+    def _validate_vividvr_caption_bridge(self):
+        if self.vividvr_caption_bridge and not self.vividvr_caption_sidecar_url:
+            raise ValueError(
+                "--vividvr-caption-sidecar-url is required when "
+                "--vividvr-caption-bridge is enabled"
+            )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -884,6 +899,30 @@ class ServerArgs:
             type=str,
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--vividvr-caption-bridge",
+            action=StoreBoolean,
+            default=ServerArgs.vividvr_caption_bridge,
+            help="Enable Vivid-VR automatic caption generation through a sidecar service.",
+        )
+        parser.add_argument(
+            "--vividvr-caption-sidecar-url",
+            type=str,
+            default=ServerArgs.vividvr_caption_sidecar_url,
+            help="Base URL for the Vivid-VR caption sidecar service.",
+        )
+        parser.add_argument(
+            "--vividvr-caption-work-dir",
+            type=str,
+            default=ServerArgs.vividvr_caption_work_dir,
+            help="Directory for Vivid-VR caption manifests and sidecar caption files.",
+        )
+        parser.add_argument(
+            "--vividvr-caption-sidecar-timeout",
+            type=float,
+            default=ServerArgs.vividvr_caption_sidecar_timeout,
+            help="Timeout in seconds for Vivid-VR caption sidecar requests.",
         )
 
         # LoRA

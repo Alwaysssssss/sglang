@@ -105,27 +105,25 @@ def build_vividvr_caption_prompt_lists(
         raise ValueError(f"tile_count must be positive, got {tile_count}")
     if start_index < 0:
         raise ValueError(f"start_index must be non-negative, got {start_index}")
-    end_index = start_index + tile_count
-    if end_index > len(caption_texts):
+    if start_index >= len(caption_texts):
         raise ValueError(
-            "caption file does not contain enough entries for the requested tiles: "
-            f"need {tile_count} entries starting at {start_index}, "
+            "caption file does not contain enough entries for the requested temporal clips: "
+            f"need 1 entry at clip index {start_index}, "
             f"but only {len(caption_texts)} captions are available"
         )
 
-    raw_caption_texts = caption_texts[start_index:end_index]
-    prompt_list = [
-        compose_positive_prompt(caption_text, pipeline_config)
-        for caption_text in raw_caption_texts
-    ]
+    clip_caption_text = caption_texts[start_index]
+    prompt_text = compose_positive_prompt(clip_caption_text, pipeline_config)
+    prompt_list = [prompt_text for _ in range(tile_count)]
     negative_prompt_list = None
     if negative_prompt_text is not None:
         negative_prompt_list = [negative_prompt_text for _ in range(tile_count)]
     return {
-        "caption_texts": raw_caption_texts,
+        "clip_caption_text": clip_caption_text,
+        "caption_texts": [clip_caption_text],
         "prompt_list": prompt_list,
         "negative_prompt_list": negative_prompt_list,
-        "next_index": end_index,
+        "next_index": start_index + 1,
     }
 
 

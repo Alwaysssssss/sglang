@@ -17,6 +17,7 @@
 - 当前仍未完成的主问题有两条：
   - 原版 `/home/zhiheng/Vivid-VR` 的 caption 目前只能在原版环境中稳定正确产出；在 `sglang` 的 `.venv` 中会因依赖版本差异导致 caption 输出异常，后续可能需要补一条“通信交换生成 caption”的桥接路径。
   - `serve` 服务接口的部分输入参数契约仍需按需求继续收口，当前不能默认视为已经完全稳定。
+- 下一步优先任务是解决原版 caption 模型环境不兼容问题；默认方向应是建立独立 caption bridge 或 sidecar 生成路径，而不是直接改坏 `/home/zhiheng/sglang/.venv` 的主推理依赖。
 - `Vivid-VR` 在 `sglang` 中必须作为原生模型集成运行；推理时不要依赖原版仓库的运行时代码。
 - 允许继续复用原版仓库中的外部资源，例如：
   - checkpoint
@@ -77,6 +78,9 @@
   - `docs_xzh/hand_over/phase_d_modular_refactor_and_fair_benchmark_handover.md`
   - `docs_xzh/hand_over/phase_d_acceptance_completion_and_phase_e_benchmark_handover.md`
   - `docs_xzh/hand_over/phase_e_e0_e3_acceptance_and_single_gpu_combo_handover.md`
+  - `docs_xzh/hand_over/phase_e_default_configs_and_serve_followups_handover_20260622.md`
+  - `docs_xzh/hand_over/flowcut_vividvr_service_compat_handover_20260622.md`
+  - `docs_xzh/hand_over/vividvr_service_external_access_and_caption_next_handover_20260622.md`
 - 如果任务涉及 modular 化方向，额外参考：
   - `docs_xzh/modular_style/vividvr_modular_refactor_plan.md`
 - 如果任务涉及 `Phase D` 长视频对齐，优先参考：
@@ -117,6 +121,9 @@
 - 如果因为环境问题无法继续，先说明问题，再处理环境，不要静默切换到别的解释器。
 - 唯一的基准对比例外是“运行原版 `/home/zhiheng/Vivid-VR` 做公平对比”时，必须使用原版本身的 `/home/zhiheng/Vivid-VR/.venv/bin/python`，不要用 `sglang` 的 `.venv` 代跑原版。
 - 做原版 `Vivid-VR` 公平对比时，必须优先保证原版 caption 语义正确；如果 `sglang` 环境里的 `transformers` 版本会导致 `CogVLM2` caption 异常，禁止继续用 `sglang` 的环境跑原版。
+- 解决 caption 环境不兼容时，禁止为了让原版 caption 在 `sglang/.venv` 内运行而随意降级或替换主推理依赖；优先采用独立进程、CLI、JSON 文件、HTTP 本地服务或 sidecar 文件等桥接方式调用 `/home/zhiheng/Vivid-VR/.venv/bin/python`。
+- caption bridge 的输出应统一保存为 sidecar caption 文件，并由 `sglang` 原生 Vivid-VR 推理链消费；不要让 `sglang` 推理运行时直接依赖原版仓库的推理代码。
+- caption bridge 验收至少要确认 sidecar 行数、顺序与 temporal clip 切分一致，并用已有 Phase C/D/E 轻量回归确认没有破坏主推理路径。
 
 ## 在 tmux 中做推理验收
 

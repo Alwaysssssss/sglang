@@ -36,15 +36,15 @@ T = TypeVar("T")
 
 
 def expand_path_fields(obj) -> None:
-    """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    """In-place expanduser on dataclass path-like fields."""
     eu = os.path.expanduser
     for f in fields(obj):
         v = getattr(obj, f.name)
-        if f.name.endswith("_path") and isinstance(v, str):
+        if f.name.endswith(("_path", "_dir")) and isinstance(v, str):
             setattr(obj, f.name, eu(v))
-        elif f.name.endswith("_path") and isinstance(v, list):
+        elif f.name.endswith(("_path", "_dir")) and isinstance(v, list):
             setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
-        elif f.name.endswith("_paths") and isinstance(v, dict):
+        elif f.name.endswith(("_paths", "_dirs")) and isinstance(v, dict):
             setattr(
                 obj,
                 f.name,

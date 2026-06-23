@@ -151,7 +151,7 @@ tmux new-session -d -s vividvr_ori_phase_d_20step \
 
 要求：
 
-- 一行一个 caption，顺序必须与原版 clip/tile 生成顺序一致。
+- 一行一个 caption，顺序必须与原版 temporal clip 生成顺序一致。
 - 保存原始 caption 文本，不要把正向 prompt suffix 手工拼进去。
 - 当前这条 `130f` 基准的 caption 文件名必须与输入视频 stem 一致。
 - 当前这条 `test_video_long_960x720_130f.txt` 应包含 2 行 raw caption，对应 2 个 temporal clip。

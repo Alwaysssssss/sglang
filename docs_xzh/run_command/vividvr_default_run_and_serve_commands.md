@@ -22,6 +22,8 @@
 注意：
 
 - 所有长时间推理都应放在 `tmux` 中启动。
+- 如果要让 `serve` 自动生成 caption sidecar，先启动 `vividvr_caption_sidecar`，再启动主服务。
+- caption sidecar 在原版 `/home/zhiheng/Vivid-VR/.venv` 下运行；如果宿主机缺少系统级 `/usr/include/python3.10/Python.h`，sidecar 会优先自动探测 `~/tmp_py310dev/extracted/usr/include/python3.10` 或 `~/tmp_py310_headers/extracted/libpython3.10-dev/usr/include/python3.10` 这类已解压 header 目录，并把它们注入 `CPATH` / `C_INCLUDE_PATH`。
 - 单卡正式 benchmark 时同一时刻只能有一个单卡推理进程，避免并发导致耗时失真。
 - 如果是 `serve` benchmark，必须先做一次 warmup，再记录第二次正式请求；warmup 不计入正式结果。
 - 本文默认 `serve` 命令使用 `--host 127.0.0.1`，只允许本机访问；如果要让其他服务器请求当前机器上的 Vivid-VR 服务，需要按“对外暴露端口”章节改为 `--host 0.0.0.0` 或指定网卡 IP。
@@ -96,9 +98,32 @@ tmux attach -r -t vividvr_dual_default
 
 ## 3. 单卡 `serve` 拉起命令
 
+先启动 caption sidecar：
+
+```bash
+tmux new-session -d -s vividvr_caption_sidecar \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && PYTHONPATH=python /home/zhiheng/Vivid-VR/.venv/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+如果 sidecar 日志里出现：
+
+```text
+[VividVR Caption Sidecar] python_include=...
+```
+
+说明它已经找到可用的 Python dev headers，可以继续执行 CogVLM2 caption。若只看到 warning 而没有 `python_include=...`，通常要先准备上面提到的已解压 Python 3.10 headers 目录。
+
+查看 sidecar：
+
+```bash
+tmux attach -r -t vividvr_caption_sidecar
+```
+
+再启动主服务：
+
 ```bash
 tmux new-session -d -s vividvr_serve_single_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
@@ -118,6 +143,10 @@ tmux new-session -d -s vividvr_serve_single_default \
     --strict-ports \
     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+    --vividvr-caption-bridge \
+    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+    --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+    --vividvr-caption-sidecar-timeout 1800 \
     2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_single_default_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
@@ -131,7 +160,7 @@ tmux attach -r -t vividvr_serve_single_default
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
@@ -151,12 +180,16 @@ tmux new-session -d -s vividvr_serve_dual_default \
     --strict-ports \
     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+    --vividvr-caption-bridge \
+    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+    --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+    --vividvr-caption-sidecar-timeout 1800 \
     2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_dual_default_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
@@ -176,6 +209,10 @@ tmux new-session -d -s vividvr_serve_dual_default \
     --strict-ports \
     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+    --vividvr-caption-bridge \
+    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+    --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+    --vividvr-caption-sidecar-timeout 1800 \
     2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_dual_default_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
@@ -347,6 +384,8 @@ JSON
 
 推荐使用仓库内验收脚本提交并轮询，脚本会遵守 FlowCut 返回码语义：`code=2` 只重试提交，`code=1` 立即失败，只有 `code=0` 接单后才轮询进度；如果轮询阶段收到 `404`，按“服务可能已重启或该进程未接单”处理，不继续盲查旧任务。
 
+如果验收的是显式 `caption_file_path` replay 路径，可以继续传 `--callback-url`、`--caption-file`、`--reference-video`：
+
 ```bash
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
@@ -363,11 +402,33 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   --perf-dump-path "${PERF_DUMP_PATH}"
 ```
 
+如果验收的是 caption bridge 路径，不传 `caption_file_path` 和 `reference_video_path`，直接让脚本在本机自建 callback receiver 并写日志：
+
+```bash
+export CALLBACK_LOG=${LOG_DIR}/${TASK_ID}_callback.jsonl
+
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
+  python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
+  --base-url "${BASE_URL}" \
+  --task-id "${TASK_ID}" \
+  --callback-log "${CALLBACK_LOG}" \
+  --video-input-path "${INPUT_VIDEO}" \
+  --num-inference-steps 20 \
+  --seed 42 \
+  --num-temporal-process-frames 121 \
+  --output-path "${OUTPUT_PATH}" \
+  --perf-dump-path "${PERF_DUMP_PATH}" \
+  --submit-timeout-s 2400 \
+  --poll-timeout-s 2400
+```
+
 说明：
 
 - `POST /v1/videos/repairs/flowcut` 是 FlowCut 专用兼容入口；普通 OpenAI 风格调用仍使用 `/v1/videos/repairs`。
 - `timeout=-1` 表示 Vivid-VR 服务侧不对长推理设置超时；同步接单仍应快速返回。
 - FlowCut callback 使用 `running`、`succeeded`、`failed` 状态，并通过 `progress` 上报中间进度。
+- `--callback-log` 模式会在本机临时拉起一个 callback receiver，并把回调逐行写到 JSONL；这条模式专门用于验证“只传视频，服务端自动 bridge 生成 caption”的新路径。
+- bridge 场景下 FlowCut 的首次 `POST` 会同步等待 caption sidecar 先把 sidecar 文本生成完，所以 `--submit-timeout-s` 也必须放大，不能只调大 `--poll-timeout-s`。
 
 查询进度：
 

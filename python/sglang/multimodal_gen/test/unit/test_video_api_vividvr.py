@@ -50,6 +50,7 @@ class TestVideoRepairAPI(unittest.TestCase):
         prompt_file_path=None,
         model_id=None,
         pipeline_class_name=None,
+        **overrides,
     ):
         return SimpleNamespace(
             pipeline_config=pipeline_config,
@@ -60,6 +61,7 @@ class TestVideoRepairAPI(unittest.TestCase):
             pipeline_class_name=pipeline_class_name,
             num_gpus=1,
             comfyui_mode=False,
+            **overrides,
         )
 
     async def _fake_dispatch_video_repair_job_async(self, *args, **kwargs):
@@ -251,6 +253,117 @@ class TestVideoRepairAPI(unittest.TestCase):
             captured_kwargs["reference_video_path"],
             str(self.reference_video_file),
         )
+
+    def test_vividvr_repair_generates_caption_when_bridge_enabled(self):
+        pipeline_config = VividVRPipelineConfig()
+        pipeline_config.default_prompt_file_path = str(self.prompt_file)
+        set_global_server_args(
+            self._make_server_args(
+                pipeline_config,
+                model_id="served-vividvr",
+                vividvr_caption_bridge=True,
+                vividvr_caption_sidecar_url="http://127.0.0.1:31200",
+                vividvr_caption_work_dir=str(
+                    Path(self.output_dir.name) / "caption_sidecars"
+                ),
+                vividvr_caption_sidecar_timeout=30.0,
+            )
+        )
+
+        captured_kwargs = {}
+
+        def fake_from_user_kwargs(_server_args, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return SimpleNamespace(
+                prompt=kwargs.get("prompt"),
+                output_file_path=lambda: str(Path(self.output_dir.name) / "job.mp4"),
+            )
+
+        async def fake_request_caption_sidecar(**kwargs):
+            output_path = Path(kwargs["output_caption_path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("caption 0\n", encoding="utf-8")
+            return SimpleNamespace(
+                caption_file_path=str(output_path),
+                caption_count=1,
+            )
+
+        with patch.object(
+            video_api,
+            "build_vividvr_caption_manifest_for_video_path",
+            return_value=SimpleNamespace(
+                expected_caption_count=1,
+                write_json=lambda path: Path(path).write_text("{}", encoding="utf-8"),
+            ),
+        ):
+            with patch.object(
+                video_api,
+                "request_vividvr_caption_sidecar",
+                side_effect=fake_request_caption_sidecar,
+            ):
+                with patch.object(video_api, "prepare_request", return_value="fake-batch"):
+                    with patch.object(
+                        video_api,
+                        "_dispatch_video_repair_job_async",
+                        side_effect=self._fake_dispatch_video_repair_job_async,
+                    ):
+                        with patch.object(
+                            video_api.VividVRSamplingParams,
+                            "from_user_kwargs",
+                            side_effect=fake_from_user_kwargs,
+                        ):
+                            with TestClient(self.app) as client:
+                                response = client.post(
+                                    "/v1/videos/repairs",
+                                    json={
+                                        "task_id": "repair-auto",
+                                        "video_input_path": str(self.video_file),
+                                    },
+                                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured_kwargs["caption_source"], "caption_file")
+        self.assertTrue(
+            captured_kwargs["caption_file_path"].endswith("repair-auto.txt")
+        )
+
+    def test_vividvr_repair_returns_500_when_caption_bridge_fails(self):
+        pipeline_config = VividVRPipelineConfig()
+        pipeline_config.default_prompt_file_path = str(self.prompt_file)
+        set_global_server_args(
+            self._make_server_args(
+                pipeline_config,
+                model_id="served-vividvr",
+                vividvr_caption_bridge=True,
+                vividvr_caption_sidecar_url="http://127.0.0.1:31200",
+                vividvr_caption_work_dir=str(
+                    Path(self.output_dir.name) / "caption_sidecars"
+                ),
+                vividvr_caption_sidecar_timeout=30.0,
+            )
+        )
+
+        with patch.object(
+            video_api,
+            "build_vividvr_caption_manifest_for_video_path",
+            return_value=SimpleNamespace(
+                expected_caption_count=1,
+                write_json=lambda path: Path(path).write_text("{}", encoding="utf-8"),
+            ),
+        ):
+            with patch.object(
+                video_api,
+                "request_vividvr_caption_sidecar",
+                side_effect=RuntimeError("sidecar offline"),
+            ):
+                with TestClient(self.app) as client:
+                    response = client.post(
+                        "/v1/videos/repairs",
+                        json={"video_input_path": str(self.video_file)},
+                    )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("caption bridge failed", response.json()["detail"])
 
     def test_vividvr_repair_accepts_explicit_vividvr_pipeline_class(self):
         pipeline_config = SimpleNamespace(default_prompt_file_path=str(self.prompt_file))

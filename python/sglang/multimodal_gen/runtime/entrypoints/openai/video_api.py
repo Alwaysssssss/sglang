@@ -63,6 +63,13 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.vividvr.caption_bridge import (
+    VividVRCaptionBridgeConfig,
+    request_vividvr_caption_sidecar,
+)
+from sglang.multimodal_gen.runtime.vividvr.caption_manifest import (
+    build_vividvr_caption_manifest_for_video_path,
+)
 from sglang.multimodal_gen.runtime.vividvr.preprocess import read_prompt_file
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resolve_videoedit_num_frames,
@@ -424,6 +431,89 @@ def _build_vividvr_repair_kwargs(
     return vividvr_kwargs
 
 
+def _resolve_vividvr_runtime_int(req_value, server_args, attr_name: str) -> int:
+    if req_value is not None:
+        return int(req_value)
+    pipeline_config = getattr(server_args, "pipeline_config", None)
+    config_value = getattr(pipeline_config, attr_name, None)
+    if config_value is not None:
+        return int(config_value)
+    return int(getattr(VividVRSamplingParams, attr_name))
+
+
+async def _ensure_vividvr_caption_file(
+    *,
+    request_id: str,
+    req: VideoRepairRequest,
+    server_args,
+    video_input_path: str,
+    output_dir: str,
+) -> str | None:
+    if req.caption_file_path:
+        return req.caption_file_path
+    if not getattr(server_args, "vividvr_caption_bridge", False):
+        return None
+
+    work_dir = getattr(server_args, "vividvr_caption_work_dir", None)
+    if not work_dir:
+        work_dir = os.path.join(output_dir, "caption_sidecars")
+    os.makedirs(work_dir, exist_ok=True)
+
+    manifest_path = os.path.join(work_dir, f"{request_id}.manifest.json")
+    caption_path = os.path.join(work_dir, f"{request_id}.txt")
+    num_temporal_process_frames = _resolve_vividvr_runtime_int(
+        req.num_temporal_process_frames,
+        server_args,
+        "num_temporal_process_frames",
+    )
+    tile_size = _resolve_vividvr_runtime_int(
+        getattr(req, "tile_size", None),
+        server_args,
+        "tile_size",
+    )
+    tile_stride = _resolve_vividvr_runtime_int(
+        getattr(req, "tile_stride", None),
+        server_args,
+        "tile_stride",
+    )
+
+    manifest = build_vividvr_caption_manifest_for_video_path(
+        video_path=video_input_path,
+        num_temporal_process_frames=num_temporal_process_frames,
+        tile_size=tile_size,
+        tile_stride=tile_stride,
+    )
+    manifest.write_json(manifest_path)
+    result = await request_vividvr_caption_sidecar(
+        config=VividVRCaptionBridgeConfig(
+            enabled=True,
+            base_url=getattr(server_args, "vividvr_caption_sidecar_url", None),
+            timeout_s=float(
+                getattr(server_args, "vividvr_caption_sidecar_timeout", 1800.0)
+            ),
+        ),
+        manifest_path=manifest_path,
+        output_caption_path=caption_path,
+        expected_caption_count=manifest.expected_caption_count,
+    )
+    logger.info(
+        "VividVR caption bridge generated captions request_id=%s path=%s count=%s",
+        request_id,
+        result.caption_file_path,
+        result.caption_count,
+    )
+    return result.caption_file_path
+
+
+def _copy_video_repair_request_with_caption(
+    req: VideoRepairRequest,
+    caption_file_path: str | None,
+) -> VideoRepairRequest:
+    if not caption_file_path:
+        return req
+    return req.model_copy(update={"caption_file_path": caption_file_path})
+
+
 def _video_repair_job_from_sampling(
     request_id: str, req: VideoRepairRequest, sampling: SamplingParams
 ) -> Dict[str, Any]:
@@ -620,9 +710,23 @@ async def create_flowcut_video_repair(request: Request):
                 message="FlowCut repair endpoint requires Vivid-VR pipeline",
             )
 
+        try:
+            caption_file_path = await _ensure_vividvr_caption_file(
+                request_id=request_id,
+                req=req,
+                server_args=server_args,
+                video_input_path=video_input_path,
+                output_dir=output_dir,
+            )
+        except Exception as e:
+            return FlowCutResponse(code=1, message=f"caption bridge failed: {e}")
+        req_for_sampling = _copy_video_repair_request_with_caption(
+            req,
+            caption_file_path,
+        )
         vividvr_kwargs = _build_vividvr_repair_kwargs(
             request_id=request_id,
-            req=req,
+            req=req_for_sampling,
             server_args=server_args,
             video_input_path=video_input_path,
             output_dir=output_dir,
@@ -699,9 +803,26 @@ async def create_video_repair(req: VideoRepairRequest):
             output_persistent = False
 
         if _is_vividvr_video_repair_pipeline(server_args):
+            try:
+                caption_file_path = await _ensure_vividvr_caption_file(
+                    request_id=request_id,
+                    req=req,
+                    server_args=server_args,
+                    video_input_path=video_input_path,
+                    output_dir=output_dir,
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"caption bridge failed: {e}",
+                ) from e
+            req_for_sampling = _copy_video_repair_request_with_caption(
+                req,
+                caption_file_path,
+            )
             vividvr_kwargs = _build_vividvr_repair_kwargs(
                 request_id=request_id,
-                req=req,
+                req=req_for_sampling,
                 server_args=server_args,
                 video_input_path=video_input_path,
                 output_dir=output_dir,

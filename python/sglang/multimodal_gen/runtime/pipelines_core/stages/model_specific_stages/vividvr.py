@@ -1400,7 +1400,8 @@ class VividVRLongClipPreparationStage(PipelineStage):
                 clip_caption_records.append(
                     {
                         "clip_index": int(clip_spec.clip_index),
-                        "caption_texts": list(tiled_prompts["caption_texts"]),
+                        "caption_text": str(tiled_prompts["clip_caption_text"]),
+                        "tile_count": len(tiling_infos),
                     }
                 )
             else:
@@ -1442,7 +1443,10 @@ class VividVRLongClipPreparationStage(PipelineStage):
             }
             clip_states.append(clip_state)
             clip_latent_lengths.append(int(latents.shape[1]))
-            clip_tile_counts.append(int(tiling_state["tile_count"]))
+            tile_count = tiling_state.get("tile_count")
+            if tile_count is None:
+                tile_count = len(tiling_state["tiling_infos"])
+            clip_tile_counts.append(int(tile_count))
 
         if params.runtime_caption_texts is not None:
             if caption_cursor != len(params.runtime_caption_texts):
@@ -1504,11 +1508,13 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
             clip_latent_lengths = [int(clip_state["latents"].shape[1]) for clip_state in clip_states]
             long_runtime["clip_latent_lengths"] = clip_latent_lengths
 
-        merge_plan = build_vividvr_temporal_latent_merge_plan(
-            clip_latent_lengths,
-            num_temporal_process_frames=params.num_temporal_process_frames,
-            vae_scale_factor_temporal=self.vae_scale_factor_temporal,
-        )
+        merge_plan = None
+        if len(clip_states) > 1:
+            merge_plan = build_vividvr_temporal_latent_merge_plan(
+                clip_latent_lengths,
+                num_temporal_process_frames=params.num_temporal_process_frames,
+                vae_scale_factor_temporal=self.vae_scale_factor_temporal,
+            )
         params.runtime_temporal_merge_plan = merge_plan
 
         denoising_states: list[dict[str, Any]] = []
@@ -1550,7 +1556,11 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
                                 params.restoration_guidance_scale
                             ),
                         )
-                    merge_vividvr_temporal_latent_states(denoising_states, merge_plan)
+                    if merge_plan is not None:
+                        merge_vividvr_temporal_latent_states(
+                            denoising_states,
+                            merge_plan,
+                        )
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
                 )

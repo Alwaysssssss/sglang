@@ -194,6 +194,7 @@ work_dirs/
 !logo.png
 
 # Large binary artifacts
+Vivid_Acceptance/
 Vivid_Acceptance/indicator/
 Vivid_Acceptance/logs/
 Vivid_Acceptance/result_videos/

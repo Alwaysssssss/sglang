@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -190,6 +191,104 @@ def test_flowcut_endpoint_accepts_and_schedules_background_job(monkeypatch, tmp_
     assert response.status_code == 200
     assert response.json() == {"code": 0, "message": "ok"}
     assert acquired["value"] is True
+    assert scheduled["coro_name"] == "_dispatch_flowcut_video_repair_job_async"
+
+
+def test_flowcut_endpoint_generates_caption_when_bridge_enabled(monkeypatch, tmp_path):
+    scheduled = {}
+
+    class AvailableSemaphore:
+        def locked(self):
+            return False
+
+        async def acquire(self):
+            pass
+
+        def release(self):
+            pass
+
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("restore the video", encoding="utf-8")
+
+    monkeypatch.setattr(video_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(
+        video_api,
+        "get_global_server_args",
+        lambda: SimpleNamespace(
+            input_save_path=str(tmp_path / "inputs"),
+            output_path=str(tmp_path / "outputs"),
+            prompt_file_path=str(prompt_file),
+            pipeline_config=SimpleNamespace(default_prompt_file_path=str(prompt_file)),
+            model_id="vividvr",
+            pipeline_class_name="CogVideoXVividVRControlNetPipeline",
+            vividvr_caption_bridge=True,
+            vividvr_caption_sidecar_url="http://127.0.0.1:31200",
+            vividvr_caption_work_dir=str(tmp_path / "caption_sidecars"),
+            vividvr_caption_sidecar_timeout=30.0,
+        ),
+    )
+    monkeypatch.setattr(
+        video_api,
+        "build_vividvr_caption_manifest_for_video_path",
+        lambda **kwargs: SimpleNamespace(
+            expected_caption_count=1,
+            write_json=lambda path: Path(path).write_text("{}", encoding="utf-8"),
+        ),
+    )
+
+    async def fake_request_caption_sidecar(**kwargs):
+        Path(kwargs["output_caption_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(kwargs["output_caption_path"]).write_text("caption 0\n", encoding="utf-8")
+        return SimpleNamespace(
+            caption_file_path=kwargs["output_caption_path"],
+            caption_count=1,
+        )
+
+    monkeypatch.setattr(
+        video_api,
+        "request_vividvr_caption_sidecar",
+        fake_request_caption_sidecar,
+    )
+
+    captured_kwargs = {}
+    monkeypatch.setattr(
+        video_api.VividVRSamplingParams,
+        "from_user_kwargs",
+        staticmethod(
+            lambda server_args, **kwargs: captured_kwargs.update(kwargs)
+            or SimpleNamespace(
+                output_file_path=lambda: str(tmp_path / "outputs" / "task-auto.mp4")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        video_api,
+        "prepare_request",
+        lambda server_args, sampling_params: "prepared-batch",
+    )
+
+    def fake_create_task(coro):
+        scheduled["coro_name"] = coro.cr_code.co_name
+        coro.close()
+        return None
+
+    monkeypatch.setattr(video_api.asyncio, "create_task", fake_create_task)
+
+    client = _make_test_client()
+    response = client.post(
+        "/v1/videos/repairs/flowcut",
+        json={
+            "taskId": "task-auto",
+            "timeout": -1,
+            "callbackUrl": "http://127.0.0.1:9000/callback",
+            "video_input_path": "/tmp/in.mp4",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["code"] == 0
+    assert captured_kwargs["caption_source"] == "caption_file"
+    assert captured_kwargs["caption_file_path"].endswith("task-auto.txt")
     assert scheduled["coro_name"] == "_dispatch_flowcut_video_repair_job_async"
 
 
