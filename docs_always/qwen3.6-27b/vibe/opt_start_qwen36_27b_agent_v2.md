@@ -110,6 +110,12 @@ sudo nginx -T | grep -A20 -B5 "listen 18080" | grep "timeout"
 
 验证 OpenAI 兼容入口仍可用：
 
+KEY=sk-qwen36-KGf3k3ocLnAzsMuvcLep4rXyPdWWIDJ0vep3opqriug
+
+curl --noproxy '*' -i \
+  -H "Authorization: Bearer ${KEY}" \
+  http://106.75.235.227:10069/v1/models
+
 ```bash
 KEY=$(tr -d '[:space:]' < /etc/sglang/qwen36_openai_api_key)
 
