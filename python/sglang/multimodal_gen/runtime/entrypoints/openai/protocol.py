@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat, StrictInt
 
 
 # Image API protocol models
@@ -129,10 +129,11 @@ class VideoRepairMinioConfig(BaseModel):
 
 
 def default_video_repair_output_object_key(
-    request_id: str, now: datetime | None = None
+    request_id: str, now: datetime | None = None, extension: str = ".mp4"
 ) -> str:
     now = now or datetime.now()
-    return f"{now:%Y/%m/%d}/{now:%H%M%S}_{request_id}.mp4"
+    extension = extension if extension.startswith(".") else f".{extension}"
+    return f"{now:%Y/%m/%d}/{now:%H%M%S}_{request_id}{extension}"
 
 
 class VideoRepairRequest(BaseModel):
@@ -157,9 +158,9 @@ class VideoRepairRequest(BaseModel):
 
     num_frames: int = -1
     infer_len: int = 81
-    overlap: int = 9
+    overlap: int = 10
     strength: float = 1.0
-    num_inference_steps: int = 20
+    num_inference_steps: int = 40
     guidance_scale: float = 5.0
     seed: int = 42
     generator_device: Optional[str] = None
@@ -183,12 +184,13 @@ class VideoRepairRequest(BaseModel):
     vary_seed_by_window: bool = False
     init_latent_mode: Literal["noise", "add_noise"] = "noise"
     mask_downsample_mode: Literal["nearest", "nearest-exact"] = "nearest"
-    overlap_commit_mode: Literal["native_skip", "weighted"] = "native_skip"
-    tail_padding_mode: Literal["native_reverse_mirror", "reflect"] = (
-        "native_reverse_mirror"
-    )
+    overlap_commit_mode: Literal["native_skip", "weighted"] = "weighted"
+    tail_padding_mode: Literal["native_reverse_mirror", "reflect"] = "reflect"
     decode_mode: Literal["eager", "stream"] = "stream"
-    enable_teacache: bool = False
+    enable_teacache: bool = True
+    teacache_thresh: float = 0.3
+    teacache_start_skipping: Union[StrictInt, StrictFloat] = 5
+    teacache_end_skipping: Union[StrictInt, StrictFloat] = 1.0
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1
     frame_interpolation_scale: float = 1.0

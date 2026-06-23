@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 import weakref
 from typing import Any
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.preprocess import prepare_window_inputs
 from sglang.multimodal_gen.runtime.videoedit.progress import (
@@ -66,14 +68,21 @@ def _retrieve_latents(encoder_output: Any) -> torch.Tensor:
 def _vae_latent_mean_std(
     vae: torch.nn.Module, device: torch.device, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    z_dim = int(getattr(vae.config, "z_dim", getattr(vae, "z_dim", 16)))
+    vae_config = getattr(vae, "config", None)
+    z_dim = int(getattr(vae_config, "z_dim", None) or getattr(vae, "z_dim", 16))
+    latents_mean = getattr(vae_config, "latents_mean", None)
+    if latents_mean is None:
+        latents_mean = getattr(vae, "latents_mean")
+    latents_std = getattr(vae_config, "latents_std", None)
+    if latents_std is None:
+        latents_std = getattr(vae, "latents_std")
     mean = torch.tensor(
-        getattr(vae.config, "latents_mean", getattr(vae, "latents_mean")),
+        latents_mean,
         device=device,
         dtype=dtype,
     ).view(1, z_dim, 1, 1, 1)
     std = torch.tensor(
-        getattr(vae.config, "latents_std", getattr(vae, "latents_std")),
+        latents_std,
         device=device,
         dtype=dtype,
     ).view(1, z_dim, 1, 1, 1)
@@ -98,6 +107,47 @@ def _ensure_tensor_decode_output(decode_output: Any) -> torch.Tensor:
     if hasattr(decode_output, "sample"):
         return decode_output.sample
     return decode_output
+
+
+def _move_vae_for_videoedit(
+    vae: torch.nn.Module,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.nn.Module:
+    if getattr(vae, "_sglang_videoedit_native_vae", False):
+        return vae.to(device=device)
+    return vae.to(device=device, dtype=dtype)
+
+
+def _decode_vae_for_videoedit(
+    vae: torch.nn.Module,
+    latents: torch.Tensor,
+) -> torch.Tensor:
+    try:
+        decoded = vae.decode(latents, return_dict=False)
+    except TypeError:
+        decoded = vae.decode(latents)
+    return _ensure_tensor_decode_output(decoded)
+
+
+def _ensure_tensor_transformer_output(transformer_output: Any) -> torch.Tensor:
+    if isinstance(transformer_output, torch.Tensor):
+        return transformer_output
+    if isinstance(transformer_output, tuple):
+        return transformer_output[0]
+    if hasattr(transformer_output, "sample"):
+        return transformer_output.sample
+    raise TypeError(
+        "VideoEdit transformer output must be a tensor, tuple, or object with .sample; "
+        f"got {type(transformer_output).__name__}"
+    )
+
+
+def _transformer_cache_context(transformer: torch.nn.Module, name: str):
+    if hasattr(transformer, "cache_context"):
+        return transformer.cache_context(name)
+    return nullcontext()
 
 
 def calc_current_cfg(
@@ -169,24 +219,35 @@ class VideoEditTextEncodingStage(PipelineStage):
         target_dtype = _module_dtype(
             self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         )
-        prompt_embeds, _, _ = self.text_stage.encode_text(
-            params.prompt or " ",
-            server_args,
-            encoder_index=[0],
-            return_attention_mask=True,
+        autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+        with torch.autocast(
+            device_type=current_platform.device_type,
             dtype=target_dtype,
-        )
-        params.runtime_prompt_embeds = prompt_embeds[0]
-
-        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
-        if params.runtime_do_cfg:
-            neg_embeds, _, _ = self.text_stage.encode_text(
-                params.negative_prompt or "",
+            enabled=autocast_enabled,
+        ):
+            prompt_embeds, _, _ = self.text_stage.encode_text(
+                params.prompt or " ",
                 server_args,
                 encoder_index=[0],
                 return_attention_mask=True,
                 dtype=target_dtype,
             )
+        params.runtime_prompt_embeds = prompt_embeds[0]
+
+        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+        if params.runtime_do_cfg:
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ):
+                neg_embeds, _, _ = self.text_stage.encode_text(
+                    params.negative_prompt or "",
+                    server_args,
+                    encoder_index=[0],
+                    return_attention_mask=True,
+                    dtype=target_dtype,
+                )
             params.runtime_negative_prompt_embeds = neg_embeds[0]
         else:
             params.runtime_negative_prompt_embeds = None
@@ -254,12 +315,18 @@ class VideoEditImageEncodingStage(PipelineStage):
         target_dtype = _module_dtype(
             self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         )
+        autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
         try:
-            outputs = self.image_encoder(
-                pixel_values=pixel_values.to(dtype=image_dtype),
-                **server_args.pipeline_config.image_encoder_extra_args,
-            )
-            image_embeds = server_args.pipeline_config.postprocess_image(outputs)
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=target_dtype,
+                enabled=autocast_enabled,
+            ):
+                outputs = self.image_encoder(
+                    pixel_values=pixel_values.to(dtype=image_dtype),
+                    **server_args.pipeline_config.image_encoder_extra_args,
+                )
+                image_embeds = server_args.pipeline_config.postprocess_image(outputs)
             params.runtime_image_embeds = image_embeds.to(device=device, dtype=target_dtype)
         finally:
             if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
@@ -279,13 +346,23 @@ class VideoEditConditionEncodingStage(PipelineStage):
         *,
         vae_dtype: torch.dtype,
         output_dtype: torch.dtype,
+        autocast_enabled: bool,
     ) -> torch.Tensor:
         device = get_local_torch_device()
-        self.vae = self.vae.to(device=device, dtype=vae_dtype)
+        self.vae = _move_vae_for_videoedit(
+            self.vae,
+            device=device,
+            dtype=vae_dtype,
+        )
         video_tensor = video_tensor.to(device=device, dtype=vae_dtype)
-        encoded = self.vae.encode(video_tensor)
-        latents = _retrieve_latents(encoded)
-        latents = _normalize_vae_latents(latents, self.vae)
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=output_dtype,
+            enabled=autocast_enabled,
+        ):
+            encoded = self.vae.encode(video_tensor)
+            latents = _retrieve_latents(encoded)
+            latents = _normalize_vae_latents(latents, self.vae)
         return latents.to(device=device, dtype=output_dtype)
 
     @torch.no_grad()
@@ -303,11 +380,18 @@ class VideoEditConditionEncodingStage(PipelineStage):
             device=device,
             dtype=tensor_dtype,
             mask_downsample_mode=params.mask_downsample_mode,
+            preserve_first_frame=(params.runtime_window_index in (None, 0)),
         )
         params.runtime_masked_video_tensor = prepared["masked_video_tensor"]
         params.runtime_raw_video_tensor = prepared["video_tensor"]
         params.runtime_mask_video_tensor = prepared["mask_video_tensor"]
         params.runtime_cond_masks = prepared["cond_masks"]
+
+        if server_args.pipeline_config.vae_tiling and hasattr(self.vae, "enable_tiling"):
+            self.vae.enable_tiling()
+        elif hasattr(self.vae, "disable_tiling"):
+            self.vae.disable_tiling()
+        autocast_enabled = tensor_dtype != torch.float32 and not server_args.disable_autocast
 
         masked_video = params.runtime_masked_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
         raw_video = params.runtime_raw_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
@@ -316,11 +400,13 @@ class VideoEditConditionEncodingStage(PipelineStage):
             masked_video,
             vae_dtype=vae_dtype,
             output_dtype=tensor_dtype,
+            autocast_enabled=autocast_enabled,
         )
         params.runtime_video_latents = self._encode_video_latents(
             raw_video,
             vae_dtype=vae_dtype,
             output_dtype=tensor_dtype,
+            autocast_enabled=autocast_enabled,
         )
         params.runtime_condition_latent = torch.cat(
             [params.runtime_cond_masks, params.runtime_cond_latents], dim=1
@@ -503,6 +589,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                 total=params.runtime_effective_num_inference_steps
             ) as progress_bar:
                 for i, t_host in enumerate(timesteps_cpu):
+                    check_request_timeout(batch)
                     t_device = timesteps[i]
                     current_cfg, do_cfg = calc_current_cfg(
                         max_cfg=float(params.guidance_scale),
@@ -533,12 +620,18 @@ class VideoEditDenoisingStage(DenoisingStage):
                         attn_metadata=attn_metadata,
                         forward_batch=batch,
                     ):
-                        noise_pred = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=params.runtime_prompt_embeds,
-                            encoder_hidden_states_image=image_embeds,
-                        )
+                        with _transformer_cache_context(self.transformer, "cond"):
+                            noise_pred = _ensure_tensor_transformer_output(
+                                self.transformer(
+                                    hidden_states=latent_model_input,
+                                    timestep=timestep,
+                                    encoder_hidden_states=params.runtime_prompt_embeds,
+                                    encoder_hidden_states_image=image_embeds,
+                                    attention_kwargs=None,
+                                    return_dict=False,
+                                )
+                            )
+                    check_request_timeout(batch)
 
                     if do_cfg:
                         if params.runtime_negative_prompt_embeds is None:
@@ -549,12 +642,18 @@ class VideoEditDenoisingStage(DenoisingStage):
                             attn_metadata=attn_metadata,
                             forward_batch=batch,
                         ):
-                            noise_uncond = self.transformer(
-                                hidden_states=latent_model_input,
-                                timestep=timestep,
-                                encoder_hidden_states=params.runtime_negative_prompt_embeds,
-                                encoder_hidden_states_image=image_embeds,
-                            )
+                            with _transformer_cache_context(self.transformer, "uncond"):
+                                noise_uncond = _ensure_tensor_transformer_output(
+                                    self.transformer(
+                                        hidden_states=latent_model_input,
+                                        timestep=timestep,
+                                        encoder_hidden_states=params.runtime_negative_prompt_embeds,
+                                        encoder_hidden_states_image=image_embeds,
+                                        attention_kwargs=None,
+                                        return_dict=False,
+                                    )
+                                )
+                        check_request_timeout(batch)
                         noise_pred = noise_uncond + current_cfg * (
                             noise_pred - noise_uncond
                         )
@@ -595,19 +694,28 @@ class VideoEditDecodingStage(PipelineStage):
             raise ValueError("VideoEdit denoised latents must be prepared")
         device = get_local_torch_device()
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = self.vae.to(device=device, dtype=vae_dtype)
+        self.vae = _move_vae_for_videoedit(
+            self.vae,
+            device=device,
+            dtype=vae_dtype,
+        )
         if server_args.pipeline_config.vae_tiling:
             self.vae.enable_tiling()
-        latents = params.runtime_latents.to(device=device, dtype=vae_dtype)
-        latents = _denormalize_vae_latents(latents, self.vae)
-        decoded = self.vae.decode(latents)
-        decoded = _ensure_tensor_decode_output(decoded)
-        decoded = (decoded / 2 + 0.5).clamp(0, 1)
-        params.runtime_decoded_video_tensor = decoded
+        latents = params.runtime_latents.to(device=device).to(dtype=vae_dtype)
+        autocast_enabled = vae_dtype != torch.float32 and not server_args.disable_autocast
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=vae_dtype,
+            enabled=autocast_enabled,
+        ):
+            latents = _denormalize_vae_latents(latents, self.vae)
+            decoded = _decode_vae_for_videoedit(self.vae, latents)
+        decoded_frames = (decoded / 2 + 0.5).clamp(0, 1)[0].permute(1, 0, 2, 3)
+        params.runtime_decoded_video_tensor = decoded_frames
 
-        video = decoded[0].detach().float().cpu()
+        video = decoded_frames.detach().float().cpu()
         frames = []
-        for frame in video.permute(1, 2, 3, 0):
+        for frame in video.permute(0, 2, 3, 1):
             arr = (frame.clamp(0, 1).numpy() * 255.0).astype("uint8")
             from PIL import Image
 

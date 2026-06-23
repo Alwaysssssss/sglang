@@ -84,6 +84,16 @@ class DataType(Enum):
         return "glb"
 
 
+VIDEO_OUTPUT_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".avi",
+    ".mkv",
+    ".webm",
+}
+
+
 @dataclass
 class SamplingParams:
     """
@@ -93,6 +103,7 @@ class SamplingParams:
     data_type: DataType = DataType.VIDEO
 
     request_id: str | None = None
+    request_timeout_deadline: float | None = None
 
     # All fields below are copied from ForwardBatch
 
@@ -191,10 +202,14 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        if not any(
-            self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
-        ):
+        valid_extensions = VIDEO_OUTPUT_EXTENSIONS | {
+            ".jpg",
+            ".png",
+            ".webp",
+            ".obj",
+            ".glb",
+        }
+        if os.path.splitext(self.output_file_name)[1].lower() not in valid_extensions:
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )

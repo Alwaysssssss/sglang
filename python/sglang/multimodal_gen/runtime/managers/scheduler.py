@@ -28,6 +28,11 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.request_timeout import (
+    TASK_TIMEOUT_MESSAGE,
+    TaskTimeoutError,
+    check_request_timeout,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -165,6 +170,12 @@ class Scheduler:
                 )
             else:
                 logger.info("Processing warmup req...")
+        for req in reqs:
+            try:
+                check_request_timeout(req)
+            except TaskTimeoutError:
+                logger.info("Request %s timed out before execution", req.request_id)
+                return OutputBatch(error=TASK_TIMEOUT_MESSAGE, metrics=req.metrics)
         return self.worker.execute_forward(reqs)
 
     def return_result(

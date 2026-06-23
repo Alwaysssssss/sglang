@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -69,6 +70,7 @@ class ParallelExecutor(PipelineExecutor):
 
         # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
         for stage in stages:
+            check_request_timeout(batch)
             paradigm = stage.parallelism_type
 
             if paradigm == StageParallelismType.MAIN_RANK_ONLY:
@@ -76,6 +78,7 @@ class ParallelExecutor(PipelineExecutor):
                     # Only main rank executes, others just wait
                     batch = stage(batch, server_args)
                 torch.distributed.barrier()
+                check_request_timeout(batch)
 
             elif paradigm == StageParallelismType.CFG_PARALLEL:
                 obj_list = [batch] if rank == 0 else []
@@ -87,9 +90,11 @@ class ParallelExecutor(PipelineExecutor):
                 batch = stage(batch, server_args)
 
                 torch.distributed.barrier()
+                check_request_timeout(batch)
 
             elif paradigm == StageParallelismType.REPLICATED:
                 batch = stage(batch, server_args)
+                check_request_timeout(batch)
         return batch
 
     def execute(

@@ -318,10 +318,11 @@ def create_masked_video(
     video_frames: list[Image.Image],
     mask_frames: list[Image.Image],
     binarize_threshold: int = 128,
+    preserve_first_frame: bool = True,
 ) -> list[Image.Image]:
     masked: list[Image.Image] = []
     for i, (frame, mask) in enumerate(zip(video_frames, mask_frames, strict=True)):
-        if i == 0:
+        if preserve_first_frame and i == 0:
             masked.append(frame.copy())
             continue
         frame_np = np.array(frame)
@@ -330,10 +331,16 @@ def create_masked_video(
     return masked
 
 
-def create_mask_video(mask_frames: list[Image.Image]) -> list[Image.Image]:
+def create_mask_video(
+    mask_frames: list[Image.Image], preserve_first_frame: bool = True
+) -> list[Image.Image]:
     processed: list[Image.Image] = []
     for i, mask in enumerate(mask_frames):
-        processed.append(Image.new("L", mask.size, 0) if i == 0 else mask.convert("L"))
+        processed.append(
+            Image.new("L", mask.size, 0)
+            if preserve_first_frame and i == 0
+            else mask.convert("L")
+        )
     return processed
 
 
@@ -472,7 +479,7 @@ def prepare_global_inputs(
     if reference_image:
         with Image.open(reference_image) as image:
             reference_frame = image.convert("RGB").resize(original_frames[0].size)
-        reference_mask = Image.new("L", original_frames[0].size, 255)
+        reference_mask = Image.new("L", original_frames[0].size, 0)
         original_frames = [reference_frame] + original_frames
         raw_mask_frames = [reference_mask] + raw_mask_frames
         n = len(original_frames)
@@ -540,6 +547,7 @@ def prepare_window_inputs(
     device: str | torch.device,
     dtype: torch.dtype,
     mask_downsample_mode: str = "nearest",
+    preserve_first_frame: bool = True,
 ) -> dict:
     if len(window_video) != len(window_masks):
         raise ValueError("Window video and mask length mismatch")
@@ -548,8 +556,12 @@ def prepare_window_inputs(
             "mask_downsample_mode must be one of nearest/nearest-exact, "
             f"got {mask_downsample_mode!r}"
         )
-    masked_video = create_masked_video(window_video, window_masks)
-    processed_masks = create_mask_video(window_masks)
+    masked_video = create_masked_video(
+        window_video, window_masks, preserve_first_frame=preserve_first_frame
+    )
+    processed_masks = create_mask_video(
+        window_masks, preserve_first_frame=preserve_first_frame
+    )
     masked_video_tensor = frames_to_tensor(masked_video, normalize=True).to(device=device, dtype=dtype)
     mask_video_tensor = frames_to_tensor(processed_masks, normalize=False).to(device=device, dtype=torch.float32)
     first_frame_mask = mask_video_tensor[0:1].repeat(4, 1, 1, 1)

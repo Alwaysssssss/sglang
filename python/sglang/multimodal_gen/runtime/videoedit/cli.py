@@ -10,6 +10,7 @@ from sglang.multimodal_gen import DiffGenerator
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT,
     WanVideoEditSamplingParams,
+    build_videoedit_teacache_params,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
@@ -20,6 +21,12 @@ from sglang.multimodal_gen.runtime.server_args import Backend, ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resolve_videoedit_num_frames,
 )
+
+
+def _int_or_float(value: str) -> int | float:
+    if any(marker in value for marker in (".", "e", "E")):
+        return float(value)
+    return int(value)
 
 
 def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
@@ -37,9 +44,9 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-file-name")
     parser.add_argument("--num-frames", type=int, default=81)
     parser.add_argument("--infer-len", type=int, default=81)
-    parser.add_argument("--overlap", type=int, default=9)
+    parser.add_argument("--overlap", type=int, default=10)
     parser.add_argument("--strength", type=float, default=1.0)
-    parser.add_argument("--num-inference-steps", type=int, default=20)
+    parser.add_argument("--num-inference-steps", type=int, default=40)
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -61,13 +68,16 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vary-seed-by-window", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--init-latent-mode", choices=["noise", "add_noise"], default="noise")
     parser.add_argument("--mask-downsample-mode", choices=["nearest", "nearest-exact"], default="nearest")
-    parser.add_argument("--overlap-commit-mode", choices=["native_skip", "weighted"], default="native_skip")
-    parser.add_argument("--tail-padding-mode", choices=["native_reverse_mirror", "reflect"], default="native_reverse_mirror")
+    parser.add_argument("--overlap-commit-mode", choices=["native_skip", "weighted"], default="weighted")
+    parser.add_argument("--tail-padding-mode", choices=["native_reverse_mirror", "reflect"], default="reflect")
     parser.add_argument("--decode-mode", choices=["eager", "stream"], default="stream")
     parser.add_argument("--generator-device")
     parser.add_argument("--output-quality", default="default")
     parser.add_argument("--output-compression", type=int)
-    parser.add_argument("--enable-teacache", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--enable-teacache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--teacache-thresh", type=float, default=0.3)
+    parser.add_argument("--teacache-start-skipping", type=_int_or_float, default=5)
+    parser.add_argument("--teacache-end-skipping", type=_int_or_float, default=1.0)
     parser.add_argument("--enable-frame-interpolation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--frame-interpolation-exp", type=int, default=1)
     parser.add_argument("--frame-interpolation-scale", type=float, default=1.0)
@@ -86,7 +96,11 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dp-degree", type=int, default=1)
     parser.add_argument("--hsdp-replicate-dim", type=int, default=1)
     parser.add_argument("--hsdp-shard-dim", type=int)
-    parser.add_argument("--dist-timeout", type=int)
+    parser.add_argument(
+        "--dist-timeout",
+        type=int,
+        help="Timeout for torch.distributed operations in seconds. Use <= 0 for no timeout.",
+    )
     parser.add_argument("--attention-backend")
     parser.add_argument("--attention-backend-config")
     parser.add_argument("--cache-dit-config")
@@ -164,6 +178,8 @@ def _server_args_kwargs(args: argparse.Namespace, component_paths: dict[str, str
     ):
         value = getattr(args, name)
         if value is not None:
+            if name == "dist_timeout" and value <= 0:
+                value = None
             kwargs[name] = value
     return kwargs
 
@@ -253,6 +269,11 @@ def repair_cmd(args: argparse.Namespace) -> int:
         output_quality=args.output_quality,
         output_compression=args.output_compression,
         enable_teacache=args.enable_teacache,
+        teacache_params=build_videoedit_teacache_params(
+            teacache_thresh=args.teacache_thresh,
+            start_skipping=args.teacache_start_skipping,
+            end_skipping=args.teacache_end_skipping,
+        ),
         enable_frame_interpolation=args.enable_frame_interpolation,
         frame_interpolation_exp=args.frame_interpolation_exp,
         frame_interpolation_scale=args.frame_interpolation_scale,

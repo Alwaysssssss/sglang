@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.request_timeout import (
+    TaskTimeoutError,
+    is_task_timeout_error,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -264,6 +268,8 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None and result.output_file_paths is None:
+            if is_task_timeout_error(result.error):
+                raise TaskTimeoutError(str(result.error))
             error_msg = result.error or "Unknown error"
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"

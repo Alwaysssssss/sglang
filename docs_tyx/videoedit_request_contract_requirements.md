@@ -142,7 +142,7 @@
 | `infer_len` | `81` | VideoEdit 当前窗口长度要求。 |
 | `overlap` | `0` | 默认不做窗口重叠。 |
 | `strength` | `1.0` | 默认完整编辑强度。 |
-| `num_inference_steps` | `20` | 默认推理步数。 |
+| `num_inference_steps` | `40` | 默认推理步数。 |
 | `guidance_scale` | `5.0` | 默认 CFG。 |
 | `seed` | `42` | 默认随机种子。 |
 | `dtype` | `bf16` | 默认精度。 |
@@ -239,7 +239,7 @@ HTTP/1.1 200 OK
   "status": "succeeded",
   "progress": 100,
   "reason": "",
-  "output": "{\"result_url\":\"2026/06/09/060635_a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4\",\"duration\":45}"
+  "output": "{\"gen_video_url\":\"2026/06/09/060635_a1b2c3d4-e5f6-7890-abcd-ef1234567890.mp4\",\"duration\":45}"
 }
 ```
 

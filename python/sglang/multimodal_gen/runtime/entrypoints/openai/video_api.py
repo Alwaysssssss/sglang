@@ -24,10 +24,12 @@ from pydantic import ValidationError
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
+    VIDEO_OUTPUT_EXTENSIONS,
     generate_request_id,
 )
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
+    build_videoedit_teacache_params,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
@@ -53,6 +55,14 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.request_timeout import (
+    TASK_TIMEOUT_MESSAGE,
+    TaskTimeoutError,
+    check_request_timeout,
+    is_task_timeout_error,
+    remaining_request_timeout,
+    request_timeout_deadline,
+)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
@@ -86,6 +96,9 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
     "maskDownsampleMode": "mask_downsample_mode",
     "overlapCommitMode": "overlap_commit_mode",
     "tailPaddingMode": "tail_padding_mode",
+    "teacacheThresh": "teacache_thresh",
+    "teacacheStartSkipping": "teacache_start_skipping",
+    "teacacheEndSkipping": "teacache_end_skipping",
     "minioConfig": "minio_config",
     "outputObjectKey": "output_object_key",
 }
@@ -164,6 +177,14 @@ def _job_reason(job: Dict[str, Any]) -> str | None:
     return _job_error_message(job)
 
 
+def _job_is_task_timeout(job: Dict[str, Any] | None) -> bool:
+    if not job or job.get("status") != "failed":
+        return False
+    return is_task_timeout_error(job.get("reason")) or is_task_timeout_error(
+        _job_error_message(job)
+    )
+
+
 def _task_id_from_video_repair_body(body: Any) -> str | None:
     if not isinstance(body, dict):
         return None
@@ -224,13 +245,13 @@ def _build_video_repair_callback_payload(
     status = job.get("status")
     progress = _current_video_progress(job)
     if status == "completed":
-        result_url = (
+        gen_video_url = (
             job.get("output_object_key") or job.get("url") or job.get("file_path") or ""
         )
         duration = job.get("inference_time_s")
         if duration is None and job.get("completed_at") and job.get("created_at"):
             duration = max(0, int(job["completed_at"] - job["created_at"]))
-        output = {"result_url": result_url}
+        output = {"gen_video_url": gen_video_url}
         if duration is not None:
             output["duration"] = duration
         return {
@@ -497,6 +518,7 @@ async def _dispatch_job_async(
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
         )
+        check_request_timeout(batch)
         save_file_path = save_file_path_list[0]
 
         if request_storage is not None:
@@ -526,6 +548,9 @@ async def _dispatch_job_async(
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
         )
+        existing_job = await VIDEO_STORE.get(job_id)
+        if _job_is_task_timeout(existing_job):
+            return
         await VIDEO_STORE.update_fields(job_id, update_fields)
         job = await VIDEO_STORE.get(job_id)
         if job and callback_url:
@@ -539,14 +564,17 @@ async def _dispatch_job_async(
     except Exception as e:
         logger.error(f"{e}")
         existing_job = await VIDEO_STORE.get(job_id)
+        if _job_is_task_timeout(existing_job):
+            return
         progress = _current_video_progress(existing_job or {})
+        reason = TASK_TIMEOUT_MESSAGE if is_task_timeout_error(e) else str(e)
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
                 "progress": progress,
-                "error": {"message": str(e)},
-                "reason": str(e),
+                "error": {"message": reason},
+                "reason": reason,
             },
         )
         job = await VIDEO_STORE.get(job_id)
@@ -589,15 +617,41 @@ async def _save_video_source_to_path(
     return target_path
 
 
+def _source_video_extension(video_path: str | None) -> str | None:
+    if not video_path:
+        return None
+    source = video_path.split("?", 1)[0]
+    ext = os.path.splitext(source)[1].lower()
+    return ext if ext in VIDEO_OUTPUT_EXTENSIONS else None
+
+
+def _with_video_extension(path: str, extension: str | None) -> str:
+    if not extension:
+        return path
+    base, current_ext = os.path.splitext(path)
+    if current_ext:
+        return f"{base}{extension}"
+    return f"{path}{extension}"
+
+
 def _split_output_path(
-    output_path: str | None, job_id: str, server_output_path: str | None
+    output_path: str | None,
+    job_id: str,
+    server_output_path: str | None,
+    reference_path: str | None = None,
 ):
-    if output_path and os.path.splitext(output_path)[1].lower() == ".mp4":
-        return os.path.dirname(os.path.abspath(output_path)), os.path.basename(
-            output_path
-        )
+    source_ext = _source_video_extension(reference_path)
+    if (
+        output_path
+        and os.path.splitext(output_path)[1].lower() in VIDEO_OUTPUT_EXTENSIONS
+    ):
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        output_base, output_ext = os.path.splitext(os.path.basename(output_path))
+        output_file_name = f"{output_base}{source_ext or output_ext}"
+        return output_dir, output_file_name
     output_dir = output_path or server_output_path
-    return output_dir, f"{job_id}.mp4"
+    output_ext = source_ext or ".mp4"
+    return output_dir, f"{job_id}{output_ext}"
 
 
 def _current_video_progress(job: Dict[str, Any]) -> int:
@@ -641,7 +695,7 @@ async def _dispatch_video_repair_job_async(
     request_storage: RequestCloudStorage | None = None,
     output_object_key: str | None = None,
     output_bucket: str | None = None,
-    timeout: int = -1,
+    timeout_deadline: float | None = None,
 ) -> None:
     progress_callback_task = None
     try:
@@ -661,11 +715,12 @@ async def _dispatch_video_repair_job_async(
             output_object_key=output_object_key,
             output_bucket=output_bucket,
         )
-        if timeout == -1:
+        timeout_remaining = remaining_request_timeout(timeout_deadline)
+        if timeout_remaining is None:
             await dispatch_coro
         else:
-            await asyncio.wait_for(dispatch_coro, timeout=timeout)
-    except asyncio.TimeoutError:
+            await asyncio.wait_for(dispatch_coro, timeout=timeout_remaining)
+    except (asyncio.TimeoutError, TaskTimeoutError):
         existing_job = await VIDEO_STORE.get(job_id)
         progress = _current_video_progress(existing_job or {})
         await VIDEO_STORE.update_fields(
@@ -673,8 +728,8 @@ async def _dispatch_video_repair_job_async(
             {
                 "status": "failed",
                 "progress": progress,
-                "error": {"message": "task timeout"},
-                "reason": "task timeout",
+                "error": {"message": TASK_TIMEOUT_MESSAGE},
+                "reason": TASK_TIMEOUT_MESSAGE,
             },
         )
         job = await VIDEO_STORE.get(job_id)
@@ -727,6 +782,7 @@ async def create_video_repair(request: Request):
 
     server_args = get_global_server_args()
     request_id = req.task_id or generate_request_id()
+    timeout_deadline = request_timeout_deadline(req.timeout)
     temp_dirs: list[str] = []
 
     try:
@@ -792,7 +848,10 @@ async def create_video_repair(request: Request):
         )
 
         output_dir, output_file_name = _split_output_path(
-            req.output_path, request_id, server_args.output_path
+            req.output_path,
+            request_id,
+            server_args.output_path,
+            reference_path=video_input_path,
         )
         output_persistent = output_dir is not None
         if output_dir is None:
@@ -805,6 +864,7 @@ async def create_video_repair(request: Request):
         sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
             server_args,
             request_id=request_id,
+            request_timeout_deadline=timeout_deadline,
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             video_input_path=video_input_path,
@@ -843,6 +903,11 @@ async def create_video_repair(request: Request):
             tail_padding_mode=req.tail_padding_mode,
             decode_mode=req.decode_mode,
             enable_teacache=req.enable_teacache,
+            teacache_params=build_videoedit_teacache_params(
+                teacache_thresh=req.teacache_thresh,
+                start_skipping=req.teacache_start_skipping,
+                end_skipping=req.teacache_end_skipping,
+            ),
             enable_frame_interpolation=req.enable_frame_interpolation,
             frame_interpolation_exp=req.frame_interpolation_exp,
             frame_interpolation_scale=req.frame_interpolation_scale,
@@ -862,9 +927,14 @@ async def create_video_repair(request: Request):
             or req.output_storage == "s3"
             or req.output_object_key is not None
         ):
+            output_ext = os.path.splitext(output_file_name)[1] or ".mp4"
             output_object_key = normalize_object_key(
-                req.output_object_key
-                or default_video_repair_output_object_key(request_id)
+                _with_video_extension(req.output_object_key, output_ext)
+                if req.output_object_key
+                else default_video_repair_output_object_key(
+                    request_id,
+                    extension=output_ext,
+                )
             )
         req.output_object_key = output_object_key
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)
@@ -883,7 +953,7 @@ async def create_video_repair(request: Request):
                 request_storage=request_storage,
                 output_object_key=output_object_key,
                 output_bucket=req.output_bucket,
-                timeout=req.timeout,
+                timeout_deadline=timeout_deadline,
             )
         )
         return _video_repair_submit_response(0, "ok")
