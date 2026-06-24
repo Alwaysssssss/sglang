@@ -56,8 +56,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     merge_image_input_list,
-    process_generation_batch,
     save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.video_job_runner import (
+    run_video_generation_job,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -248,13 +250,10 @@ async def _dispatch_job_async(
     output_persistent: bool = True,
     callback_url: str | None = None,
 ) -> None:
-    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
-
     try:
-        save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
-        )
-        save_file_path = save_file_path_list[0]
+        job_result = await run_video_generation_job(batch)
+        save_file_path = job_result.save_file_path
+        result = job_result.result
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
