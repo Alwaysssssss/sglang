@@ -13,10 +13,16 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     FlowCutResponse,
     FlowCutVideoRepairRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
+    VividVRFlowCutCallbackPayload,
+    VividVRFlowCutMinIOConfig,
+    VividVRFlowCutRequest,
+    VividVRFlowCutSubmitResponse,
+)
 
 
-def test_flowcut_request_accepts_camel_case_system_fields():
-    req = FlowCutVideoRepairRequest.model_validate(
+def test_vividvr_flowcut_request_accepts_camel_case_system_fields():
+    req = VividVRFlowCutRequest.model_validate(
         {
             "taskId": "task-1",
             "timeout": -1,
@@ -45,13 +51,27 @@ def test_flowcut_request_accepts_camel_case_system_fields():
     assert req.num_inference_steps == 20
 
 
+def test_vividvr_flowcut_timeout_zero_or_missing_defaults_to_300():
+    assert VividVRFlowCutRequest.model_validate({}).timeout == 300
+    assert VividVRFlowCutRequest.model_validate({"timeout": 0}).timeout == 300
+    assert VividVRFlowCutRequest.model_validate({"timeout": -1}).timeout == -1
+
+
 def test_flowcut_response_uses_numeric_code():
-    accepted = FlowCutResponse(code=0, message="ok")
-    busy = FlowCutResponse(code=2, message="A task is running.")
+    accepted = VividVRFlowCutSubmitResponse(code=0, message="ok")
+    busy = VividVRFlowCutSubmitResponse(code=2, message="A task is running.")
 
     assert accepted.model_dump() == {"code": 0, "message": "ok"}
     assert busy.model_dump()["code"] == 2
     assert isinstance(busy.model_dump()["code"], int)
+
+
+def test_legacy_flowcut_protocol_aliases_remain_available():
+    assert FlowCutMinIOConfig is VividVRFlowCutMinIOConfig
+    assert FlowCutVideoRepairRequest is VividVRFlowCutRequest
+    assert FlowCutResponse is VividVRFlowCutSubmitResponse
+    assert FlowCutVideoRepairRequest(taskId="task-1").task_id == "task-1"
+    assert FlowCutResponse(code=0).model_dump() == {"code": 0, "message": "ok"}
 
 
 def test_flowcut_running_callback_payload():
@@ -65,6 +85,46 @@ def test_flowcut_running_callback_payload():
         "status": "running",
         "progress": 45.5,
         "reason": "processing",
+        "output": "",
+    }
+
+
+def test_vividvr_flowcut_success_callback_output_is_json_string_result_only():
+    payload = VividVRFlowCutCallbackPayload.succeeded(
+        result_url="http://storage/out.mp4",
+        duration=12.5,
+    )
+    output = json.loads(payload.output)
+
+    assert payload.status == "succeeded"
+    assert output == {
+        "result_url": "http://storage/out.mp4",
+        "duration": 12.5,
+    }
+    assert "gen_video_url" not in output
+    assert "file_path" not in output
+
+
+def test_vividvr_flowcut_running_and_failed_callbacks_use_empty_output():
+    running = VividVRFlowCutCallbackPayload.running(
+        progress=45.5,
+        reason="processing",
+    )
+    failed = VividVRFlowCutCallbackPayload.failed(
+        reason="invalid video input",
+        progress=12.0,
+    )
+
+    assert running.model_dump() == {
+        "status": "running",
+        "progress": 45.5,
+        "reason": "processing",
+        "output": "",
+    }
+    assert failed.model_dump() == {
+        "status": "failed",
+        "progress": 12.0,
+        "reason": "invalid video input",
         "output": "",
     }
 

@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
+    VividVRFlowCutMinIOConfig,
+    VividVRFlowCutRequest,
+    VividVRFlowCutSubmitResponse,
+)
+
+
+FlowCutMinIOConfig = VividVRFlowCutMinIOConfig
+FlowCutVideoRepairRequest = VividVRFlowCutRequest
+FlowCutResponse = VividVRFlowCutSubmitResponse
+
 
 # Image API protocol models
 class ImageResponseData(BaseModel):
@@ -173,34 +184,6 @@ class VideoRepairRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     perf_dump_path: Optional[str] = None
-
-
-class FlowCutMinIOConfig(BaseModel):
-    endpoint: str
-    bucket_name: str
-    access_key: str
-    secret_key: str
-    secure: bool = False
-    region: Optional[str] = None
-
-
-class FlowCutVideoRepairRequest(VideoRepairRequest):
-    task_id: Optional[str] = Field(default=None, alias="taskId")
-    timeout: int = -1
-    callback_url: Optional[str] = Field(default=None, alias="callbackUrl")
-    minio_config: Optional[FlowCutMinIOConfig] = Field(
-        default=None, alias="minioConfig"
-    )
-
-    model_config = {
-        "populate_by_name": True,
-        "extra": "allow",
-    }
-
-
-class FlowCutResponse(BaseModel):
-    code: int
-    message: str = "ok"
 
 
 class VideoListResponse(BaseModel):
