@@ -16,9 +16,13 @@ class VividVRFlowCutStorage:
     """Request-scoped file storage for FlowCut Vivid-VR jobs."""
 
     def __init__(self, *, base_dir: str | Path, request_id: str):
-        self.base_dir = Path(base_dir)
+        self.base_dir = Path(base_dir).resolve()
+        workdir = (self.base_dir / request_id).resolve()
+        if workdir == self.base_dir or not self._is_path_inside(workdir, self.base_dir):
+            raise ValueError(f"request_id escapes base_dir: {request_id!r}")
+
         self.request_id = request_id
-        self.workdir = self.base_dir / request_id
+        self.workdir = workdir
         self.inputs_dir = self.workdir / "inputs"
         self.outputs_dir = self.workdir / "outputs"
         self.manifests_dir = self.workdir / "manifests"
@@ -63,12 +67,19 @@ class VividVRFlowCutStorage:
         if minio_config is None:
             return local_path_str
 
+        local_path_resolved = Path(local_path).resolve()
+        outputs_dir_resolved = self.outputs_dir.resolve()
+        if not self._is_path_inside(local_path_resolved, outputs_dir_resolved):
+            raise ValueError(
+                f"local_path must be inside outputs_dir: {local_path_resolved}"
+            )
+
         result_url = await upload_to_flowcut_minio(
-            local_path=local_path_str,
+            local_path=str(local_path_resolved),
             object_key=f"outputs/{self.request_id}.mp4",
             config=minio_config,
         )
-        Path(local_path).unlink()
+        local_path_resolved.unlink()
         return result_url
 
     def cleanup(self) -> None:
@@ -85,3 +96,11 @@ class VividVRFlowCutStorage:
         if path.suffix:
             return filename
         return f"{filename}.mp4"
+
+    @staticmethod
+    def _is_path_inside(path: Path, parent: Path) -> bool:
+        try:
+            path.relative_to(parent)
+        except ValueError:
+            return False
+        return True

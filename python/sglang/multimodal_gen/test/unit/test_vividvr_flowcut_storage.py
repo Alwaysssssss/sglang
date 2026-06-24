@@ -12,6 +12,12 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_storage im
 )
 
 
+@pytest.mark.parametrize("request_id", ["../escape", "/tmp/flowcut-escape"])
+def test_storage_rejects_request_id_that_escapes_base_dir(tmp_path, request_id):
+    with pytest.raises(ValueError, match="request_id"):
+        VividVRFlowCutStorage(base_dir=tmp_path / "work", request_id=request_id)
+
+
 def test_materialize_video_copies_local_file_into_request_inputs(tmp_path):
     source = tmp_path / "source.mov"
     source.write_bytes(b"video-bytes")
@@ -161,6 +167,38 @@ def test_upload_result_with_minio_keeps_local_file_after_failure(tmp_path, monke
         asyncio.run(storage.upload_result(str(output_path), config))
 
     assert output_path.exists()
+
+
+def test_upload_result_rejects_external_local_path_without_uploading_or_deleting(
+    tmp_path, monkeypatch
+):
+    upload_called = False
+
+    async def fake_upload_to_flowcut_minio(*, local_path, object_key, config):
+        nonlocal upload_called
+        upload_called = True
+        return "http://minio/flowcut/outputs/task-guard.mp4"
+
+    monkeypatch.setattr(
+        vividvr_flowcut_storage,
+        "upload_to_flowcut_minio",
+        fake_upload_to_flowcut_minio,
+    )
+    config = VividVRFlowCutMinIOConfig(
+        endpoint="minio:9000",
+        bucket_name="flowcut",
+        access_key="ak",
+        secret_key="sk",
+    )
+    storage = VividVRFlowCutStorage(base_dir=tmp_path / "work", request_id="task-guard")
+    external_path = tmp_path / "external.mp4"
+    external_path.write_bytes(b"external")
+
+    with pytest.raises(ValueError, match="outputs_dir"):
+        asyncio.run(storage.upload_result(str(external_path), config))
+
+    assert not upload_called
+    assert external_path.read_bytes() == b"external"
 
 
 def test_cleanup_deletes_request_workdir(tmp_path):
