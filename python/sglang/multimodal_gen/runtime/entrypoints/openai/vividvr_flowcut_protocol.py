@@ -88,7 +88,7 @@ class VividVRFlowCutRequest(BaseModel):
 
 
 class VividVRFlowCutSubmitResponse(BaseModel):
-    code: int
+    code: Literal[0, 1, 2]
     message: str = "ok"
 
 
@@ -137,3 +137,9 @@ class VividVRFlowCutCallbackPayload(BaseModel):
             reason=reason,
             output="",
         )
+
+
+FlowCutMinIOConfig = VividVRFlowCutMinIOConfig
+FlowCutVideoRepairRequest = VividVRFlowCutRequest
+FlowCutResponse = VividVRFlowCutSubmitResponse
+FlowCutCallbackPayload = VividVRFlowCutCallbackPayload

@@ -7,15 +7,10 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
-    VividVRFlowCutMinIOConfig,
-    VividVRFlowCutRequest,
-    VividVRFlowCutSubmitResponse,
+    FlowCutMinIOConfig,
+    FlowCutResponse,
+    FlowCutVideoRepairRequest,
 )
-
-
-FlowCutMinIOConfig = VividVRFlowCutMinIOConfig
-FlowCutVideoRepairRequest = VividVRFlowCutRequest
-FlowCutResponse = VividVRFlowCutSubmitResponse
 
 
 # Image API protocol models

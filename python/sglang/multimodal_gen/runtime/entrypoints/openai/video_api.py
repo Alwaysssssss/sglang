@@ -610,8 +610,8 @@ async def _dispatch_flowcut_video_repair_job_async(
         job = await VIDEO_STORE.get(job_id) or {}
         if job.get("status") == "completed":
             try:
-                result_url = job.get("url")
                 file_path = job.get("file_path")
+                result_url = job.get("url") or file_path
                 if minio_config is not None and file_path:
                     object_key = f"outputs/{job_id}.mp4"
                     result_url = await upload_to_flowcut_minio(
@@ -625,7 +625,6 @@ async def _dispatch_flowcut_video_repair_job_async(
                     reason="",
                     output={
                         "result_url": result_url,
-                        "file_path": file_path,
                         "duration": job.get("inference_time_s"),
                     },
                 )

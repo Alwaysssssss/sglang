@@ -1,6 +1,9 @@
 import asyncio
 import json
 
+import pytest
+from pydantic import ValidationError
+
 from sglang.multimodal_gen.runtime.entrypoints.openai import flowcut
 from sglang.multimodal_gen.runtime.entrypoints.openai.flowcut import (
     build_flowcut_final_callback_payload,
@@ -14,6 +17,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     FlowCutVideoRepairRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
+    FlowCutCallbackPayload as ModuleFlowCutCallbackPayload,
+    FlowCutMinIOConfig as ModuleFlowCutMinIOConfig,
+    FlowCutResponse as ModuleFlowCutResponse,
+    FlowCutVideoRepairRequest as ModuleFlowCutVideoRepairRequest,
     VividVRFlowCutCallbackPayload,
     VividVRFlowCutMinIOConfig,
     VividVRFlowCutRequest,
@@ -64,6 +71,18 @@ def test_flowcut_response_uses_numeric_code():
     assert accepted.model_dump() == {"code": 0, "message": "ok"}
     assert busy.model_dump()["code"] == 2
     assert isinstance(busy.model_dump()["code"], int)
+
+
+def test_flowcut_response_rejects_unknown_numeric_code():
+    with pytest.raises(ValidationError):
+        VividVRFlowCutSubmitResponse(code=3)
+
+
+def test_vividvr_flowcut_module_exposes_direct_public_names():
+    assert ModuleFlowCutMinIOConfig is VividVRFlowCutMinIOConfig
+    assert ModuleFlowCutVideoRepairRequest is VividVRFlowCutRequest
+    assert ModuleFlowCutResponse is VividVRFlowCutSubmitResponse
+    assert ModuleFlowCutCallbackPayload is VividVRFlowCutCallbackPayload
 
 
 def test_legacy_flowcut_protocol_aliases_remain_available():

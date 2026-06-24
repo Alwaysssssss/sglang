@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,6 +444,10 @@ def test_dispatch_flowcut_job_posts_running_and_final_callbacks(monkeypatch, tmp
     assert callbacks[0]["status"] == "running"
     assert callbacks[-1]["status"] == "succeeded"
     assert callbacks[-1]["progress"] == 100.0
+    assert json.loads(callbacks[-1]["output"]) == {
+        "result_url": str(tmp_path / "out.mp4"),
+        "duration": 1.25,
+    }
     assert semaphore.released is True
 
 
