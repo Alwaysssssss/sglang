@@ -211,12 +211,43 @@ def test_flowcut_final_callback_payload_success_output_is_json_string():
     }
 
 
+@pytest.mark.parametrize("legacy_key", ["file_path", "gen_video_url"])
+def test_flowcut_final_callback_payload_rejects_legacy_success_output_fields(
+    legacy_key,
+):
+    with pytest.raises(ValidationError):
+        build_flowcut_final_callback_payload(
+            status="succeeded",
+            progress=100,
+            reason="",
+            output={
+                "result_url": "http://storage/out.mp4",
+                "duration": 12.5,
+                legacy_key: "http://storage/legacy.mp4",
+            },
+        )
+
+
+def test_flowcut_final_callback_payload_rejects_success_output_without_result_url():
+    with pytest.raises(ValidationError):
+        build_flowcut_final_callback_payload(
+            status="succeeded",
+            progress=100,
+            reason="",
+            output={"duration": 12.5},
+        )
+
+
 def test_flowcut_final_callback_payload_failed_omits_output_data():
     payload = build_flowcut_final_callback_payload(
         status="failed",
         progress=0,
         reason="invalid video input",
-        output=None,
+        output={
+            "result_url": "http://storage/out.mp4",
+            "file_path": "/tmp/out.mp4",
+            "gen_video_url": "http://storage/legacy.mp4",
+        },
     )
 
     assert payload == {

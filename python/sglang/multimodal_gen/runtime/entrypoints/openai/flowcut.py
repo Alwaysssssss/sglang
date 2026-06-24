@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import time
 from typing import Any, Dict, Optional
@@ -7,6 +6,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    FlowCutCallbackOutput,
     FlowCutMinIOConfig,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -38,11 +38,15 @@ def build_flowcut_final_callback_payload(
 ) -> Dict[str, Any]:
     if status not in {"succeeded", "failed"}:
         raise ValueError(f"Unsupported FlowCut final status: {status}")
+    serialized_output = ""
+    if status == "succeeded":
+        callback_output = FlowCutCallbackOutput.model_validate(output or {})
+        serialized_output = callback_output.model_dump_json(exclude_none=True)
     return {
         "status": status,
         "progress": float(progress),
         "reason": reason,
-        "output": json.dumps(output, ensure_ascii=False) if output else "",
+        "output": serialized_output,
     }
 
 

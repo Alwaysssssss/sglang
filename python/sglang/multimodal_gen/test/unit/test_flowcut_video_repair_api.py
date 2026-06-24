@@ -386,6 +386,7 @@ def test_dispatch_flowcut_job_posts_running_and_final_callbacks(monkeypatch, tmp
                 "progress": 100,
                 "file_path": str(tmp_path / "out.mp4"),
                 "url": None,
+                "gen_video_url": "http://storage/legacy.mp4",
                 "inference_time_s": 1.25,
             },
         )
@@ -444,10 +445,14 @@ def test_dispatch_flowcut_job_posts_running_and_final_callbacks(monkeypatch, tmp
     assert callbacks[0]["status"] == "running"
     assert callbacks[-1]["status"] == "succeeded"
     assert callbacks[-1]["progress"] == 100.0
-    assert json.loads(callbacks[-1]["output"]) == {
+    final_output = json.loads(callbacks[-1]["output"])
+    assert final_output == {
         "result_url": str(tmp_path / "out.mp4"),
         "duration": 1.25,
     }
+    assert set(final_output) == {"result_url", "duration"}
+    assert "file_path" not in final_output
+    assert "gen_video_url" not in final_output
     assert semaphore.released is True
 
 
