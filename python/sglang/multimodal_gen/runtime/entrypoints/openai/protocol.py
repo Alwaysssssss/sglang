@@ -7,9 +7,16 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
+    FlowCutCallbackOutput,
+    FlowCutCallbackPayload,
     FlowCutMinIOConfig,
     FlowCutResponse,
     FlowCutVideoRepairRequest,
+    VividVRFlowCutCallbackOutput,
+    VividVRFlowCutCallbackPayload,
+    VividVRFlowCutMinIOConfig,
+    VividVRFlowCutRequest,
+    VividVRFlowCutSubmitResponse,
 )
 
 

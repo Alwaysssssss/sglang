@@ -15,12 +15,19 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     FlowCutMinIOConfig,
     FlowCutResponse,
     FlowCutVideoRepairRequest,
+    VividVRFlowCutCallbackOutput as ProtocolVividVRFlowCutCallbackOutput,
+    VividVRFlowCutCallbackPayload as ProtocolVividVRFlowCutCallbackPayload,
+    VividVRFlowCutMinIOConfig as ProtocolVividVRFlowCutMinIOConfig,
+    VividVRFlowCutRequest as ProtocolVividVRFlowCutRequest,
+    VividVRFlowCutSubmitResponse as ProtocolVividVRFlowCutSubmitResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
+    FlowCutCallbackOutput as ModuleFlowCutCallbackOutput,
     FlowCutCallbackPayload as ModuleFlowCutCallbackPayload,
     FlowCutMinIOConfig as ModuleFlowCutMinIOConfig,
     FlowCutResponse as ModuleFlowCutResponse,
     FlowCutVideoRepairRequest as ModuleFlowCutVideoRepairRequest,
+    VividVRFlowCutCallbackOutput,
     VividVRFlowCutCallbackPayload,
     VividVRFlowCutMinIOConfig,
     VividVRFlowCutRequest,
@@ -73,16 +80,27 @@ def test_flowcut_response_uses_numeric_code():
     assert isinstance(busy.model_dump()["code"], int)
 
 
-def test_flowcut_response_rejects_unknown_numeric_code():
+@pytest.mark.parametrize("response_cls", [VividVRFlowCutSubmitResponse, FlowCutResponse])
+@pytest.mark.parametrize("invalid_code", [3, True, False])
+def test_flowcut_response_rejects_invalid_code(response_cls, invalid_code):
     with pytest.raises(ValidationError):
-        VividVRFlowCutSubmitResponse(code=3)
+        response_cls(code=invalid_code)
 
 
 def test_vividvr_flowcut_module_exposes_direct_public_names():
     assert ModuleFlowCutMinIOConfig is VividVRFlowCutMinIOConfig
     assert ModuleFlowCutVideoRepairRequest is VividVRFlowCutRequest
     assert ModuleFlowCutResponse is VividVRFlowCutSubmitResponse
+    assert ModuleFlowCutCallbackOutput is VividVRFlowCutCallbackOutput
     assert ModuleFlowCutCallbackPayload is VividVRFlowCutCallbackPayload
+
+
+def test_protocol_exposes_vivid_prefixed_flowcut_names():
+    assert ProtocolVividVRFlowCutMinIOConfig is VividVRFlowCutMinIOConfig
+    assert ProtocolVividVRFlowCutRequest is VividVRFlowCutRequest
+    assert ProtocolVividVRFlowCutSubmitResponse is VividVRFlowCutSubmitResponse
+    assert ProtocolVividVRFlowCutCallbackOutput is VividVRFlowCutCallbackOutput
+    assert ProtocolVividVRFlowCutCallbackPayload is VividVRFlowCutCallbackPayload
 
 
 def test_legacy_flowcut_protocol_aliases_remain_available():
@@ -116,12 +134,40 @@ def test_vividvr_flowcut_success_callback_output_is_json_string_result_only():
     output = json.loads(payload.output)
 
     assert payload.status == "succeeded"
+    assert payload.success_output == VividVRFlowCutCallbackOutput(
+        result_url="http://storage/out.mp4",
+        duration=12.5,
+    )
     assert output == {
         "result_url": "http://storage/out.mp4",
         "duration": 12.5,
     }
     assert "gen_video_url" not in output
     assert "file_path" not in output
+
+
+def test_vividvr_flowcut_callback_output_forbids_legacy_result_fields():
+    output = VividVRFlowCutCallbackOutput(
+        result_url="http://storage/out.mp4",
+        duration=12.5,
+    )
+
+    assert output.model_dump(exclude_none=True) == {
+        "result_url": "http://storage/out.mp4",
+        "duration": 12.5,
+    }
+    assert "gen_video_url" not in VividVRFlowCutCallbackOutput.model_fields
+    assert "file_path" not in VividVRFlowCutCallbackOutput.model_fields
+    with pytest.raises(ValidationError):
+        VividVRFlowCutCallbackOutput(
+            result_url="http://storage/out.mp4",
+            file_path="/tmp/out.mp4",
+        )
+    with pytest.raises(ValidationError):
+        VividVRFlowCutCallbackOutput(
+            result_url="http://storage/out.mp4",
+            gen_video_url="http://storage/legacy.mp4",
+        )
 
 
 def test_vividvr_flowcut_running_and_failed_callbacks_use_empty_output():

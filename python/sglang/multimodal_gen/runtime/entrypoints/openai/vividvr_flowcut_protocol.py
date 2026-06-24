@@ -1,4 +1,3 @@
-import json
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -91,12 +90,31 @@ class VividVRFlowCutSubmitResponse(BaseModel):
     code: Literal[0, 1, 2]
     message: str = "ok"
 
+    @field_validator("code", mode="before")
+    @classmethod
+    def reject_bool_code(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("code must be numeric 0, 1, or 2")
+        return value
+
+
+class VividVRFlowCutCallbackOutput(BaseModel):
+    result_url: str
+    duration: Optional[float] = None
+
+    model_config = {
+        "extra": "forbid",
+    }
+
 
 class VividVRFlowCutCallbackPayload(BaseModel):
     status: Literal["running", "succeeded", "failed"]
     progress: float
     reason: str = ""
     output: str = ""
+    success_output: Optional[VividVRFlowCutCallbackOutput] = Field(
+        default=None, exclude=True
+    )
 
     @classmethod
     def running(cls, *, progress: float, reason: str) -> "VividVRFlowCutCallbackPayload":
@@ -114,14 +132,16 @@ class VividVRFlowCutCallbackPayload(BaseModel):
         result_url: str,
         duration: Optional[float] = None,
     ) -> "VividVRFlowCutCallbackPayload":
-        output = {"result_url": result_url}
-        if duration is not None:
-            output["duration"] = duration
+        success_output = VividVRFlowCutCallbackOutput(
+            result_url=result_url,
+            duration=duration,
+        )
         return cls(
             status="succeeded",
             progress=100.0,
             reason="",
-            output=json.dumps(output, ensure_ascii=False),
+            output=success_output.model_dump_json(exclude_none=True),
+            success_output=success_output,
         )
 
     @classmethod
@@ -142,4 +162,5 @@ class VividVRFlowCutCallbackPayload(BaseModel):
 FlowCutMinIOConfig = VividVRFlowCutMinIOConfig
 FlowCutVideoRepairRequest = VividVRFlowCutRequest
 FlowCutResponse = VividVRFlowCutSubmitResponse
+FlowCutCallbackOutput = VividVRFlowCutCallbackOutput
 FlowCutCallbackPayload = VividVRFlowCutCallbackPayload
