@@ -170,10 +170,10 @@ class VideoRepairRequest(BaseModel):
     dynamic_cfg_min: float = 1.0
 
     bbox_padding: int = 0
-    bbox_expand_scale: float = 1.5
-    dilate_px: int = 0
-    mask_scale: float = 1.0
-    feather_px: int = 0
+    bbox_expand_scale: float = 1.2
+    dilate_px: int = 15
+    mask_scale: float = 1.2
+    feather_px: int = 15
     adain_boundary_dilate: int = 0
     enable_paste_back: bool = True
     save_crop_only: bool = False

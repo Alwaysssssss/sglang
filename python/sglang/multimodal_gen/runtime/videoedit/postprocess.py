@@ -24,7 +24,7 @@ def _edge_feather_blend(
     orig_crop: np.ndarray,
     gen: np.ndarray,
     mask_bin: np.ndarray,
-    feather_px: int = 12,
+    feather_px: int = 15,
 ) -> np.ndarray:
     k = feather_px * 2 + 1
     feather = cv2.GaussianBlur(
@@ -41,8 +41,8 @@ def paste_back(
     bbox: tuple[int, int, int, int],
     crop_h: int,
     crop_w: int,
-    feather_px: int = 12,
-    adain_boundary_dilate: int = 15,
+    feather_px: int = 15,
+    adain_boundary_dilate: int = 0,
 ) -> list[Image.Image]:
     del adain_boundary_dilate
     gen_resized = resize_frames(generated_frames, crop_h, crop_w)
@@ -65,7 +65,7 @@ def paste_back_frame(
     generated_frame: Image.Image,
     mask_frame,
     bbox: tuple[int, int, int, int],
-    feather_px: int = 12,
+    feather_px: int = 15,
 ) -> Image.Image:
     x_min, y_min, _, _ = bbox
     orig_np = np.array(original_frame).astype(np.float32)

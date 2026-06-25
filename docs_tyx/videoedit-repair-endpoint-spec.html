@@ -655,10 +655,11 @@ Content-Type: application/json</code></pre>
     "num_frames":-1,
     "infer_len":81,
     "overlap":9,
-    "bbox_expand_scale":0.3,
-    "dilate_px":0,
-    "mask_scale":1.0,
-    "feather_px":0,
+    "bbox_expand_scale":1.2,
+    "dilate_px":15,
+    "mask_scale":1.2,
+    "feather_px":15,
+    "adain_boundary_dilate":0,
     "num_inference_steps":40,
     "guidance_scale":5.0,
     "seed":42,
@@ -743,23 +744,28 @@ Content-Type: application/json</code></pre>
                     </tr>
                     <tr>
                         <td><code>bbox_expand_scale</code></td><td>float</td><td><span class="badge badge-optional">否</span></td>
-                        <td><code>0.3（默认）</code></td>
-                        <td>对所有 mask 合并得到的 bbox 进行比例外扩。<code>0.3</code> 表示左右各外扩原 bbox 宽度的 30%，上下各外扩原 bbox 高度的 30%；超出视频边界的部分会被裁剪。外扩可为修复区域提供更多上下文，但会增大裁剪区域和推理开销。</td>
+                        <td><code>1.2（默认）</code></td>
+                        <td>对所有 mask 合并得到的 bbox 进行比例外扩。<code>1.2</code> 表示左右各外扩原 bbox 宽度的 120%，上下各外扩原 bbox 高度的 120%；未触及视频边界时，最终宽高约为原 bbox 的 3.4 倍。超出视频边界的部分会被裁剪。外扩可提供更多上下文，但会增大推理区域和计算开销。</td>
                     </tr>
                     <tr>
                         <td><code>dilate_px</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
-                        <td><code>0（默认）</code></td>
-                        <td>模型输入 mask 的像素膨胀量。<code>0</code> 表示不膨胀；正值使用大小为 <code>2 × dilate_px + 1</code> 的椭圆核向外扩张 mask，可覆盖目标边缘或减少残留，但过大会扩大实际生成区域。</td>
+                        <td><code>15（默认）</code></td>
+                        <td>模型输入 mask 的像素膨胀量。默认使用大小为 <code>31 × 31</code> 的椭圆核向外扩张 mask，可覆盖目标边缘或减少残留；设置为 <code>0</code> 可关闭膨胀，数值过大会扩大实际生成区域。</td>
                     </tr>
                     <tr>
                         <td><code>mask_scale</code></td><td>float</td><td><span class="badge badge-optional">否</span></td>
-                        <td><code>1.0（默认）</code></td>
-                        <td>在 <code>dilate_px</code> 膨胀之后，以 mask 前景中心为基准缩放 mask。<code>1.0</code> 表示不缩放，<code>&gt;1.0</code> 扩大，<code>0~1.0</code> 收缩。该参数会影响模型编辑范围和最终回贴使用的 mask。</td>
+                        <td><code>1.2（默认）</code></td>
+                        <td>在 <code>dilate_px</code> 膨胀之后，以 mask 前景中心为基准缩放 mask。默认 <code>1.2</code> 表示将 mask 宽高放大至约 1.2 倍；<code>1.0</code> 表示不缩放，<code>0~1.0</code> 表示收缩。该参数会影响模型编辑范围和最终回贴使用的 mask。</td>
                     </tr>
                     <tr>
                         <td><code>feather_px</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>15（默认）</code></td>
+                        <td>生成区域回贴到原视频时的 mask 边缘羽化宽度。默认使用 15 像素，通过高斯模糊形成渐变融合边缘；设置为 <code>0</code> 表示硬边界。仅在 <code>enable_paste_back=true</code> 时影响最终合成，不改变模型输入 mask。</td>
+                    </tr>
+                    <tr>
+                        <td><code>adain_boundary_dilate</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
                         <td><code>0（默认）</code></td>
-                        <td>生成区域回贴到原视频时的 mask 边缘羽化宽度。<code>0</code> 表示硬边界；正值通过高斯模糊形成渐变融合边缘。仅在 <code>enable_paste_back=true</code> 时影响最终合成，不改变模型输入 mask。</td>
+                        <td>预留的 AdaIN 边界膨胀参数。API 和 CLI 已暴露，但当前回贴实现会忽略该值，因此目前不会改变输出。</td>
                     </tr>
                     <tr>
                         <td><code>num_inference_steps</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
@@ -812,13 +818,13 @@ Content-Type: application/json</code></pre>
             <h4>Mask 扩展与回贴说明</h4>
             <div class="callout callout-info">
                 <div class="callout-title"><code>dilate_px</code>、<code>mask_scale</code> 和 <code>feather_px</code> 的作用阶段不同</div>
-                mask 预处理顺序为：先按阈值二值化，再应用 <code>dilate_px</code> 膨胀，最后应用 <code>mask_scale</code> 缩放。处理后的 mask 会用于模型编辑，也会在启用回贴时限定生成区域。<code>feather_px</code> 仅在最后回贴阶段平滑生成区域与原视频的边界。默认配置 <code>dilate_px=0</code>、<code>mask_scale=1.0</code>、<code>feather_px=0</code> 不额外扩大 mask，也不进行边缘羽化。参考帧的 mask 仍会被强制设为不可编辑。
+                mask 预处理顺序为：先按阈值二值化，再应用 <code>dilate_px</code> 膨胀，最后应用 <code>mask_scale</code> 缩放。处理后的 mask 会用于模型编辑，也会在启用回贴时限定生成区域。<code>feather_px</code> 仅在最后回贴阶段平滑生成区域与原视频的边界。默认配置为 <code>dilate_px=15</code>、<code>mask_scale=1.2</code>、<code>feather_px=15</code>、<code>adain_boundary_dilate=0</code>。参考帧的 mask 仍会被强制设为不可编辑；当前实现尚未执行 AdaIN 边界处理。
             </div>
 
             <h4>BBox 外扩说明</h4>
             <div class="callout callout-info">
                 <div class="callout-title"><code>bbox_expand_scale</code> 控制模型可见的修复上下文</div>
-                服务先根据所有 mask 计算联合 bbox，再按该参数向四周扩展裁剪范围。默认值 <code>0.3</code> 在不触碰画面边界时，会使宽度和高度理论上分别扩大到原 bbox 的 <code>1.6</code> 倍。值过小可能缺少目标周边上下文；值过大会让模型处理更多无关区域，并增加显存和计算开销。设置为 <code>0</code> 可关闭这一步比例外扩，但小目标仍可能触发服务端的小区域自适应扩展。
+                服务先根据所有 mask 计算联合 bbox，再按该参数向四周扩展裁剪范围。默认值 <code>1.2</code> 表示四边分别按原 bbox 宽高的 120% 外扩；不触碰画面边界时，宽度和高度理论上分别扩大到原 bbox 的 <code>3.4</code> 倍。值过小可能缺少目标周边上下文；值过大会让模型处理更多无关区域，并增加显存和计算开销。设置为 <code>0</code> 可关闭这一步比例外扩，但小目标仍可能触发服务端的小区域自适应扩展。
             </div>
 
             <h4>TeaCache 说明</h4>
