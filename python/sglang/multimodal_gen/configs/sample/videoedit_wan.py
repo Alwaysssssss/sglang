@@ -50,7 +50,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     mask_input_path: str | None = None
     reference_image_path: str | None = None
     infer_len: int = 81
-    overlap: int = 10
+    overlap: int = 9
     strength: float = 1.0
     dtype: str = "bf16"
 

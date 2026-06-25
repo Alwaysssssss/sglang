@@ -35,7 +35,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
     def test_sampling_params_default_num_inference_steps_is_40(self):
         params = WanVideoEditSamplingParams()
         self.assertEqual(params.num_inference_steps, 40)
-        self.assertEqual(params.overlap, 10)
+        self.assertEqual(params.overlap, 9)
         self.assertEqual(params.dilate_px, 0)
         self.assertEqual(params.mask_scale, 1.0)
         self.assertEqual(params.feather_px, 0)
@@ -88,7 +88,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             mask_input_path="/tmp/mask.mp4",
         )
         self.assertEqual(request.decode_mode, "stream")
-        self.assertEqual(request.overlap, 10)
+        self.assertEqual(request.overlap, 9)
         self.assertEqual(request.dilate_px, 0)
         self.assertEqual(request.mask_scale, 1.0)
         self.assertEqual(request.feather_px, 0)

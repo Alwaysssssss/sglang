@@ -654,11 +654,19 @@ Content-Type: application/json</code></pre>
     "outputObjectKey":"outputs/ubuntu-minio-videoedit-008.mp4",
     "num_frames":-1,
     "infer_len":81,
-    "overlap":5,
+    "overlap":9,
+    "bbox_expand_scale":0.3,
+    "dilate_px":0,
+    "mask_scale":1.0,
+    "feather_px":0,
     "num_inference_steps":40,
     "guidance_scale":5.0,
     "seed":42,
     "dtype":"bf16",
+    "enable_teacache":true,
+    "teacache_thresh":0.3,
+    "teacache_start_skipping":5,
+    "teacache_end_skipping":1.0,
     "enable_paste_back":true
   }'</code></pre>
 
@@ -730,8 +738,28 @@ Content-Type: application/json</code></pre>
                     </tr>
                     <tr>
                         <td><code>overlap</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
-                        <td><code>5</code></td>
-                        <td>多窗口推理时相邻窗口重叠帧数。</td>
+                        <td><code>9（默认）</code></td>
+                        <td>多窗口推理时相邻窗口重叠帧数。默认值为 <code>9</code>；<code>infer_len=81</code> 时窗口步长为 <code>72</code> 帧。增大重叠可增强窗口衔接，但会增加重复推理开销。</td>
+                    </tr>
+                    <tr>
+                        <td><code>bbox_expand_scale</code></td><td>float</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>0.3（默认）</code></td>
+                        <td>对所有 mask 合并得到的 bbox 进行比例外扩。<code>0.3</code> 表示左右各外扩原 bbox 宽度的 30%，上下各外扩原 bbox 高度的 30%；超出视频边界的部分会被裁剪。外扩可为修复区域提供更多上下文，但会增大裁剪区域和推理开销。</td>
+                    </tr>
+                    <tr>
+                        <td><code>dilate_px</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>0（默认）</code></td>
+                        <td>模型输入 mask 的像素膨胀量。<code>0</code> 表示不膨胀；正值使用大小为 <code>2 × dilate_px + 1</code> 的椭圆核向外扩张 mask，可覆盖目标边缘或减少残留，但过大会扩大实际生成区域。</td>
+                    </tr>
+                    <tr>
+                        <td><code>mask_scale</code></td><td>float</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>1.0（默认）</code></td>
+                        <td>在 <code>dilate_px</code> 膨胀之后，以 mask 前景中心为基准缩放 mask。<code>1.0</code> 表示不缩放，<code>&gt;1.0</code> 扩大，<code>0~1.0</code> 收缩。该参数会影响模型编辑范围和最终回贴使用的 mask。</td>
+                    </tr>
+                    <tr>
+                        <td><code>feather_px</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>0（默认）</code></td>
+                        <td>生成区域回贴到原视频时的 mask 边缘羽化宽度。<code>0</code> 表示硬边界；正值通过高斯模糊形成渐变融合边缘。仅在 <code>enable_paste_back=true</code> 时影响最终合成，不改变模型输入 mask。</td>
                     </tr>
                     <tr>
                         <td><code>num_inference_steps</code></td><td>int</td><td><span class="badge badge-optional">否</span></td>
@@ -754,12 +782,50 @@ Content-Type: application/json</code></pre>
                         <td>推理精度。</td>
                     </tr>
                     <tr>
+                        <td><code>enable_teacache</code></td><td>bool</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>true（默认）</code></td>
+                        <td>是否启用 TeaCache。启用后会复用变化较小的扩散步骤计算结果，以降低推理耗时。</td>
+                    </tr>
+                    <tr>
+                        <td><code>teacache_thresh</code></td><td>float</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>0.3（默认）</code></td>
+                        <td>TeaCache 累积相对 L1 距离阈值。阈值越大，通常缓存命中和加速机会越多，但画面质量变化风险也会增加；降低该值会更保守。</td>
+                    </tr>
+                    <tr>
+                        <td><code>teacache_start_skipping</code></td><td>int | float</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>5（默认）</code></td>
+                        <td>允许 TeaCache 跳过计算的起始位置。整数表示先完整计算的步数；0 到 1 的浮点数表示总采样步数比例。默认先完整计算前 5 步。</td>
+                    </tr>
+                    <tr>
+                        <td><code>teacache_end_skipping</code></td><td>int | float</td><td><span class="badge badge-optional">否</span></td>
+                        <td><code>1.0（默认）</code></td>
+                        <td>停止允许 TeaCache 跳过计算的位置。整数表示采样步索引，负整数表示从末尾倒数；0 到 1 的浮点数表示总采样步数比例。默认 <code>1.0</code> 表示允许区间延续到全部采样步骤的末端。</td>
+                    </tr>
+                    <tr>
                         <td><code>enable_paste_back</code></td><td>bool</td><td><span class="badge badge-optional">否</span></td>
                         <td><code>true</code></td>
                         <td>启用修复区域回贴到原视频。</td>
                     </tr>
                 </tbody>
             </table>
+
+            <h4>Mask 扩展与回贴说明</h4>
+            <div class="callout callout-info">
+                <div class="callout-title"><code>dilate_px</code>、<code>mask_scale</code> 和 <code>feather_px</code> 的作用阶段不同</div>
+                mask 预处理顺序为：先按阈值二值化，再应用 <code>dilate_px</code> 膨胀，最后应用 <code>mask_scale</code> 缩放。处理后的 mask 会用于模型编辑，也会在启用回贴时限定生成区域。<code>feather_px</code> 仅在最后回贴阶段平滑生成区域与原视频的边界。默认配置 <code>dilate_px=0</code>、<code>mask_scale=1.0</code>、<code>feather_px=0</code> 不额外扩大 mask，也不进行边缘羽化。参考帧的 mask 仍会被强制设为不可编辑。
+            </div>
+
+            <h4>BBox 外扩说明</h4>
+            <div class="callout callout-info">
+                <div class="callout-title"><code>bbox_expand_scale</code> 控制模型可见的修复上下文</div>
+                服务先根据所有 mask 计算联合 bbox，再按该参数向四周扩展裁剪范围。默认值 <code>0.3</code> 在不触碰画面边界时，会使宽度和高度理论上分别扩大到原 bbox 的 <code>1.6</code> 倍。值过小可能缺少目标周边上下文；值过大会让模型处理更多无关区域，并增加显存和计算开销。设置为 <code>0</code> 可关闭这一步比例外扩，但小目标仍可能触发服务端的小区域自适应扩展。
+            </div>
+
+            <h4>TeaCache 说明</h4>
+            <div class="callout callout-info">
+                <div class="callout-title">TeaCache 默认开启，用于减少重复的扩散计算</div>
+                默认配置为 <code>enable_teacache=true</code>、<code>teacache_thresh=0.3</code>、<code>teacache_start_skipping=5</code>、<code>teacache_end_skipping=1.0</code>。如更重视结果稳定性，可关闭 TeaCache，或适当降低 <code>teacache_thresh</code>；如更重视速度，可在验证画质后提高阈值。
+            </div>
 
             <h4>字段别名</h4>
             <p>接口支持当前请求中的驼峰字段名，并在服务端转换为内部 snake_case 字段。</p>
@@ -773,6 +839,10 @@ Content-Type: application/json</code></pre>
                     <tr><td><code>videoUrl</code></td><td><code>video_url</code></td></tr>
                     <tr><td><code>maskUrl</code></td><td><code>mask_url</code></td></tr>
                     <tr><td><code>referenceImageUrl</code></td><td><code>reference_image_url</code></td></tr>
+                    <tr><td><code>bboxExpandScale</code></td><td><code>bbox_expand_scale</code></td></tr>
+                    <tr><td><code>teacacheThresh</code></td><td><code>teacache_thresh</code></td></tr>
+                    <tr><td><code>teacacheStartSkipping</code></td><td><code>teacache_start_skipping</code></td></tr>
+                    <tr><td><code>teacacheEndSkipping</code></td><td><code>teacache_end_skipping</code></td></tr>
                     <tr><td><code>minioConfig</code></td><td><code>minio_config</code></td></tr>
                     <tr><td><code>outputObjectKey</code></td><td><code>output_object_key</code></td></tr>
                 </tbody>
