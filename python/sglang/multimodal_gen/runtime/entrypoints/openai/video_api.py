@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -78,6 +79,9 @@ _VIDEOEDIT_SEMAPHORE = asyncio.Semaphore(_VIDEOEDIT_QUEUE_CAPACITY)
 _VIDEOEDIT_CALLBACK_PROGRESS_INTERVAL_SECONDS = max(
     1.0, float(os.environ.get("VIDEOEDIT_CALLBACK_PROGRESS_INTERVAL_SECONDS", "5"))
 )
+_VIDEO_TASKS: dict[str, asyncio.Task] = {}
+_VIDEO_TASKS_LOCK = asyncio.Lock()
+_VIDEO_CANCEL_DIR = os.path.join(tempfile.gettempdir(), "sglang_video_cancel")
 
 CallbackPayloadBuilder = Callable[[str, Dict[str, Any]], Dict[str, Any]]
 
@@ -108,6 +112,60 @@ _VIDEO_REPAIR_MINIO_FIELD_ALIASES = {
     "accessKey": "access_key",
     "secretKey": "secret_key",
 }
+
+
+def _video_cancel_path(video_id: str) -> str:
+    digest = hashlib.sha256(video_id.encode("utf-8")).hexdigest()
+    return os.path.join(_VIDEO_CANCEL_DIR, f"{digest}.cancel")
+
+
+def _write_video_cancel_marker(cancel_path: str | None) -> None:
+    if not cancel_path:
+        return
+    os.makedirs(os.path.dirname(cancel_path), exist_ok=True)
+    tmp_path = f"{cancel_path}.{os.getpid()}.tmp"
+    with open(tmp_path, "w") as f:
+        f.write(str(time.time()))
+    os.replace(tmp_path, cancel_path)
+
+
+def _clear_video_cancel_marker(cancel_path: str | None) -> None:
+    if not cancel_path:
+        return
+    try:
+        os.unlink(cancel_path)
+    except FileNotFoundError:
+        pass
+
+
+async def _run_registered_video_task(job_id: str, task_func, *args, **kwargs) -> None:
+    try:
+        await task_func(*args, **kwargs)
+    finally:
+        current_task = asyncio.current_task()
+        async with _VIDEO_TASKS_LOCK:
+            if _VIDEO_TASKS.get(job_id) is current_task:
+                _VIDEO_TASKS.pop(job_id, None)
+
+
+async def _create_registered_video_task(
+    job_id: str, task_func, *args, **kwargs
+) -> asyncio.Task:
+    task = asyncio.create_task(
+        _run_registered_video_task(job_id, task_func, *args, **kwargs)
+    )
+    async with _VIDEO_TASKS_LOCK:
+        _VIDEO_TASKS[job_id] = task
+    return task
+
+
+async def _cancel_registered_video_task(job_id: str) -> bool:
+    async with _VIDEO_TASKS_LOCK:
+        task = _VIDEO_TASKS.get(job_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
 
 
 def _video_repair_submit_response(code: int, message: str) -> Dict[str, Any]:
@@ -351,7 +409,12 @@ def _validate_video_repair_request(req: VideoRepairRequest) -> None:
             raise ValueError("minioConfig is required for S3 output")
 
 
-def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
+def _build_video_sampling_params(
+    request_id: str,
+    request: VideoGenerationsRequest,
+    *,
+    request_cancel_path: str | None = None,
+):
     """Resolve video-specific defaults (fps, seconds → num_frames) then
     delegate to the shared build_sampling_params."""
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
@@ -386,6 +449,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_compression=request.output_compression,
         output_quality=request.output_quality,
         perf_dump_path=request.perf_dump_path,
+        request_cancel_path=request_cancel_path,
     )
 
 
@@ -406,6 +470,7 @@ def _video_job_from_sampling(
         "seconds": str(seconds),
         "quality": "standard",
         "file_path": os.path.abspath(sampling.output_file_path()),
+        "request_cancel_path": sampling.request_cancel_path,
     }
 
 
@@ -662,6 +727,39 @@ def _current_video_progress(job: Dict[str, Any]) -> int:
     return int(progress)
 
 
+async def _mark_video_job_cancelled(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
+    cancel_path = job.get("request_cancel_path") or _video_cancel_path(job_id)
+    _write_video_cancel_marker(cancel_path)
+
+    progress = _current_video_progress(job)
+    updates = {
+        "status": "failed",
+        "progress": progress,
+        "error": {"message": TASK_TIMEOUT_MESSAGE},
+        "reason": TASK_TIMEOUT_MESSAGE,
+        "request_cancel_path": cancel_path,
+        "cancelled_at": int(time.time()),
+    }
+    await VIDEO_STORE.update_fields(job_id, updates)
+    await _cancel_registered_video_task(job_id)
+
+    updated_job = await VIDEO_STORE.get(job_id)
+    if updated_job is None:
+        updated_job = dict(job)
+        updated_job.update(updates)
+
+    callback_url = updated_job.get("callback_url")
+    if callback_url:
+        asyncio.create_task(
+            _post_video_callback(
+                job_id,
+                callback_url,
+                _build_video_repair_callback_payload(job_id, updated_job),
+            )
+        )
+    return updated_job
+
+
 def _video_repair_job_from_sampling(
     request_id: str, req: VideoRepairRequest, sampling: SamplingParams
 ) -> Dict[str, Any]:
@@ -682,6 +780,7 @@ def _video_repair_job_from_sampling(
         "timeout": req.timeout,
         "output_object_key": req.output_object_key,
         "reason": None,
+        "request_cancel_path": sampling.request_cancel_path,
     }
 
 
@@ -741,6 +840,28 @@ async def _dispatch_video_repair_job_async(
                     _build_video_repair_callback_payload(job_id, job),
                 )
             )
+    except asyncio.CancelledError:
+        existing_job = await VIDEO_STORE.get(job_id)
+        if existing_job and not _job_is_task_timeout(existing_job):
+            progress = _current_video_progress(existing_job)
+            await VIDEO_STORE.update_fields(
+                job_id,
+                {
+                    "status": "failed",
+                    "progress": progress,
+                    "error": {"message": TASK_TIMEOUT_MESSAGE},
+                    "reason": TASK_TIMEOUT_MESSAGE,
+                },
+            )
+            job = await VIDEO_STORE.get(job_id)
+            if job and callback_url:
+                asyncio.create_task(
+                    _post_video_callback(
+                        job_id,
+                        callback_url,
+                        _build_video_repair_callback_payload(job_id, job),
+                    )
+                )
     finally:
         if progress_callback_task is not None:
             progress_callback_task.cancel()
@@ -783,6 +904,8 @@ async def create_video_repair(request: Request):
     server_args = get_global_server_args()
     request_id = req.task_id or generate_request_id()
     timeout_deadline = request_timeout_deadline(req.timeout)
+    request_cancel_path = _video_cancel_path(request_id)
+    _clear_video_cancel_marker(request_cancel_path)
     temp_dirs: list[str] = []
 
     try:
@@ -865,6 +988,7 @@ async def create_video_repair(request: Request):
             server_args,
             request_id=request_id,
             request_timeout_deadline=timeout_deadline,
+            request_cancel_path=request_cancel_path,
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             video_input_path=video_input_path,
@@ -943,18 +1067,18 @@ async def create_video_repair(request: Request):
         batch = prepare_request(
             server_args=server_args, sampling_params=sampling_params
         )
-        asyncio.create_task(
-            _dispatch_video_repair_job_async(
-                request_id,
-                batch,
-                temp_dirs=temp_dirs or None,
-                output_persistent=output_persistent,
-                callback_url=req.callback_url,
-                request_storage=request_storage,
-                output_object_key=output_object_key,
-                output_bucket=req.output_bucket,
-                timeout_deadline=timeout_deadline,
-            )
+        await _create_registered_video_task(
+            request_id,
+            _dispatch_video_repair_job_async,
+            request_id,
+            batch,
+            temp_dirs=temp_dirs or None,
+            output_persistent=output_persistent,
+            callback_url=req.callback_url,
+            request_storage=request_storage,
+            output_object_key=output_object_key,
+            output_bucket=req.output_bucket,
+            timeout_deadline=timeout_deadline,
         )
         return _video_repair_submit_response(0, "ok")
     except Exception as e:
@@ -1003,6 +1127,8 @@ async def create_video(
 ):
     content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
+    request_cancel_path = _video_cancel_path(request_id)
+    _clear_video_cancel_marker(request_cancel_path)
 
     server_args = get_global_server_args()
     task_type = server_args.pipeline_config.task_type
@@ -1136,7 +1262,11 @@ async def create_video(
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
     try:
-        sampling_params = _build_video_sampling_params(request_id, req)
+        sampling_params = _build_video_sampling_params(
+            request_id,
+            req,
+            request_cancel_path=request_cancel_path,
+        )
     except (ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1152,13 +1282,13 @@ async def create_video(
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(
-        _dispatch_job_async(
-            request_id,
-            batch,
-            temp_dirs=temp_dirs or None,
-            output_persistent=output_persistent,
-        )
+    await _create_registered_video_task(
+        request_id,
+        _dispatch_job_async,
+        request_id,
+        batch,
+        temp_dirs=temp_dirs or None,
+        output_persistent=output_persistent,
     )
     return VideoResponse(**job)
 
@@ -1227,15 +1357,18 @@ async def retrieve_video_progress(video_id: str = Path(...)):
     }
 
 
-# TODO: support aborting a job.
 @router.delete("/{video_id}", response_model=VideoResponse)
 async def delete_video(video_id: str = Path(...)):
-    job = await VIDEO_STORE.pop(video_id)
+    job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    # Mark as deleted in response semantics
-    job["status"] = "deleted"
-    return VideoResponse(**job)
+    if job.get("status") not in {"completed", "failed"}:
+        job = await _mark_video_job_cancelled(video_id, job)
+
+    response_job = dict(job)
+    response_job["progress"] = _current_video_progress(response_job)
+    response_job["reason"] = _job_reason(response_job)
+    return VideoResponse(**response_job)
 
 
 @router.get("/{video_id}/content")
