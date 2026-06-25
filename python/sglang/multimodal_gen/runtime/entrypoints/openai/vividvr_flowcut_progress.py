@@ -12,18 +12,19 @@ VividVRFlowCutStage = Literal[
     "accepted",
     "input_ready",
     "caption_ready",
-    "editing",
     "uploading_result",
     "succeeded",
     "failed",
 ]
 
+FLOWCUT_DENOISE_START_PROGRESS = 5.0
+FLOWCUT_DENOISE_END_PROGRESS = 95.0
+
 FLOWCUT_STAGE_PROGRESS: dict[str, float] = {
     "accepted": 1.0,
-    "input_ready": 10.0,
-    "caption_ready": 20.0,
-    "editing": 60.0,
-    "uploading_result": 90.0,
+    "input_ready": 3.0,
+    "caption_ready": FLOWCUT_DENOISE_START_PROGRESS,
+    "uploading_result": 98.0,
     "succeeded": 100.0,
 }
 
@@ -31,7 +32,7 @@ FLOWCUT_STAGE_REASONS: dict[str, str] = {
     "accepted": "accepted",
     "input_ready": "input_ready",
     "caption_ready": "caption_ready",
-    "editing": "editing",
+    "denoising": "denoising",
     "uploading_result": "uploading_result",
     "succeeded": "succeeded",
 }
@@ -40,6 +41,12 @@ PostFlowCutCallback = Callable[
     [str, dict[str, Any]],
     Awaitable[None],
 ]
+
+
+def flowcut_denoise_progress(runtime_progress: float) -> float:
+    clamped = min(max(float(runtime_progress), 0.0), 1.0)
+    span = FLOWCUT_DENOISE_END_PROGRESS - FLOWCUT_DENOISE_START_PROGRESS
+    return round(FLOWCUT_DENOISE_START_PROGRESS + clamped * span, 4)
 
 
 class VividVRFlowCutProgressReporter:
@@ -56,6 +63,11 @@ class VividVRFlowCutProgressReporter:
         self.callback_url = callback_url
         self._post_callback = post_callback
         self._last_progress = 0.0
+        self._last_denoise_progress: float | None = None
+
+    @property
+    def last_progress(self) -> float:
+        return self._last_progress
 
     async def send_stage(self, stage: VividVRFlowCutStage) -> None:
         if stage not in FLOWCUT_STAGE_PROGRESS or stage == "succeeded":
@@ -68,6 +80,24 @@ class VividVRFlowCutProgressReporter:
         ).model_dump()
         self._last_progress = progress
         await self._post_callback(self.callback_url, payload)
+
+    async def send_denoise_progress(
+        self,
+        runtime_progress: float,
+    ) -> bool:
+        progress = flowcut_denoise_progress(runtime_progress)
+        if self._last_denoise_progress is not None:
+            if progress <= self._last_denoise_progress:
+                return False
+
+        payload = VividVRFlowCutCallbackPayload.running(
+            progress=progress,
+            reason=FLOWCUT_STAGE_REASONS["denoising"],
+        ).model_dump()
+        self._last_progress = progress
+        self._last_denoise_progress = progress
+        await self._post_callback(self.callback_url, payload)
+        return True
 
     async def send_succeeded(
         self,

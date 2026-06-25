@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import cv2
 import torch
 
 
@@ -75,6 +76,32 @@ def _slice_start_stop(tile_slice: list[slice], dim: int) -> tuple[int, int]:
     if value.start is None or value.stop is None:
         raise ValueError(f"caption tile slice for dim={dim} is not bounded")
     return int(value.start), int(value.stop)
+
+
+def probe_vividvr_caption_video_metadata(video_path: str) -> dict[str, float | int]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video file: {video_path}")
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    finally:
+        cap.release()
+
+    if num_frames <= 0 or width <= 0 or height <= 0:
+        raise ValueError(
+            "Could not probe VividVR caption video metadata: "
+            f"path={video_path} num_frames={num_frames} width={width} height={height}"
+        )
+
+    return {
+        "fps": fps,
+        "num_frames": num_frames,
+        "height": height,
+        "width": width,
+    }
 
 
 def build_vividvr_caption_manifest_from_video_info(
@@ -172,20 +199,13 @@ def build_vividvr_caption_manifest_for_video_path(
     tile_size: int,
     tile_stride: int,
 ) -> VividVRCaptionManifest:
-    from sglang.multimodal_gen.runtime.vividvr.preprocess import (
-        load_control_video_frames,
-    )
-
-    frames, fps = load_control_video_frames(video_path)
-    if not frames:
-        raise ValueError(f"No frames found in video file: {video_path}")
-    first_frame = frames[0]
+    video_info = probe_vividvr_caption_video_metadata(video_path)
     return build_vividvr_caption_manifest_from_video_info(
         video_path=video_path,
-        fps=fps,
-        num_frames=len(frames),
-        height=int(first_frame.height),
-        width=int(first_frame.width),
+        fps=float(video_info["fps"]),
+        num_frames=int(video_info["num_frames"]),
+        height=int(video_info["height"]),
+        width=int(video_info["width"]),
         num_temporal_process_frames=num_temporal_process_frames,
         tile_size=tile_size,
         tile_stride=tile_stride,

@@ -7,7 +7,8 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
+from sglang.multimodal_gen.runtime.entrypoints import http_server
+from sglang.multimodal_gen.runtime.entrypoints.openai import video_repair_shared
 from sglang.multimodal_gen.runtime.entrypoints.openai import vividvr_flowcut_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import VideoRepairRequest
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
@@ -34,6 +35,19 @@ def _make_vivid_server_args(tmp_path, *, prompt_file=None, **overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_create_app_registers_flowcut_route_from_dedicated_router(tmp_path):
+    app = http_server.create_app(_make_vivid_server_args(tmp_path))
+
+    flowcut_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/videos/repairs/flowcut"
+    ]
+
+    assert len(flowcut_routes) == 1
+    assert flowcut_routes[0].endpoint.__module__.endswith("vividvr_flowcut_api")
 
 
 def _patch_sampling(monkeypatch, tmp_path, *, captured_kwargs=None):
@@ -75,7 +89,7 @@ def test_build_vividvr_kwargs_keeps_phase_e_defaults_optional(tmp_path):
         seed=42,
     )
 
-    kwargs = video_api._build_vividvr_repair_kwargs(
+    kwargs = video_repair_shared.build_vividvr_repair_kwargs(
         request_id="job-1",
         req=req,
         server_args=server_args,
@@ -102,7 +116,7 @@ def test_flowcut_endpoint_returns_code_2_when_queue_full(monkeypatch, tmp_path):
         async def acquire(self):
             raise AssertionError("busy request must not acquire semaphore")
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", LockedSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", LockedSemaphore())
     monkeypatch.setattr(
         vividvr_flowcut_api,
         "get_global_server_args",
@@ -132,7 +146,7 @@ def test_flowcut_endpoint_returns_code_1_for_missing_input(monkeypatch):
         async def acquire(self):
             raise AssertionError("should not acquire semaphore for invalid request")
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
     client = _make_test_client()
 
     response = client.post(
@@ -157,7 +171,7 @@ def test_flowcut_endpoint_returns_code_1_for_invalid_json(monkeypatch):
         async def acquire(self):
             raise AssertionError("should not acquire semaphore for invalid request")
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
     client = _make_test_client()
 
     response = client.post(
@@ -189,7 +203,7 @@ def test_flowcut_endpoint_rejects_non_vivid_pipeline_without_dispatch(
         def release(self):
             acquired["value"] = False
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
     monkeypatch.setattr(
         vividvr_flowcut_api,
         "get_global_server_args",
@@ -241,7 +255,7 @@ def test_flowcut_endpoint_accepts_and_schedules_background_job(monkeypatch, tmp_
         def release(self):
             acquired["value"] = False
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
     monkeypatch.setattr(
         vividvr_flowcut_api,
         "get_global_server_args",
@@ -294,7 +308,7 @@ def test_flowcut_endpoint_generates_caption_when_bridge_enabled(monkeypatch, tmp
         def release(self):
             pass
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
     monkeypatch.setattr(
         vividvr_flowcut_api,
         "get_global_server_args",
@@ -313,8 +327,8 @@ def test_flowcut_endpoint_generates_caption_when_bridge_enabled(monkeypatch, tmp
         return str(caption_path)
 
     monkeypatch.setattr(
-        vividvr_flowcut_api,
-        "_ensure_vividvr_caption_file",
+        video_repair_shared,
+        "ensure_vividvr_caption_file",
         fake_ensure_caption_file,
     )
 
@@ -359,7 +373,7 @@ def test_flowcut_endpoint_logs_accepted_task(monkeypatch, tmp_path, caplog):
         def release(self):
             pass
 
-    monkeypatch.setattr(vividvr_flowcut_api, "_VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
     monkeypatch.setattr(
         vividvr_flowcut_api,
         "get_global_server_args",
@@ -424,8 +438,8 @@ def test_dispatch_vividvr_flowcut_job_posts_stage_and_final_callbacks(
         fake_run_video_generation_job,
     )
     monkeypatch.setattr(
-        vividvr_flowcut_api,
-        "_VIDEOEDIT_SEMAPHORE",
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
         ReleaseTrackingSemaphore(),
     )
     storage = vividvr_flowcut_api.VividVRFlowCutStorage(
@@ -451,11 +465,9 @@ def test_dispatch_vividvr_flowcut_job_posts_stage_and_final_callbacks(
 
     assert [callback["status"] for callback in callbacks] == [
         "running",
-        "running",
         "succeeded",
     ]
     assert [callback["reason"] for callback in callbacks] == [
-        "editing",
         "uploading_result",
         "succeeded",
     ]
@@ -467,7 +479,101 @@ def test_dispatch_vividvr_flowcut_job_posts_stage_and_final_callbacks(
     assert set(final_output) == {"result_url", "duration"}
     assert "file_path" not in final_output
     assert "gen_video_url" not in final_output
-    assert vividvr_flowcut_api._VIDEOEDIT_SEMAPHORE.released is True
+    assert video_repair_shared.VIDEOEDIT_SEMAPHORE.released is True
+
+
+def test_monitor_vividvr_denoise_progress_posts_runtime_progress(tmp_path):
+    callbacks = []
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        callbacks.append(payload)
+
+    reporter = vividvr_flowcut_api.VividVRFlowCutProgressReporter(
+        task_id="task-denoise",
+        callback_url="http://127.0.0.1:9000/callback",
+        post_callback=fake_post_flowcut_callback,
+    )
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(runtime_progress=None),
+    )
+
+    async def fake_generation():
+        for progress in (0.10, 0.50, 1.0):
+            batch.sampling_params.runtime_progress = progress
+            await asyncio.sleep(0.01)
+        return SimpleNamespace(save_file_path=str(tmp_path / "out.mp4"))
+
+    async def run_test():
+        await vividvr_flowcut_api.VIDEO_STORE.upsert(
+            "task-denoise",
+            {"id": "task-denoise", "status": "queued", "progress": 0},
+        )
+        generation_task = asyncio.create_task(fake_generation())
+        await vividvr_flowcut_api._monitor_vividvr_denoise_progress(
+            "task-denoise",
+            batch,
+            reporter,
+            generation_task,
+            poll_interval_s=0.001,
+        )
+        await generation_task
+
+    asyncio.run(run_test())
+
+    assert [callback["reason"] for callback in callbacks] == [
+        "denoising",
+        "denoising",
+        "denoising",
+    ]
+    assert [callback["progress"] for callback in callbacks] == [14.0, 50.0, 95.0]
+
+
+def test_monitor_vividvr_denoise_progress_reads_progress_file(tmp_path):
+    callbacks = []
+    progress_path = tmp_path / "runtime_progress.json"
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        callbacks.append(payload)
+
+    reporter = vividvr_flowcut_api.VividVRFlowCutProgressReporter(
+        task_id="task-denoise-file",
+        callback_url="http://127.0.0.1:9000/callback",
+        post_callback=fake_post_flowcut_callback,
+    )
+    batch = SimpleNamespace(sampling_params=SimpleNamespace(runtime_progress=None))
+
+    async def fake_generation():
+        for progress in (0.10, 0.50, 1.0):
+            progress_path.write_text(
+                json.dumps({"runtime_progress": progress}),
+                encoding="utf-8",
+            )
+            await asyncio.sleep(0.01)
+
+    async def run_test():
+        await vividvr_flowcut_api.VIDEO_STORE.upsert(
+            "task-denoise-file",
+            {"id": "task-denoise-file", "status": "queued", "progress": 0},
+        )
+        generation_task = asyncio.create_task(fake_generation())
+        await vividvr_flowcut_api._monitor_vividvr_denoise_progress(
+            "task-denoise-file",
+            batch,
+            reporter,
+            generation_task,
+            progress_path=str(progress_path),
+            poll_interval_s=0.001,
+        )
+        await generation_task
+
+    asyncio.run(run_test())
+
+    assert [callback["reason"] for callback in callbacks] == [
+        "denoising",
+        "denoising",
+        "denoising",
+    ]
+    assert [callback["progress"] for callback in callbacks] == [14.0, 50.0, 95.0]
 
 
 def test_dispatch_vividvr_flowcut_job_uses_minio_and_deletes_local_output(
@@ -512,8 +618,8 @@ def test_dispatch_vividvr_flowcut_job_uses_minio_and_deletes_local_output(
             pass
 
     monkeypatch.setattr(
-        vividvr_flowcut_api,
-        "_VIDEOEDIT_SEMAPHORE",
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
         ReleaseTrackingSemaphore(),
     )
 
@@ -582,8 +688,8 @@ def test_dispatch_vividvr_flowcut_job_posts_failed_callback_and_keeps_local_outp
             pass
 
     monkeypatch.setattr(
-        vividvr_flowcut_api,
-        "_VIDEOEDIT_SEMAPHORE",
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
         ReleaseTrackingSemaphore(),
     )
 
@@ -606,8 +712,84 @@ def test_dispatch_vividvr_flowcut_job_posts_failed_callback_and_keeps_local_outp
 
     assert callbacks[-1] == {
         "status": "failed",
-        "progress": 90.0,
+        "progress": 98.0,
         "reason": "upload failed",
         "output": "",
     }
     assert output_path.exists()
+
+
+def test_dispatch_vividvr_flowcut_timeout_keeps_semaphore_until_generation_finishes(
+    monkeypatch, tmp_path
+):
+    callbacks = []
+    release_events = []
+    generation_started = asyncio.Event()
+    generation_can_finish = asyncio.Event()
+    failed_callback_seen = asyncio.Event()
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        callbacks.append(payload)
+        if payload["status"] == "failed":
+            failed_callback_seen.set()
+
+    async def fake_run_video_generation_job(batch):
+        generation_started.set()
+        await generation_can_finish.wait()
+        return SimpleNamespace(
+            save_file_path=str(tmp_path / "late-result.mp4"),
+            result=SimpleNamespace(inference_time_s=10.0),
+        )
+
+    class ReleaseTrackingSemaphore:
+        def release(self):
+            release_events.append("released")
+
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "post_flowcut_callback",
+        fake_post_flowcut_callback,
+    )
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "run_video_generation_job",
+        fake_run_video_generation_job,
+    )
+    monkeypatch.setattr(
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
+        ReleaseTrackingSemaphore(),
+    )
+    storage = vividvr_flowcut_api.VividVRFlowCutStorage(
+        base_dir=tmp_path,
+        request_id="task-timeout",
+    )
+
+    async def run_test():
+        await vividvr_flowcut_api.VIDEO_STORE.upsert(
+            "task-timeout",
+            {"id": "task-timeout", "status": "queued", "progress": 0},
+        )
+        task = asyncio.create_task(
+            vividvr_flowcut_api._dispatch_vividvr_flowcut_video_repair_job_async(
+                "task-timeout",
+                batch="prepared",
+                callback_url="http://127.0.0.1:9000/callback",
+                storage=storage,
+                timeout=0.01,
+            )
+        )
+        await asyncio.wait_for(generation_started.wait(), timeout=1.0)
+        await asyncio.wait_for(failed_callback_seen.wait(), timeout=1.0)
+        assert release_events == []
+        generation_can_finish.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run_test())
+
+    failed_callbacks = [
+        callback for callback in callbacks if callback["status"] == "failed"
+    ]
+    assert len(failed_callbacks) == 1
+    assert "timed out" in failed_callbacks[0]["reason"].lower()
+    assert release_events == ["released"]

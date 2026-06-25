@@ -29,7 +29,7 @@
 - 当前 caption bridge 的 sidecar 文本契约是：`caption.txt` 一行对应一个 temporal clip，行数、顺序和文本内容都必须与单卡基线逐字一致。
 - 单卡正式 benchmark 时同一时刻只能有一个单卡推理进程，避免并发导致耗时失真。
 - 如果是 `serve` benchmark，必须先做一次 warmup，再记录第二次正式请求；warmup 不计入正式结果。
-- 本文默认 `serve` 命令使用 `--host 127.0.0.1`，只允许本机访问；如果要让其他服务器请求当前机器上的 Vivid-VR 服务，需要按“对外暴露端口”章节改为 `--host 0.0.0.0` 或指定网卡 IP。
+- 本文默认 `serve` 命令使用 `--host 0.0.0.0`，方便其他服务器直接请求当前机器上的 Vivid-VR 服务；如果只希望本机访问，可按“对外暴露端口”章节改回 `--host 127.0.0.1` 或指定网卡 IP。
 
 ## 1. 单卡直接运行命令
 
@@ -99,29 +99,51 @@ tmux new-session -d -s vividvr_dual_default \
 tmux attach -r -t vividvr_dual_default
 ```
 
-## 3. 单卡 `serve` 拉起命令
+## 3. 当前推荐的 `serve` 启动顺序
 
-先启动 caption sidecar：
+当前正式推荐的服务形态是：
+
+- caption sidecar：独立 HTTP 服务，运行在 `/home/zhiheng/sglang/.venv-vividvr-caption`
+- 主服务：`sglang serve`，运行在 `/home/zhiheng/sglang/.venv`
+- 当前默认正式配置：双卡 `dual_gpu_fa_eager_compile`
+- 默认端口：
+  - caption sidecar：`31200`
+  - 单卡主服务：`31190`
+  - 双卡主服务：`31191`
+
+当前 bridge 路径的关键约束：
+
+- 主服务必须显式打开 `--vividvr-caption-bridge`
+- 主服务必须显式传 `--vividvr-caption-sidecar-url http://127.0.0.1:31200`
+- sidecar 输出目录固定为 `/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars`
+- 自动 bridge 请求默认不传 `caption_file_path`
+- Vivid-VR 服务请求统一走 `POST /v1/videos/repairs/flowcut`；共享 `POST /v1/videos/repairs` 在 Vivid server 下会拒绝并提示使用专用路由
+- FlowCut 提交响应只返回 `{"code": 0|1|2, "message": "..."}`；`code=0` 只表示已接单，真正生成继续在后端执行，不能只看首个 HTTP 返回
+- 成功 callback 的 `output` 只允许包含 `result_url` 和可选 `duration`，不能返回 `gen_video_url` 或 `file_path`
+
+### 3.1 首次使用时创建 caption env
+
+这一步通常只需要做一次：
+
+```bash
+cd /home/zhiheng/sglang
+bash python/sglang/multimodal_gen/tools/setup_vividvr_caption_env.sh
+```
+
+成功后，caption sidecar 独立环境应位于：
+
+```bash
+/home/zhiheng/sglang/.venv-vividvr-caption
+```
+
+### 3.2 启动 caption sidecar
+
+当前正式验收使用的是 dual-worker sidecar，两个 worker 分别绑定 `cuda:0` 和 `cuda:1`：
 
 ```bash
 tmux new-session -d -s vividvr_caption_sidecar \
   'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
-
-当前默认 sidecar 口径：
-
-- sidecar 运行环境固定为 `/home/zhiheng/sglang/.venv-vividvr-caption`。
-- 这是给当前双卡 `dual_gpu_fa_eager_compile` + caption bridge 验收配套的 dual-worker 配置，2 个 caption worker 分别绑定 `cuda:0` 和 `cuda:1`。
-- sidecar 服务入口仍然是 `python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py`，主服务继续通过 `--vividvr-caption-bridge --vividvr-caption-sidecar-url http://127.0.0.1:31200 --vividvr-caption-work-dir ...` 消费 sidecar 输出。
-- sidecar 生成的 `caption.txt` 必须保持一行对应一个 temporal clip，并与单卡基线逐字一致；如果 benchmark 脚本比对失败，不要继续做正式 `serve` 验收。
-
-如果 sidecar 日志里出现：
-
-```text
-[VividVR Caption Sidecar] python_include=...
-```
-
-说明它已经找到可用的 Python dev headers，可以继续执行 CogVLM2 caption。若只看到 warning 而没有 `python_include=...`，通常要先准备上面提到的已解压 Python 3.10 headers 目录。
 
 查看 sidecar：
 
@@ -129,81 +151,23 @@ tmux new-session -d -s vividvr_caption_sidecar \
 tmux attach -r -t vividvr_caption_sidecar
 ```
 
-再启动主服务：
+检查 sidecar 健康：
 
 ```bash
-tmux new-session -d -s vividvr_serve_single_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
-    --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
-    --model-id VividVR \
-    --pipeline-class-name CogVideoXVividVRControlNetPipeline \
-    --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
-    --attention-backend fa \
-    --num-gpus 1 \
-    --tp-size 1 \
-    --sp-degree 1 \
-    --ulysses-degree 1 \
-    --ring-degree 1 \
-    --enable-torch-compile \
-    --dist-timeout 3600 \
-    --host 127.0.0.1 \
-    --port 31190 \
-    --master-port 30190 \
-    --scheduler-port 56190 \
-    --strict-ports \
-    --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
-    --vividvr-caption-bridge \
-    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
-    --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
-    --vividvr-caption-sidecar-timeout 1800 \
-    2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_single_default_$(date -u +%Y%m%dT%H%M%SZ).log'
+curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
 ```
 
-查看进度：
+如果 sidecar 日志里出现：
 
-```bash
-tmux attach -r -t vividvr_serve_single_default
+```text
+[VividVR Caption Sidecar] python_include=...
 ```
 
-## 4. 双卡 `serve` 拉起命令
+说明它已经找到可用的 Python dev headers，可以继续执行 caption。
 
-正式双卡 `serve` 默认配置固定为 `dual_gpu_fa_eager_compile`，也就是 `FA + SP=2 + eager_global + control_pool_size=1 + compile`。在 bridge 模式下，先保证上面的 dual-worker sidecar 已就绪，再启动下面这条主服务命令。
+### 3.3 启动双卡主服务
 
-```bash
-tmux new-session -d -s vividvr_serve_dual_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
-    --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
-    --model-id VividVR \
-    --pipeline-class-name CogVideoXVividVRControlNetPipeline \
-    --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
-    --attention-backend fa \
-    --num-gpus 2 \
-    --tp-size 1 \
-    --sp-degree 2 \
-    --ulysses-degree 2 \
-    --ring-degree 1 \
-    --enable-torch-compile \
-    --dist-timeout 3600 \
-    --host 127.0.0.1 \
-    --port 31191 \
-    --master-port 30191 \
-    --scheduler-port 56191 \
-    --strict-ports \
-    --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
-    --vividvr-caption-bridge \
-    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
-    --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
-    --vividvr-caption-sidecar-timeout 1800 \
-    2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_dual_default_$(date -u +%Y%m%dT%H%M%SZ).log'
-```
-
-bridge 验收要点：
-
-- `--vividvr-caption-bridge`、`--vividvr-caption-sidecar-url http://127.0.0.1:31200` 和 `--vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars` 是当前正式双卡 `serve` 口径的一部分，不要省略。
-- `caption.txt` 必须按 temporal clip 对齐；对当前 `130f` 输入，sidecar 输出应与基线 clip 切分一致。
-- 如果需要先做独立 caption 预检，使用 `docs_xzh/run_vivid_benchmark.md` 里的 caption sidecar benchmark 命令，再做正式 `serve` benchmark。
+这是当前正式默认口径：
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_default \
@@ -234,195 +198,215 @@ tmux new-session -d -s vividvr_serve_dual_default \
     2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_dual_default_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
-查看进度：
+查看主服务：
 
 ```bash
 tmux attach -r -t vividvr_serve_dual_default
 ```
 
-## 5. 对外暴露端口
-
-当前 `sglang.multimodal_gen` 的服务端支持通过 `--host` 控制 HTTP API 监听地址：
-
-- `--host 127.0.0.1`：只监听本机 loopback，只有当前机器能用 `http://127.0.0.1:<port>` 访问。
-- `--host 0.0.0.0`：监听全部 IPv4 网卡，局域网或其他服务器可以通过当前机器的真实 IP 访问。
-- `--host <SERVER_LAN_IP>`：只监听指定网卡 IP，适合需要限制暴露范围的部署。
-
-如果要让其他服务器调用单卡服务，把第 3 节命令中的：
+检查主服务健康：
 
 ```bash
---host 127.0.0.1 \
---port 31190 \
+curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31191/health
 ```
 
-改为：
+### 3.4 单卡主服务命令
+
+如果只需要单卡 `serve`，使用下面这条命令。caption sidecar 仍按上一节先起：
 
 ```bash
---host 0.0.0.0 \
---port 31190 \
+tmux new-session -d -s vividvr_serve_single_default \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
+    --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+    --model-id VividVR \
+    --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+    --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
+    --attention-backend fa \
+    --num-gpus 1 \
+    --tp-size 1 \
+    --sp-degree 1 \
+    --ulysses-degree 1 \
+    --ring-degree 1 \
+    --enable-torch-compile \
+    --dist-timeout 3600 \
+    --host 0.0.0.0 \
+    --port 31190 \
+    --master-port 30190 \
+    --scheduler-port 56190 \
+    --strict-ports \
+    --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+    --vividvr-caption-bridge \
+    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+    --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+    --vividvr-caption-sidecar-timeout 1800 \
+    2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_single_default_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
-如果要让其他服务器调用双卡服务，把第 4 节命令中的：
+查看单卡主服务：
 
 ```bash
---host 127.0.0.1 \
---port 31191 \
+tmux attach -r -t vividvr_serve_single_default
 ```
 
-改为：
+### 3.5 统一环境变量
 
-```bash
---host 0.0.0.0 \
---port 31191 \
-```
-
-服务启动后，日志中应能看到类似：
-
-```text
-Uvicorn running on http://0.0.0.0:31191
-```
-
-在 Vivid-VR 服务所在机器上查看可被其他机器访问的 IP：
-
-```bash
-hostname -I
-```
-
-假设服务机器 IP 是 `192.168.1.20`，双卡服务端口是 `31191`，则其他电脑上的请求地址应写为：
-
-```bash
-export BASE_URL=http://192.168.1.20:31191
-```
-
-在其他电脑上先做健康检查：
-
-```bash
-curl --noproxy '*' --silent --show-error --fail "${BASE_URL}/health"
-```
-
-如果健康检查连不上，优先检查：
-
-- 服务是否确实用 `--host 0.0.0.0` 或服务器网卡 IP 启动，而不是 `127.0.0.1`。
-- 服务器防火墙、安全组、机房 ACL 是否放行对应 TCP 端口，例如 `31190` 或 `31191`。
-- 如果服务跑在 Docker 或 Kubernetes 中，容器端口是否映射到宿主机，Kubernetes Service 是否暴露了对应端口。
-- 其他电脑访问时不能使用 `127.0.0.1`；`127.0.0.1` 永远指向发起请求的那台电脑自己。
-
-远程请求时还需要注意输入、输出和 callback 地址：
-
-- `video_input_path`、`caption_file_path`、`reference_video_path`、`output_path`、`perf_dump_path` 是 Vivid-VR 服务所在机器上的路径，不是发起请求那台电脑上的路径。
-- 如果输入视频在其他电脑上，不能直接把那台电脑的本地路径传给服务；应先放到 Vivid-VR 服务机器可读的位置，或使用服务可访问的 URL / 对象存储输入。
-- `callbackUrl` 必须是 Vivid-VR 服务机器能访问到的地址；远程调用时不要写 `http://127.0.0.1:...`，除非 callback 服务也运行在 Vivid-VR 服务机器本机。
-- 如果结果只保存在 `output_path`，文件会落在 Vivid-VR 服务机器本地；远程电脑可以通过 `/v1/videos/${TASK_ID}/content` 下载，或通过 `minioConfig` / 对象存储拿到可访问 URL。
-
-## 6. `curl` 请求命令
-
-单卡服务默认：
-
-```bash
-export BASE_URL=http://127.0.0.1:31190
-export BASE_URL=http://10.119.16.10:31190
-```
-
-双卡服务默认：
+下面请求命令默认以双卡主服务为例；如果你起的是单卡服务，把 `BASE_URL` 改成 `31190`。
 
 ```bash
 export BASE_URL=http://127.0.0.1:31191
-export BASE_URL=http://10.119.16.10:31191
-```
-
-如果在其他电脑上请求已对外暴露的 Vivid-VR 服务，把 `BASE_URL` 换成服务机器 IP：
-
-```bash
-export BASE_URL=http://<VIVIDVR_SERVER_IP>:31191
-```
-
-共同变量：
-
-```bash
-export INPUT_VIDEO=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4
-export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
-export REFERENCE_VIDEO=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4
 export OUTPUT_DIR=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark
 export INDICATOR_DIR=/home/zhiheng/sglang/Vivid_Acceptance/indicator
-export TASK_ID=vividvr-manual-$(date -u +%Y%m%dT%H%M%SZ)
-export OUTPUT_PATH=${OUTPUT_DIR}/${TASK_ID}.mp4
-export PERF_DUMP_PATH=${INDICATOR_DIR}/${TASK_ID}_perf.json
+export LOG_DIR=/home/zhiheng/sglang/Vivid_Acceptance/logs
+export CALLBACK_BASE_URL=http://<CALLBACK_SERVER_IP>:39090
+mkdir -p "${OUTPUT_DIR}" "${INDICATOR_DIR}" "${LOG_DIR}"
 ```
 
-检查服务健康：
+默认 `2 clip` 输入：
 
 ```bash
-curl --noproxy '*' --silent --show-error --fail "${BASE_URL}/health"
+export INPUT_VIDEO_130F=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4
 ```
 
-提交任务：
+当前已正式验收过的 `4 clip` 输入：
 
 ```bash
-curl --noproxy '*' -X POST "${BASE_URL}/v1/videos/repairs" \
+export INPUT_VIDEO_301F=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_301f_h264.mp4
+```
+
+### 3.6 warmup 请求
+
+正式 benchmark 前，先做一次 warmup。下面这条是当前推荐的自动 bridge warmup 方式，不显式传 `caption_file_path`：
+
+```bash
+export WARMUP_TASK_ID=vividvr-warmup-$(date -u +%Y%m%dT%H%M%SZ)
+
+NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
   -H 'Content-Type: application/json' \
-  --data-binary @- <<JSON
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${WARMUP_TASK_ID}.submit.log"
 {
-  "model": "VividVR",
-  "task_id": "${TASK_ID}",
-  "video_input_path": "${INPUT_VIDEO}",
+  "taskId": "${WARMUP_TASK_ID}",
+  "timeout": -1,
+  "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${WARMUP_TASK_ID}/callback",
+  "video_input_path": "${INPUT_VIDEO_130F}",
+  "num_inference_steps": 1,
+  "seed": 42,
+  "num_temporal_process_frames": 121,
+  "output_path": "${OUTPUT_DIR}/${WARMUP_TASK_ID}.mp4",
+  "perf_dump_path": "${INDICATOR_DIR}/${WARMUP_TASK_ID}_perf.json"
+}
+JSON
+```
+
+### 3.7 正式 `2 clip` 请求
+
+这是当前默认 `130f / 20 step` 正式请求：
+
+```bash
+export TASK_ID=vividvr-service-benchmark-130f-bridge-$(date -u +%Y%m%dT%H%M%SZ)
+
+NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
+{
+  "taskId": "${TASK_ID}",
+  "timeout": -1,
+  "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
+  "video_input_path": "${INPUT_VIDEO_130F}",
+  "num_inference_steps": 20,
+  "seed": 42,
+  "num_temporal_process_frames": 121,
+  "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json"
+}
+JSON
+```
+
+### 3.8 正式 `4 clip` 请求
+
+如果要验证 `clip > 2` 的自动 bridge 路径，直接把输入换成当前已验收通过的 `301f` 样本：
+
+```bash
+export TASK_ID=vividvr-service-benchmark-301f-4clip-bridge-$(date -u +%Y%m%dT%H%M%SZ)
+
+NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
+{
+  "taskId": "${TASK_ID}",
+  "timeout": -1,
+  "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
+  "video_input_path": "${INPUT_VIDEO_301F}",
+  "num_inference_steps": 20,
+  "seed": 42,
+  "num_temporal_process_frames": 121,
+  "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json"
+}
+JSON
+```
+
+当前这条 `4 clip` 路径已经完成端到端验收，sidecar 会自动生成 `4` 行 caption，并由主服务继续完成推理。
+
+### 3.9 显式 caption replay 请求
+
+如果你要绕过 bridge，复用已知 caption 文件和 reference 视频，可以显式传入：
+
+```bash
+export TASK_ID=vividvr-manual-replay-$(date -u +%Y%m%dT%H%M%SZ)
+export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
+export REFERENCE_VIDEO=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4
+
+NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
+{
+  "taskId": "${TASK_ID}",
+  "timeout": -1,
+  "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
+  "video_input_path": "${INPUT_VIDEO_130F}",
   "caption_file_path": "${CAPTION_FILE}",
   "reference_video_path": "${REFERENCE_VIDEO}",
   "num_inference_steps": 20,
   "seed": 42,
   "num_temporal_process_frames": 121,
-  "output_path": "${OUTPUT_PATH}",
-  "perf_dump_path": "${PERF_DUMP_PATH}"
+  "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json"
 }
 JSON
 ```
 
-提交 FlowCut 兼容任务：
+### 3.10 FlowCut 兼容请求
+
+如果需要手写最小 FlowCut 兼容请求：
 
 ```bash
+export TASK_ID=vividvr-flowcut-$(date -u +%Y%m%dT%H%M%SZ)
 export FLOWCUT_CALLBACK_URL=http://<CALLBACK_SERVER_IP>:39090/tasks/${TASK_ID}/callback
 
-curl --noproxy '*' -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
+NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
   -H 'Content-Type: application/json' \
-  --data-binary @- <<JSON
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
 {
   "taskId": "${TASK_ID}",
   "timeout": -1,
   "callbackUrl": "${FLOWCUT_CALLBACK_URL}",
-  "video_input_path": "${INPUT_VIDEO}",
-  "caption_file_path": "${CAPTION_FILE}",
-  "reference_video_path": "${REFERENCE_VIDEO}",
+  "video_input_path": "${INPUT_VIDEO_130F}",
   "num_inference_steps": 20,
   "seed": 42,
   "num_temporal_process_frames": 121,
-  "output_path": "${OUTPUT_PATH}",
-  "perf_dump_path": "${PERF_DUMP_PATH}"
+  "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json"
 }
 JSON
 ```
 
-推荐使用仓库内验收脚本提交并轮询，脚本会遵守 FlowCut 返回码语义：`code=2` 只重试提交，`code=1` 立即失败，只有 `code=0` 接单后才轮询进度；如果轮询阶段收到 `404`，按“服务可能已重启或该进程未接单”处理，不继续盲查旧任务。
+推荐优先使用仓库内验收脚本提交并轮询，脚本会遵守 FlowCut 返回码语义：`code=2` 只重试提交，`code=1` 立即失败，只有 `code=0` 接单后才轮询进度；如果轮询阶段收到 `404`，按“服务可能已重启或该进程未接单”处理，不继续盲查旧任务。使用 `--callback-log` 时脚本会在本机临时拉起 callback receiver，并校验成功 callback 的 `output.result_url` 契约。
 
-如果验收的是显式 `caption_file_path` replay 路径，可以继续传 `--callback-url`、`--caption-file`、`--reference-video`：
-
-```bash
-PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
-  python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
-  --base-url "${BASE_URL}" \
-  --task-id "${TASK_ID}" \
-  --callback-url "${FLOWCUT_CALLBACK_URL}" \
-  --input-video "${INPUT_VIDEO}" \
-  --caption-file "${CAPTION_FILE}" \
-  --reference-video "${REFERENCE_VIDEO}" \
-  --num-inference-steps 20 \
-  --seed 42 \
-  --num-temporal-process-frames 121 \
-  --output-path "${OUTPUT_PATH}" \
-  --perf-dump-path "${PERF_DUMP_PATH}"
-```
-
-如果验收的是 caption bridge 路径，不传 `caption_file_path` 和 `reference_video_path`，直接让脚本在本机自建 callback receiver 并写日志：
+显式 caption replay 验收示例：
 
 ```bash
+export TASK_ID=vividvr-flowcut-replay-$(date -u +%Y%m%dT%H%M%SZ)
 export CALLBACK_LOG=${LOG_DIR}/${TASK_ID}_callback.jsonl
 
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
@@ -430,25 +414,41 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   --base-url "${BASE_URL}" \
   --task-id "${TASK_ID}" \
   --callback-log "${CALLBACK_LOG}" \
-  --video-input-path "${INPUT_VIDEO}" \
+  --input-video "${INPUT_VIDEO_130F}" \
+  --caption-file "${CAPTION_FILE}" \
+  --reference-video "${REFERENCE_VIDEO}" \
   --num-inference-steps 20 \
   --seed 42 \
   --num-temporal-process-frames 121 \
-  --output-path "${OUTPUT_PATH}" \
-  --perf-dump-path "${PERF_DUMP_PATH}" \
+  --output-path "${OUTPUT_DIR}/${TASK_ID}.mp4" \
+  --perf-dump-path "${INDICATOR_DIR}/${TASK_ID}_perf.json" \
+  --poll-timeout-s 2400
+```
+
+自动 caption bridge 验收示例：
+
+```bash
+export TASK_ID=vividvr-flowcut-bridge-$(date -u +%Y%m%dT%H%M%SZ)
+export CALLBACK_LOG=${LOG_DIR}/${TASK_ID}_callback.jsonl
+
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
+  python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
+  --base-url "${BASE_URL}" \
+  --task-id "${TASK_ID}" \
+  --callback-log "${CALLBACK_LOG}" \
+  --video-input-path "${INPUT_VIDEO_130F}" \
+  --num-inference-steps 20 \
+  --seed 42 \
+  --num-temporal-process-frames 121 \
+  --output-path "${OUTPUT_DIR}/${TASK_ID}.mp4" \
+  --perf-dump-path "${INDICATOR_DIR}/${TASK_ID}_perf.json" \
   --submit-timeout-s 2400 \
   --poll-timeout-s 2400
 ```
 
-说明：
+### 3.11 查询进度与下载结果
 
-- `POST /v1/videos/repairs/flowcut` 是 FlowCut 专用兼容入口；普通 OpenAI 风格调用仍使用 `/v1/videos/repairs`。
-- `timeout=-1` 表示 Vivid-VR 服务侧不对长推理设置超时；同步接单仍应快速返回。
-- FlowCut callback 使用 `running`、`succeeded`、`failed` 状态，并通过 `progress` 上报中间进度。
-- `--callback-log` 模式会在本机临时拉起一个 callback receiver，并把回调逐行写到 JSONL；这条模式专门用于验证“只传视频，服务端自动 bridge 生成 caption”的新路径。
-- bridge 场景下 FlowCut 的首次 `POST` 会同步等待 caption sidecar 先把 sidecar 文本生成完，所以 `--submit-timeout-s` 也必须放大，不能只调大 `--poll-timeout-s`。
-
-查询进度：
+请求提交后，先拿到的是排队结果，后续需要继续查进度：
 
 ```bash
 curl --noproxy '*' -X GET "${BASE_URL}/v1/videos/${TASK_ID}/progress"
@@ -467,8 +467,76 @@ curl --noproxy '*' -X GET "${BASE_URL}/v1/videos/${TASK_ID}/content" \
   -o "${OUTPUT_DIR}/downloaded_${TASK_ID}.mp4"
 ```
 
-如果要做正式 benchmark：
+bridge 场景下的 sidecar 文本默认写到：
 
-1. 先用一个单独的 `TASK_ID` 提交一次 warmup。
-2. warmup 完成后，再换一个新的 `TASK_ID` 提交正式请求。
-3. 正式统计只记录第二次请求，不把 warmup 计入最终结果。
+```bash
+/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/${TASK_ID}.txt
+```
+
+主日志和 sidecar 日志默认分别在：
+
+```bash
+/home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_serve_*.log
+/home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_caption_sidecar_*.log
+```
+
+## 4. 对外暴露端口
+
+当前 `sglang.multimodal_gen` 的服务端支持通过 `--host` 控制 HTTP API 监听地址：
+
+- `--host 127.0.0.1`：只监听本机 loopback，只有当前机器能访问
+- `--host 0.0.0.0`：监听全部 IPv4 网卡，其他服务器也能访问；这是本文当前默认 `serve` 口径
+- `--host <SERVER_LAN_IP>`：只监听指定网卡 IP
+
+当前双卡和单卡默认命令已经使用 `0.0.0.0`。如果你只想让本机访问双卡服务，可把第 `3.3` 节命令里的：
+
+```bash
+--host 0.0.0.0 \
+--port 31191 \
+```
+
+改为：
+
+```bash
+--host 127.0.0.1 \
+--port 31191 \
+```
+
+如果你只想让本机访问单卡服务，可把第 `3.4` 节命令里的：
+
+```bash
+--host 0.0.0.0 \
+--port 31190 \
+```
+
+改为：
+
+```bash
+--host 127.0.0.1 \
+--port 31190 \
+```
+
+服务启动后，日志中应能看到类似：
+
+```text
+Uvicorn running on http://0.0.0.0:31191
+```
+
+在服务机器上查看可被其他机器访问的 IP：
+
+```bash
+hostname -I
+```
+
+假设服务机器 IP 是 `192.168.1.20`，双卡服务端口是 `31191`，则远程请求地址应写为：
+
+```bash
+export BASE_URL=http://192.168.1.20:31191
+```
+
+远程调用时还要注意：
+
+- `video_input_path`、`caption_file_path`、`reference_video_path`、`output_path`、`perf_dump_path` 都是服务机器上的路径
+- 其他机器不能把自己的本地路径直接传给服务
+- `callbackUrl` 必须是服务机器可访问的地址，远程调用时不要写 `127.0.0.1`
+- 如果结果只写到 `output_path`，文件会落在服务机器本地；远程侧可以再调用 `/v1/videos/${TASK_ID}/content` 下载

@@ -8,6 +8,7 @@ from sglang.multimodal_gen.tools.run_flowcut_vividvr_service_acceptance import (
     _FlowCutCallbackRecorder,
     _LocalFlowCutCallbackServer,
     _build_payload,
+    _validate_final_callback_payload,
     poll_accepted_task,
     parse_args,
     submit_flowcut_task_with_retry,
@@ -155,6 +156,39 @@ def test_parse_args_accepts_long_submit_timeout_for_caption_bridge(tmp_path):
     assert args.submit_timeout_s == 2400.0
 
 
+def test_validate_final_callback_requires_result_url_only():
+    _validate_final_callback_payload(
+        {
+            "status": "succeeded",
+            "progress": 100,
+            "reason": "",
+            "output": '{"result_url":"http://storage.example.com/out.mp4","duration":12.5}',
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "",
+        "{}",
+        '{"gen_video_url":"http://storage.example.com/out.mp4"}',
+        '{"result_url":"http://storage.example.com/out.mp4","file_path":"/tmp/out.mp4"}',
+        '{"result_url":"http://storage.example.com/out.mp4","unexpected":"x"}',
+    ],
+)
+def test_validate_final_callback_rejects_non_flowcut_output(output):
+    with pytest.raises(FlowCutAcceptanceError):
+        _validate_final_callback_payload(
+            {
+                "status": "succeeded",
+                "progress": 100,
+                "reason": "",
+                "output": output,
+            }
+        )
+
+
 def test_local_callback_server_records_final_payload(tmp_path):
     callback_log = tmp_path / "callback.jsonl"
     recorder = _FlowCutCallbackRecorder(str(callback_log))
@@ -172,7 +206,7 @@ def test_local_callback_server_records_final_payload(tmp_path):
                     "status": "succeeded",
                     "progress": 100,
                     "reason": "done",
-                    "output": "",
+                    "output": '{"result_url":"http://storage.example.com/out.mp4"}',
                 },
             )
             response.raise_for_status()
@@ -180,4 +214,5 @@ def test_local_callback_server_records_final_payload(tmp_path):
         final_payload = recorder.wait_for_final(timeout=1.0)
 
     assert final_payload["status"] == "succeeded"
+    _validate_final_callback_payload(final_payload)
     assert callback_log.read_text(encoding="utf-8").strip()

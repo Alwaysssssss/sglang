@@ -11,7 +11,11 @@ import torch
 from fastapi import APIRouter, FastAPI, Request
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai import (
+    image_api,
+    video_api,
+    vividvr_flowcut_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
@@ -295,6 +299,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(vividvr_flowcut_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
 

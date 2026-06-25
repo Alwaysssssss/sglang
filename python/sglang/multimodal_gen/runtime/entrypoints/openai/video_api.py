@@ -25,29 +25,16 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
-from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
-    VividVRPipelineConfig,
-)
-from sglang.multimodal_gen.runtime.entrypoints.openai.flowcut import (
-    build_flowcut_final_callback_payload,
-    build_flowcut_running_callback_payload,
-    post_flowcut_callback,
-    report_flowcut_running_until_done,
-    upload_to_flowcut_minio,
-)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
-    FlowCutMinIOConfig,
-    FlowCutResponse,
-    FlowCutVideoRepairRequest,
     VideoGenerationsRequest,
     VideoListResponse,
     VideoRepairRequest,
     VideoResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai import video_repair_shared
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -65,23 +52,12 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.vividvr.caption_bridge import (
-    VividVRCaptionBridgeConfig,
-    request_vividvr_caption_sidecar,
-)
-from sglang.multimodal_gen.runtime.vividvr.caption_manifest import (
-    build_vividvr_caption_manifest_for_video_path,
-)
-from sglang.multimodal_gen.runtime.vividvr.preprocess import read_prompt_file
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resolve_videoedit_num_frames,
 )
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
-
-_VIDEOEDIT_QUEUE_CAPACITY = max(1, int(os.environ.get("VIDEOEDIT_QUEUE_CAPACITY", "1")))
-_VIDEOEDIT_SEMAPHORE = asyncio.Semaphore(_VIDEOEDIT_QUEUE_CAPACITY)
 
 
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
@@ -322,229 +298,6 @@ async def _save_video_source_to_path(source: str, target_path: str) -> str:
     return target_path
 
 
-def _split_output_path(output_path: str | None, job_id: str, server_output_path: str | None):
-    if output_path and os.path.splitext(output_path)[1].lower() == ".mp4":
-        return os.path.dirname(os.path.abspath(output_path)), os.path.basename(output_path)
-    output_dir = output_path or server_output_path
-    return output_dir, f"{job_id}.mp4"
-
-
-def _is_vividvr_video_repair_pipeline(server_args) -> bool:
-    if isinstance(server_args.pipeline_config, VividVRPipelineConfig):
-        return True
-
-    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
-    if pipeline_class_name == "CogVideoXVividVRControlNetPipeline":
-        return True
-
-    model_id = getattr(server_args, "model_id", None)
-    if isinstance(model_id, str) and model_id.lower().replace("-", "") == "vividvr":
-        return True
-
-    return False
-
-
-def _resolve_video_repair_model_name(
-    req: VideoRepairRequest, server_args, default_model_name: str
-) -> str:
-    return (
-        req.model
-        or getattr(server_args, "model_id", None)
-        or default_model_name
-    )
-
-
-def _resolve_vividvr_prompt_file_path(server_args) -> str:
-    prompt_file_path = getattr(server_args, "prompt_file_path", None) or getattr(
-        server_args.pipeline_config, "default_prompt_file_path", None
-    )
-    if not prompt_file_path:
-        raise HTTPException(
-            status_code=500,
-            detail="vividvr_prompt_file_path is not configured",
-        )
-    if not os.path.exists(prompt_file_path):
-        raise HTTPException(
-            status_code=500,
-            detail=f"vividvr_prompt_file_path does not exist: {prompt_file_path}",
-        )
-    return prompt_file_path
-
-
-def _build_vividvr_repair_kwargs(
-    *,
-    request_id: str,
-    req: VideoRepairRequest,
-    server_args,
-    video_input_path: str,
-    output_dir: str,
-    output_file_name: str,
-) -> Dict[str, Any]:
-    vividvr_prompt_file_path = _resolve_vividvr_prompt_file_path(server_args)
-    vividvr_kwargs = {
-        "request_id": request_id,
-        "video_input_path": video_input_path,
-        "prompt": read_prompt_file(vividvr_prompt_file_path),
-        "prompt_file_path": vividvr_prompt_file_path,
-        "output_path": output_dir,
-        "output_file_name": output_file_name,
-        "seed": req.seed,
-        "dtype": req.dtype,
-        "enable_teacache": req.enable_teacache,
-        "enable_frame_interpolation": req.enable_frame_interpolation,
-        "frame_interpolation_exp": req.frame_interpolation_exp,
-        "frame_interpolation_scale": req.frame_interpolation_scale,
-        "enable_upscaling": req.enable_upscaling,
-        "upscaling_scale": req.upscaling_scale,
-        "perf_dump_path": req.perf_dump_path,
-    }
-    if req.output_quality not in (None, "default"):
-        vividvr_kwargs["output_quality"] = req.output_quality
-    if req.negative_prompt is not None:
-        vividvr_kwargs["negative_prompt"] = req.negative_prompt
-    if req.caption_file_path is not None:
-        vividvr_kwargs["caption_source"] = "caption_file"
-        vividvr_kwargs["caption_file_path"] = req.caption_file_path
-    if req.reference_video_path is not None:
-        vividvr_kwargs["reference_video_path"] = req.reference_video_path
-    if req.num_frames is not None:
-        vividvr_kwargs["num_frames"] = req.num_frames
-    if req.num_inference_steps is not None:
-        vividvr_kwargs["num_inference_steps"] = req.num_inference_steps
-    if req.guidance_scale is not None:
-        vividvr_kwargs["guidance_scale"] = req.guidance_scale
-    if req.generator_device is not None:
-        vividvr_kwargs["generator_device"] = req.generator_device
-    if req.num_temporal_process_frames is not None:
-        vividvr_kwargs["num_temporal_process_frames"] = req.num_temporal_process_frames
-    if req.restoration_guidance_scale is not None:
-        vividvr_kwargs["restoration_guidance_scale"] = req.restoration_guidance_scale
-    if req.frame_interpolation_model_path is not None:
-        vividvr_kwargs["frame_interpolation_model_path"] = (
-            req.frame_interpolation_model_path
-        )
-    if req.upscaling_model_path is not None:
-        vividvr_kwargs["upscaling_model_path"] = req.upscaling_model_path
-    if req.output_compression is not None:
-        vividvr_kwargs["output_compression"] = req.output_compression
-    return vividvr_kwargs
-
-
-def _resolve_vividvr_runtime_int(req_value, server_args, attr_name: str) -> int:
-    if req_value is not None:
-        return int(req_value)
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    config_value = getattr(pipeline_config, attr_name, None)
-    if config_value is not None:
-        return int(config_value)
-    return int(getattr(VividVRSamplingParams, attr_name))
-
-
-async def _ensure_vividvr_caption_file(
-    *,
-    request_id: str,
-    req: VideoRepairRequest,
-    server_args,
-    video_input_path: str,
-    output_dir: str,
-) -> str | None:
-    if req.caption_file_path:
-        return req.caption_file_path
-    if not getattr(server_args, "vividvr_caption_bridge", False):
-        return None
-
-    work_dir = getattr(server_args, "vividvr_caption_work_dir", None)
-    if not work_dir:
-        work_dir = os.path.join(output_dir, "caption_sidecars")
-    os.makedirs(work_dir, exist_ok=True)
-
-    manifest_path = os.path.join(work_dir, f"{request_id}.manifest.json")
-    caption_path = os.path.join(work_dir, f"{request_id}.txt")
-    num_temporal_process_frames = _resolve_vividvr_runtime_int(
-        req.num_temporal_process_frames,
-        server_args,
-        "num_temporal_process_frames",
-    )
-    tile_size = _resolve_vividvr_runtime_int(
-        getattr(req, "tile_size", None),
-        server_args,
-        "tile_size",
-    )
-    tile_stride = _resolve_vividvr_runtime_int(
-        getattr(req, "tile_stride", None),
-        server_args,
-        "tile_stride",
-    )
-
-    manifest = build_vividvr_caption_manifest_for_video_path(
-        video_path=video_input_path,
-        num_temporal_process_frames=num_temporal_process_frames,
-        tile_size=tile_size,
-        tile_stride=tile_stride,
-    )
-    manifest.write_json(manifest_path)
-    bridge_start = time.perf_counter()
-    result = await request_vividvr_caption_sidecar(
-        config=VividVRCaptionBridgeConfig(
-            enabled=True,
-            base_url=getattr(server_args, "vividvr_caption_sidecar_url", None),
-            timeout_s=float(
-                getattr(server_args, "vividvr_caption_sidecar_timeout", 1800.0)
-            ),
-        ),
-        manifest_path=manifest_path,
-        output_caption_path=caption_path,
-        expected_caption_count=manifest.expected_caption_count,
-    )
-    bridge_elapsed_s = time.perf_counter() - bridge_start
-    logger.info(
-        "VividVR caption bridge generated captions request_id=%s path=%s count=%s "
-        "mode=%s worker_count=%s fallback_used=%s total_clip_count=%s bridge_elapsed_s=%.3f "
-        "worker_assignments=%s sidecar_request_id=%s sidecar_timing=%s",
-        request_id,
-        result.caption_file_path,
-        result.caption_count,
-        getattr(result, "mode", None),
-        getattr(result, "worker_count", None),
-        getattr(result, "fallback_used", None),
-        getattr(result, "total_clip_count", None),
-        bridge_elapsed_s,
-        getattr(result, "assigned_clip_indices_by_worker", None),
-        getattr(result, "request_id", None),
-        getattr(result, "timing", None),
-    )
-    return result.caption_file_path
-
-
-def _copy_video_repair_request_with_caption(
-    req: VideoRepairRequest,
-    caption_file_path: str | None,
-) -> VideoRepairRequest:
-    if not caption_file_path:
-        return req
-    return req.model_copy(update={"caption_file_path": caption_file_path})
-
-
-def _video_repair_job_from_sampling(
-    request_id: str, req: VideoRepairRequest, sampling: SamplingParams
-) -> Dict[str, Any]:
-    return {
-        "id": request_id,
-        "object": "video",
-        "model": req.model or "videoedit",
-        "status": "queued",
-        "progress": 0,
-        "created_at": int(time.time()),
-        "size": "",
-        "seconds": "",
-        "quality": "standard",
-        "file_path": os.path.abspath(sampling.output_file_path()),
-        "callback_url": req.callback_url,
-        "callback_status": None,
-        "callback_error": None,
-    }
-
-
 async def _dispatch_video_repair_job_async(
     job_id: str,
     batch: Req,
@@ -563,228 +316,23 @@ async def _dispatch_video_repair_job_async(
             callback_url=callback_url,
         )
     finally:
-        _VIDEOEDIT_SEMAPHORE.release()
+        video_repair_shared.VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
-
-
-async def _dispatch_flowcut_video_repair_job_async(
-    job_id: str,
-    batch: Req,
-    *,
-    callback_url: str,
-    minio_config: FlowCutMinIOConfig | None = None,
-    temp_dirs: list[str] | None = None,
-    output_persistent: bool = True,
-) -> None:
-    done_event = asyncio.Event()
-    try:
-        await post_flowcut_callback(
-            callback_url,
-            build_flowcut_running_callback_payload(
-                task_id=job_id,
-                progress=1,
-                reason="accepted",
-            ),
-        )
-    except Exception as e:
-        logger.warning("FlowCut initial running callback failed for job=%s: %s", job_id, e)
-    reporter_task = asyncio.create_task(
-        report_flowcut_running_until_done(
-            task_id=job_id,
-            callback_url=callback_url,
-            done_event=done_event,
-            send_initial=False,
-        )
-    )
-    try:
-        await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 1})
-        await _dispatch_job_async(
-            job_id,
-            batch,
-            temp_dirs=None,
-            output_persistent=output_persistent,
-            callback_url=None,
-        )
-        job = await VIDEO_STORE.get(job_id) or {}
-        if job.get("status") == "completed":
-            try:
-                file_path = job.get("file_path")
-                result_url = job.get("url") or file_path
-                if minio_config is not None and file_path:
-                    object_key = f"outputs/{job_id}.mp4"
-                    result_url = await upload_to_flowcut_minio(
-                        local_path=file_path,
-                        object_key=object_key,
-                        config=minio_config,
-                    )
-                payload = build_flowcut_final_callback_payload(
-                    status="succeeded",
-                    progress=100,
-                    reason="",
-                    output={
-                        "result_url": result_url,
-                        "duration": job.get("inference_time_s"),
-                    },
-                )
-            except Exception as e:
-                payload = build_flowcut_final_callback_payload(
-                    status="failed",
-                    progress=0,
-                    reason=str(e),
-                    output=None,
-                )
-        else:
-            error = job.get("error") or {}
-            payload = build_flowcut_final_callback_payload(
-                status="failed",
-                progress=0,
-                reason=error.get("message") or "video repair failed",
-                output=None,
-            )
-        await post_flowcut_callback(callback_url, payload)
-    finally:
-        done_event.set()
-        reporter_task.cancel()
-        try:
-            await reporter_task
-        except asyncio.CancelledError:
-            pass
-        _VIDEOEDIT_SEMAPHORE.release()
-        for td in temp_dirs or []:
-            shutil.rmtree(td, ignore_errors=True)
-
-
-@router.post("/repairs/flowcut", response_model=FlowCutResponse)
-async def create_flowcut_video_repair(request: Request):
-    try:
-        payload = await request.json()
-    except Exception as e:
-        return FlowCutResponse(code=1, message=f"invalid request: {e}")
-    if not isinstance(payload, dict):
-        return FlowCutResponse(code=1, message="invalid request: JSON object required")
-    try:
-        req = FlowCutVideoRepairRequest.model_validate(payload)
-    except Exception as e:
-        return FlowCutResponse(code=1, message=f"invalid request: {e}")
-
-    if _VIDEOEDIT_SEMAPHORE.locked():
-        return FlowCutResponse(code=2, message="A task is running.")
-
-    if not req.task_id:
-        return FlowCutResponse(code=1, message="taskId is required")
-    if not req.callback_url:
-        return FlowCutResponse(code=1, message="callbackUrl is required")
-    if not req.video_input_path and not req.video_url:
-        return FlowCutResponse(
-            code=1,
-            message="video_input_path or video_url is required",
-        )
-
-    await _VIDEOEDIT_SEMAPHORE.acquire()
-    server_args = get_global_server_args()
-    request_id = req.task_id
-    temp_dirs: list[str] = []
-    scheduled = False
-
-    try:
-        uploads_dir = server_args.input_save_path
-        if uploads_dir is None:
-            uploads_dir = tempfile.mkdtemp(prefix="sglang_flowcut_input_")
-            temp_dirs.append(uploads_dir)
-        os.makedirs(uploads_dir, exist_ok=True)
-
-        video_input_path = req.video_input_path
-        if req.video_url:
-            video_input_path = await _save_video_source_to_path(
-                req.video_url, os.path.join(uploads_dir, f"{request_id}_video")
-            )
-        if not video_input_path:
-            return FlowCutResponse(
-                code=1,
-                message="video_input_path or video_url is required",
-            )
-
-        output_dir, output_file_name = _split_output_path(
-            req.output_path, request_id, server_args.output_path
-        )
-        output_persistent = output_dir is not None
-        if output_dir is None:
-            output_dir = tempfile.mkdtemp(prefix="sglang_flowcut_output_")
-            temp_dirs.append(output_dir)
-            output_persistent = False
-
-        if not _is_vividvr_video_repair_pipeline(server_args):
-            return FlowCutResponse(
-                code=1,
-                message="FlowCut repair endpoint requires Vivid-VR pipeline",
-            )
-
-        try:
-            caption_file_path = await _ensure_vividvr_caption_file(
-                request_id=request_id,
-                req=req,
-                server_args=server_args,
-                video_input_path=video_input_path,
-                output_dir=output_dir,
-            )
-        except Exception as e:
-            return FlowCutResponse(code=1, message=f"caption bridge failed: {e}")
-        req_for_sampling = _copy_video_repair_request_with_caption(
-            req,
-            caption_file_path,
-        )
-        vividvr_kwargs = _build_vividvr_repair_kwargs(
-            request_id=request_id,
-            req=req_for_sampling,
-            server_args=server_args,
-            video_input_path=video_input_path,
-            output_dir=output_dir,
-            output_file_name=output_file_name,
-        )
-        sampling_params = VividVRSamplingParams.from_user_kwargs(
-            server_args,
-            **vividvr_kwargs,
-        )
-        job = _video_repair_job_from_sampling(request_id, req, sampling_params)
-        job["model"] = _resolve_video_repair_model_name(req, server_args, "VividVR")
-        await VIDEO_STORE.upsert(request_id, job)
-        logger.info(
-            "FlowCut video repair accepted task_id=%s output_path=%s callback_url=%s",
-            request_id,
-            job.get("file_path"),
-            req.callback_url,
-        )
-        batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
-        asyncio.create_task(
-            _dispatch_flowcut_video_repair_job_async(
-                request_id,
-                batch,
-                temp_dirs=temp_dirs or None,
-                output_persistent=output_persistent,
-                callback_url=req.callback_url,
-                minio_config=req.minio_config,
-            )
-        )
-        scheduled = True
-        return FlowCutResponse(code=0, message="ok")
-    except Exception as e:
-        detail = e.detail if isinstance(e, HTTPException) else str(e)
-        return FlowCutResponse(code=1, message=detail)
-    finally:
-        if not scheduled:
-            _VIDEOEDIT_SEMAPHORE.release()
-            for td in temp_dirs:
-                shutil.rmtree(td, ignore_errors=True)
 
 
 @router.post("/repairs", response_model=VideoResponse)
 async def create_video_repair(req: VideoRepairRequest):
-    if _VIDEOEDIT_SEMAPHORE.locked():
-        raise HTTPException(status_code=429, detail="videoedit_queue_full")
-    await _VIDEOEDIT_SEMAPHORE.acquire()
-
     server_args = get_global_server_args()
+    if video_repair_shared.is_vividvr_video_repair_pipeline(server_args):
+        raise HTTPException(
+            status_code=400,
+            detail="Vivid-VR video repair must use /v1/videos/repairs/flowcut",
+        )
+    if video_repair_shared.VIDEOEDIT_SEMAPHORE.locked():
+        raise HTTPException(status_code=429, detail="videoedit_queue_full")
+    await video_repair_shared.VIDEOEDIT_SEMAPHORE.acquire()
+
     request_id = req.task_id or generate_request_id()
     temp_dirs: list[str] = []
 
@@ -801,9 +349,12 @@ async def create_video_repair(req: VideoRepairRequest):
                 req.video_url, os.path.join(uploads_dir, f"{request_id}_video")
             )
         if not video_input_path:
-            raise HTTPException(status_code=400, detail="video_input_path or video_url is required")
+            raise HTTPException(
+                status_code=400,
+                detail="video_input_path or video_url is required",
+            )
 
-        output_dir, output_file_name = _split_output_path(
+        output_dir, output_file_name = video_repair_shared.split_output_path(
             req.output_path, request_id, server_args.output_path
         )
         output_persistent = output_dir is not None
@@ -812,110 +363,79 @@ async def create_video_repair(req: VideoRepairRequest):
             temp_dirs.append(output_dir)
             output_persistent = False
 
-        if _is_vividvr_video_repair_pipeline(server_args):
-            try:
-                caption_file_path = await _ensure_vividvr_caption_file(
-                    request_id=request_id,
-                    req=req,
-                    server_args=server_args,
-                    video_input_path=video_input_path,
-                    output_dir=output_dir,
-                )
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"caption bridge failed: {e}",
-                ) from e
-            req_for_sampling = _copy_video_repair_request_with_caption(
-                req,
-                caption_file_path,
+        mask_input_path = req.mask_input_path
+        if req.mask_url:
+            mask_input_path = await _save_video_source_to_path(
+                req.mask_url, os.path.join(uploads_dir, f"{request_id}_mask")
             )
-            vividvr_kwargs = _build_vividvr_repair_kwargs(
-                request_id=request_id,
-                req=req_for_sampling,
-                server_args=server_args,
-                video_input_path=video_input_path,
-                output_dir=output_dir,
-                output_file_name=output_file_name,
-            )
-            sampling_params = VividVRSamplingParams.from_user_kwargs(
-                server_args,
-                **vividvr_kwargs,
-            )
-            default_model_name = "VividVR"
-        else:
-            mask_input_path = req.mask_input_path
-            if req.mask_url:
-                mask_input_path = await _save_video_source_to_path(
-                    req.mask_url, os.path.join(uploads_dir, f"{request_id}_mask")
-                )
-            if not req.prompt:
-                raise HTTPException(status_code=400, detail="prompt is required")
-            if not mask_input_path:
-                raise HTTPException(
-                    status_code=400, detail="mask_input_path or mask_url is required"
-                )
-
-            resolved_num_frames = resolve_videoedit_num_frames(
-                req.num_frames if req.num_frames is not None else 81,
-                video_input_path,
-                mask_input_path,
+        if not req.prompt:
+            raise HTTPException(status_code=400, detail="prompt is required")
+        if not mask_input_path:
+            raise HTTPException(
+                status_code=400, detail="mask_input_path or mask_url is required"
             )
 
-            sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
-                server_args,
-                request_id=request_id,
-                prompt=req.prompt,
-                negative_prompt=req.negative_prompt,
-                video_input_path=video_input_path,
-                mask_input_path=mask_input_path,
-                output_path=output_dir,
-                output_file_name=output_file_name,
-                num_frames=resolved_num_frames,
-                infer_len=req.infer_len,
-                overlap=req.overlap,
-                strength=req.strength,
-                num_inference_steps=(
-                    req.num_inference_steps
-                    if req.num_inference_steps is not None
-                    else 20
-                ),
-                guidance_scale=(
-                    req.guidance_scale if req.guidance_scale is not None else 5.0
-                ),
-                seed=req.seed,
-                generator_device=req.generator_device,
-                dtype=req.dtype,
-                dynamic_cfg=req.dynamic_cfg,
-                dynamic_cfg_max_step=req.dynamic_cfg_max_step,
-                dynamic_cfg_min=req.dynamic_cfg_min,
-                bbox_padding=req.bbox_padding,
-                dilate_px=req.dilate_px,
-                mask_scale=req.mask_scale,
-                feather_px=req.feather_px,
-                adain_boundary_dilate=req.adain_boundary_dilate,
-                enable_paste_back=req.enable_paste_back,
-                save_crop_only=req.save_crop_only,
-                drop_reference_frame=req.drop_reference_frame,
-                keep_intermediate_windows=req.keep_intermediate_windows,
-                use_repaired_context=req.use_repaired_context,
-                vary_seed_by_window=req.vary_seed_by_window,
-                enable_teacache=req.enable_teacache,
-                enable_frame_interpolation=req.enable_frame_interpolation,
-                frame_interpolation_exp=req.frame_interpolation_exp,
-                frame_interpolation_scale=req.frame_interpolation_scale,
-                frame_interpolation_model_path=req.frame_interpolation_model_path,
-                enable_upscaling=req.enable_upscaling,
-                upscaling_model_path=req.upscaling_model_path,
-                upscaling_scale=req.upscaling_scale,
-                output_quality=req.output_quality,
-                output_compression=req.output_compression,
-                perf_dump_path=req.perf_dump_path,
-            )
-            default_model_name = "videoedit"
-        job = _video_repair_job_from_sampling(request_id, req, sampling_params)
-        job["model"] = _resolve_video_repair_model_name(
-            req, server_args, default_model_name
+        resolved_num_frames = resolve_videoedit_num_frames(
+            req.num_frames if req.num_frames is not None else 81,
+            video_input_path,
+            mask_input_path,
+        )
+
+        sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
+            server_args,
+            request_id=request_id,
+            prompt=req.prompt,
+            negative_prompt=req.negative_prompt,
+            video_input_path=video_input_path,
+            mask_input_path=mask_input_path,
+            output_path=output_dir,
+            output_file_name=output_file_name,
+            num_frames=resolved_num_frames,
+            infer_len=req.infer_len,
+            overlap=req.overlap,
+            strength=req.strength,
+            num_inference_steps=(
+                req.num_inference_steps
+                if req.num_inference_steps is not None
+                else 20
+            ),
+            guidance_scale=(
+                req.guidance_scale if req.guidance_scale is not None else 5.0
+            ),
+            seed=req.seed,
+            generator_device=req.generator_device,
+            dtype=req.dtype,
+            dynamic_cfg=req.dynamic_cfg,
+            dynamic_cfg_max_step=req.dynamic_cfg_max_step,
+            dynamic_cfg_min=req.dynamic_cfg_min,
+            bbox_padding=req.bbox_padding,
+            dilate_px=req.dilate_px,
+            mask_scale=req.mask_scale,
+            feather_px=req.feather_px,
+            adain_boundary_dilate=req.adain_boundary_dilate,
+            enable_paste_back=req.enable_paste_back,
+            save_crop_only=req.save_crop_only,
+            drop_reference_frame=req.drop_reference_frame,
+            keep_intermediate_windows=req.keep_intermediate_windows,
+            use_repaired_context=req.use_repaired_context,
+            vary_seed_by_window=req.vary_seed_by_window,
+            enable_teacache=req.enable_teacache,
+            enable_frame_interpolation=req.enable_frame_interpolation,
+            frame_interpolation_exp=req.frame_interpolation_exp,
+            frame_interpolation_scale=req.frame_interpolation_scale,
+            frame_interpolation_model_path=req.frame_interpolation_model_path,
+            enable_upscaling=req.enable_upscaling,
+            upscaling_model_path=req.upscaling_model_path,
+            upscaling_scale=req.upscaling_scale,
+            output_quality=req.output_quality,
+            output_compression=req.output_compression,
+            perf_dump_path=req.perf_dump_path,
+        )
+        job = video_repair_shared.video_repair_job_from_sampling(
+            request_id, req, sampling_params
+        )
+        job["model"] = video_repair_shared.resolve_video_repair_model_name(
+            req, server_args, "videoedit"
         )
         await VIDEO_STORE.upsert(request_id, job)
         batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
@@ -930,7 +450,7 @@ async def create_video_repair(req: VideoRepairRequest):
         )
         return VideoResponse(**job)
     except Exception:
-        _VIDEOEDIT_SEMAPHORE.release()
+        video_repair_shared.VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
         raise

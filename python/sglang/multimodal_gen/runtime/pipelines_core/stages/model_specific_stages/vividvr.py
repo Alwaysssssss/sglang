@@ -57,6 +57,9 @@ from sglang.multimodal_gen.runtime.vividvr import (
     stitch_vividvr_temporal_output_clips,
     trim_vividvr_temporal_output_clip,
 )
+from sglang.multimodal_gen.runtime.vividvr.progress_file import (
+    write_vividvr_runtime_progress,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
@@ -70,6 +73,13 @@ def _vividvr_params(batch: Req) -> VividVRSamplingParams:
             f"got {type(params).__name__}"
         )
     return params
+
+
+def _flowcut_progress_path(batch: Req) -> str | None:
+    extra = getattr(batch, "extra", None)
+    if isinstance(extra, dict):
+        return extra.get("vividvr_flowcut_progress_path")
+    return None
 
 
 def _module_dtype(module: torch.nn.Module, default: torch.dtype) -> torch.dtype:
@@ -1168,6 +1178,11 @@ class VividVRDenoisingStage(PipelineStage):
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
                 )
+                write_vividvr_runtime_progress(
+                    _flowcut_progress_path(batch),
+                    request_id=batch.request_id,
+                    runtime_progress=params.runtime_progress,
+                )
                 if progress_bar is not None:
                     progress_bar.update()
 
@@ -1563,6 +1578,11 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
                         )
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
+                )
+                write_vividvr_runtime_progress(
+                    _flowcut_progress_path(batch),
+                    request_id=batch.request_id,
+                    runtime_progress=params.runtime_progress,
                 )
                 if progress_bar is not None:
                     progress_bar.update()

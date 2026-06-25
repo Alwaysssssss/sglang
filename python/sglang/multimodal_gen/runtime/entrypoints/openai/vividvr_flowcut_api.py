@@ -2,6 +2,7 @@ import asyncio
 import shutil
 import tempfile
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -17,20 +18,12 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     FlowCutVideoRepairRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
-from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-    _VIDEOEDIT_SEMAPHORE,
-    _build_vividvr_repair_kwargs,
-    _copy_video_repair_request_with_caption,
-    _ensure_vividvr_caption_file,
-    _is_vividvr_video_repair_pipeline,
-    _resolve_video_repair_model_name,
-    _split_output_path,
-    _video_repair_job_from_sampling,
-)
+from sglang.multimodal_gen.runtime.entrypoints.openai import video_repair_shared
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_job_runner import (
     run_video_generation_job,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_progress import (
+    FLOWCUT_STAGE_PROGRESS,
     VividVRFlowCutProgressReporter,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_storage import (
@@ -39,9 +32,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_storage im
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.vividvr.progress_file import (
+    read_vividvr_runtime_progress,
+)
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
+FLOWCUT_DENOISE_MONITOR_INTERVAL_SECONDS = 1.0
 
 
 async def _post_stage_callback(callback_url: str, payload: dict[str, Any]) -> None:
@@ -84,6 +81,84 @@ async def _send_failed_safely(
         )
 
 
+def _runtime_progress_from_batch(batch, progress_path: str | None = None) -> float | None:
+    file_progress = read_vividvr_runtime_progress(progress_path)
+    if file_progress is not None:
+        return file_progress
+
+    sampling_params = getattr(batch, "sampling_params", None)
+    for candidate in (sampling_params, batch):
+        if candidate is None:
+            continue
+        runtime_progress = getattr(candidate, "runtime_progress", None)
+        if runtime_progress is None:
+            continue
+        try:
+            return float(runtime_progress)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _attach_flowcut_progress_path(batch, progress_path: str) -> None:
+    extra = getattr(batch, "extra", None)
+    if isinstance(extra, dict):
+        extra["vividvr_flowcut_progress_path"] = progress_path
+    elif hasattr(batch, "__dict__"):
+        setattr(batch, "extra", {"vividvr_flowcut_progress_path": progress_path})
+
+
+async def _send_denoise_progress_safely(
+    reporter: VividVRFlowCutProgressReporter,
+    runtime_progress: float,
+    *,
+    task_id: str,
+) -> None:
+    try:
+        sent = await reporter.send_denoise_progress(runtime_progress)
+    except Exception as e:
+        logger.warning(
+            "FlowCut denoise callback failed task_id=%s runtime_progress=%s: %s",
+            task_id,
+            runtime_progress,
+            e,
+        )
+        return
+    if sent:
+        await VIDEO_STORE.update_fields(
+            task_id,
+            {"status": "running", "progress": reporter.last_progress},
+        )
+
+
+async def _monitor_vividvr_denoise_progress(
+    task_id: str,
+    batch,
+    reporter: VividVRFlowCutProgressReporter,
+    generation_task: asyncio.Task,
+    *,
+    progress_path: str | None = None,
+    poll_interval_s: float = FLOWCUT_DENOISE_MONITOR_INTERVAL_SECONDS,
+) -> None:
+    while not generation_task.done():
+        runtime_progress = _runtime_progress_from_batch(batch, progress_path)
+        if runtime_progress is not None:
+            await _send_denoise_progress_safely(
+                reporter,
+                runtime_progress,
+                task_id=task_id,
+            )
+        await asyncio.wait({generation_task}, timeout=poll_interval_s)
+
+    runtime_progress = _runtime_progress_from_batch(batch, progress_path)
+    if runtime_progress is not None:
+        await _send_denoise_progress_safely(
+            reporter,
+            runtime_progress,
+            task_id=task_id,
+        )
+
+
 def _flowcut_work_base_dir(server_args) -> tuple[str, bool]:
     base_dir = getattr(server_args, "input_save_path", None) or getattr(
         server_args, "output_path", None
@@ -94,7 +169,9 @@ def _flowcut_work_base_dir(server_args) -> tuple[str, bool]:
 
 
 def _flowcut_output_file_name(req: FlowCutVideoRepairRequest, request_id: str) -> str:
-    _, output_file_name = _split_output_path(req.output_path, request_id, None)
+    _, output_file_name = video_repair_shared.split_output_path(
+        req.output_path, request_id, None
+    )
     return output_file_name
 
 
@@ -106,14 +183,31 @@ def _duration_from_job_result(job_result) -> float | None:
     return duration
 
 
+class _FlowCutGenerationTimeoutError(TimeoutError):
+    def __init__(self, timeout_s: float, generation_task: asyncio.Task):
+        super().__init__(f"generation timed out after {timeout_s:g} seconds")
+        self.timeout_s = timeout_s
+        self.generation_task = generation_task
+
+
 async def _run_generation_with_timeout(batch, timeout: int | float | None):
+    generation_task = asyncio.create_task(run_video_generation_job(batch))
+    return await _await_generation_task_with_timeout(generation_task, timeout)
+
+
+async def _await_generation_task_with_timeout(
+    generation_task: asyncio.Task,
+    timeout: int | float | None,
+):
     normalized_timeout = 300 if timeout in (None, 0) else timeout
     if normalized_timeout == -1:
-        return await run_video_generation_job(batch)
-    return await asyncio.wait_for(
-        run_video_generation_job(batch),
-        timeout=float(normalized_timeout),
-    )
+        return await generation_task
+
+    timeout_s = float(normalized_timeout)
+    try:
+        return await asyncio.wait_for(asyncio.shield(generation_task), timeout=timeout_s)
+    except asyncio.TimeoutError as e:
+        raise _FlowCutGenerationTimeoutError(timeout_s, generation_task) from e
 
 
 async def _dispatch_vividvr_flowcut_video_repair_job_async(
@@ -130,17 +224,49 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
         callback_url=callback_url,
         post_callback=_post_stage_callback,
     )
+    generation_task_to_drain = None
+    monitor_task = None
     try:
-        await VIDEO_STORE.update_fields(job_id, {"status": "running", "progress": 60})
-        await _send_stage_safely(reporter, "editing", task_id=job_id)
-        job_result = await _run_generation_with_timeout(batch, timeout)
+        await VIDEO_STORE.update_fields(
+            job_id,
+            {
+                "status": "running",
+                "progress": FLOWCUT_STAGE_PROGRESS["caption_ready"],
+            },
+        )
+        progress_path = str(storage.manifests_dir / "runtime_progress.json")
+        _attach_flowcut_progress_path(batch, progress_path)
+        generation_task = asyncio.create_task(run_video_generation_job(batch))
+        monitor_task = asyncio.create_task(
+            _monitor_vividvr_denoise_progress(
+                job_id,
+                batch,
+                reporter,
+                generation_task,
+                progress_path=progress_path,
+            )
+        )
+        try:
+            job_result = await _await_generation_task_with_timeout(
+                generation_task,
+                timeout,
+            )
+        except Exception:
+            if monitor_task is not None:
+                monitor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitor_task
+            raise
+        else:
+            if monitor_task is not None:
+                await monitor_task
         save_file_path = job_result.save_file_path
 
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "uploading",
-                "progress": 90,
+                "progress": FLOWCUT_STAGE_PROGRESS["uploading_result"],
                 "file_path": save_file_path,
             },
         )
@@ -167,6 +293,8 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
                 callback_error,
             )
     except Exception as e:
+        if isinstance(e, _FlowCutGenerationTimeoutError):
+            generation_task_to_drain = e.generation_task
         reason = str(e)
         logger.error("FlowCut Vivid-VR repair failed job=%s: %s", job_id, reason)
         await VIDEO_STORE.update_fields(
@@ -178,7 +306,16 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
         )
         await _send_failed_safely(reporter, reason, task_id=job_id)
     finally:
-        _VIDEOEDIT_SEMAPHORE.release()
+        if generation_task_to_drain is not None:
+            try:
+                await generation_task_to_drain
+            except Exception as e:
+                logger.warning(
+                    "FlowCut timed-out generation finished with error job=%s: %s",
+                    job_id,
+                    e,
+                )
+        video_repair_shared.VIDEOEDIT_SEMAPHORE.release()
 
 
 @router.post("/repairs/flowcut", response_model=FlowCutResponse)
@@ -205,15 +342,15 @@ async def create_vividvr_flowcut_video_repair(request: Request):
         )
 
     server_args = get_global_server_args()
-    if not _is_vividvr_video_repair_pipeline(server_args):
+    if not video_repair_shared.is_vividvr_video_repair_pipeline(server_args):
         return FlowCutResponse(
             code=1,
             message="FlowCut repair endpoint requires Vivid-VR pipeline",
         )
-    if _VIDEOEDIT_SEMAPHORE.locked():
+    if video_repair_shared.VIDEOEDIT_SEMAPHORE.locked():
         return FlowCutResponse(code=2, message="A task is running.")
 
-    await _VIDEOEDIT_SEMAPHORE.acquire()
+    await video_repair_shared.VIDEOEDIT_SEMAPHORE.acquire()
     request_id = req.task_id
     reporter = VividVRFlowCutProgressReporter(
         task_id=request_id,
@@ -241,7 +378,7 @@ async def create_vividvr_flowcut_video_repair(request: Request):
         output_file_path = storage.output_file_path(output_file_name)
         output_dir = str(Path(output_file_path).parent)
         try:
-            caption_file_path = await _ensure_vividvr_caption_file(
+            caption_file_path = await video_repair_shared.ensure_vividvr_caption_file(
                 request_id=request_id,
                 req=req,
                 server_args=server_args,
@@ -257,11 +394,11 @@ async def create_vividvr_flowcut_video_repair(request: Request):
             return FlowCutResponse(code=1, message=f"caption bridge failed: {e}")
         await _send_stage_safely(reporter, "caption_ready", task_id=request_id)
 
-        req_for_sampling = _copy_video_repair_request_with_caption(
+        req_for_sampling = video_repair_shared.copy_video_repair_request_with_caption(
             req,
             caption_file_path,
         )
-        vividvr_kwargs = _build_vividvr_repair_kwargs(
+        vividvr_kwargs = video_repair_shared.build_vividvr_repair_kwargs(
             request_id=request_id,
             req=req_for_sampling,
             server_args=server_args,
@@ -273,8 +410,12 @@ async def create_vividvr_flowcut_video_repair(request: Request):
             server_args,
             **vividvr_kwargs,
         )
-        job = _video_repair_job_from_sampling(request_id, req, sampling_params)
-        job["model"] = _resolve_video_repair_model_name(req, server_args, "VividVR")
+        job = video_repair_shared.video_repair_job_from_sampling(
+            request_id, req, sampling_params
+        )
+        job["model"] = video_repair_shared.resolve_video_repair_model_name(
+            req, server_args, "VividVR"
+        )
         await VIDEO_STORE.upsert(request_id, job)
         logger.info(
             "FlowCut video repair accepted task_id=%s output_path=%s callback_url=%s",
@@ -301,7 +442,7 @@ async def create_vividvr_flowcut_video_repair(request: Request):
         return FlowCutResponse(code=1, message=detail)
     finally:
         if not scheduled:
-            _VIDEOEDIT_SEMAPHORE.release()
+            video_repair_shared.VIDEOEDIT_SEMAPHORE.release()
             if storage is not None:
                 storage.cleanup()
             if temp_base_dir is not None:

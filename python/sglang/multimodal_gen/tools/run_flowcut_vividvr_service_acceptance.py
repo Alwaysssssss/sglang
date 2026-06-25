@@ -189,6 +189,47 @@ def poll_accepted_task(
     )
 
 
+def _validate_final_callback_payload(payload: dict[str, Any]) -> None:
+    status = payload.get("status")
+    if status != "succeeded":
+        raise FlowCutAcceptanceError(
+            f"FlowCut callback ended with status={status}: {payload}"
+        )
+
+    raw_output = payload.get("output")
+    if not isinstance(raw_output, str) or not raw_output:
+        raise FlowCutAcceptanceError(
+            f"FlowCut succeeded callback must include JSON string output: {payload}"
+        )
+    try:
+        output = json.loads(raw_output)
+    except Exception as exc:
+        raise FlowCutAcceptanceError(
+            f"FlowCut succeeded callback output is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(output, dict):
+        raise FlowCutAcceptanceError(
+            f"FlowCut succeeded callback output must be a JSON object: {output!r}"
+        )
+    allowed_keys = {"result_url", "duration"}
+    unexpected_keys = set(output) - allowed_keys
+    if unexpected_keys:
+        raise FlowCutAcceptanceError(
+            f"FlowCut succeeded callback output contains unexpected keys: "
+            f"{sorted(unexpected_keys)}"
+        )
+    result_url = output.get("result_url")
+    if not isinstance(result_url, str) or not result_url:
+        raise FlowCutAcceptanceError(
+            f"FlowCut succeeded callback output must include result_url: {output}"
+        )
+    duration = output.get("duration")
+    if duration is not None and not isinstance(duration, (int, float)):
+        raise FlowCutAcceptanceError(
+            f"FlowCut succeeded callback duration must be numeric when present: {output}"
+        )
+
+
 def _build_payload(
     args: argparse.Namespace, *, callback_url: str
 ) -> dict[str, Any]:
@@ -315,11 +356,7 @@ def main() -> int:
                 args.final_callback_timeout_s
             )
             print(json.dumps(final_callback, ensure_ascii=False), flush=True)
-            if final_callback.get("status") != "succeeded":
-                raise FlowCutAcceptanceError(
-                    f"FlowCut callback ended with status={final_callback.get('status')}: "
-                    f"{final_callback}"
-                )
+            _validate_final_callback_payload(final_callback)
     return 0
 
 
