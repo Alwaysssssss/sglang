@@ -121,6 +121,7 @@ def make_request(
     seed: int,
     num_inference_steps: int,
     caption_file_path: Path | None,
+    upscale: float,
 ):
     request_kwargs = {
         "prompt": " ",
@@ -132,6 +133,7 @@ def make_request(
         "return_file_paths_only": False,
         "seed": seed,
         "num_inference_steps": num_inference_steps,
+        "upscale": upscale,
     }
     if caption_file_path is not None:
         request_kwargs["caption_source"] = "caption_file"
@@ -211,6 +213,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of denoising steps used by both the SGLang and original benchmarks.",
     )
     parser.add_argument(
+        "--upscale",
+        type=float,
+        default=1.0,
+        help=(
+            "Original Vivid-VR input upscale contract. 0 scales the short side to 1024, "
+            "1 keeps the input resolution, and other positive values apply a direct "
+            "pre-inference resize factor."
+        ),
+    )
+    parser.add_argument(
         "--wait-for-reference-seconds",
         type=float,
         default=7200.0,
@@ -287,6 +299,7 @@ def main() -> int:
         seed=42,
         num_inference_steps=args.num_inference_steps,
         caption_file_path=args.caption_file,
+        upscale=args.upscale,
     )
 
     print(f"[PhaseD] run_id={run_id}")

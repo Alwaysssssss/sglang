@@ -160,6 +160,7 @@ class VideoRepairRequest(BaseModel):
     dtype: str = "bf16"
     num_temporal_process_frames: Optional[int] = None
     restoration_guidance_scale: Optional[float] = None
+    upscale: Optional[float] = None
     dynamic_cfg: bool = True
     dynamic_cfg_max_step: int = 15
     dynamic_cfg_min: float = 1.0

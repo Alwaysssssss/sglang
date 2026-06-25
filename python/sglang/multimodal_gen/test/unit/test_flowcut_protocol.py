@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 
 import pytest
 from pydantic import ValidationError
@@ -69,6 +70,17 @@ def test_vividvr_flowcut_timeout_zero_or_missing_defaults_to_300():
     assert VividVRFlowCutRequest.model_validate({}).timeout == 300
     assert VividVRFlowCutRequest.model_validate({"timeout": 0}).timeout == 300
     assert VividVRFlowCutRequest.model_validate({"timeout": -1}).timeout == -1
+
+
+def test_vividvr_flowcut_request_accepts_original_upscale_contract():
+    assert VividVRFlowCutRequest.model_validate({"upscale": 0.0}).upscale == 0.0
+    assert VividVRFlowCutRequest.model_validate({"upscale": 2.0}).upscale == 2.0
+
+
+@pytest.mark.parametrize("invalid", [-1.0, math.nan, math.inf, True])
+def test_vividvr_flowcut_request_rejects_invalid_upscale(invalid):
+    with pytest.raises(ValidationError):
+        VividVRFlowCutRequest.model_validate({"upscale": invalid})
 
 
 def test_flowcut_response_uses_numeric_code():

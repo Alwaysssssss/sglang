@@ -220,7 +220,10 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         )
         pipeline.video_processor = SimpleNamespace()
         pipeline.get_module = lambda _name: SimpleNamespace(
-            config=SimpleNamespace(temporal_compression_ratio=4)
+            config=SimpleNamespace(
+                temporal_compression_ratio=4,
+                block_out_channels=[128, 256, 256, 512],
+            )
         )
 
         clip_specs = [
@@ -304,6 +307,8 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
                 {"clip_index": 1, "caption_text": "clip 1", "tile_count": 2},
             ],
         )
+        self.assertEqual(batch.height, 8)
+        self.assertEqual(batch.width, 8)
 
     def test_build_temporal_latent_merge_plan_matches_reference_math(self):
         plan = build_vividvr_temporal_latent_merge_plan(
@@ -597,13 +602,16 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.load_control_video",
             return_value=fake_video_info,
         ) as mock_load_control_video:
-            first = pipeline._resolve_input_video_info("/tmp/control.mp4")
-            second = pipeline._resolve_input_video_info("/tmp/control.mp4")
+            first = pipeline._resolve_input_video_info("/tmp/control.mp4", upscale=1.0)
+            second = pipeline._resolve_input_video_info("/tmp/control.mp4", upscale=1.0)
 
         self.assertIs(first, fake_video_info)
         self.assertIs(second, fake_video_info)
         self.assertIs(first, second)
-        mock_load_control_video.assert_called_once_with("/tmp/control.mp4")
+        mock_load_control_video.assert_called_once_with(
+            "/tmp/control.mp4",
+            upscale=1.0,
+        )
 
     def test_temporal_windowed_forward_uses_unbound_step_profile_helper(self):
         params = self._make_vividvr_params(
@@ -718,7 +726,10 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         )
         pipeline.video_processor = SimpleNamespace()
         pipeline.get_module = lambda _name: SimpleNamespace(
-            config=SimpleNamespace(temporal_compression_ratio=4)
+            config=SimpleNamespace(
+                temporal_compression_ratio=4,
+                block_out_channels=[128, 256, 256, 512],
+            )
         )
 
         clip_spec = SimpleNamespace(
@@ -785,6 +796,8 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             dummy_denoising_stage.last_call["raw_latent_shape"],
             dummy_denoising_stage.last_call["latent_shape"],
         )
+        self.assertEqual(batch.height, 8)
+        self.assertEqual(batch.width, 8)
         self.assertEqual(batch.output.shape, (3, 4, 4, 4))
         self.assertFalse(batch.extra["vividvr_debug"]["vae_tiling_enabled"])
         self.assertEqual(batch.sampling_params.runtime_progress, 1.0)

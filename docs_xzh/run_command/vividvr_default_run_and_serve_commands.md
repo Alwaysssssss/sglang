@@ -6,6 +6,7 @@
 
 - 单卡默认：`single_gpu_fa_compile`
 - 双卡默认：`dual_gpu_fa_eager_compile`
+- 本地 `offline / benchmark` 默认 `upscale=1.0`，与原版 `/home/zhiheng/Vivid-VR` 的 `up1` 语义对齐
 - 双卡默认质量口径固定：
   - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`
   - `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`
@@ -27,6 +28,7 @@
 - `/home/zhiheng/Vivid-VR` 当前只继续提供静态资源，例如 checkpoint、输入视频、`prompt.txt`、reference 和基线 caption 文件。
 - 主推理和 `serve` 必须继续使用 `/home/zhiheng/sglang/.venv`；不要为了 caption 把主推理切回原版环境。
 - 当前 caption bridge 的 sidecar 文本契约是：`caption.txt` 一行对应一个 temporal clip，行数、顺序和文本内容都必须与单卡基线逐字一致。
+- 当前 `upscale` 已接入 `serve / FlowCut` 请求体，但它仍然表示**原版 Vivid-VR 的输入预缩放语义**，不是 `enable_upscaling / upscaling_scale` 那条后处理超分链。
 - 单卡正式 benchmark 时同一时刻只能有一个单卡推理进程，避免并发导致耗时失真。
 - 如果是 `serve` benchmark，必须先做一次 warmup，再记录第二次正式请求；warmup 不计入正式结果。
 - 本文默认 `serve` 命令使用 `--host 0.0.0.0`，方便其他服务器直接请求当前机器上的 Vivid-VR 服务；如果只希望本机访问，可按“对外暴露端口”章节改回 `--host 127.0.0.1` 或指定网卡 IP。
@@ -47,6 +49,7 @@ tmux new-session -d -s vividvr_single_default \
     --mode-label single_gpu_fa_compile \
     --num-temporal-process-frames 121 \
     --num-inference-steps 20 \
+    --upscale 1.0 \
     --seed 42 \
     --num-gpus 1 \
     --tp-size 1 \
@@ -80,6 +83,7 @@ tmux new-session -d -s vividvr_dual_default \
     --mode-label dual_gpu_fa_eager_compile \
     --num-temporal-process-frames 121 \
     --num-inference-steps 20 \
+    --upscale 1.0 \
     --seed 42 \
     --num-gpus 2 \
     --tp-size 1 \
@@ -98,6 +102,12 @@ tmux new-session -d -s vividvr_dual_default \
 ```bash
 tmux attach -r -t vividvr_dual_default
 ```
+
+如果要显式复现原版 `upscale` 语义，可只改这一个参数：
+
+- `--upscale 0.0`：把输入短边缩放到 `1024`
+- `--upscale 1.0`：保持输入分辨率不变
+- `--upscale <正数且不等于 1.0>`：按倍率做推理前输入 resize
 
 ## 3. 当前推荐的 `serve` 启动顺序
 
@@ -478,6 +488,187 @@ bridge 场景下的 sidecar 文本默认写到：
 ```bash
 /home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_serve_*.log
 /home/zhiheng/sglang/Vivid_Acceptance/logs/vividvr_caption_sidecar_*.log
+```
+
+### 3.12 启动本地 S3/MinIO 模拟服务
+
+如果要做 FlowCut `minioConfig` 上传验收，先起一个本地 `moto_server` 作为 S3/MinIO 模拟服务：
+
+```bash
+tmux new-session -d -s vividvr_moto_s3 \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && /home/zhiheng/sglang/.venv/bin/moto_server -H 127.0.0.1 -p 4566 2>&1 | tee Vivid_Acceptance/logs/vividvr_moto_s3_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+查看模拟 S3 服务：
+
+```bash
+tmux attach -r -t vividvr_moto_s3
+```
+
+准备环境变量并创建 bucket：
+
+```bash
+export MOTO_S3_ENDPOINT=127.0.0.1:4566
+export MOTO_S3_BUCKET=flowcut
+export MOTO_S3_ACCESS_KEY=test
+export MOTO_S3_SECRET_KEY=test
+
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import boto3
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+s3.create_bucket(Bucket="flowcut")
+print([b["Name"] for b in s3.list_buckets()["Buckets"]])
+PY
+```
+
+### 3.13 启动 FlowCut MinIO 单卡服务
+
+当前本地 `moto_server` 验收口径走单卡 `fa eager`，不启用 caption bridge，直接复用已知 `caption_file_path + reference_video_path`。这里如果要保持当前已验收基线，建议继续显式传 `upscale=1.0`。
+
+```bash
+tmux new-session -d -s vividvr_moto_minio_service \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && \
+   export CUDA_VISIBLE_DEVICES=1 && \
+   export PYTHONPATH=python && \
+   export NO_PROXY=127.0.0.1,localhost && \
+   export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+   /home/zhiheng/sglang/.venv/bin/sglang serve \
+     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+     --model-id VividVR \
+     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+     --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
+     --num-gpus 1 \
+     --attention-backend fa \
+     --host 127.0.0.1 \
+     --port 31220 \
+     --master-port 30220 \
+     --scheduler-port 56220 \
+     --strict-ports \
+     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_moto_minio_service_fa_eager_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+查看服务：
+
+```bash
+tmux attach -r -t vividvr_moto_minio_service
+```
+
+检查健康：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31220/health
+```
+
+### 3.14 FlowCut MinIO 模拟请求
+
+先准备请求变量：
+
+```bash
+export MOTO_BASE_URL=http://127.0.0.1:31220
+export MOTO_CALLBACK_BASE_URL=http://<CALLBACK_SERVER_IP>:39090
+export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
+export REFERENCE_VIDEO=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4
+```
+
+然后提交带 `minioConfig` 的 FlowCut 模拟请求：
+
+```bash
+export TASK_ID=vividvr-moto-minio-$(date -u +%Y%m%dT%H%M%SZ)
+
+NO_PROXY=* curl -sS -X POST "${MOTO_BASE_URL}/v1/videos/repairs/flowcut" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
+{
+  "taskId": "${TASK_ID}",
+  "timeout": -1,
+  "callbackUrl": "${MOTO_CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
+  "video_input_path": "${INPUT_VIDEO_130F}",
+  "caption_file_path": "${CAPTION_FILE}",
+  "reference_video_path": "${REFERENCE_VIDEO}",
+  "num_inference_steps": 20,
+  "seed": 42,
+  "num_temporal_process_frames": 121,
+  "upscale": 1.0,
+  "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json",
+  "minioConfig": {
+    "endpoint": "${MOTO_S3_ENDPOINT}",
+    "bucket_name": "${MOTO_S3_BUCKET}",
+    "access_key": "${MOTO_S3_ACCESS_KEY}",
+    "secret_key": "${MOTO_S3_SECRET_KEY}",
+    "secure": false,
+    "region": "us-east-1"
+  }
+}
+JSON
+```
+
+如果你已经有 callback receiver，也可以把这条请求改成自动 bridge 版本；当前字段差异只在于不传 `caption_file_path` 和 `reference_video_path`。
+
+如果你用的是仓库内的 acceptance runner，也可以直接带 `--upscale` 提交：
+
+```bash
+export TASK_ID=vividvr-moto-minio-runner-$(date -u +%Y%m%dT%H%M%SZ)
+
+NO_PROXY=* PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
+  python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
+  --base-url "${MOTO_BASE_URL}" \
+  --task-id "${TASK_ID}" \
+  --callback-log "${LOG_DIR}/${TASK_ID}.callback.jsonl" \
+  --video-input-path "${INPUT_VIDEO_130F}" \
+  --caption-file-path "${CAPTION_FILE}" \
+  --reference-video-path "${REFERENCE_VIDEO}" \
+  --output-path "${OUTPUT_DIR}/${TASK_ID}.mp4" \
+  --perf-dump-path "${INDICATOR_DIR}/${TASK_ID}_perf.json" \
+  --num-inference-steps 20 \
+  --num-temporal-process-frames 121 \
+  --upscale 1.0 \
+  --seed 42
+```
+
+### 3.15 查询 FlowCut MinIO 结果
+
+轮询任务进度：
+
+```bash
+curl --noproxy '*' -X GET "${MOTO_BASE_URL}/v1/videos/${TASK_ID}/progress"
+```
+
+检查模拟 S3 中是否已有上传对象：
+
+```bash
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import boto3
+import os
+
+task_id = os.environ["TASK_ID"]
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+head = s3.head_object(Bucket="flowcut", Key=f"outputs/{task_id}.mp4")
+print({"content_length": head["ContentLength"]})
+PY
+```
+
+成功 callback 返回的 `result_url` 形态应为：
+
+```text
+http://127.0.0.1:4566/flowcut/outputs/<TASK_ID>.mp4
 ```
 
 ## 4. 对外暴露端口

@@ -108,6 +108,32 @@ def test_build_vividvr_kwargs_keeps_phase_e_defaults_optional(tmp_path):
     assert kwargs["seed"] == 42
 
 
+def test_build_vividvr_kwargs_forwards_original_upscale_contract(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("restore the video", encoding="utf-8")
+    server_args = SimpleNamespace(
+        prompt_file_path=str(prompt_file),
+        pipeline_config=SimpleNamespace(default_prompt_file_path=str(prompt_file)),
+    )
+    req = VideoRepairRequest(
+        task_id="job-1",
+        video_input_path="/tmp/input.mp4",
+        seed=42,
+        upscale=0.0,
+    )
+
+    kwargs = video_repair_shared.build_vividvr_repair_kwargs(
+        request_id="job-1",
+        req=req,
+        server_args=server_args,
+        video_input_path="/tmp/input.mp4",
+        output_dir=str(tmp_path),
+        output_file_name="job-1.mp4",
+    )
+
+    assert kwargs["upscale"] == 0.0
+
+
 def test_flowcut_endpoint_returns_code_2_when_queue_full(monkeypatch, tmp_path):
     class LockedSemaphore:
         def locked(self):

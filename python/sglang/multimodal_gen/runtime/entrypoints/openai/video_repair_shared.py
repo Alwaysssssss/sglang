@@ -129,6 +129,8 @@ def build_vividvr_repair_kwargs(
         vividvr_kwargs["num_temporal_process_frames"] = req.num_temporal_process_frames
     if req.restoration_guidance_scale is not None:
         vividvr_kwargs["restoration_guidance_scale"] = req.restoration_guidance_scale
+    if getattr(req, "upscale", None) is not None:
+        vividvr_kwargs["upscale"] = req.upscale
     if req.frame_interpolation_model_path is not None:
         vividvr_kwargs["frame_interpolation_model_path"] = (
             req.frame_interpolation_model_path

@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.vividvr import (
     apply_reference_color_fix,
+    attach_generation_resolution,
     build_vividvr_caption_prompt_lists,
     build_vividvr_temporal_latent_merge_plan,
     build_vividvr_temporal_window_plan,
@@ -175,6 +176,8 @@ def _build_temporal_clip_video_info(
         "fps": input_video_info["fps"],
         "original_height": input_video_info["original_height"],
         "original_width": input_video_info["original_width"],
+        "gen_height": input_video_info["gen_height"],
+        "gen_width": input_video_info["gen_width"],
         "original_num_frames": clip_spec.original_num_frames,
         "num_padding_frames": clip_spec.num_padding_frames,
     }
@@ -392,12 +395,29 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
         params: VividVRSamplingParams,
         control_video_info: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if control_video_info is not None:
-            return control_video_info
-        preloaded = batch.extra.pop("vividvr_input_video_info", None)
-        if preloaded is not None:
-            return preloaded
-        return load_control_video(params.video_input_path)
+        resolved = control_video_info
+        if resolved is None:
+            preloaded = batch.extra.pop("vividvr_input_video_info", None)
+            if preloaded is not None:
+                resolved = preloaded
+        if resolved is None:
+            resolved = load_control_video(
+                params.video_input_path,
+                upscale=float(params.upscale),
+            )
+        return attach_generation_resolution(
+            resolved,
+            tile_size=int(params.tile_size),
+            vae_scale_factor_spatial=int(self._vae_scale_factor_spatial),
+        )
+
+    def _sync_runtime_resolution(
+        self,
+        params: VividVRSamplingParams,
+        control_video_info: dict[str, Any],
+    ) -> None:
+        params.height = int(control_video_info["gen_height"])
+        params.width = int(control_video_info["gen_width"])
 
     def _resolve_generator(
         self,
@@ -446,6 +466,7 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             params,
             control_video_info,
         )
+        self._sync_runtime_resolution(params, control_video_info)
 
         control_video = self.video_processor.preprocess_video(
             control_video_info["video"],
@@ -467,6 +488,8 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             "control_latents": control_latents,
             "original_height": int(control_video_info["original_height"]),
             "original_width": int(control_video_info["original_width"]),
+            "gen_height": int(control_video_info["gen_height"]),
+            "gen_width": int(control_video_info["gen_width"]),
             "original_num_frames": int(control_video_info["original_num_frames"]),
             "num_padding_frames": int(control_video_info["num_padding_frames"]),
             "padded_input_frames": int(control_video.shape[2]),
@@ -491,6 +514,8 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
 
         debug = batch.extra.setdefault("vividvr_debug", {})
         debug["padded_input_frames"] = params.runtime_padded_input_frames
+        debug["gen_height"] = int(prepared["gen_height"])
+        debug["gen_width"] = int(prepared["gen_width"])
 
         batch.height = int(params.height)
         batch.width = int(params.width)
@@ -765,6 +790,24 @@ class VividVRDenoisingStage(PipelineStage):
             local_rank = 0
         return tqdm(total=total, disable=local_rank != 0, desc="VividVR denoising")
 
+    def _prepare_image_rotary_emb(
+        self,
+        latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.transformer.config.use_rotary_positional_embeddings:
+            return None
+        return prepare_rotary_positional_embeddings(
+            latent_height=latents.shape[-2],
+            latent_width=latents.shape[-1],
+            num_frames=latents.shape[1],
+            patch_size=self.transformer.config.patch_size,
+            patch_size_t=self.transformer.config.patch_size_t,
+            attention_head_dim=self.transformer.config.attention_head_dim,
+            device=latents.device,
+            sample_height=self.transformer.config.sample_height,
+            sample_width=self.transformer.config.sample_width,
+        )
+
     def _build_runtime_attn_metadata(
         self,
         batch: Req,
@@ -857,21 +900,7 @@ class VividVRDenoisingStage(PipelineStage):
             if self.transformer.config.ofs_embed_dim is None
             else latents.new_full((1,), fill_value=2.0)
         )
-        image_rotary_emb = (
-            prepare_rotary_positional_embeddings(
-                latent_height=latents.shape[-2],
-                latent_width=latents.shape[-1],
-                num_frames=latents.shape[1],
-                patch_size=self.transformer.config.patch_size,
-                patch_size_t=self.transformer.config.patch_size_t,
-                attention_head_dim=self.transformer.config.attention_head_dim,
-                device=device,
-                sample_height=self.transformer.config.sample_height,
-                sample_width=self.transformer.config.sample_width,
-            )
-            if self.transformer.config.use_rotary_positional_embeddings
-            else None
-        )
+        image_rotary_emb = self._prepare_image_rotary_emb(latents)
 
         debug = batch.extra.setdefault("vividvr_debug", {})
         debug.update(
@@ -967,7 +996,6 @@ class VividVRDenoisingStage(PipelineStage):
                 batch.eta,
             ),
             "ofs_emb": ofs_emb,
-            "image_rotary_emb": image_rotary_emb,
             "old_pred_original_sample": None,
             "target_dtype": target_dtype,
             "autocast_enabled": autocast_enabled,
@@ -994,7 +1022,6 @@ class VividVRDenoisingStage(PipelineStage):
         tiling_infos = denoising_state["tiling_infos"]
         extra_step_kwargs = denoising_state["extra_step_kwargs"]
         ofs_emb = denoising_state["ofs_emb"]
-        image_rotary_emb = denoising_state["image_rotary_emb"]
         old_pred_original_sample = denoising_state["old_pred_original_sample"]
         target_dtype = denoising_state["target_dtype"]
         debug = batch.extra.setdefault("vividvr_debug", {})
@@ -1021,6 +1048,7 @@ class VividVRDenoisingStage(PipelineStage):
                 if old_pred_original_sample is not None
                 else None
             )
+            image_rotary_emb = self._prepare_image_rotary_emb(tile_latents)
             timestep_expand = timestep.expand(tile_latents.shape[0])
 
             latent_model_input = (
@@ -1330,6 +1358,8 @@ class VividVRTemporalWindowPlanningStage(PipelineStage):
         params.runtime_original_num_frames = original_num_frames
         params.runtime_fps = max(1, int(round(float(input_video_info["fps"]))))
         params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+        params.height = int(input_video_info["gen_height"])
+        params.width = int(input_video_info["gen_width"])
 
         batch.height = int(params.height)
         batch.width = int(params.width)

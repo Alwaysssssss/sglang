@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import sys
@@ -413,6 +414,7 @@ def build_request(
         "guidance_scale": args.guidance_scale,
         "restoration_guidance_scale": args.restoration_guidance_scale,
         "num_temporal_process_frames": args.num_temporal_process_frames,
+        "upscale": args.upscale,
         "dtype": args.dtype,
         "enable_spatial_tiling": args.enable_spatial_tiling,
         "enable_temporal_tiling": args.enable_temporal_tiling,
@@ -557,6 +559,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=121,
         help="Temporal clip length used for long-video split / merge orchestration.",
+    )
+    parser.add_argument(
+        "--upscale",
+        type=float,
+        default=1.0,
+        help=(
+            "Original Vivid-VR input upscale contract. 0 scales the short side to 1024, "
+            "1 keeps the input resolution, and other positive values apply a direct "
+            "pre-inference resize factor."
+        ),
     )
     parser.add_argument(
         "--dtype",
@@ -847,6 +859,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--num-inference-steps must be positive")
     if args.num_temporal_process_frames <= 0:
         raise SystemExit("--num-temporal-process-frames must be positive")
+    if not math.isfinite(args.upscale) or args.upscale < 0:
+        raise SystemExit("--upscale must be a finite float >= 0")
     if args.allow_frame_count_delta < 0:
         raise SystemExit("--allow-frame-count-delta must be >= 0")
     if args.num_gpus <= 0:
@@ -926,6 +940,7 @@ def build_dry_run_payload(
         "guidance_scale": args.guidance_scale,
         "restoration_guidance_scale": args.restoration_guidance_scale,
         "num_temporal_process_frames": args.num_temporal_process_frames,
+        "upscale": args.upscale,
         "dtype": args.dtype,
         "enable_spatial_tiling": args.enable_spatial_tiling,
         "enable_temporal_tiling": args.enable_temporal_tiling,

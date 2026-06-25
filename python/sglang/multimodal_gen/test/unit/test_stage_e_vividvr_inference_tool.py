@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipelineConfig
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.compare import compare_videos
 from sglang.multimodal_gen.runtime.videoedit.frame_cache import (
@@ -18,6 +19,7 @@ from sglang.multimodal_gen.runtime.videoedit.preprocess import load_video_frames
 from sglang.multimodal_gen.tools.run_vividvr_inference import (
     _ensure_python_dev_headers_for_torch_compile,
     _synchronize_ranks_before_cleanup,
+    build_request,
     build_dry_run_payload,
     build_runtime_config_snapshot,
     build_server_args,
@@ -110,6 +112,19 @@ class TestVividVRInferenceTool(unittest.TestCase):
         self.assertEqual(args.ring_degree, 1)
         self.assertEqual(args.master_port, 30123)
         self.assertEqual(args.dist_timeout, 1800)
+
+    def test_parse_args_supports_original_upscale_flag(self):
+        argv = [
+            "run_vividvr_inference.py",
+            "--input-video",
+            "/tmp/input.mp4",
+            "--upscale",
+            "0",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.upscale, 0.0)
 
     def test_build_server_args_forwards_qk_norm_rope_fusion(self):
         args = Namespace(
@@ -312,6 +327,7 @@ class TestVividVRInferenceTool(unittest.TestCase):
             guidance_scale=7.5,
             restoration_guidance_scale=1.0,
             num_temporal_process_frames=49,
+            upscale=0.0,
             dtype="bfloat16",
             enable_spatial_tiling=True,
             enable_temporal_tiling=False,
@@ -370,6 +386,39 @@ class TestVividVRInferenceTool(unittest.TestCase):
         self.assertEqual(payload["distributed_env"]["world_size"], 2)
         self.assertEqual(payload["distributed_env"]["rank"], 0)
         self.assertEqual(payload["distributed_env"]["local_rank"], 0)
+        self.assertEqual(payload["upscale"], 0.0)
+
+    def test_build_request_forwards_original_upscale_contract(self):
+        args = Namespace(
+            input_video=Path("/tmp/input.mp4"),
+            output_dir=Path("/tmp/out"),
+            seed=42,
+            num_inference_steps=20,
+            guidance_scale=6.0,
+            restoration_guidance_scale=-1.0,
+            num_temporal_process_frames=121,
+            upscale=0.0,
+            dtype="bf16",
+            enable_spatial_tiling=True,
+            enable_temporal_tiling=False,
+            tile_size=128,
+            tile_stride=64,
+            prompt_file=Path("/tmp/prompt.txt"),
+            caption_file=None,
+        )
+        server_args = ServerArgs(
+            model_path="/tmp/model",
+            output_path="/tmp/out",
+            pipeline_config=VividVRPipelineConfig(),
+        )
+
+        request = build_request(
+            server_args=server_args,
+            args=args,
+            output_file_name="candidate.mp4",
+        )
+
+        self.assertEqual(request.sampling_params.upscale, 0.0)
 
     def test_validate_args_rejects_num_gpus_world_size_mismatch(self):
         args = Namespace(
@@ -381,6 +430,7 @@ class TestVividVRInferenceTool(unittest.TestCase):
             reference_video=None,
             num_inference_steps=20,
             num_temporal_process_frames=49,
+            upscale=1.0,
             allow_frame_count_delta=1,
             num_gpus=1,
             dp_size=1,

@@ -134,6 +134,7 @@ def test_build_payload_omits_optional_caption_and_reference_for_bridge_path(tmp_
 
     assert payload["video_input_path"] == "/tmp/input.mp4"
     assert payload["callbackUrl"].endswith("/tasks/task-bridge/callback")
+    assert payload["upscale"] == 1.0
     assert "caption_file_path" not in payload
     assert "reference_video_path" not in payload
 
@@ -154,6 +155,24 @@ def test_parse_args_accepts_long_submit_timeout_for_caption_bridge(tmp_path):
     )
 
     assert args.submit_timeout_s == 2400.0
+
+
+def test_parse_args_accepts_original_upscale_flag_for_service_request(tmp_path):
+    callback_log = tmp_path / "callback.jsonl"
+    args = parse_args(
+        [
+            "--task-id",
+            "task-upscale",
+            "--callback-log",
+            str(callback_log),
+            "--video-input-path",
+            "/tmp/input.mp4",
+            "--upscale",
+            "2.0",
+        ]
+    )
+
+    assert args.upscale == 2.0
 
 
 def test_validate_final_callback_requires_result_url_only():

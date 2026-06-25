@@ -241,6 +241,7 @@ def _build_payload(
         "num_inference_steps": args.num_inference_steps,
         "seed": args.seed,
         "num_temporal_process_frames": args.num_temporal_process_frames,
+        "upscale": args.upscale,
     }
     if args.caption_file:
         payload["caption_file_path"] = args.caption_file
@@ -275,6 +276,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-inference-steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-temporal-process-frames", type=int, default=121)
+    parser.add_argument(
+        "--upscale",
+        type=float,
+        default=1.0,
+        help=(
+            "Original Vivid-VR input upscale contract. 0 scales the short side to "
+            "1024, 1 keeps the input resolution unchanged, and other positive "
+            "values scale the input by that multiplier before inference."
+        ),
+    )
     parser.add_argument("--submit-timeout-s", type=float, default=1800.0)
     parser.add_argument("--submit-retry-interval-seconds", type=float, default=30.0)
     parser.add_argument("--max-submit-attempts", type=int, default=60)
@@ -287,6 +298,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--callback-url and --callback-log are mutually exclusive")
     if not args.callback_url and not args.callback_log:
         parser.error("either --callback-url or --callback-log is required")
+    if not math.isfinite(args.upscale) or args.upscale < 0:
+        parser.error("--upscale must be a finite float >= 0")
     return args
 
 

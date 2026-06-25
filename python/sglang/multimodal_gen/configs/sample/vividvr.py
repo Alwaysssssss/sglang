@@ -33,6 +33,7 @@ class VividVRSamplingParams(SamplingParams):
     tile_stride: int = 64
     num_temporal_process_frames: int = 121
     restoration_guidance_scale: float = -1.0
+    upscale: float = 1.0
 
     height: int = 720
     width: int = 960
@@ -178,6 +179,16 @@ class VividVRSamplingParams(SamplingParams):
             raise ValueError(
                 "restoration_guidance_scale must be a finite number, "
                 f"got {self.restoration_guidance_scale!r}"
+            )
+        if (
+            isinstance(self.upscale, bool)
+            or not isinstance(self.upscale, (int, float))
+            or not math.isfinite(float(self.upscale))
+            or float(self.upscale) < 0.0
+        ):
+            raise ValueError(
+                "upscale must be a finite number >= 0 that follows the original "
+                f"Vivid-VR contract, got {self.upscale!r}"
             )
 
     def _validate_with_pipeline_config(self, pipeline_config):

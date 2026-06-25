@@ -94,6 +94,7 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual(params.width, 960)
         self.assertEqual(params.height, 720)
         self.assertEqual(params.num_frames, 121)
+        self.assertEqual(params.upscale, 1.0)
         self.assertIsNone(params.output_quality)
         self.assertIsNone(params.output_compression)
 
@@ -119,6 +120,16 @@ class TestSamplingParamsSubclass(unittest.TestCase):
             VividVRSamplingParams(use_live_cogvlm2_caption=True)
         with self.assertRaisesRegex(ValueError, r"cogvlm2_model_path"):
             VividVRSamplingParams(cogvlm2_model_path="/tmp/cogvlm2")
+
+    def test_vividvr_accepts_original_upscale_contract_values(self):
+        self.assertEqual(VividVRSamplingParams(upscale=0.0).upscale, 0.0)
+        self.assertEqual(VividVRSamplingParams(upscale=2.0).upscale, 2.0)
+
+    def test_vividvr_rejects_invalid_upscale_values(self):
+        for invalid in (-1.0, math.nan, math.inf, True):
+            with self.subTest(upscale=invalid):
+                with self.assertRaisesRegex(ValueError, r"\bupscale\b"):
+                    VividVRSamplingParams(upscale=invalid)
 
     def test_vividvr_from_user_kwargs_uses_stage_a_contract(self):
         server_args = SimpleNamespace(

@@ -550,6 +550,7 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             self.assertEqual(
                 module.compile_invocations[0]["mode"], "reduce-overhead"
             )
+            self.assertIs(module.compile_invocations[0]["dynamic"], False)
 
             compiled_again = _maybe_torch_compile_module(
                 compiled_module,

@@ -80,6 +80,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.vividvr import (
     apply_reference_color_fix,
+    attach_generation_resolution,
     build_vividvr_caption_prompt_lists,
     build_vividvr_tiled_prompt_lists,
     build_vividvr_temporal_latent_merge_plan,
@@ -307,6 +308,10 @@ def _maybe_torch_compile_module(
         mode = os.environ.get(
             "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
         )
+        # Keep VividVR on static-shape graphs per realized tile shape. This avoids
+        # inductor autotune carrying symbolic tile extents into benchmark buffer
+        # allocation on edge-tile inputs such as 90x128 latent views.
+        compile_kwargs["dynamic"] = False
         compile_kwargs["mode"] = mode
         logger.info("Compiling VividVR %s with mode=%s.", module_name, mode)
 
@@ -464,14 +469,19 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         debug.update(self._build_runtime_acceleration_debug(server_args))
 
     def _build_control_video_cache_key(
-        self, video_input_path: str
-    ) -> tuple[str, int, int]:
+        self, video_input_path: str, upscale: float
+    ) -> tuple[str, int, int, float]:
         resolved_path = os.path.abspath(os.fspath(video_input_path))
         stat = os.stat(resolved_path)
-        return resolved_path, int(stat.st_mtime_ns), int(stat.st_size)
+        return resolved_path, int(stat.st_mtime_ns), int(stat.st_size), float(upscale)
 
-    def _resolve_input_video_info(self, video_input_path: str) -> dict[str, object]:
-        cache_key = self._build_control_video_cache_key(video_input_path)
+    def _resolve_input_video_info(
+        self,
+        video_input_path: str,
+        *,
+        upscale: float,
+    ) -> dict[str, object]:
+        cache_key = self._build_control_video_cache_key(video_input_path, upscale)
         cached_key = getattr(self, "_cached_control_video_cache_key", None)
         cached_info = getattr(self, "_cached_control_video_info", None)
         if cached_key == cache_key and cached_info is not None:
@@ -479,10 +489,27 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
 
         # Warmup requests are built via deepcopy(req), so keep the large decoded
         # control video cache on the pipeline instance instead of the request.
-        input_video_info = load_control_video(video_input_path)
+        input_video_info = load_control_video(video_input_path, upscale=upscale)
         self._cached_control_video_cache_key = cache_key
         self._cached_control_video_info = input_video_info
         return input_video_info
+
+    def _enrich_input_video_info_with_generation_resolution(
+        self,
+        input_video_info: dict[str, object],
+        *,
+        tile_size: int,
+    ) -> dict[str, object]:
+        if "gen_height" in input_video_info and "gen_width" in input_video_info:
+            return input_video_info
+
+        vae = self.get_module("vae")
+        vae_scale_factor_spatial = 2 ** (len(vae.config.block_out_channels) - 1)
+        return attach_generation_resolution(
+            input_video_info,
+            tile_size=int(tile_size),
+            vae_scale_factor_spatial=int(vae_scale_factor_spatial),
+        )
 
     def _apply_attention_backend(self, server_args: ServerArgs) -> None:
         requested_backend = server_args.attention_backend
@@ -977,6 +1004,8 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             "fps": input_video_info["fps"],
             "original_height": input_video_info["original_height"],
             "original_width": input_video_info["original_width"],
+            "gen_height": input_video_info["gen_height"],
+            "gen_width": input_video_info["gen_width"],
             "original_num_frames": clip_spec.original_num_frames,
             "num_padding_frames": clip_spec.num_padding_frames,
         }
@@ -1059,6 +1088,10 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         server_args: ServerArgs,
         input_video_info: dict[str, object],
     ) -> Req:
+        input_video_info = self._enrich_input_video_info_with_generation_resolution(
+            input_video_info,
+            tile_size=int(_as_vividvr_params(batch).tile_size),
+        )
         params = _as_vividvr_params(batch)
         batch = self._run_temporal_windowed_compat_stage(
             self.input_validation_stage,
@@ -1093,6 +1126,8 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         params.runtime_original_num_frames = original_num_frames
         params.runtime_fps = max(1, int(round(float(input_video_info["fps"]))))
         params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+        params.height = int(input_video_info["gen_height"])
+        params.width = int(input_video_info["gen_width"])
 
         batch.height = int(params.height)
         batch.width = int(params.width)
@@ -1366,6 +1401,10 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         server_args: ServerArgs,
         input_video_info: dict[str, object],
     ) -> Req:
+        input_video_info = self._enrich_input_video_info_with_generation_resolution(
+            input_video_info,
+            tile_size=int(_as_vividvr_params(batch).tile_size),
+        )
         batch.extra["vividvr_input_video_info"] = input_video_info
         stages = self._ensure_temporal_windowed_runtime(server_args)
         if not hasattr(batch, "profile") or not hasattr(batch, "is_warmup"):
@@ -1384,7 +1423,14 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         params = _as_vividvr_params(batch)
-        input_video_info = self._resolve_input_video_info(params.video_input_path)
+        raw_input_video_info = self._resolve_input_video_info(
+            params.video_input_path,
+            upscale=float(params.upscale),
+        )
+        input_video_info = self._enrich_input_video_info_with_generation_resolution(
+            raw_input_video_info,
+            tile_size=int(params.tile_size),
+        )
 
         if int(input_video_info["original_num_frames"]) <= params.num_temporal_process_frames:
             batch.extra["vividvr_input_video_info"] = input_video_info

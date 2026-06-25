@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.runtime.models.schedulers.cogvideox_dpm_vividvr import (
     CogVideoXDDIMScheduler,
 )
@@ -173,7 +173,7 @@ class TestStageEVividVROffload(unittest.TestCase):
                 controlnet=controlnet,
                 scheduler=scheduler,
             )
-        batch = Req(sampling_params=SamplingParams())
+        batch = Req(sampling_params=VividVRSamplingParams())
         batch.generator = torch.Generator(device="cuda").manual_seed(11)
         batch.eta = 0.0
 
@@ -206,7 +206,7 @@ class TestStageEVividVROffload(unittest.TestCase):
                 controlnet=controlnet,
                 scheduler=scheduler,
             )
-        batch = Req(sampling_params=SamplingParams())
+        batch = Req(sampling_params=VividVRSamplingParams())
         batch.generator = torch.Generator(device="cuda").manual_seed(11)
         batch.eta = 0.0
         batch.raw_latent_shape = (1, 3, 16, 4, 4)

@@ -1,3 +1,4 @@
+import math
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -46,6 +47,7 @@ class VividVRFlowCutRequest(BaseModel):
     dtype: str = "bf16"
     num_temporal_process_frames: Optional[int] = None
     restoration_guidance_scale: Optional[float] = None
+    upscale: Optional[float] = None
     dynamic_cfg: bool = True
     dynamic_cfg_max_step: int = 15
     dynamic_cfg_min: float = 1.0
@@ -79,6 +81,23 @@ class VividVRFlowCutRequest(BaseModel):
         if value is None or value == 0:
             return 300
         return value
+
+    @field_validator("upscale", mode="before")
+    @classmethod
+    def validate_original_vividvr_upscale_contract(cls, value):
+        if value is None:
+            return value
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(
+                "upscale must be a finite number >= 0 that follows the original "
+                f"Vivid-VR contract, got {value!r}"
+            )
+        return float(value)
 
     model_config = {
         "populate_by_name": True,

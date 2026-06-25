@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipelineConfig
@@ -103,7 +105,60 @@ def load_control_video_frames(video_path: str) -> tuple[list[Image.Image], float
         return _load_control_video_frames_cv2(video_path)
 
 
-def load_control_video(video_path: str) -> dict[str, object]:
+def _apply_original_vividvr_upscale(
+    video: torch.Tensor,
+    *,
+    upscale: float,
+) -> torch.Tensor:
+    if upscale == 1.0:
+        return video
+
+    if upscale == 0.0:
+        scale_factor = 1024.0 / min(int(video.shape[-2]), int(video.shape[-1]))
+    else:
+        scale_factor = float(upscale)
+
+    return F.interpolate(video, scale_factor=scale_factor, mode="bicubic").clip(0, 1)
+
+
+def plan_generation_resolution(
+    *,
+    raw_height: int,
+    raw_width: int,
+    tile_size: int,
+    vae_scale_factor_spatial: int,
+) -> tuple[int, int]:
+    threshold = int(tile_size) * int(vae_scale_factor_spatial)
+    gen_height = (
+        8 * math.ceil(int(raw_height) / 8)
+        if int(raw_height) < threshold
+        else int(raw_height)
+    )
+    gen_width = (
+        8 * math.ceil(int(raw_width) / 8) if int(raw_width) < threshold else int(raw_width)
+    )
+    return int(gen_height), int(gen_width)
+
+
+def attach_generation_resolution(
+    control_video_info: dict[str, object],
+    *,
+    tile_size: int,
+    vae_scale_factor_spatial: int,
+) -> dict[str, object]:
+    gen_height, gen_width = plan_generation_resolution(
+        raw_height=int(control_video_info["original_height"]),
+        raw_width=int(control_video_info["original_width"]),
+        tile_size=int(tile_size),
+        vae_scale_factor_spatial=int(vae_scale_factor_spatial),
+    )
+    enriched = dict(control_video_info)
+    enriched["gen_height"] = gen_height
+    enriched["gen_width"] = gen_width
+    return enriched
+
+
+def load_control_video(video_path: str, *, upscale: float = 1.0) -> dict[str, object]:
     frames, fps = load_control_video_frames(video_path)
     if not frames:
         raise ValueError(f"No frames found in control video: {video_path}")
@@ -112,6 +167,7 @@ def load_control_video(video_path: str) -> dict[str, object]:
         np.asarray(frame.convert("RGB"), dtype=np.float32) / 255.0 for frame in frames
     ]
     video = torch.from_numpy(np.stack(arrays, axis=0)).permute(0, 3, 1, 2).contiguous()
+    video = _apply_original_vividvr_upscale(video, upscale=float(upscale))
 
     # Preserve the unpadded reference frames. Phase C color alignment depends on
     # using the original control video, not the repeated tail frames.
