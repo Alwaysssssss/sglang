@@ -454,7 +454,15 @@ class SamplingParams:
 
         pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
 
-        if ("wan" in pipeline_name_lower or "helios" in pipeline_name_lower) and (
+        supports_native_sequence_shard = (
+            "wan" in pipeline_name_lower
+            or "helios" in pipeline_name_lower
+            or (
+                "vividvr" in pipeline_name_lower and getattr(server_args, "num_gpus", 1) > 1
+            )
+        )
+
+        if supports_native_sequence_shard and (
             self.enable_sequence_shard is None or self.enable_sequence_shard
         ):
             self.enable_sequence_shard = True

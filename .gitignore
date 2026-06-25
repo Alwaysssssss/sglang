@@ -176,6 +176,7 @@ benchmark/mmlu/data
 benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
+/logs/
 *.jsonl
 tmp*.txt
 
@@ -191,6 +192,16 @@ work_dirs/
 *.csv
 
 !logo.png
+
+# Large binary artifacts
+Vivid_Acceptance/indicator/
+Vivid_Acceptance/logs/
+Vivid_Acceptance/result_videos/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
 
 # Prerequisites
 *.d
@@ -277,4 +288,7 @@ sgl-kernel/csrc/**/*_musa/
 *.mp4
 
 # mgtv
-wheel/output_tyx/
+wheel/
+
+tmp/
+output_tyx/

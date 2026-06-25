@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.videoedit.mask_io import (
     load_mask_frames,
     probe_mask_frame_count,
 )
+from sglang.multimodal_gen.runtime.videoedit.frame_cache import (
+    get_cached_video_frames,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,13 @@ logger = logging.getLogger(__name__)
 def load_video_frames(
     video_path: str, num_frames: int | None = None
 ) -> tuple[list[Image.Image], float]:
+    cached = get_cached_video_frames(video_path)
+    if cached is not None:
+        frames = list(cached.frames)
+        if num_frames is not None:
+            frames = frames[:num_frames]
+        return [Image.fromarray(frame) for frame in frames], cached.fps
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video file: {video_path}")

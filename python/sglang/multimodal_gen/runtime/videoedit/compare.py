@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 import cv2
 import numpy as np
 
+from sglang.multimodal_gen.runtime.videoedit.frame_cache import cache_video_frames
+
 
 @dataclass
 class FrameMetrics:
@@ -22,10 +24,11 @@ class FrameMetrics:
     pass_frame: bool
 
 
-def _read_video(path: str) -> list[np.ndarray]:
+def _read_video(path: str) -> tuple[list[np.ndarray], float]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise FileNotFoundError(f"Could not open video: {path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     frames = []
     while True:
         ok, frame = cap.read()
@@ -35,7 +38,8 @@ def _read_video(path: str) -> list[np.ndarray]:
     cap.release()
     if not frames:
         raise ValueError(f"No frames in video: {path}")
-    return frames
+    cache_video_frames(path, frames, fps)
+    return frames, float(fps)
 
 
 def _ssim(frame_a: np.ndarray, frame_b: np.ndarray) -> float:
@@ -66,8 +70,10 @@ def compare_videos(
     drop_reference_first_frame: bool = False,
     drop_candidate_first_frame: bool = False,
 ) -> dict:
-    ref_frames = _read_video(reference)
-    cand_frames = _read_video(candidate)
+    ref_frames, _ = _read_video(reference)
+    cand_frames, _ = _read_video(candidate)
+    reference_frame_count = len(ref_frames)
+    candidate_frame_count = len(cand_frames)
     if drop_reference_first_frame:
         ref_frames = ref_frames[1:]
     if drop_candidate_first_frame:
@@ -111,6 +117,9 @@ def compare_videos(
         if any(math.isfinite(m.psnr) for m in frame_reports)
         else float("inf"),
         "max_abs_diff": int(np.max([m.max_abs_diff for m in frame_reports])),
+        "reference_frame_count": reference_frame_count,
+        "candidate_frame_count": candidate_frame_count,
+        "frame_count_delta": abs(reference_frame_count - candidate_frame_count),
         "failed_frames": failed,
         "pass_compare": failed_ratio <= max_failed_frame_ratio,
         "thresholds": {

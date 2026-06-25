@@ -189,7 +189,7 @@ VideoEdit-diffusers-model/
 `--transformer-path` 仍然作为组件覆盖：
 
 ```bash
---transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+--transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer
 ```
 
 业务参数不要用通用 unknown args 传给 `sglang serve`，避免 `--xxx-path` 被 `ServerArgs._extract_component_paths()` 误解析为组件路径。
@@ -806,7 +806,7 @@ cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 
 python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
-  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
+  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer \
   --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
   --video-input-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
   --mask-input-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
@@ -895,7 +895,7 @@ sglang serve \
   --tp-size 1 \
   --output-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs \
   --input-save-path /tmp/sglang-videoedit-inputs \
-  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer
 ```
 
 提交任务：

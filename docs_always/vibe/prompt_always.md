@@ -134,7 +134,7 @@ cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 
 python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
-  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
+  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer \
   --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
   --video-input-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
   --mask-input-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
@@ -223,7 +223,7 @@ sglang serve \
   --tp-size 1 \
   --output-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs \
   --input-save-path /tmp/sglang-videoedit-inputs \
-  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer
 ```
 
 提交任务：
@@ -256,7 +256,7 @@ cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 
 python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
-  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
+  --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer \
   --prompt "A close-up of an orange flower with a yellow center, remaining in focus against a blurred green grass background throughout the video." \
   --video-input-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4 \
   --mask-input-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4 \
@@ -376,7 +376,26 @@ sglang serve \
     "perf_dump_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/videoedit_perf_api_sp1_no_offload_compile.json"
   }'
 
-  [05-07 08:16:03] server_args: {"model_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model", "model_id": null, "backend": "auto", "attention_backend": null, "attention_backend_config": {}, "cache_dit_config": null, "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 1, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": false, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 1, "dist_timeout": 3600, "pipeline_class_name": null, "lora_path": null, "lora_nickname": "default", "lora_scale": 1.0, "component_paths": {"transformer": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer"}, "transformer_weights_path": null, "lora_target_modules": null, "dit_cpu_offload": false, "dit_layerwise_offload": false, "dit_offload_prefetch_size": 0.0, "text_encoder_cpu_offload": false, "image_encoder_cpu_offload": false, "vae_cpu_offload": false, "use_fsdp_inference": false, "pin_cpu_memory": true, "comfyui_mode": false, "enable_torch_compile": true, "warmup": true, "warmup_resolutions": null, "warmup_steps": 1, "disable_autocast": false, "master_port": 30005, "host": "0.0.0.0", "port": 30000, "webui": false, "webui_port": 12312, "scheduler_port": 5567, "strict_ports": false, "output_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs", "input_save_path": "/tmp/sglang-videoedit-inputs", "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true, "video_vae": true, "audio_vae": true, "video_dit": true, "audio_dit": true, "dual_tower_bridge": true}, "boundary_ratio": null, "log_level": "info", "uvicorn_access_log_exclude_prefixes": []}
+[05-07 08:16:03] server_args: {"model_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model", "model_id": null, "backend": "auto", "attention_backend": null, "attention_backend_config": {}, "cache_dit_config": null, "nccl_port": null, "trust_remote_code": false, "revision": null, "num_gpus": 1, "tp_size": 1, "sp_degree": 1, "ulysses_degree": 1, "ring_degree": 1, "dp_size": 1, "dp_degree": 1, "enable_cfg_parallel": false, "hsdp_replicate_dim": 1, "hsdp_shard_dim": 1, "dist_timeout": 3600, "pipeline_class_name": null, "lora_path": null, "lora_nickname": "default", "lora_scale": 1.0, "component_paths": {"transformer": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer"}, "transformer_weights_path": null, "lora_target_modules": null, "dit_cpu_offload": false, "dit_layerwise_offload": false, "dit_offload_prefetch_size": 0.0, "text_encoder_cpu_offload": false, "image_encoder_cpu_offload": false, "vae_cpu_offload": false, "use_fsdp_inference": false, "pin_cpu_memory": true, "comfyui_mode": false, "enable_torch_compile": true, "warmup": true, "warmup_resolutions": null, "warmup_steps": 1, "disable_autocast": false, "master_port": 30005, "host": "0.0.0.0", "port": 30000, "webui": false, "webui_port": 12312, "scheduler_port": 5567, "strict_ports": false, "output_path": "/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs", "input_save_path": "/tmp/sglang-videoedit-inputs", "prompt_file_path": null, "model_paths": {}, "model_loaded": {"transformer": true, "vae": true, "video_vae": true, "audio_vae": true, "video_dit": true, "audio_dit": true, "dual_tower_bridge": true}, "boundary_ratio": null, "log_level": "info", "uvicorn_access_log_exclude_prefixes": []}
 
 
   python -m sglang.multimodal_gen.runtime.videoedit.cli repair   --model-path "$MODEL_PATH"   --transformer-path "$TRANSFORMER_PATH"   --prompt "$PROMPT"   --video-input-path "$INPUT_VIDEO"   --mask-input-path "$INPUT_MASK"   --output-path "$OUT_DIR"   --output-file-name 15108907_3840_2160_50fps_sp2_no_offload.mp4   --num-gpus 2   --sp-degree 2   --ulysses-degree 2   --ring-degree 1   --num-frames 81   --infer-len 81   --overlap 0   --num-inference-steps 20   --guidance-scale 5.0   --seed 42   --dtype bf16   --enable-paste-back   --drop-reference-frame   --perf-dump-path "$OUT_DIR/videoedit_perf_sp2r_no_offload.json"
+
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/activate.sh && codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers
+
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers
+
+
