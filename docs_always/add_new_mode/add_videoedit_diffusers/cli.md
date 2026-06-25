@@ -14,7 +14,7 @@ source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
 cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 
 export MODEL_PATH=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model
-export TRANSFORMER_PATH=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer
+export TRANSFORMER_PATH=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/step-55000-diffusers-lh/transformer
 export INPUT_VIDEO=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/videos/15108907_3840_2160_50fps_short.mp4
 export INPUT_MASK=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pexel_test_data_0410/masks/15108907_3840_2160_50fps_No_bbox_mask.mp4
 export OUT_DIR=/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs
@@ -38,6 +38,8 @@ python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --mask-input-path "$INPUT_MASK" \
   --output-path "$OUT_DIR" \
   --output-file-name 15108907_3840_2160_50fps_1gpu_default.mp4 \
+  --num-gpus 4 \
+  --sp-degree 4 \
   --num-frames 81 \
   --infer-len 81 \
   --overlap 0 \
