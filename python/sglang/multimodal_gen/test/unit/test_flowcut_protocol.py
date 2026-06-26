@@ -66,15 +66,50 @@ def test_vividvr_flowcut_request_accepts_camel_case_system_fields():
     assert req.num_inference_steps == 20
 
 
+def test_vividvr_flowcut_request_accepts_nested_minio_aliases():
+    req = VividVRFlowCutRequest.model_validate(
+        {
+            "taskId": "task-1",
+            "callbackUrl": "http://127.0.0.1:9000/tasks/task-1/callback",
+            "video_url": "https://example.com/in.mp4",
+            "minioConfig": {
+                "endpoint": "minio.example.com:9000",
+                "bucketName": "flowcut",
+                "accessKey": "ak",
+                "secretKey": "sk",
+            },
+        }
+    )
+
+    assert req.minio_config is not None
+    assert req.minio_config.bucket_name == "flowcut"
+    assert req.minio_config.access_key == "ak"
+    assert req.minio_config.secret_key == "sk"
+
+
 def test_vividvr_flowcut_timeout_zero_or_missing_defaults_to_300():
     assert VividVRFlowCutRequest.model_validate({}).timeout == 300
     assert VividVRFlowCutRequest.model_validate({"timeout": 0}).timeout == 300
     assert VividVRFlowCutRequest.model_validate({"timeout": -1}).timeout == -1
 
 
+def test_vividvr_flowcut_request_rejects_timeout_less_than_minus_one():
+    with pytest.raises(ValidationError):
+        VividVRFlowCutRequest.model_validate({"timeout": -2})
+
+
 def test_vividvr_flowcut_request_accepts_original_upscale_contract():
     assert VividVRFlowCutRequest.model_validate({"upscale": 0.0}).upscale == 0.0
     assert VividVRFlowCutRequest.model_validate({"upscale": 2.0}).upscale == 2.0
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["reference_video_path", "referenceVideoPath"],
+)
+def test_vividvr_flowcut_request_rejects_reference_video_path(field_name):
+    with pytest.raises(ValidationError):
+        VividVRFlowCutRequest.model_validate({field_name: "/tmp/reference.mp4"})
 
 
 @pytest.mark.parametrize("invalid", [-1.0, math.nan, math.inf, True])

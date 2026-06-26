@@ -83,6 +83,13 @@ class DataType(Enum):
             return "mp4"
         return "glb"
 
+    def supported_output_extensions(self) -> tuple[str, ...]:
+        if self == DataType.IMAGE:
+            return (".png", ".jpg", ".jpeg", ".webp")
+        if self == DataType.VIDEO:
+            return (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v")
+        return (".obj", ".glb")
+
 
 @dataclass
 class SamplingParams:
@@ -173,6 +180,8 @@ class SamplingParams:
     # Debugging
     debug: bool = False
     perf_dump_path: str | None = None
+    request_cancel_path: str | None = None
+    request_timeout_deadline: float | None = None
 
     # Misc
     save_output: bool = True
@@ -191,10 +200,8 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        if not any(
-            self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
-        ):
+        suffix = os.path.splitext(self.output_file_name)[1].lower()
+        if suffix not in self.data_type.supported_output_extensions():
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )

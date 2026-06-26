@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import (
     randn_tensor_with_generator_device,
@@ -1193,6 +1194,7 @@ class VividVRDenoisingStage(PipelineStage):
         )
         with self.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
             for timestep_index, _ in enumerate(params.runtime_timesteps):
+                check_request_timeout(batch)
                 self.run_denoising_step(
                     batch,
                     server_args,
@@ -1582,6 +1584,7 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
 
         with self.denoising_stage.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
             for timestep_index, _ in enumerate(params.runtime_timesteps):
+                check_request_timeout(batch)
                 with StageProfiler(
                     f"denoising_step_{timestep_index}",
                     logger=logger,

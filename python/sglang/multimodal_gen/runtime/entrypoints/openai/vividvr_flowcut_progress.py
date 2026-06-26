@@ -39,7 +39,7 @@ FLOWCUT_STAGE_REASONS: dict[str, str] = {
 
 PostFlowCutCallback = Callable[
     [str, dict[str, Any]],
-    Awaitable[None],
+    Awaitable[object],
 ]
 
 

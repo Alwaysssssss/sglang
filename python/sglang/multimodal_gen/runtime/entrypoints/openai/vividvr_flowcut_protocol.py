@@ -6,11 +6,16 @@ from pydantic import BaseModel, Field, field_validator
 
 class VividVRFlowCutMinIOConfig(BaseModel):
     endpoint: str
-    bucket_name: str
-    access_key: str
-    secret_key: str
+    bucket_name: str = Field(alias="bucketName")
+    access_key: str = Field(alias="accessKey")
+    secret_key: str = Field(alias="secretKey")
     secure: bool = False
     region: Optional[str] = None
+
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid",
+    }
 
 
 class VividVRFlowCutRequest(BaseModel):
@@ -20,11 +25,8 @@ class VividVRFlowCutRequest(BaseModel):
     model: Optional[str] = None
 
     video_input_path: Optional[str] = None
-    mask_input_path: Optional[str] = None
     video_url: Optional[str] = None
-    mask_url: Optional[str] = None
     caption_file_path: Optional[str] = None
-    reference_video_path: Optional[str] = None
 
     timeout: int = 300
     callback_url: Optional[str] = Field(default=None, alias="callbackUrl")
@@ -37,9 +39,6 @@ class VividVRFlowCutRequest(BaseModel):
     output_object_key: Optional[str] = None
 
     num_frames: Optional[int] = None
-    infer_len: int = 81
-    overlap: int = 0
-    strength: float = 1.0
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     seed: int = 42
@@ -48,21 +47,7 @@ class VividVRFlowCutRequest(BaseModel):
     num_temporal_process_frames: Optional[int] = None
     restoration_guidance_scale: Optional[float] = None
     upscale: Optional[float] = None
-    dynamic_cfg: bool = True
-    dynamic_cfg_max_step: int = 15
-    dynamic_cfg_min: float = 1.0
 
-    bbox_padding: int = 0
-    dilate_px: int = 15
-    mask_scale: float = 1.2
-    feather_px: int = 12
-    adain_boundary_dilate: int = 15
-    enable_paste_back: bool = True
-    save_crop_only: bool = False
-    drop_reference_frame: bool = True
-    keep_intermediate_windows: bool = False
-    use_repaired_context: bool = True
-    vary_seed_by_window: bool = False
     enable_teacache: bool = False
     enable_frame_interpolation: bool = False
     frame_interpolation_exp: int = 1
@@ -80,6 +65,8 @@ class VividVRFlowCutRequest(BaseModel):
     def normalize_default_timeout(cls, value):
         if value is None or value == 0:
             return 300
+        if int(value) < -1:
+            raise ValueError("timeout must be positive or -1")
         return value
 
     @field_validator("upscale", mode="before")
@@ -101,7 +88,7 @@ class VividVRFlowCutRequest(BaseModel):
 
     model_config = {
         "populate_by_name": True,
-        "extra": "allow",
+        "extra": "forbid",
     }
 
 
@@ -178,8 +165,44 @@ class VividVRFlowCutCallbackPayload(BaseModel):
         )
 
 
+class VividVRFlowCutVideoResponse(BaseModel):
+    id: str
+    object: str = "video"
+    model: str = "VividVR"
+    status: str = "queued"
+    progress: int = 0
+    created_at: int
+    size: str = ""
+    seconds: str = ""
+    quality: str = "standard"
+    url: Optional[str] = None
+    remixed_from_video_id: Optional[str] = None
+    completed_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    error: Optional[dict] = None
+    reason: Optional[str] = None
+    file_path: Optional[str] = None
+    peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
+
+
+class VividVRFlowCutProgressResponse(BaseModel):
+    id: str
+    status: Optional[str] = None
+    progress: float = 0.0
+    file_path: Optional[str] = None
+    url: Optional[str] = None
+    error: Optional[dict] = None
+    reason: Optional[str] = None
+    callback_status: Optional[str] = None
+    callback_error: Optional[str] = None
+    callback_attempts: Optional[int] = None
+
+
 FlowCutMinIOConfig = VividVRFlowCutMinIOConfig
 FlowCutVideoRepairRequest = VividVRFlowCutRequest
 FlowCutResponse = VividVRFlowCutSubmitResponse
 FlowCutCallbackOutput = VividVRFlowCutCallbackOutput
 FlowCutCallbackPayload = VividVRFlowCutCallbackPayload
+FlowCutVideoResponse = VividVRFlowCutVideoResponse
+FlowCutProgressResponse = VividVRFlowCutProgressResponse

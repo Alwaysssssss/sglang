@@ -115,8 +115,6 @@ def build_vividvr_repair_kwargs(
     if req.caption_file_path is not None:
         vividvr_kwargs["caption_source"] = "caption_file"
         vividvr_kwargs["caption_file_path"] = req.caption_file_path
-    if req.reference_video_path is not None:
-        vividvr_kwargs["reference_video_path"] = req.reference_video_path
     if req.num_frames is not None:
         vividvr_kwargs["num_frames"] = req.num_frames
     if req.num_inference_steps is not None:

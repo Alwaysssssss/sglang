@@ -202,6 +202,15 @@ class TestSamplingParamsSubclass(unittest.TestCase):
             _json_safe(coefficients_callback),
         )
 
+    def test_video_output_file_name_preserves_supported_non_mp4_extension(self):
+        params = SamplingParams(
+            output_file_name="custom_output.mov",
+        )
+
+        params._set_output_file_name()
+
+        self.assertEqual(params.output_file_name, "custom_output.mov")
+
     def test_teacache_callback_takes_precedence_over_static_coefficients(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
             return [9.0, 8.0, 7.0, 6.0, 5.0]

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import shutil
 import tempfile
 import time
@@ -7,15 +8,23 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import ValidationError
 
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.flowcut import (
     post_flowcut_callback,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
     FlowCutMinIOConfig,
+    FlowCutProgressResponse,
     FlowCutResponse,
     FlowCutVideoRepairRequest,
+    FlowCutVideoResponse,
+)
+from sglang.multimodal_gen.runtime.request_timeout import (
+    TASK_TIMEOUT_MESSAGE,
+    is_task_timeout_error,
+    request_timeout_deadline,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_repair_shared
@@ -28,6 +37,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_progress i
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_storage import (
     VividVRFlowCutStorage,
+    default_flowcut_output_object_key,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
@@ -39,10 +49,219 @@ from sglang.multimodal_gen.runtime.vividvr.progress_file import (
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
 FLOWCUT_DENOISE_MONITOR_INTERVAL_SECONDS = 1.0
+FLOWCUT_VIDEO_EXTENSIONS = {
+    ".avi",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".webm",
+}
+_FLOWCUT_CANCEL_DIR = Path(tempfile.gettempdir()) / "sglang_vividvr_flowcut_cancel"
+_FLOWCUT_TASKS: dict[str, asyncio.Task[Any]] = {}
+_FLOWCUT_TASKS_LOCK = asyncio.Lock()
+
+_FLOWCUT_FIELD_ALIASES = {
+    "taskId": "task_id",
+    "callbackUrl": "callback_url",
+    "videoUrl": "video_url",
+    "captionFilePath": "caption_file_path",
+    "minioConfig": "minio_config",
+    "outputStorage": "output_storage",
+    "outputPath": "output_path",
+    "outputBucket": "output_bucket",
+    "outputObjectKey": "output_object_key",
+    "numFrames": "num_frames",
+    "numInferenceSteps": "num_inference_steps",
+    "guidanceScale": "guidance_scale",
+    "generatorDevice": "generator_device",
+    "numTemporalProcessFrames": "num_temporal_process_frames",
+    "restorationGuidanceScale": "restoration_guidance_scale",
+    "outputQuality": "output_quality",
+    "outputCompression": "output_compression",
+    "perfDumpPath": "perf_dump_path",
+}
+
+_FLOWCUT_MINIO_FIELD_ALIASES = {
+    "bucketName": "bucket_name",
+    "accessKey": "access_key",
+    "secretKey": "secret_key",
+}
 
 
-async def _post_stage_callback(callback_url: str, payload: dict[str, Any]) -> None:
-    await post_flowcut_callback(callback_url, payload, timeout=2.0, max_retries=1)
+def _normalize_aliases(
+    payload: dict[str, Any],
+    aliases: dict[str, str],
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    for alias, canonical in aliases.items():
+        if alias not in payload:
+            continue
+        normalized[canonical] = payload[alias]
+        if alias != canonical:
+            normalized.pop(alias, None)
+    return normalized
+
+
+def _normalize_vividvr_flowcut_payload(body: Any) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object")
+    payload = _normalize_aliases(body, _FLOWCUT_FIELD_ALIASES)
+    minio_config = payload.get("minio_config")
+    if minio_config is not None:
+        if not isinstance(minio_config, dict):
+            raise ValueError("minioConfig must be a JSON object")
+        payload["minio_config"] = _normalize_aliases(
+            minio_config, _FLOWCUT_MINIO_FIELD_ALIASES
+        )
+    return payload
+
+
+def _exception_message(e: Exception) -> str:
+    if isinstance(e, HTTPException):
+        return str(e.detail)
+    if isinstance(e, ValidationError):
+        messages = []
+        for error in e.errors():
+            loc = ".".join(str(part) for part in error.get("loc", ()))
+            msg = error.get("msg", "invalid value")
+            messages.append(f"{loc}: {msg}" if loc else msg)
+        return "; ".join(messages) or "invalid request body"
+    return str(e)
+
+
+def _task_id_from_flowcut_body(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    task_id = body.get("task_id") or body.get("taskId")
+    if task_id is None:
+        return None
+    task_id = str(task_id).strip()
+    return task_id or None
+
+
+def _failed_flowcut_submission_job(
+    request_id: str,
+    reason: str,
+    *,
+    req: FlowCutVideoRepairRequest | None = None,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    callback_url = req.callback_url if req is not None else None
+    output_object_key = req.output_object_key if req is not None else None
+    output_bucket = req.output_bucket if req is not None else None
+    timeout = req.timeout if req is not None else None
+    model = req.model if req is not None else None
+
+    if body is not None:
+        callback_url = callback_url or body.get("callback_url") or body.get(
+            "callbackUrl"
+        )
+        output_object_key = output_object_key or body.get(
+            "output_object_key"
+        ) or body.get("outputObjectKey")
+        output_bucket = output_bucket or body.get("output_bucket") or body.get(
+            "outputBucket"
+        )
+        timeout = timeout if timeout is not None else body.get("timeout")
+        model = model or body.get("model")
+
+    return {
+        "id": request_id,
+        "object": "video",
+        "model": model or "VividVR",
+        "status": "failed",
+        "progress": 0,
+        "created_at": int(time.time()),
+        "size": "",
+        "seconds": "",
+        "quality": "standard",
+        "file_path": None,
+        "url": None,
+        "error": {"message": reason},
+        "reason": reason,
+        "callback_url": callback_url,
+        "callback_status": None,
+        "callback_error": None,
+        "timeout": timeout,
+        "output_object_key": output_object_key,
+        "output_bucket": output_bucket,
+    }
+
+
+async def _store_failed_flowcut_submission(
+    request_id: str,
+    reason: str,
+    *,
+    req: FlowCutVideoRepairRequest | None = None,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    job = _failed_flowcut_submission_job(request_id, reason, req=req, body=body)
+    await VIDEO_STORE.upsert(request_id, job)
+    return job
+
+
+def _validate_flowcut_request(req: FlowCutVideoRepairRequest) -> None:
+    if not req.task_id:
+        raise ValueError("taskId is required")
+    if not req.callback_url:
+        raise ValueError("callbackUrl is required")
+    if not req.video_input_path and not req.video_url:
+        raise ValueError("video_input_path or video_url is required")
+    if req.minio_config is None and (
+        req.output_storage == "s3"
+        or req.output_object_key is not None
+        or req.output_bucket is not None
+    ):
+        raise ValueError("minioConfig is required for S3 output")
+
+
+async def _post_stage_callback(callback_url: str, payload: dict[str, Any]) -> int:
+    return await post_flowcut_callback(callback_url, payload, timeout=2.0, max_retries=1)
+
+
+async def _post_flowcut_callback_with_bookkeeping(
+    task_id: str,
+    callback_url: str,
+    payload: dict[str, Any],
+) -> int:
+    try:
+        attempts = await _post_stage_callback(callback_url, payload)
+    except Exception as e:
+        await VIDEO_STORE.update_fields(
+            task_id,
+            {
+                "callback_status": "failed",
+                "callback_error": str(e),
+                "callback_attempts": 1,
+                "callback_completed_at": int(time.time()),
+            },
+        )
+        raise
+
+    await VIDEO_STORE.update_fields(
+        task_id,
+        {
+            "callback_status": "succeeded",
+            "callback_error": None,
+            "callback_attempts": attempts,
+            "callback_completed_at": int(time.time()),
+        },
+    )
+    return attempts
+
+
+def _make_bookkept_flowcut_callback(task_id: str):
+    async def _post_callback(callback_url: str, payload: dict[str, Any]) -> int:
+        return await _post_flowcut_callback_with_bookkeeping(
+            task_id,
+            callback_url,
+            payload,
+        )
+
+    return _post_callback
 
 
 async def _send_stage_safely(
@@ -160,19 +379,178 @@ async def _monitor_vividvr_denoise_progress(
 
 
 def _flowcut_work_base_dir(server_args) -> tuple[str, bool]:
-    base_dir = getattr(server_args, "input_save_path", None) or getattr(
-        server_args, "output_path", None
-    )
+    base_dir = getattr(server_args, "input_save_path", None)
     if base_dir:
         return str(base_dir), False
     return tempfile.mkdtemp(prefix="sglang_vividvr_flowcut_"), True
 
 
-def _flowcut_output_file_name(req: FlowCutVideoRepairRequest, request_id: str) -> str:
-    _, output_file_name = video_repair_shared.split_output_path(
-        req.output_path, request_id, None
+def _flowcut_cancel_path(task_id: str) -> str:
+    _FLOWCUT_CANCEL_DIR.mkdir(parents=True, exist_ok=True)
+    safe_task_id = Path(task_id).name
+    return str((_FLOWCUT_CANCEL_DIR / f"{safe_task_id}.cancel").resolve())
+
+
+def _clear_flowcut_cancel_marker(task_id: str) -> str:
+    cancel_path = Path(_flowcut_cancel_path(task_id))
+    cancel_path.unlink(missing_ok=True)
+    return str(cancel_path)
+
+
+def _write_flowcut_cancel_marker(task_id: str) -> str:
+    cancel_path = Path(_flowcut_cancel_path(task_id))
+    cancel_path.parent.mkdir(parents=True, exist_ok=True)
+    cancel_path.write_text("cancelled\n", encoding="utf-8")
+    return str(cancel_path)
+
+
+async def _register_flowcut_task(task_id: str, task: Any) -> None:
+    async with _FLOWCUT_TASKS_LOCK:
+        _FLOWCUT_TASKS[task_id] = task
+
+
+async def _unregister_flowcut_task(task_id: str, task: Any | None) -> None:
+    async with _FLOWCUT_TASKS_LOCK:
+        current = _FLOWCUT_TASKS.get(task_id)
+        if current is task or task is None:
+            _FLOWCUT_TASKS.pop(task_id, None)
+
+
+def _schedule_flowcut_task_cleanup(task_id: str, task: Any) -> None:
+    if not hasattr(task, "add_done_callback"):
+        return
+
+    def _cleanup(done_task: Any) -> None:
+        asyncio.create_task(_unregister_flowcut_task(task_id, done_task))
+
+    task.add_done_callback(_cleanup)
+
+
+async def _cancel_registered_flowcut_task(task_id: str) -> bool:
+    async with _FLOWCUT_TASKS_LOCK:
+        task = _FLOWCUT_TASKS.get(task_id)
+    if task is None:
+        return False
+    task.cancel()
+    return True
+
+
+async def _get_flowcut_job_or_404(video_id: str) -> dict[str, Any]:
+    job = await VIDEO_STORE.get(video_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return job
+
+
+def _flowcut_progress_payload(video_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": video_id,
+        "status": job.get("status"),
+        "progress": job.get("progress", 0),
+        "file_path": job.get("file_path"),
+        "url": job.get("url"),
+        "error": job.get("error"),
+        "reason": job.get("reason"),
+        "callback_status": job.get("callback_status"),
+        "callback_error": job.get("callback_error"),
+        "callback_attempts": job.get("callback_attempts"),
+    }
+
+
+def _normalize_flowcut_video_extension(extension: str | None) -> str:
+    normalized = (extension or ".mp4").lower()
+    if not normalized.startswith("."):
+        normalized = f".{normalized}"
+    if normalized not in FLOWCUT_VIDEO_EXTENSIONS:
+        return ".mp4"
+    return normalized
+
+
+def _flowcut_input_extension(video_input_path: str) -> str:
+    return _normalize_flowcut_video_extension(Path(video_input_path).suffix)
+
+
+def _flowcut_output_target(
+    output_path: str | None,
+    request_id: str,
+    server_output_path: str | None,
+    *,
+    input_extension: str,
+) -> tuple[str | None, str]:
+    normalized_extension = _normalize_flowcut_video_extension(input_extension)
+    if output_path:
+        output_path_obj = Path(output_path).expanduser()
+        if output_path_obj.suffix:
+            return (
+                str(output_path_obj.resolve().parent),
+                f"{output_path_obj.stem}{normalized_extension}",
+            )
+        return str(output_path_obj.resolve()), f"{request_id}{normalized_extension}"
+
+    output_dir = server_output_path
+    return output_dir, f"{request_id}{normalized_extension}"
+
+
+def _flowcut_output_file_name(
+    req: FlowCutVideoRepairRequest,
+    request_id: str,
+    *,
+    input_extension: str,
+) -> str:
+    _, output_file_name = _flowcut_output_target(
+        req.output_path,
+        request_id,
+        None,
+        input_extension=input_extension,
     )
     return output_file_name
+
+
+def _resolve_flowcut_persistent_output_path(
+    req: FlowCutVideoRepairRequest,
+    request_id: str,
+    server_args,
+    *,
+    input_extension: str,
+) -> str | None:
+    output_dir, output_file_name = _flowcut_output_target(
+        req.output_path,
+        request_id,
+        getattr(server_args, "output_path", None),
+        input_extension=input_extension,
+    )
+    if output_dir is None:
+        return None
+    return str((Path(output_dir).expanduser().resolve() / output_file_name).resolve())
+
+
+def _resolve_flowcut_output_bucket(
+    req: FlowCutVideoRepairRequest,
+) -> str | None:
+    if req.output_bucket:
+        return req.output_bucket
+    if req.minio_config is not None:
+        return req.minio_config.bucket_name
+    return None
+
+
+def _resolve_flowcut_output_object_key(
+    req: FlowCutVideoRepairRequest,
+    request_id: str,
+    output_file_name: str,
+    *,
+    input_extension: str,
+) -> str | None:
+    if req.output_object_key:
+        if Path(req.output_object_key).suffix:
+            return req.output_object_key
+        return f"{req.output_object_key}{_normalize_flowcut_video_extension(input_extension)}"
+    if req.minio_config is None:
+        return None
+    extension = Path(output_file_name).suffix or _normalize_flowcut_video_extension(
+        input_extension
+    )
+    return default_flowcut_output_object_key(request_id, extension=extension)
 
 
 def _duration_from_job_result(job_result) -> float | None:
@@ -217,15 +595,25 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
     callback_url: str,
     storage: VividVRFlowCutStorage,
     minio_config: FlowCutMinIOConfig | None = None,
+    output_object_key: str | None = None,
+    output_bucket: str | None = None,
+    persistent_output_path: str | None = None,
+    cleanup_workdir_on_finish: bool = False,
+    cleanup_base_dir_on_finish: bool = False,
+    cleanup_workdir_on_cancel: bool = False,
+    cleanup_base_dir_on_cancel: bool = False,
     timeout: int = 300,
 ) -> None:
     reporter = VividVRFlowCutProgressReporter(
         task_id=job_id,
         callback_url=callback_url,
-        post_callback=_post_stage_callback,
+        post_callback=_make_bookkept_flowcut_callback(job_id),
     )
     generation_task_to_drain = None
     monitor_task = None
+    generation_task = None
+    should_cleanup_artifacts = False
+    should_cleanup_base_dir = False
     try:
         await VIDEO_STORE.update_fields(
             job_id,
@@ -271,7 +659,22 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
             },
         )
         await _send_stage_safely(reporter, "uploading_result", task_id=job_id)
-        result_url = await storage.upload_result(save_file_path, minio_config)
+        if minio_config is None:
+            result_url = storage.finalize_local_result(
+                save_file_path,
+                persistent_output_path=persistent_output_path,
+            )
+        else:
+            result_url = await storage.upload_result(
+                save_file_path,
+                minio_config,
+                object_key=output_object_key,
+                bucket_name=output_bucket,
+            )
+        should_cleanup_artifacts = cleanup_workdir_on_finish and (
+            minio_config is not None or persistent_output_path is not None
+        )
+        should_cleanup_base_dir = should_cleanup_artifacts and cleanup_base_dir_on_finish
         duration = _duration_from_job_result(job_result)
         await VIDEO_STORE.update_fields(
             job_id,
@@ -282,6 +685,8 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
                 "url": result_url,
                 "file_path": None if minio_config is not None else result_url,
                 "inference_time_s": duration,
+                "output_object_key": output_object_key,
+                "output_bucket": output_bucket,
             },
         )
         try:
@@ -292,54 +697,120 @@ async def _dispatch_vividvr_flowcut_video_repair_job_async(
                 job_id,
                 callback_error,
             )
+    except asyncio.CancelledError:
+        if monitor_task is not None:
+            monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor_task
+        if generation_task is not None and not generation_task.done():
+            generation_task.cancel()
+            generation_task_to_drain = generation_task
+        reason = TASK_TIMEOUT_MESSAGE
+        logger.info("FlowCut Vivid-VR repair cancelled job=%s", job_id)
+        should_cleanup_artifacts = cleanup_workdir_on_cancel
+        should_cleanup_base_dir = cleanup_base_dir_on_cancel
+        await VIDEO_STORE.update_fields(
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": reason},
+                "reason": reason,
+                "cancelled_at": int(time.time()),
+            },
+        )
+        job = await VIDEO_STORE.get(job_id)
+        should_send_failed = True
+        if job is not None and job.get("callback_status") in {
+            "succeeded",
+            "cancel_requested",
+        }:
+            should_send_failed = False
+        if should_send_failed:
+            await _send_failed_safely(reporter, reason, task_id=job_id)
+        raise
     except Exception as e:
         if isinstance(e, _FlowCutGenerationTimeoutError):
             generation_task_to_drain = e.generation_task
-        reason = str(e)
+            reason = TASK_TIMEOUT_MESSAGE
+            should_cleanup_artifacts = cleanup_workdir_on_cancel
+            should_cleanup_base_dir = cleanup_base_dir_on_cancel
+        elif is_task_timeout_error(e):
+            reason = TASK_TIMEOUT_MESSAGE
+            should_cleanup_artifacts = cleanup_workdir_on_cancel
+            should_cleanup_base_dir = cleanup_base_dir_on_cancel
+        else:
+            reason = str(e)
         logger.error("FlowCut Vivid-VR repair failed job=%s: %s", job_id, reason)
         await VIDEO_STORE.update_fields(
             job_id,
             {
                 "status": "failed",
                 "error": {"message": reason},
+                "reason": reason,
             },
         )
-        await _send_failed_safely(reporter, reason, task_id=job_id)
+        job = await VIDEO_STORE.get(job_id)
+        should_send_failed = True
+        if is_task_timeout_error(e) or isinstance(e, _FlowCutGenerationTimeoutError):
+            if job is not None and job.get("callback_status") in {
+                "succeeded",
+                "cancel_requested",
+            }:
+                should_send_failed = False
+        if should_send_failed:
+            await _send_failed_safely(reporter, reason, task_id=job_id)
     finally:
         if generation_task_to_drain is not None:
             try:
                 await generation_task_to_drain
-            except Exception as e:
+            except BaseException as e:
                 logger.warning(
                     "FlowCut timed-out generation finished with error job=%s: %s",
                     job_id,
                     e,
                 )
+        if should_cleanup_artifacts:
+            storage.cleanup()
+            if should_cleanup_base_dir:
+                shutil.rmtree(storage.base_dir, ignore_errors=True)
+        current_task = asyncio.current_task()
+        await _unregister_flowcut_task(job_id, current_task)
         video_repair_shared.VIDEOEDIT_SEMAPHORE.release()
 
 
 @router.post("/repairs/flowcut", response_model=FlowCutResponse)
 async def create_vividvr_flowcut_video_repair(request: Request):
+    raw_payload = None
     try:
-        payload = await request.json()
-    except Exception as e:
-        return FlowCutResponse(code=1, message=f"invalid request: {e}")
-    if not isinstance(payload, dict):
-        return FlowCutResponse(code=1, message="invalid request: JSON object required")
-    try:
-        req = FlowCutVideoRepairRequest.model_validate(payload)
+        raw_payload = await request.json()
     except Exception as e:
         return FlowCutResponse(code=1, message=f"invalid request: {e}")
 
-    if not req.task_id:
-        return FlowCutResponse(code=1, message="taskId is required")
-    if not req.callback_url:
-        return FlowCutResponse(code=1, message="callbackUrl is required")
-    if not req.video_input_path and not req.video_url:
-        return FlowCutResponse(
-            code=1,
-            message="video_input_path or video_url is required",
+    try:
+        payload = _normalize_vividvr_flowcut_payload(raw_payload)
+        req = FlowCutVideoRepairRequest.model_validate(payload)
+    except Exception as e:
+        detail = _exception_message(e)
+        request_id = _task_id_from_flowcut_body(raw_payload)
+        if request_id is not None:
+            await _store_failed_flowcut_submission(
+                request_id,
+                detail,
+                body=raw_payload if isinstance(raw_payload, dict) else None,
+            )
+        return FlowCutResponse(code=1, message=f"invalid request: {detail}")
+
+    try:
+        _validate_flowcut_request(req)
+    except Exception as e:
+        detail = _exception_message(e)
+        await _store_failed_flowcut_submission(
+            req.task_id or "unknown",
+            detail,
+            req=req,
+            body=payload,
         )
+        return FlowCutResponse(code=1, message=detail)
 
     server_args = get_global_server_args()
     if not video_repair_shared.is_vividvr_video_repair_pipeline(server_args):
@@ -355,7 +826,7 @@ async def create_vividvr_flowcut_video_repair(request: Request):
     reporter = VividVRFlowCutProgressReporter(
         task_id=request_id,
         callback_url=req.callback_url,
-        post_callback=_post_stage_callback,
+        post_callback=_make_bookkept_flowcut_callback(request_id),
     )
     storage = None
     temp_base_dir = None
@@ -367,14 +838,33 @@ async def create_vividvr_flowcut_video_repair(request: Request):
         base_dir, base_dir_is_temp = _flowcut_work_base_dir(server_args)
         temp_base_dir = base_dir if base_dir_is_temp else None
         storage = VividVRFlowCutStorage(base_dir=base_dir, request_id=request_id)
+        request_cancel_path = _clear_flowcut_cancel_marker(request_id)
         source = req.video_url or req.video_input_path
-        video_input_path = await storage.materialize_video(
-            source,
-            filename_hint="input.mp4",
-        )
+        video_input_path = await storage.materialize_video(source)
         await _send_stage_safely(reporter, "input_ready", task_id=request_id)
 
-        output_file_name = _flowcut_output_file_name(req, request_id)
+        input_extension = _flowcut_input_extension(video_input_path)
+        output_file_name = _flowcut_output_file_name(
+            req,
+            request_id,
+            input_extension=input_extension,
+        )
+        output_object_key = _resolve_flowcut_output_object_key(
+            req,
+            request_id,
+            output_file_name,
+            input_extension=input_extension,
+        )
+        output_bucket = _resolve_flowcut_output_bucket(req)
+        persistent_output_path = _resolve_flowcut_persistent_output_path(
+            req,
+            request_id,
+            server_args,
+            input_extension=input_extension,
+        )
+        cleanup_workdir_on_finish = temp_base_dir is not None and (
+            req.minio_config is not None or persistent_output_path is not None
+        )
         output_file_path = storage.output_file_path(output_file_name)
         output_dir = str(Path(output_file_path).parent)
         try:
@@ -410,12 +900,18 @@ async def create_vividvr_flowcut_video_repair(request: Request):
             server_args,
             **vividvr_kwargs,
         )
+        sampling_params.request_cancel_path = request_cancel_path
+        sampling_params.request_timeout_deadline = request_timeout_deadline(req.timeout)
         job = video_repair_shared.video_repair_job_from_sampling(
             request_id, req, sampling_params
         )
         job["model"] = video_repair_shared.resolve_video_repair_model_name(
             req, server_args, "VividVR"
         )
+        job["output_object_key"] = output_object_key
+        job["output_bucket"] = output_bucket
+        job["timeout"] = req.timeout
+        job["request_cancel_path"] = request_cancel_path
         await VIDEO_STORE.upsert(request_id, job)
         logger.info(
             "FlowCut video repair accepted task_id=%s output_path=%s callback_url=%s",
@@ -424,16 +920,28 @@ async def create_vividvr_flowcut_video_repair(request: Request):
             req.callback_url,
         )
         batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
-        asyncio.create_task(
+        if hasattr(batch, "__dict__"):
+            batch.request_cancel_path = request_cancel_path
+            batch.request_timeout_deadline = sampling_params.request_timeout_deadline
+        dispatch_task = asyncio.create_task(
             _dispatch_vividvr_flowcut_video_repair_job_async(
                 request_id,
                 batch,
                 callback_url=req.callback_url,
                 storage=storage,
                 minio_config=req.minio_config,
+                output_object_key=output_object_key,
+                output_bucket=output_bucket,
+                persistent_output_path=persistent_output_path,
+                cleanup_workdir_on_finish=cleanup_workdir_on_finish,
+                cleanup_base_dir_on_finish=cleanup_workdir_on_finish,
+                cleanup_workdir_on_cancel=temp_base_dir is not None,
+                cleanup_base_dir_on_cancel=temp_base_dir is not None,
                 timeout=req.timeout,
             )
         )
+        await _register_flowcut_task(request_id, dispatch_task)
+        _schedule_flowcut_task_cleanup(request_id, dispatch_task)
         scheduled = True
         return FlowCutResponse(code=0, message="ok")
     except Exception as e:
@@ -447,3 +955,55 @@ async def create_vividvr_flowcut_video_repair(request: Request):
                 storage.cleanup()
             if temp_base_dir is not None:
                 shutil.rmtree(temp_base_dir, ignore_errors=True)
+
+
+@router.get("/repairs/flowcut/{video_id}", response_model=FlowCutVideoResponse)
+async def retrieve_vividvr_flowcut_video_repair(video_id: str):
+    job = await _get_flowcut_job_or_404(video_id)
+    return FlowCutVideoResponse(**job)
+
+
+@router.get(
+    "/repairs/flowcut/{video_id}/progress",
+    response_model=FlowCutProgressResponse,
+)
+async def retrieve_vividvr_flowcut_video_repair_progress(video_id: str):
+    job = await _get_flowcut_job_or_404(video_id)
+    return FlowCutProgressResponse(**_flowcut_progress_payload(video_id, job))
+
+
+@router.delete("/repairs/flowcut/{video_id}", response_model=FlowCutVideoResponse)
+async def delete_vividvr_flowcut_video_repair(video_id: str):
+    job = await _get_flowcut_job_or_404(video_id)
+
+    if job.get("status") in {"completed", "failed", "deleted"}:
+        return FlowCutVideoResponse(**job)
+
+    reason = TASK_TIMEOUT_MESSAGE
+    request_cancel_path = _write_flowcut_cancel_marker(video_id)
+    updated_fields = {
+        "status": "failed",
+        "error": {"message": reason},
+        "reason": reason,
+        "cancelled_at": int(time.time()),
+        "request_cancel_path": request_cancel_path,
+        "callback_status": "cancel_requested",
+        "callback_error": None,
+    }
+    await VIDEO_STORE.update_fields(video_id, updated_fields)
+    await _cancel_registered_flowcut_task(video_id)
+
+    callback_url = job.get("callback_url")
+    if callback_url:
+        payload = {
+            "status": "failed",
+            "progress": 98.0,
+            "reason": reason,
+            "output": "",
+        }
+        await _post_flowcut_callback_with_bookkeeping(video_id, callback_url, payload)
+
+    updated_job = await VIDEO_STORE.get(video_id)
+    if updated_job is None:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return FlowCutVideoResponse(**updated_job)

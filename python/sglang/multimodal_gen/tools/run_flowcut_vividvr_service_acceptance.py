@@ -245,8 +245,6 @@ def _build_payload(
     }
     if args.caption_file:
         payload["caption_file_path"] = args.caption_file
-    if args.reference_video:
-        payload["reference_video_path"] = args.reference_video
     if args.output_path:
         payload["output_path"] = args.output_path
     if args.perf_dump_path:
@@ -266,11 +264,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--callback-port", type=int, default=0)
     parser.add_argument("--input-video", "--video-input-path", dest="input_video", required=True)
     parser.add_argument("--caption-file", "--caption-file-path", dest="caption_file")
-    parser.add_argument(
-        "--reference-video",
-        "--reference-video-path",
-        dest="reference_video",
-    )
     parser.add_argument("--output-path")
     parser.add_argument("--perf-dump-path")
     parser.add_argument("--num-inference-steps", type=int, default=20)

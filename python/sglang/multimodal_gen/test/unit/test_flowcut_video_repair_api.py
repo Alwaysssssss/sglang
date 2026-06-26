@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -45,9 +46,31 @@ def test_create_app_registers_flowcut_route_from_dedicated_router(tmp_path):
         for route in app.routes
         if getattr(route, "path", None) == "/v1/videos/repairs/flowcut"
     ]
+    cancel_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/videos/repairs/flowcut/{video_id}"
+    ]
+    progress_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None)
+        == "/v1/videos/repairs/flowcut/{video_id}/progress"
+    ]
 
     assert len(flowcut_routes) == 1
     assert flowcut_routes[0].endpoint.__module__.endswith("vividvr_flowcut_api")
+    assert len(cancel_routes) == 2
+    assert {
+        tuple(sorted(getattr(route, "methods", set())))
+        for route in cancel_routes
+    } == {("DELETE",), ("GET",)}
+    assert all(
+        route.endpoint.__module__.endswith("vividvr_flowcut_api")
+        for route in cancel_routes
+    )
+    assert len(progress_routes) == 1
+    assert progress_routes[0].endpoint.__module__.endswith("vividvr_flowcut_api")
 
 
 def _patch_sampling(monkeypatch, tmp_path, *, captured_kwargs=None):
@@ -84,7 +107,6 @@ def test_build_vividvr_kwargs_keeps_phase_e_defaults_optional(tmp_path):
         task_id="job-1",
         video_input_path="/tmp/input.mp4",
         caption_file_path="/tmp/caption.txt",
-        reference_video_path="/tmp/reference.mp4",
         num_inference_steps=20,
         seed=42,
     )
@@ -103,7 +125,7 @@ def test_build_vividvr_kwargs_keeps_phase_e_defaults_optional(tmp_path):
     assert kwargs["prompt"] == "restore the video"
     assert kwargs["caption_source"] == "caption_file"
     assert kwargs["caption_file_path"] == "/tmp/caption.txt"
-    assert kwargs["reference_video_path"] == "/tmp/reference.mp4"
+    assert "reference_video_path" not in kwargs
     assert kwargs["num_inference_steps"] == 20
     assert kwargs["seed"] == 42
 
@@ -211,6 +233,51 @@ def test_flowcut_endpoint_returns_code_1_for_invalid_json(monkeypatch):
     assert "invalid request" in response.json()["message"]
 
 
+@pytest.mark.parametrize("field_name", ["reference_video_path", "referenceVideoPath"])
+def test_flowcut_endpoint_rejects_reference_video_path_field(field_name):
+    client = _make_test_client()
+
+    response = client.post(
+        "/v1/videos/repairs/flowcut",
+        json={
+            "taskId": "task-with-reference-field",
+            "timeout": -1,
+            "callbackUrl": "http://127.0.0.1:9000/callback",
+            "video_input_path": "/tmp/input.mp4",
+            field_name: "/tmp/reference.mp4",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["code"] == 1
+    assert field_name in response.json()["message"]
+
+
+def test_invalid_flowcut_request_with_task_id_is_persisted_as_failed(tmp_path):
+    client = _make_test_client()
+
+    async def run_test():
+        vividvr_flowcut_api.VIDEO_STORE._items.clear()
+        response = client.post(
+            "/v1/videos/repairs/flowcut",
+            json={
+                "taskId": "bad-task",
+                "timeout": -2,
+                "callbackUrl": "http://127.0.0.1:9000/callback",
+            },
+        )
+        job = await vividvr_flowcut_api.VIDEO_STORE.get("bad-task")
+        return response, job
+
+    response, job = asyncio.run(run_test())
+
+    assert response.status_code == 200
+    assert response.json()["code"] == 1
+    assert job is not None
+    assert job["status"] == "failed"
+    assert "timeout" in job["reason"]
+
+
 def test_flowcut_endpoint_rejects_non_vivid_pipeline_without_dispatch(
     monkeypatch, tmp_path
 ):
@@ -268,7 +335,7 @@ def test_flowcut_endpoint_rejects_non_vivid_pipeline_without_dispatch(
 def test_flowcut_endpoint_accepts_and_schedules_background_job(monkeypatch, tmp_path):
     scheduled = {}
     acquired = {"value": False}
-    input_video = tmp_path / "in.mp4"
+    input_video = tmp_path / "in.mov"
     input_video.write_bytes(b"video")
 
     class AvailableSemaphore:
@@ -305,7 +372,6 @@ def test_flowcut_endpoint_accepts_and_schedules_background_job(monkeypatch, tmp_
             "callbackUrl": "http://127.0.0.1:9000/tasks/task-1/callback",
             "video_input_path": str(input_video),
             "caption_file_path": "/tmp/caption.txt",
-            "reference_video_path": "/tmp/ref.mp4",
         },
     )
 
@@ -314,9 +380,146 @@ def test_flowcut_endpoint_accepts_and_schedules_background_job(monkeypatch, tmp_
     assert acquired["value"] is True
     assert scheduled["coro_name"] == "_dispatch_vividvr_flowcut_video_repair_job_async"
     assert captured_kwargs["video_input_path"].endswith(
-        "flowcut_work/task-1/inputs/input.mp4"
+        "flowcut_work/task-1/inputs/input.mov"
     )
     assert captured_kwargs["output_path"].endswith("flowcut_work/task-1/outputs")
+    assert captured_kwargs["output_file_name"] == "task-1.mov"
+    assert "reference_video_path" not in captured_kwargs
+
+
+def test_flowcut_endpoint_persists_default_output_object_key_for_minio_request(
+    monkeypatch, tmp_path
+):
+    scheduled = {}
+    input_video = tmp_path / "in.mov"
+    input_video.write_bytes(b"video")
+
+    class AvailableSemaphore:
+        def locked(self):
+            return False
+
+        async def acquire(self):
+            pass
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "get_global_server_args",
+        lambda: _make_vivid_server_args(tmp_path),
+    )
+    _patch_sampling(monkeypatch, tmp_path)
+
+    async def fake_dispatch(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        scheduled["coro_name"] = coro.cr_code.co_name
+        coro.close()
+        return None
+
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "_dispatch_vividvr_flowcut_video_repair_job_async",
+        fake_dispatch,
+    )
+    monkeypatch.setattr(vividvr_flowcut_api.asyncio, "create_task", fake_create_task)
+    client = _make_test_client()
+
+    async def run_test():
+        vividvr_flowcut_api.VIDEO_STORE._items.clear()
+        response = client.post(
+            "/v1/videos/repairs/flowcut",
+            json={
+                "taskId": "task-minio-default-key",
+                "timeout": -1,
+                "callbackUrl": "http://127.0.0.1:9000/callback",
+                "video_input_path": str(input_video),
+                "minioConfig": {
+                    "endpoint": "minio.example.com:9000",
+                    "bucketName": "flowcut",
+                    "accessKey": "ak",
+                    "secretKey": "sk",
+                },
+            },
+        )
+        job = await vividvr_flowcut_api.VIDEO_STORE.get("task-minio-default-key")
+        return response, job
+
+    response, job = asyncio.run(run_test())
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "message": "ok"}
+    assert scheduled["coro_name"] == "fake_dispatch"
+    assert job is not None
+    assert job["output_bucket"] == "flowcut"
+    assert job["output_object_key"].endswith("_task-minio-default-key.mov")
+
+
+def test_flowcut_endpoint_uses_temp_workdir_when_input_save_path_is_unset(
+    monkeypatch, tmp_path
+):
+    scheduled = {}
+    input_video = tmp_path / "in.mov"
+    input_video.write_bytes(b"video")
+
+    class AvailableSemaphore:
+        def locked(self):
+            return False
+
+        async def acquire(self):
+            pass
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(video_repair_shared, "VIDEOEDIT_SEMAPHORE", AvailableSemaphore())
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "get_global_server_args",
+        lambda: _make_vivid_server_args(
+            tmp_path,
+            input_save_path=None,
+            output_path=str(tmp_path / "persistent-output"),
+        ),
+    )
+    captured_kwargs = _patch_sampling(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        vividvr_flowcut_api.tempfile,
+        "mkdtemp",
+        lambda prefix: str(tmp_path / "flowcut-temp-base"),
+    )
+
+    def fake_create_task(coro):
+        scheduled["coro_name"] = coro.cr_code.co_name
+        coro.close()
+        return None
+
+    monkeypatch.setattr(vividvr_flowcut_api.asyncio, "create_task", fake_create_task)
+    client = _make_test_client()
+
+    response = client.post(
+        "/v1/videos/repairs/flowcut",
+        json={
+            "taskId": "task-temp-input",
+            "timeout": -1,
+            "callbackUrl": "http://127.0.0.1:9000/tasks/task-temp-input/callback",
+            "video_input_path": str(input_video),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"code": 0, "message": "ok"}
+    assert scheduled["coro_name"] == "_dispatch_vividvr_flowcut_video_repair_job_async"
+    assert captured_kwargs["video_input_path"].endswith(
+        "flowcut-temp-base/task-temp-input/inputs/input.mov"
+    )
+    assert captured_kwargs["output_path"].endswith(
+        "flowcut-temp-base/task-temp-input/outputs"
+    )
+    assert captured_kwargs["output_file_name"] == "task-temp-input.mov"
 
 
 def test_flowcut_endpoint_generates_caption_when_bridge_enabled(monkeypatch, tmp_path):
@@ -508,6 +711,68 @@ def test_dispatch_vividvr_flowcut_job_posts_stage_and_final_callbacks(
     assert video_repair_shared.VIDEOEDIT_SEMAPHORE.released is True
 
 
+def test_dispatch_vividvr_flowcut_job_records_callback_bookkeeping(
+    monkeypatch, tmp_path
+):
+    output_path = tmp_path / "task-callback" / "outputs" / "task-callback.mp4"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"result")
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        return 1
+
+    async def fake_run_video_generation_job(batch):
+        return SimpleNamespace(
+            save_file_path=str(output_path),
+            result=SimpleNamespace(inference_time_s=1.25),
+        )
+
+    class ReleaseTrackingSemaphore:
+        def release(self):
+            pass
+
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "post_flowcut_callback",
+        fake_post_flowcut_callback,
+    )
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "run_video_generation_job",
+        fake_run_video_generation_job,
+    )
+    monkeypatch.setattr(
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
+        ReleaseTrackingSemaphore(),
+    )
+    storage = vividvr_flowcut_api.VividVRFlowCutStorage(
+        base_dir=tmp_path,
+        request_id="task-callback",
+    )
+
+    async def run_test():
+        await vividvr_flowcut_api.VIDEO_STORE.upsert(
+            "task-callback",
+            {"id": "task-callback", "status": "queued", "progress": 0},
+        )
+        await vividvr_flowcut_api._dispatch_vividvr_flowcut_video_repair_job_async(
+            "task-callback",
+            batch="prepared",
+            callback_url="http://127.0.0.1:9000/callback",
+            storage=storage,
+            timeout=-1,
+        )
+        return await vividvr_flowcut_api.VIDEO_STORE.get("task-callback")
+
+    job = asyncio.run(run_test())
+
+    assert job is not None
+    assert job["callback_status"] == "succeeded"
+    assert job["callback_error"] is None
+    assert job["callback_attempts"] == 1
+
+
 def test_monitor_vividvr_denoise_progress_posts_runtime_progress(tmp_path):
     callbacks = []
 
@@ -619,9 +884,19 @@ def test_dispatch_vividvr_flowcut_job_uses_minio_and_deletes_local_output(
             result=SimpleNamespace(inference_time_s=None),
         )
 
-    async def fake_upload_result(local_path, minio_config):
+    captured_upload = {}
+
+    async def fake_upload_result(
+        local_path,
+        minio_config,
+        *,
+        object_key=None,
+        bucket_name=None,
+    ):
+        captured_upload["object_key"] = object_key
+        captured_upload["bucket_name"] = bucket_name
         Path(local_path).unlink()
-        return "http://minio/flowcut/outputs/task-minio.mp4"
+        return "http://minio/target-bucket/custom/task-minio.mp4"
 
     monkeypatch.setattr(
         vividvr_flowcut_api,
@@ -661,6 +936,8 @@ def test_dispatch_vividvr_flowcut_job_uses_minio_and_deletes_local_output(
                 access_key="ak",
                 secret_key="sk",
             ),
+            output_object_key="custom/task-minio.mp4",
+            output_bucket="target-bucket",
             timeout=-1,
         )
 
@@ -668,9 +945,142 @@ def test_dispatch_vividvr_flowcut_job_uses_minio_and_deletes_local_output(
 
     assert callbacks[-1]["status"] == "succeeded"
     assert json.loads(callbacks[-1]["output"]) == {
-        "result_url": "http://minio/flowcut/outputs/task-minio.mp4"
+        "result_url": "http://minio/target-bucket/custom/task-minio.mp4"
+    }
+    assert captured_upload == {
+        "object_key": "custom/task-minio.mp4",
+        "bucket_name": "target-bucket",
     }
     assert not output_path.exists()
+
+
+def test_dispatch_vividvr_flowcut_job_cleans_temp_workdir_after_externalized_result(
+    monkeypatch, tmp_path
+):
+    callbacks = []
+    base_dir = tmp_path / "temp-base"
+    storage = vividvr_flowcut_api.VividVRFlowCutStorage(
+        base_dir=base_dir,
+        request_id="task-cleanup",
+    )
+    output_path = Path(storage.output_file_path("task-cleanup.mp4"))
+    output_path.write_bytes(b"result")
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        callbacks.append(payload)
+
+    async def fake_run_video_generation_job(batch):
+        return SimpleNamespace(
+            save_file_path=str(output_path),
+            result=SimpleNamespace(inference_time_s=1.0),
+        )
+
+    async def fake_upload_result(local_path, minio_config, **kwargs):
+        Path(local_path).unlink()
+        return "http://minio/flowcut/task-cleanup.mp4"
+
+    class ReleaseTrackingSemaphore:
+        def release(self):
+            pass
+
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "post_flowcut_callback",
+        fake_post_flowcut_callback,
+    )
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "run_video_generation_job",
+        fake_run_video_generation_job,
+    )
+    monkeypatch.setattr(storage, "upload_result", fake_upload_result)
+    monkeypatch.setattr(
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
+        ReleaseTrackingSemaphore(),
+    )
+
+    async def run_test():
+        await vividvr_flowcut_api._dispatch_vividvr_flowcut_video_repair_job_async(
+            "task-cleanup",
+            batch="prepared",
+            callback_url="http://127.0.0.1:9000/callback",
+            storage=storage,
+            minio_config=FlowCutMinIOConfig(
+                endpoint="minio:9000",
+                bucket_name="flowcut",
+                access_key="ak",
+                secret_key="sk",
+            ),
+            cleanup_workdir_on_finish=True,
+            cleanup_base_dir_on_finish=True,
+            timeout=-1,
+        )
+
+    asyncio.run(run_test())
+
+    assert callbacks[-1]["status"] == "succeeded"
+    assert not storage.workdir.exists()
+    assert not storage.base_dir.exists()
+
+
+def test_dispatch_vividvr_flowcut_job_keeps_temp_workdir_for_local_only_result(
+    monkeypatch, tmp_path
+):
+    callbacks = []
+    base_dir = tmp_path / "temp-base-local"
+    storage = vividvr_flowcut_api.VividVRFlowCutStorage(
+        base_dir=base_dir,
+        request_id="task-keep-local",
+    )
+    output_path = Path(storage.output_file_path("task-keep-local.mp4"))
+    output_path.write_bytes(b"result")
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        callbacks.append(payload)
+
+    async def fake_run_video_generation_job(batch):
+        return SimpleNamespace(
+            save_file_path=str(output_path),
+            result=SimpleNamespace(inference_time_s=1.0),
+        )
+
+    class ReleaseTrackingSemaphore:
+        def release(self):
+            pass
+
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "post_flowcut_callback",
+        fake_post_flowcut_callback,
+    )
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "run_video_generation_job",
+        fake_run_video_generation_job,
+    )
+    monkeypatch.setattr(
+        video_repair_shared,
+        "VIDEOEDIT_SEMAPHORE",
+        ReleaseTrackingSemaphore(),
+    )
+
+    async def run_test():
+        await vividvr_flowcut_api._dispatch_vividvr_flowcut_video_repair_job_async(
+            "task-keep-local",
+            batch="prepared",
+            callback_url="http://127.0.0.1:9000/callback",
+            storage=storage,
+            cleanup_workdir_on_finish=False,
+            cleanup_base_dir_on_finish=False,
+            timeout=-1,
+        )
+
+    asyncio.run(run_test())
+
+    assert callbacks[-1]["status"] == "succeeded"
+    assert storage.workdir.exists()
+    assert output_path.exists()
 
 
 def test_dispatch_vividvr_flowcut_job_posts_failed_callback_and_keeps_local_output(
@@ -690,7 +1100,7 @@ def test_dispatch_vividvr_flowcut_job_posts_failed_callback_and_keeps_local_outp
             result=SimpleNamespace(inference_time_s=2.0),
         )
 
-    async def fake_upload_result(local_path, minio_config):
+    async def fake_upload_result(local_path, minio_config, **kwargs):
         raise RuntimeError("upload failed")
 
     monkeypatch.setattr(
@@ -817,5 +1227,93 @@ def test_dispatch_vividvr_flowcut_timeout_keeps_semaphore_until_generation_finis
         callback for callback in callbacks if callback["status"] == "failed"
     ]
     assert len(failed_callbacks) == 1
-    assert "timed out" in failed_callbacks[0]["reason"].lower()
+    assert failed_callbacks[0]["reason"] == vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE
     assert release_events == ["released"]
+
+
+def test_delete_flowcut_job_marks_failed_and_cancels_registered_task(
+    monkeypatch, tmp_path
+):
+    callbacks = []
+    request_cancel_path = str(tmp_path / "cancel" / "task-cancelled.cancel")
+
+    class DummyTask:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    dummy_task = DummyTask()
+
+    async def fake_post_flowcut_callback(callback_url, payload, **kwargs):
+        callbacks.append((callback_url, payload))
+        return 1
+
+    client = _make_test_client()
+    vividvr_flowcut_api.VIDEO_STORE._items.clear()
+    vividvr_flowcut_api._FLOWCUT_TASKS.clear()
+    vividvr_flowcut_api._FLOWCUT_TASKS["task-cancelled"] = dummy_task
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "_flowcut_cancel_path",
+        lambda task_id: request_cancel_path,
+    )
+    monkeypatch.setattr(
+        vividvr_flowcut_api,
+        "post_flowcut_callback",
+        fake_post_flowcut_callback,
+    )
+
+    async def run_test():
+        await vividvr_flowcut_api.VIDEO_STORE.upsert(
+            "task-cancelled",
+            {
+                "id": "task-cancelled",
+                "object": "video",
+                "model": "VividVR",
+                "status": "running",
+                "progress": 50,
+                "created_at": 1,
+                "callback_url": "http://127.0.0.1:9000/callback",
+                "request_cancel_path": request_cancel_path,
+            },
+        )
+        response = client.delete("/v1/videos/repairs/flowcut/task-cancelled")
+        read_response = client.get("/v1/videos/repairs/flowcut/task-cancelled")
+        progress_response = client.get(
+            "/v1/videos/repairs/flowcut/task-cancelled/progress"
+        )
+        job = await vividvr_flowcut_api.VIDEO_STORE.get("task-cancelled")
+        return response, read_response, progress_response, job
+
+    response, read_response, progress_response, job = asyncio.run(run_test())
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["error"]["message"] == vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE
+    assert response.json()["reason"] == vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE
+    assert read_response.status_code == 200
+    assert read_response.json()["status"] == "failed"
+    assert read_response.json()["reason"] == vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE
+    assert progress_response.status_code == 200
+    assert progress_response.json()["status"] == "failed"
+    assert progress_response.json()["reason"] == vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE
+    assert job is not None
+    assert job["status"] == "failed"
+    assert job["reason"] == vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE
+    assert "cancelled_at" in job
+    assert job["callback_status"] == "succeeded"
+    assert dummy_task.cancelled is True
+    assert Path(request_cancel_path).exists()
+    assert callbacks == [
+        (
+            "http://127.0.0.1:9000/callback",
+            {
+                "status": "failed",
+                "progress": 98.0,
+                "reason": vividvr_flowcut_api.TASK_TIMEOUT_MESSAGE,
+                "output": "",
+            },
+        )
+    ]

@@ -56,7 +56,7 @@ async def post_flowcut_callback(
     *,
     timeout: float = 10.0,
     max_retries: int = 3,
-) -> None:
+) -> int:
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -67,7 +67,7 @@ async def post_flowcut_callback(
             ) as client:
                 response = await client.post(callback_url, json=payload)
                 response.raise_for_status()
-            return
+            return attempt
         except Exception as e:
             last_error = str(e)
             logger.warning(
@@ -123,10 +123,16 @@ async def report_flowcut_running_until_done(
             )
 
 
-def build_minio_result_url(config: FlowCutMinIOConfig, object_key: str) -> str:
+def build_minio_result_url(
+    config: FlowCutMinIOConfig,
+    object_key: str,
+    *,
+    bucket_name: str | None = None,
+) -> str:
     scheme = "https" if config.secure else "http"
     endpoint = config.endpoint.rstrip("/")
-    return f"{scheme}://{endpoint}/{config.bucket_name}/{object_key.lstrip('/')}"
+    target_bucket = bucket_name or config.bucket_name
+    return f"{scheme}://{endpoint}/{target_bucket}/{object_key.lstrip('/')}"
 
 
 async def upload_to_flowcut_minio(
@@ -134,10 +140,12 @@ async def upload_to_flowcut_minio(
     local_path: str,
     object_key: str,
     config: FlowCutMinIOConfig,
+    bucket_name: str | None = None,
 ) -> str:
     import boto3
 
     endpoint_url = f"{'https' if config.secure else 'http'}://{config.endpoint.rstrip('/')}"
+    target_bucket = bucket_name or config.bucket_name
 
     def _sync_upload() -> None:
         client = boto3.client(
@@ -147,7 +155,11 @@ async def upload_to_flowcut_minio(
             endpoint_url=endpoint_url,
             region_name=config.region,
         )
-        client.upload_file(local_path, config.bucket_name, object_key)
+        client.upload_file(local_path, target_bucket, object_key)
 
     await asyncio.get_running_loop().run_in_executor(None, _sync_upload)
-    return build_minio_result_url(config, object_key)
+    return build_minio_result_url(
+        config,
+        object_key,
+        bucket_name=target_bucket,
+    )

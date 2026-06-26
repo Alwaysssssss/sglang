@@ -1,50 +1,51 @@
-# Vivid-VR FlowCut 本地模拟测试命令
+# Vivid-VR FlowCut 本地手动验收命令
 
-本文档收口一条完整的本地模拟测试链路，目标是让你可以自己完成：
+本文档收口当前 `Vivid-VR FlowCut` 服务的本地手动验收方法，目标是让你自己完成下面几类检查：
 
-- 启动本地 S3/MinIO 模拟服务
-- 启动 caption sidecar 服务
-- 启动 Vivid-VR FlowCut 服务
-- 提交带 `upscale` 的模拟请求
-- 查看 callback、轮询 progress、检查上传结果
+- 手动启动本地 S3/MinIO 模拟服务
+- 手动启动 callback receiver
+- 手动启动 Vivid-VR FlowCut 服务
+- 提交显式 replay 请求并验证成功链路
+- 提交 caption bridge 请求并验证真实链路
+- 手动取消任务并验证 `online_videoedit` 对齐后的取消语义
+- 检查回调、S3 上传、输出扩展名继承、输入缓存清理
 
-当前文档默认使用：
+当前文档以当前分支的真实实现为准：
 
-- Python 环境：`/home/zhiheng/sglang/.venv/bin/python`
-- S3 模拟：`moto_server`
-- FlowCut 服务：单卡 `fa eager`
-- FlowCut 路由：`POST /v1/videos/repairs/flowcut`
-- `upscale` 语义：官方原版 `/home/zhiheng/Viviv-VR-origin` 的输入预缩放，不是后处理超分
+- 提交接口：`POST /v1/videos/repairs/flowcut`
+- 查询接口：`GET /v1/videos/repairs/flowcut/{taskId}`
+- 进度接口：`GET /v1/videos/repairs/flowcut/{taskId}/progress`
+- 取消接口：`DELETE /v1/videos/repairs/flowcut/{taskId}`
+- `callbackUrl` 当前必填
+- `upscale` 是原版 Vivid-VR 的输入预缩放语义，不是后处理超分
+- `minioConfig.endpoint` 当前应传不带 scheme 的 host:port，例如 `127.0.0.1:4566`
 
-文档同时覆盖两条测试链路：
-
-- 显式 replay：请求显式传 `caption_file_path + reference_video_path`
-- 完整真实链路：先起 `caption sidecar`，再向 bridge 主服务发“不带 `caption_file_path` / `reference_video_path`”的真实请求
-
-`upscale` 的请求语义：
-
-- `0.0`：短边缩放到 `1024`
-- `1.0`：输入分辨率保持不变
-- 其他正数：按倍率做推理前输入 resize
-
-## 1. 预设变量
-
-先准备统一变量，后面的命令默认依赖这些环境变量：
+## 1. 统一变量
 
 ```bash
 cd /home/zhiheng/sglang
 
 export PYTHONPATH=python
+export NO_PROXY=127.0.0.1,localhost
 export LOG_DIR=/home/zhiheng/sglang/Vivid_Acceptance/logs
 export OUTPUT_DIR=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark
-export INDICATOR_DIR=/home/zhiheng/sglang/Vivid_Acceptance/indicator
+export INDICATOR_DIR=/home/zhiheng/sglang/Vivid_Acceptance/indicator/service_benchmark
+export CAPTION_SIDECAR_DIR=/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars
 
 export INPUT_VIDEO_130F=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4
 export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
 export PROMPT_FILE=/home/zhiheng/Vivid-VR/input/720p/prompt.txt
-export REFERENCE_VIDEO=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4
 
-mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}" "${INDICATOR_DIR}"
+export MOTO_S3_ENDPOINT=127.0.0.1:4566
+export MOTO_S3_BUCKET=flowcut
+export MOTO_S3_ACCESS_KEY=test
+export MOTO_S3_SECRET_KEY=test
+
+export REPLAY_BASE_URL=http://127.0.0.1:31220
+export BRIDGE_BASE_URL=http://127.0.0.1:31221
+export CALLBACK_BASE_URL=http://127.0.0.1:39090
+
+mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}" "${INDICATOR_DIR}" "${CAPTION_SIDECAR_DIR}"
 ```
 
 ## 2. 准备 caption sidecar 环境
@@ -64,8 +65,6 @@ bash python/sglang/multimodal_gen/tools/setup_vividvr_caption_env.sh
 
 ## 3. 启动本地 S3 / MinIO 模拟服务
 
-启动 `moto_server`：
-
 ```bash
 tmux new-session -d -s vividvr_moto_s3 \
   'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && /home/zhiheng/sglang/.venv/bin/moto_server -H 127.0.0.1 -p 4566 2>&1 | tee Vivid_Acceptance/logs/vividvr_moto_s3_$(date -u +%Y%m%dT%H%M%SZ).log'
@@ -77,14 +76,9 @@ tmux new-session -d -s vividvr_moto_s3 \
 tmux attach -r -t vividvr_moto_s3
 ```
 
-准备 S3 变量并创建 bucket：
+创建 bucket：
 
 ```bash
-export MOTO_S3_ENDPOINT=127.0.0.1:4566
-export MOTO_S3_BUCKET=flowcut
-export MOTO_S3_ACCESS_KEY=test
-export MOTO_S3_SECRET_KEY=test
-
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
 import boto3
 
@@ -103,121 +97,11 @@ print([b["Name"] for b in s3.list_buckets()["Buckets"]])
 PY
 ```
 
-## 4. 启动 caption sidecar 服务
+预期结果：
 
-如果你要模拟“真实完整请求”，需要先启动 caption sidecar。
+- 输出中包含 `flowcut`
 
-```bash
-tmux new-session -d -s vividvr_caption_sidecar_mock \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_mock_$(date -u +%Y%m%dT%H%M%SZ).log'
-```
-
-查看 caption sidecar：
-
-```bash
-tmux attach -r -t vividvr_caption_sidecar_mock
-```
-
-健康检查：
-
-```bash
-curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
-```
-
-## 5. 启动 Vivid-VR FlowCut 服务
-
-### 5.1 显式 replay 服务
-
-当前这条模拟链路使用单卡 `fa eager`，不启用 caption bridge，直接复用已有 `caption_file_path + reference_video_path`。
-
-```bash
-tmux new-session -d -s vividvr_flowcut_mock_service \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && \
-   export CUDA_VISIBLE_DEVICES=1 && \
-   export PYTHONPATH=python && \
-   export NO_PROXY=127.0.0.1,localhost && \
-   export AWS_EC2_METADATA_DISABLED=true && \
-   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
-   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
-   /home/zhiheng/sglang/.venv/bin/sglang serve \
-     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
-     --model-id VividVR \
-     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
-     --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
-     --num-gpus 1 \
-     --attention-backend fa \
-     --host 127.0.0.1 \
-     --port 31220 \
-     --master-port 30220 \
-     --scheduler-port 56220 \
-     --strict-ports \
-     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
-     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
-```
-
-查看服务：
-
-```bash
-tmux attach -r -t vividvr_flowcut_mock_service
-```
-
-健康检查：
-
-```bash
-curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31220/health
-```
-
-### 5.2 完整真实链路服务
-
-这条命令会显式打开 caption bridge，服务在收到不带 `caption_file_path` 的请求后，会先调用 `caption sidecar` 生成 sidecar，再继续主推理。
-
-```bash
-tmux new-session -d -s vividvr_flowcut_bridge_mock_service \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/captions/service_sidecars && \
-   export CUDA_VISIBLE_DEVICES=1 && \
-   export PYTHONUNBUFFERED=1 && \
-   export PYTHONPATH=python && \
-   export NO_PROXY=127.0.0.1,localhost && \
-   export AWS_EC2_METADATA_DISABLED=true && \
-   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
-   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
-   /home/zhiheng/sglang/.venv/bin/sglang serve \
-     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
-     --model-id VividVR \
-     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
-     --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
-     --num-gpus 1 \
-     --attention-backend fa \
-     --host 127.0.0.1 \
-     --port 31221 \
-     --master-port 30221 \
-     --scheduler-port 56221 \
-     --strict-ports \
-     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
-     --vividvr-caption-bridge \
-     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
-     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
-     --vividvr-caption-sidecar-timeout 1800 \
-     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_bridge_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
-```
-
-查看 bridge 主服务：
-
-```bash
-tmux attach -r -t vividvr_flowcut_bridge_mock_service
-```
-
-健康检查：
-
-```bash
-curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31221/health
-```
-
-## 6. 启动本地 callback receiver
-
-如果你想手动用 `curl` 提交请求，先起一个最小 callback receiver，把每条回调直接写到日志文件。
+## 4. 启动 callback receiver
 
 ```bash
 tmux new-session -d -s vividvr_flowcut_callback_receiver \
@@ -255,35 +139,128 @@ server.serve_forever()
 PY'
 ```
 
-查看 callback receiver：
+查看 receiver：
 
 ```bash
 tmux attach -r -t vividvr_flowcut_callback_receiver
 ```
 
-统一设置服务地址：
+## 5. 启动服务
+
+### 5.1 显式 replay 服务
+
+这条服务链路直接复用 `caption_file_path`，不依赖 caption bridge。
+
+如果你要验证“任务完成后输入副本和 request workdir 被清理”，请保留 `--input-save-path ""`。
+
+如果你想观察持久缓存行为，可以删掉 `--input-save-path ""`，那样服务会回到默认的 `inputs/uploads` 持久目录模式。
 
 ```bash
-export MOTO_BASE_URL=http://127.0.0.1:31220
-export BRIDGE_BASE_URL=http://127.0.0.1:31221
-export CALLBACK_BASE_URL=http://127.0.0.1:39090
+tmux new-session -d -s vividvr_flowcut_mock_service \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && \
+   export CUDA_VISIBLE_DEVICES=1 && \
+   export PYTHONPATH=python && \
+   export NO_PROXY=127.0.0.1,localhost && \
+   export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+   /home/zhiheng/sglang/.venv/bin/sglang serve \
+     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+     --model-id VividVR \
+     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+     --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
+     --num-gpus 1 \
+     --attention-backend fa \
+     --host 127.0.0.1 \
+     --port 31220 \
+     --master-port 30220 \
+     --scheduler-port 56220 \
+     --strict-ports \
+     --input-save-path "" \
+     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
-## 7. 手动提交 FlowCut 模拟请求
-
-### 7.1 显式 replay 请求
-
-下面这条命令会直接向服务发 `curl` 请求，带上：
-
-- `caption_file_path`
-- `reference_video_path`
-- `upscale`
-- `minioConfig`
+查看服务：
 
 ```bash
-export TASK_ID=vividvr-mock-$(date -u +%Y%m%dT%H%M%SZ)
+tmux attach -r -t vividvr_flowcut_mock_service
+```
 
-NO_PROXY=* curl -sS -X POST "${MOTO_BASE_URL}/v1/videos/repairs/flowcut" \
+健康检查：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail "${REPLAY_BASE_URL}/health"
+```
+
+### 5.2 完整真实链路服务
+
+这条链路显式启用 caption bridge。请求不传 `caption_file_path` 时，服务会先去 sidecar 生成 caption，再继续主推理。
+
+先起 caption sidecar：
+
+```bash
+tmux new-session -d -s vividvr_caption_sidecar_mock \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_mock_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+健康检查：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
+```
+
+再起 bridge 主服务：
+
+```bash
+tmux new-session -d -s vividvr_flowcut_bridge_mock_service \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/captions/service_sidecars && \
+   export CUDA_VISIBLE_DEVICES=1 && \
+   export PYTHONUNBUFFERED=1 && \
+   export PYTHONPATH=python && \
+   export NO_PROXY=127.0.0.1,localhost && \
+   export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+   /home/zhiheng/sglang/.venv/bin/sglang serve \
+     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+     --model-id VividVR \
+     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+     --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
+     --num-gpus 1 \
+     --attention-backend fa \
+     --host 127.0.0.1 \
+     --port 31221 \
+     --master-port 30221 \
+     --scheduler-port 56221 \
+     --strict-ports \
+     --input-save-path "" \
+     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
+     --vividvr-caption-bridge \
+     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+     --vividvr-caption-sidecar-timeout 1800 \
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_bridge_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+健康检查：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail "${BRIDGE_BASE_URL}/health"
+```
+
+## 6. 显式 replay 成功链路
+
+### 6.1 提交请求
+
+这里显式传 `caption_file_path`，并且把 `outputObjectKey` 写成不带扩展名，借此一起验证“输出扩展名继承输入格式”。
+
+```bash
+export TASK_ID=vividvr-replay-$(date -u +%Y%m%dT%H%M%SZ)
+
+curl --noproxy '*' -sS -X POST "${REPLAY_BASE_URL}/v1/videos/repairs/flowcut" \
   -H 'Content-Type: application/json' \
   --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
 {
@@ -292,12 +269,12 @@ NO_PROXY=* curl -sS -X POST "${MOTO_BASE_URL}/v1/videos/repairs/flowcut" \
   "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
   "video_input_path": "${INPUT_VIDEO_130F}",
   "caption_file_path": "${CAPTION_FILE}",
-  "reference_video_path": "${REFERENCE_VIDEO}",
   "num_inference_steps": 20,
   "seed": 42,
   "num_temporal_process_frames": 121,
   "upscale": 1.0,
   "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "outputObjectKey": "service-semantic-check/${TASK_ID}",
   "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json",
   "minioConfig": {
     "endpoint": "${MOTO_S3_ENDPOINT}",
@@ -311,32 +288,216 @@ NO_PROXY=* curl -sS -X POST "${MOTO_BASE_URL}/v1/videos/repairs/flowcut" \
 JSON
 ```
 
-如果你要测试官方原版 `upscale` 语义，可以只改这个字段：
+预期结果：
 
-- `1.0`：保持当前已验收基线
-- `0.0`：短边缩到 `1024`
-- `2.0`：输入先放大两倍再进推理
+- 提交响应是 `{"code":0,"message":"ok"}`
 
-当前代码已经对齐官方原版的 `gen_height / gen_width` 规划语义，所以 `960x720_130f` 这条验收视频用 `upscale=0.0` 时，期望行为是：
-
-- 请求被正常 accept
-- progress 最终进入 `completed`
-- callback 最后一条为 `status=succeeded`
-- `output` 里返回 `result_url`
-
-### 7.2 完整真实请求
-
-这条请求用于模拟“客户端只给视频，服务端自动补 caption sidecar”的真实链路：
-
-- 不传 `caption_file_path`
-- 不传 `reference_video_path`
-- 服务端先同步等待 caption bridge 生成 sidecar
-- 然后再进入主推理
+### 6.2 查询详情与进度
 
 ```bash
-export TASK_ID=vividvr-bridge-mock-$(date -u +%Y%m%dT%H%M%SZ)
+curl --noproxy '*' --silent "${REPLAY_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}"
+echo
+curl --noproxy '*' --silent "${REPLAY_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}/progress"
+echo
+```
 
-NO_PROXY=* curl -sS -X POST "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut" \
+持续轮询：
+
+```bash
+while true; do
+  curl --noproxy '*' --silent "${REPLAY_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}/progress"
+  echo
+  sleep 10
+done
+```
+
+成功终态预期：
+
+- `GET /repairs/flowcut/{taskId}` 返回：
+  - `status = "completed"`
+  - `url` 为 `http://127.0.0.1:4566/...`
+  - `file_path = null`
+  - `reason = null`
+- `GET /repairs/flowcut/{taskId}/progress` 返回：
+  - `status = "completed"`
+  - `progress = 100`
+  - `callback_status = "succeeded"`
+
+### 6.3 查看 callback
+
+```bash
+tail -f "${LOG_DIR}"/mock_callback_*.jsonl
+```
+
+预期最后一条 callback：
+
+- `status = "succeeded"`
+- `progress = 100`
+- `reason = ""`
+- `output` 是 JSON string，至少包含 `result_url`
+
+### 6.4 检查 S3 对象
+
+```bash
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import boto3
+import os
+
+task_id = os.environ["TASK_ID"]
+key = f"service-semantic-check/{task_id}.mp4"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+head = s3.head_object(Bucket="flowcut", Key=key)
+print({"key": key, "content_length": head["ContentLength"]})
+PY
+```
+
+预期结果：
+
+- `head_object` 成功
+- key 形态是 `service-semantic-check/<TASK_ID>.mp4`
+- 因为输入样例是 `.mp4`，服务会把未带后缀的 `outputObjectKey` 自动补成 `.mp4`
+
+如果你换成 `.mov` 输入视频，预期 key 和最终 `result_url` 后缀都应变成 `.mov`。
+
+### 6.5 下载结果文件
+
+#### 6.5.1 replay 服务下载
+
+这一节对应 `replay` 服务，使用 `REPLAY_BASE_URL`。
+
+先从 replay 详情接口取回 `result_url`：
+
+```bash
+export RESULT_URL=$(curl --noproxy '*' --silent "${REPLAY_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}" | /home/zhiheng/sglang/.venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+echo "${RESULT_URL}"
+```
+
+预期结果：
+
+- 输出为 `http://127.0.0.1:4566/flowcut/service-semantic-check/<TASK_ID>.mp4`
+
+直接通过 `result_url` 下载：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail -L \
+  -o "${OUTPUT_DIR}/${TASK_ID}.downloaded.mp4" \
+  "${RESULT_URL}"
+ls -lh "${OUTPUT_DIR}/${TASK_ID}.downloaded.mp4"
+```
+
+如果你想绕过 `result_url`，也可以直接从 mock S3 key 下载：
+
+```bash
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import boto3
+import os
+
+task_id = os.environ["TASK_ID"]
+target = os.path.join(os.environ["OUTPUT_DIR"], f"{task_id}.downloaded-from-s3.mp4")
+key = f"service-semantic-check/{task_id}.mp4"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+s3.download_file("flowcut", key, target)
+print({"downloaded_to": target, "key": key})
+PY
+```
+
+预期结果：
+
+- 本地出现 `${OUTPUT_DIR}/${TASK_ID}.downloaded.mp4`
+- 或 `${OUTPUT_DIR}/${TASK_ID}.downloaded-from-s3.mp4`
+- 文件大小大于 `0`
+
+#### 6.5.2 caption bridge 服务下载
+
+这一节对应 `caption bridge` 服务，使用 `BRIDGE_BASE_URL`。
+
+先从 bridge 详情接口取回 `result_url`：
+
+```bash
+export RESULT_URL=$(curl --noproxy '*' --silent "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}" | /home/zhiheng/sglang/.venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["url"])')
+echo "${RESULT_URL}"
+```
+
+预期结果：
+
+- 输出为 `http://127.0.0.1:4566/flowcut/bridge-semantic-check/<TASK_ID>.mp4`
+
+直接通过 `result_url` 下载：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail -L \
+  -o "${OUTPUT_DIR}/${TASK_ID}.bridge-downloaded.mp4" \
+  "${RESULT_URL}"
+ls -lh "${OUTPUT_DIR}/${TASK_ID}.bridge-downloaded.mp4"
+```
+
+如果你想绕过 `result_url`，也可以直接从 mock S3 key 下载：
+
+```bash
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import boto3
+import os
+
+task_id = os.environ["TASK_ID"]
+target = os.path.join(os.environ["OUTPUT_DIR"], f"{task_id}.bridge-downloaded-from-s3.mp4")
+key = f"bridge-semantic-check/{task_id}.mp4"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+s3.download_file("flowcut", key, target)
+print({"downloaded_to": target, "key": key})
+PY
+```
+
+预期结果：
+
+- 本地出现 `${OUTPUT_DIR}/${TASK_ID}.bridge-downloaded.mp4`
+- 或 `${OUTPUT_DIR}/${TASK_ID}.bridge-downloaded-from-s3.mp4`
+- 文件大小大于 `0`
+
+### 6.6 检查清理
+
+如果服务是按上面的 `--input-save-path ""` 启动的，再做一次本地检查：
+
+```bash
+find /tmp -maxdepth 2 -type d -name "${TASK_ID}" 2>/dev/null
+find /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars -maxdepth 1 -type f -name "${TASK_ID}*" 2>/dev/null
+```
+
+预期结果：
+
+- replay 服务本身不生成 bridge caption
+- request workdir 不应残留 `${TASK_ID}` 目录
+
+## 7. caption bridge 成功链路
+
+### 7.1 提交请求
+
+这条请求不传 `caption_file_path`，由 bridge 主服务自动补 caption。
+
+```bash
+export TASK_ID=vividvr-bridge-$(date -u +%Y%m%dT%H%M%SZ)
+
+curl --noproxy '*' -sS -X POST "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut" \
   -H 'Content-Type: application/json' \
   --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
 {
@@ -349,6 +510,7 @@ NO_PROXY=* curl -sS -X POST "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut" \
   "num_temporal_process_frames": 121,
   "upscale": 1.0,
   "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "outputObjectKey": "bridge-semantic-check/${TASK_ID}",
   "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json",
   "minioConfig": {
     "endpoint": "${MOTO_S3_ENDPOINT}",
@@ -362,73 +524,168 @@ NO_PROXY=* curl -sS -X POST "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut" \
 JSON
 ```
 
-这条请求的关键点是：
+预期结果：
 
-- 它更接近外部真实客户端
-- `submit` 阶段会更长，因为服务端要先等 caption sidecar
-- bridge 生成的 sidecar 会写到：
-  - `/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/${TASK_ID}.txt`
-- 如果把 `upscale` 改成 `0.0`，当前期望也是成功完成，而不是在模型内部报尺寸错误
+- 提交响应仍然是 `{"code":0,"message":"ok"}`
+- 因为服务要先补 caption，提交到出现首个 `caption_ready` 回调之间的间隔会比 replay 链路更长
 
-## 8. 轮询 progress 和查看 callback
-
-轮询任务进度：
+### 7.2 轮询与预期
 
 ```bash
-# 显式 replay 链路
-curl --noproxy '*' -X GET "${MOTO_BASE_URL}/v1/videos/${TASK_ID}/progress"
-
-# 完整真实链路
-curl --noproxy '*' -X GET "${BRIDGE_BASE_URL}/v1/videos/${TASK_ID}/progress"
-```
-
-持续轮询直到任务完成：
-
-```bash
-# 显式 replay 链路
 while true; do
-  curl --noproxy '*' --silent "${MOTO_BASE_URL}/v1/videos/${TASK_ID}/progress"
-  echo
-  sleep 10
-done
-
-# 完整真实链路
-while true; do
-  curl --noproxy '*' --silent "${BRIDGE_BASE_URL}/v1/videos/${TASK_ID}/progress"
+  curl --noproxy '*' --silent "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}/progress"
   echo
   sleep 10
 done
 ```
 
-查看 callback 日志：
+成功终态预期：
+
+- `status = "completed"`
+- `progress = 100`
+- `callback_status = "succeeded"`
+- `url` 指向 `http://127.0.0.1:4566/flowcut/bridge-semantic-check/<TASK_ID>.mp4`
+
+callback 中间阶段预期会依次出现：
+
+- `reason = "accepted"`
+- `reason = "input_ready"`
+- `reason = "caption_ready"`
+- `reason = "denoising"`
+- `reason = "uploading_result"`
+- 最后一条 `status = "succeeded"`
+
+### 7.3 检查 bridge caption 与 request workdir
+
+按上面的启动命令，bridge 服务显式配置了：
+
+- `--input-save-path ""`
+- `--vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars`
+
+因此当前默认预期是：
+
+- request workdir 会被清理
+- bridge 自动生成的 caption sidecar 会保留在 `CAPTION_SIDECAR_DIR`
+
+任务完成后检查：
+
+```bash
+find "${CAPTION_SIDECAR_DIR}" -maxdepth 1 -type f -name "${TASK_ID}*" 2>/dev/null
+find /tmp -maxdepth 2 -type d -name "${TASK_ID}" 2>/dev/null
+```
+
+预期结果：
+
+- `CAPTION_SIDECAR_DIR` 下能看到 `${TASK_ID}.txt` 和对应 manifest
+- request workdir 不再残留
+
+如果你想验证“bridge 自动生成 caption 也随任务一起清理”，请重新启动 bridge 服务并去掉 `--vividvr-caption-work-dir ...`。那样 caption 会回落到 request workdir 下的 `outputs/caption_sidecars`，在临时 workdir 模式下会随任务一起删除。
+
+## 8. 取消链路
+
+### 8.1 提交一个待取消任务
+
+```bash
+export TASK_ID=vividvr-cancel-$(date -u +%Y%m%dT%H%M%SZ)
+
+curl --noproxy '*' -sS -X POST "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON | tee "${LOG_DIR}/${TASK_ID}.submit.log"
+{
+  "taskId": "${TASK_ID}",
+  "timeout": -1,
+  "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
+  "video_input_path": "${INPUT_VIDEO_130F}",
+  "num_inference_steps": 50,
+  "seed": 42,
+  "num_temporal_process_frames": 121,
+  "upscale": 1.0,
+  "output_path": "${OUTPUT_DIR}/${TASK_ID}.mp4",
+  "outputObjectKey": "cancel-semantic-check/${TASK_ID}",
+  "perf_dump_path": "${INDICATOR_DIR}/${TASK_ID}_perf.json",
+  "minioConfig": {
+    "endpoint": "${MOTO_S3_ENDPOINT}",
+    "bucket_name": "${MOTO_S3_BUCKET}",
+    "access_key": "${MOTO_S3_ACCESS_KEY}",
+    "secret_key": "${MOTO_S3_SECRET_KEY}",
+    "secure": false,
+    "region": "us-east-1"
+  }
+}
+JSON
+```
+
+先轮询到任务进入运行中：
+
+```bash
+while true; do
+  curl --noproxy '*' --silent "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}/progress"
+  echo
+  sleep 5
+done
+```
+
+当你看到：
+
+- `status = "running"`
+- `progress > 0`
+
+就可以发取消请求。
+
+### 8.2 取消任务
+
+```bash
+curl --noproxy '*' --silent -X DELETE "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}"
+echo
+```
+
+取消返回预期：
+
+- `status = "failed"`
+- `reason = "Request timed out."`
+- `error.message = "Request timed out."`
+
+再查详情和进度：
+
+```bash
+curl --noproxy '*' --silent "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}"
+echo
+curl --noproxy '*' --silent "${BRIDGE_BASE_URL}/v1/videos/repairs/flowcut/${TASK_ID}/progress"
+echo
+```
+
+终态预期：
+
+- `status = "failed"`
+- `reason = "Request timed out."`
+- `callback_status = "succeeded"`
+- 不应再继续上传成功结果
+
+### 8.3 检查 callback 和 S3
+
+查看 callback：
 
 ```bash
 tail -f "${LOG_DIR}"/mock_callback_*.jsonl
 ```
 
-成功时你应看到：
+最后一条预期：
 
-- progress 终态 `status=completed`
-- progress 返回的 `url` 为 S3 模拟地址
-- callback 最后一条 `status=succeeded`
-- callback 的 `output` 只包含 `result_url` 和可选 `duration`
+- `status = "failed"`
+- `reason = "Request timed out."`
+- `output = ""`
 
-如果你走的是完整真实链路，也建议同时检查：
-
-```bash
-ls -l /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/
-```
-
-## 9. 检查 S3 / MinIO 上传结果
-
-检查模拟 S3 中是否已有上传对象：
+确认取消后没有结果对象：
 
 ```bash
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python - <<'PY'
 import boto3
+import botocore
 import os
 
 task_id = os.environ["TASK_ID"]
+key = f"cancel-semantic-check/{task_id}.mp4"
+
 s3 = boto3.client(
     "s3",
     endpoint_url="http://127.0.0.1:4566",
@@ -436,113 +693,58 @@ s3 = boto3.client(
     aws_secret_access_key="test",
     region_name="us-east-1",
 )
-head = s3.head_object(Bucket="flowcut", Key=f"outputs/{task_id}.mp4")
-print({"content_length": head["ContentLength"]})
+try:
+    s3.head_object(Bucket="flowcut", Key=key)
+    print({"unexpected_object": key})
+except botocore.exceptions.ClientError as exc:
+    print({"missing_as_expected": key, "error": exc.response["Error"]["Code"]})
 PY
 ```
 
-成功时返回的 `result_url` 形态应为：
+预期结果：
 
-```text
-http://127.0.0.1:4566/flowcut/outputs/<TASK_ID>.mp4
-```
+- 对象不存在
 
-## 10. 一键验收命令
-
-如果你不想自己单独起 callback receiver 和手动轮询，可以直接使用仓库内的 acceptance runner。它会：
-
-- 本地起 callback server
-- 自动 submit
-- 自动轮询 progress
-- 自动等待最终 callback
-- 校验成功 callback 的 `output` 契约
-
-命令如下：
+如果 bridge 服务是按本文命令启动的，再检查：
 
 ```bash
-export TASK_ID=vividvr-mock-runner-$(date -u +%Y%m%dT%H%M%SZ)
-
-NO_PROXY=* PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
-  python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
-  --base-url "${MOTO_BASE_URL}" \
-  --task-id "${TASK_ID}" \
-  --callback-log "${LOG_DIR}/${TASK_ID}.callback.jsonl" \
-  --video-input-path "${INPUT_VIDEO_130F}" \
-  --caption-file-path "${CAPTION_FILE}" \
-  --reference-video-path "${REFERENCE_VIDEO}" \
-  --output-path "${OUTPUT_DIR}/${TASK_ID}.mp4" \
-  --perf-dump-path "${INDICATOR_DIR}/${TASK_ID}_perf.json" \
-  --num-inference-steps 20 \
-  --num-temporal-process-frames 121 \
-  --upscale 1.0 \
-  --seed 42
+find "${CAPTION_SIDECAR_DIR}" -maxdepth 1 -type f -name "${TASK_ID}*" 2>/dev/null
+find /tmp -maxdepth 2 -type d -name "${TASK_ID}" 2>/dev/null
 ```
 
-注意：
+预期结果：
 
-- 这个 runner 当前不会帮你传 `minioConfig`
-- 所以它适合做服务协议、callback、progress、`upscale` 请求透传验收
-- 如果你要验证 MinIO 上传，仍然要使用第 `7` 节那条手动 `curl` 请求
+- request workdir 应被清理
+- `CAPTION_SIDECAR_DIR` 下的 `${TASK_ID}.txt` 和 manifest 仍会保留，因为当前 bridge caption 输出目录是显式持久目录
 
-完整真实链路的 runner 验收命令如下。它会走 caption bridge，不传 `caption_file_path` 和 `reference_video_path`：
+## 9. 最低验收标准
 
-```bash
-export TASK_ID=vividvr-bridge-runner-$(date -u +%Y%m%dT%H%M%SZ)
+至少完成下面 3 组检查：
 
-NO_PROXY=* PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
-  python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
-  --base-url "${BRIDGE_BASE_URL}" \
-  --task-id "${TASK_ID}" \
-  --callback-log "${LOG_DIR}/${TASK_ID}.callback.jsonl" \
-  --video-input-path "${INPUT_VIDEO_130F}" \
-  --output-path "${OUTPUT_DIR}/${TASK_ID}.mp4" \
-  --perf-dump-path "${INDICATOR_DIR}/${TASK_ID}_perf.json" \
-  --num-inference-steps 20 \
-  --num-temporal-process-frames 121 \
-  --upscale 1.0 \
-  --seed 42 \
-  --submit-timeout-s 2400 \
-  --poll-timeout-s 2400
-```
+1. replay 成功链路
+- 提交返回 `{"code":0,"message":"ok"}`
+- 详情和进度终态是 `completed`
+- callback 最后一条是 `succeeded`
+- S3 对象存在
 
-## 11. 最低验收标准
+2. bridge 成功链路
+- 中间阶段能看到 `caption_ready`
+- 终态 `completed`
+- 按本文默认命令启动时，自动生成的 caption 会保留在 `CAPTION_SIDECAR_DIR`
+- request workdir 已清理
 
-完成一次本地模拟测试，至少检查这几项：
+3. 取消链路
+- `DELETE` 之后终态是 `failed`
+- `reason = Request timed out.`
+- callback 最后一条是 `failed`
+- S3 不存在结果对象
 
-- 服务 submit 返回 `{"code":0,"message":"ok"}`
-- `GET /v1/videos/<task_id>/progress` 最终是：
-  - `status=completed`
-  - `progress=100`
-  - `file_path=null`
-  - `url=http://127.0.0.1:4566/flowcut/outputs/<TASK_ID>.mp4`
-- callback 最后一条是：
-  - `status=succeeded`
-  - `progress=100`
-  - `reason=succeeded`
-  - `output` 中只包含 `result_url` 和可选 `duration`
-- S3 模拟中存在 `outputs/<TASK_ID>.mp4`
-- 本地 perf 文件已生成：
-  - `${INDICATOR_DIR}/${TASK_ID}_perf.json`
-
-如果走的是完整真实链路，还要额外检查：
-
-- 主服务没有显式传 `caption_file_path`
-- sidecar 目录下生成了 `${TASK_ID}.txt`
-- caption sidecar 日志中没有失败记录
-
-推荐额外检查：
-
-```bash
-tail -n 200 "${LOG_DIR}"/vividvr_caption_sidecar_mock_*.log
-tail -n 200 "${LOG_DIR}"/vividvr_flowcut_bridge_mock_service_*.log
-```
-
-## 12. 常用停止命令
+## 10. 停止服务
 
 ```bash
 tmux kill-session -t vividvr_flowcut_mock_service
 tmux kill-session -t vividvr_flowcut_bridge_mock_service
-tmux kill-session -t vividvr_moto_s3
 tmux kill-session -t vividvr_caption_sidecar_mock
 tmux kill-session -t vividvr_flowcut_callback_receiver
+tmux kill-session -t vividvr_moto_s3
 ```

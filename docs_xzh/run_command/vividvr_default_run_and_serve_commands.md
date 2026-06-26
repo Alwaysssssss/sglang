@@ -360,12 +360,11 @@ JSON
 
 ### 3.9 显式 caption replay 请求
 
-如果你要绕过 bridge，复用已知 caption 文件和 reference 视频，可以显式传入：
+如果你要绕过 bridge，复用已知 caption 文件，可以显式传入：
 
 ```bash
 export TASK_ID=vividvr-manual-replay-$(date -u +%Y%m%dT%H%M%SZ)
 export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
-export REFERENCE_VIDEO=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4
 
 NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
   -H 'Content-Type: application/json' \
@@ -376,7 +375,6 @@ NO_PROXY=* curl -sS -X POST "${BASE_URL}/v1/videos/repairs/flowcut" \
   "callbackUrl": "${CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
   "video_input_path": "${INPUT_VIDEO_130F}",
   "caption_file_path": "${CAPTION_FILE}",
-  "reference_video_path": "${REFERENCE_VIDEO}",
   "num_inference_steps": 20,
   "seed": 42,
   "num_temporal_process_frames": 121,
@@ -426,7 +424,6 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   --callback-log "${CALLBACK_LOG}" \
   --input-video "${INPUT_VIDEO_130F}" \
   --caption-file "${CAPTION_FILE}" \
-  --reference-video "${REFERENCE_VIDEO}" \
   --num-inference-steps 20 \
   --seed 42 \
   --num-temporal-process-frames 121 \
@@ -530,7 +527,7 @@ PY
 
 ### 3.13 启动 FlowCut MinIO 单卡服务
 
-当前本地 `moto_server` 验收口径走单卡 `fa eager`，不启用 caption bridge，直接复用已知 `caption_file_path + reference_video_path`。这里如果要保持当前已验收基线，建议继续显式传 `upscale=1.0`。
+当前本地 `moto_server` 验收口径走单卡 `fa eager`，不启用 caption bridge，直接复用已知 `caption_file_path`。这里如果要保持当前已验收基线，建议继续显式传 `upscale=1.0`。
 
 ```bash
 tmux new-session -d -s vividvr_moto_minio_service \
@@ -578,7 +575,6 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31220/health
 export MOTO_BASE_URL=http://127.0.0.1:31220
 export MOTO_CALLBACK_BASE_URL=http://<CALLBACK_SERVER_IP>:39090
 export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
-export REFERENCE_VIDEO=/home/zhiheng/Vivid-VR/result/720p_long_up1_result_vivid_ori_20step/videos/test_video_long_960x720_130f.mp4
 ```
 
 然后提交带 `minioConfig` 的 FlowCut 模拟请求：
@@ -595,7 +591,6 @@ NO_PROXY=* curl -sS -X POST "${MOTO_BASE_URL}/v1/videos/repairs/flowcut" \
   "callbackUrl": "${MOTO_CALLBACK_BASE_URL}/tasks/${TASK_ID}/callback",
   "video_input_path": "${INPUT_VIDEO_130F}",
   "caption_file_path": "${CAPTION_FILE}",
-  "reference_video_path": "${REFERENCE_VIDEO}",
   "num_inference_steps": 20,
   "seed": 42,
   "num_temporal_process_frames": 121,
@@ -614,7 +609,7 @@ NO_PROXY=* curl -sS -X POST "${MOTO_BASE_URL}/v1/videos/repairs/flowcut" \
 JSON
 ```
 
-如果你已经有 callback receiver，也可以把这条请求改成自动 bridge 版本；当前字段差异只在于不传 `caption_file_path` 和 `reference_video_path`。
+如果你已经有 callback receiver，也可以把这条请求改成自动 bridge 版本；当前字段差异只在于不传 `caption_file_path`。
 
 如果你用的是仓库内的 acceptance runner，也可以直接带 `--upscale` 提交：
 
@@ -628,7 +623,6 @@ NO_PROXY=* PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   --callback-log "${LOG_DIR}/${TASK_ID}.callback.jsonl" \
   --video-input-path "${INPUT_VIDEO_130F}" \
   --caption-file-path "${CAPTION_FILE}" \
-  --reference-video-path "${REFERENCE_VIDEO}" \
   --output-path "${OUTPUT_DIR}/${TASK_ID}.mp4" \
   --perf-dump-path "${INDICATOR_DIR}/${TASK_ID}_perf.json" \
   --num-inference-steps 20 \
@@ -727,7 +721,7 @@ export BASE_URL=http://192.168.1.20:31191
 
 远程调用时还要注意：
 
-- `video_input_path`、`caption_file_path`、`reference_video_path`、`output_path`、`perf_dump_path` 都是服务机器上的路径
+- `video_input_path`、`caption_file_path`、`output_path`、`perf_dump_path` 都是服务机器上的路径
 - 其他机器不能把自己的本地路径直接传给服务
 - `callbackUrl` 必须是服务机器可访问的地址，远程调用时不要写 `127.0.0.1`
 - 如果结果只写到 `output_path`，文件会落在服务机器本地；远程侧可以再调用 `/v1/videos/${TASK_ID}/content` 下载
