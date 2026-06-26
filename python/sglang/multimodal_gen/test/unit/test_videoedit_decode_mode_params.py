@@ -42,6 +42,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(params.adain_boundary_dilate, 0)
         self.assertEqual(params.bbox_expand_scale, 2.5)
         self.assertTrue(params.use_clip)
+        self.assertEqual(params.clip_preprocess, "diffuser")
         self.assertFalse(params.use_repaired_context)
         self.assertEqual(params.init_latent_mode, "noise")
         self.assertEqual(params.mask_downsample_mode, "nearest")
@@ -79,6 +80,8 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             WanVideoEditSamplingParams(overlap_commit_mode="blend")
         with self.assertRaisesRegex(ValueError, "tail_padding_mode must be one of"):
             WanVideoEditSamplingParams(tail_padding_mode="pad_last")
+        with self.assertRaisesRegex(ValueError, "clip_preprocess must be one of"):
+            WanVideoEditSamplingParams(clip_preprocess="native")
 
     def test_video_repair_request_defaults_to_stream(self):
         request = VideoRepairRequest(
@@ -96,6 +99,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(request.adain_boundary_dilate, 0)
         self.assertEqual(request.bbox_expand_scale, 2.5)
         self.assertTrue(request.use_clip)
+        self.assertEqual(request.clip_preprocess, "diffuser")
         self.assertFalse(request.use_repaired_context)
         self.assertEqual(request.init_latent_mode, "noise")
         self.assertEqual(request.mask_downsample_mode, "nearest")
@@ -131,6 +135,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
                 "teacacheThresh": 0.25,
                 "teacacheStartSkipping": 6,
                 "teacacheEndSkipping": 0.8,
+                "clipPreprocess": "diffsynth",
             }
         )
 
@@ -139,6 +144,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(request.teacache_thresh, 0.25)
         self.assertEqual(request.teacache_start_skipping, 6)
         self.assertEqual(request.teacache_end_skipping, 0.8)
+        self.assertEqual(request.clip_preprocess, "diffsynth")
 
     def test_video_repair_request_defaults_timeout_to_no_limit(self):
         request = VideoRepairRequest(
@@ -314,6 +320,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(args.adain_boundary_dilate, 0)
         self.assertEqual(args.bbox_expand_scale, 2.5)
         self.assertTrue(args.use_clip)
+        self.assertEqual(args.clip_preprocess, "diffuser")
         self.assertFalse(args.use_repaired_context)
         self.assertEqual(args.init_latent_mode, "noise")
         self.assertEqual(args.mask_downsample_mode, "nearest")
@@ -323,6 +330,28 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(args.teacache_thresh, 0.3)
         self.assertEqual(args.teacache_start_skipping, 5)
         self.assertEqual(args.teacache_end_skipping, 1.0)
+
+    def test_cli_parser_accepts_clip_preprocess_override(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "repair",
+                "--model-path",
+                "/tmp/model",
+                "--prompt",
+                "repair video",
+                "--video-input-path",
+                "/tmp/video.mp4",
+                "--mask-input-path",
+                "/tmp/mask.mp4",
+                "--output-path",
+                "/tmp/output.mp4",
+                "--clip-preprocess",
+                "diffsynth",
+            ]
+        )
+
+        self.assertEqual(args.clip_preprocess, "diffsynth")
 
     def test_cli_parser_accepts_teacache_overrides(self):
         parser = build_parser()

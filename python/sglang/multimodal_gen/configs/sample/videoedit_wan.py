@@ -19,6 +19,7 @@ VIDEOEDIT_INIT_LATENT_MODES = ("noise", "add_noise")
 VIDEOEDIT_MASK_DOWNSAMPLE_MODES = ("nearest", "nearest-exact")
 VIDEOEDIT_OVERLAP_COMMIT_MODES = ("native_skip", "weighted")
 VIDEOEDIT_TAIL_PADDING_MODES = ("native_reverse_mirror", "reflect")
+VIDEOEDIT_CLIP_PREPROCESS_MODES = ("diffsynth", "diffuser")
 
 
 def build_videoedit_teacache_params(
@@ -70,6 +71,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     drop_reference_frame: bool = True
     keep_intermediate_windows: bool = False
     use_clip: bool = True
+    clip_preprocess: str = "diffuser"
     use_repaired_context: bool = False
     vary_seed_by_window: bool = False
     init_latent_mode: str = "noise"
@@ -217,6 +219,11 @@ class WanVideoEditSamplingParams(SamplingParams):
             raise ValueError(
                 "tail_padding_mode must be one of "
                 f"{'/'.join(VIDEOEDIT_TAIL_PADDING_MODES)}, got {self.tail_padding_mode!r}"
+            )
+        if self.clip_preprocess not in VIDEOEDIT_CLIP_PREPROCESS_MODES:
+            raise ValueError(
+                "clip_preprocess must be one of "
+                f"{'/'.join(VIDEOEDIT_CLIP_PREPROCESS_MODES)}, got {self.clip_preprocess!r}"
             )
 
     def _validate_with_pipeline_config(self, pipeline_config):

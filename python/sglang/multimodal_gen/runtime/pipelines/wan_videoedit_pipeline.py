@@ -117,6 +117,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             extra_one_step=True,
         )
         self._maybe_load_image_encoder(server_args)
+        self._maybe_load_image_processor(server_args)
 
     def _maybe_load_image_encoder(self, server_args: ServerArgs) -> None:
         if self.modules.get("image_encoder") is not None:
@@ -139,6 +140,27 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         self.modules["image_encoder"] = module
         self.memory_usages["image_encoder"] = memory_usage
 
+    def _maybe_load_image_processor(self, server_args: ServerArgs) -> None:
+        if self.modules.get("image_processor") is not None:
+            return
+        override_path = server_args.component_paths.get("image_processor")
+        default_path = os.path.join(self.model_path, "image_processor")
+        image_processor_path = override_path or default_path
+        if not os.path.isdir(image_processor_path):
+            logger.warning(
+                "VideoEdit image_processor was not found at %s; "
+                "requests with clip_preprocess='diffuser' will fail.",
+                image_processor_path,
+            )
+            return
+        from transformers import CLIPImageProcessor
+
+        self.modules["image_processor"] = CLIPImageProcessor.from_pretrained(
+            image_processor_path,
+            revision=server_args.revision,
+        )
+        self.memory_usages["image_processor"] = 0.0
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.videoedit_stages = [
             VideoEditWindowValidationStage(),
@@ -149,6 +171,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             VideoEditImageEncodingStage(
                 image_encoder=self.get_module("image_encoder", None),
+                image_processor=self.get_module("image_processor", None),
                 transformer=self.get_module("transformer"),
             ),
             VideoEditConditionEncodingStage(vae=self.get_module("vae")),

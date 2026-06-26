@@ -180,6 +180,7 @@ class VideoRepairRequest(BaseModel):
     drop_reference_frame: Optional[bool] = None
     keep_intermediate_windows: bool = False
     use_clip: bool = True
+    clip_preprocess: Literal["diffsynth", "diffuser"] = "diffuser"
     use_repaired_context: bool = False
     vary_seed_by_window: bool = False
     init_latent_mode: Literal["noise", "add_noise"] = "noise"

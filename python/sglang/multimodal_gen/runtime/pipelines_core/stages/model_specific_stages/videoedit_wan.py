@@ -258,34 +258,19 @@ class VideoEditImageEncodingStage(PipelineStage):
     def __init__(
         self,
         image_encoder: torch.nn.Module | None,
+        image_processor: Any | None,
         transformer: torch.nn.Module,
     ):
         super().__init__()
         self.image_encoder = image_encoder
+        self.image_processor = image_processor
         self.transformer = transformer
 
-    @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        params = _videoedit_params(batch)
-        params.runtime_image_embeds = None
-        if not params.use_clip:
-            return batch
-        if self.image_encoder is None:
-            raise ValueError(
-                "VideoEdit use_clip=True requires an image_encoder component. "
-                "Provide --image-encoder-path/--component_paths.image_encoder or set use_clip=False."
-            )
-        if params.runtime_window_frames is None or not params.runtime_window_frames:
-            raise ValueError("VideoEdit window frames must be materialized before image encoding")
-        if params.runtime_height is None or params.runtime_width is None:
-            raise ValueError("VideoEdit window must be validated before image encoding")
-
-        device = get_local_torch_device()
-        if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
-            self.image_encoder = self.image_encoder.to(device)
-
-        image = params.runtime_window_frames[0].convert("RGB")
-        image = image.resize((params.runtime_width, params.runtime_height))
+    def _prepare_diffsynth_pixel_values(
+        self,
+        image,
+        device: torch.device,
+    ) -> torch.Tensor:
         pixel_values = (
             torch.from_numpy(np.array(image).astype(np.float32) / 255.0)
             .permute(2, 0, 1)
@@ -309,23 +294,67 @@ class VideoEditImageEncodingStage(PipelineStage):
             device=device,
             dtype=torch.float32,
         ).view(1, 3, 1, 1)
-        pixel_values = (pixel_values - mean) / std
+        return (pixel_values - mean) / std
+
+    def _prepare_diffuser_image_inputs(self, image, device: torch.device):
+        if self.image_processor is None:
+            raise ValueError(
+                "VideoEdit clip_preprocess='diffuser' requires an image_processor component. "
+                "Provide --image-processor-path/--component_paths.image_processor "
+                "or set clip_preprocess='diffsynth'."
+            )
+        return self.image_processor(images=image, return_tensors="pt").to(device)
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        params.runtime_image_embeds = None
+        if not params.use_clip:
+            return batch
+        if self.image_encoder is None:
+            raise ValueError(
+                "VideoEdit use_clip=True requires an image_encoder component. "
+                "Provide --image-encoder-path/--component_paths.image_encoder or set use_clip=False."
+            )
+        if params.runtime_window_frames is None or not params.runtime_window_frames:
+            raise ValueError("VideoEdit window frames must be materialized before image encoding")
+        if params.runtime_height is None or params.runtime_width is None:
+            raise ValueError("VideoEdit window must be validated before image encoding")
+
+        device = get_local_torch_device()
+        if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
+            self.image_encoder = self.image_encoder.to(device)
+
+        image = params.runtime_window_frames[0].convert("RGB")
+        image = image.resize((params.runtime_width, params.runtime_height))
 
         image_dtype = _module_dtype(self.image_encoder, torch.float32)
         target_dtype = _module_dtype(
             self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         )
         autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+        if params.clip_preprocess == "diffuser":
+            image_inputs = self._prepare_diffuser_image_inputs(image, device)
+            pixel_values = None
+        else:
+            image_inputs = None
+            pixel_values = self._prepare_diffsynth_pixel_values(image, device)
         try:
             with torch.autocast(
                 device_type=current_platform.device_type,
                 dtype=target_dtype,
                 enabled=autocast_enabled,
             ):
-                outputs = self.image_encoder(
-                    pixel_values=pixel_values.to(dtype=image_dtype),
-                    **server_args.pipeline_config.image_encoder_extra_args,
-                )
+                if image_inputs is not None:
+                    outputs = self.image_encoder(
+                        **image_inputs,
+                        **server_args.pipeline_config.image_encoder_extra_args,
+                    )
+                else:
+                    outputs = self.image_encoder(
+                        pixel_values=pixel_values.to(dtype=image_dtype),
+                        **server_args.pipeline_config.image_encoder_extra_args,
+                    )
                 image_embeds = server_args.pipeline_config.postprocess_image(outputs)
             params.runtime_image_embeds = image_embeds.to(device=device, dtype=target_dtype)
         finally:

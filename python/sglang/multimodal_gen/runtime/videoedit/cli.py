@@ -33,6 +33,7 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--transformer-path")
     parser.add_argument("--image-encoder-path")
+    parser.add_argument("--image-processor-path")
     parser.add_argument("--transformer-weights-path")
     parser.add_argument("--transformer-quantization", choices=["fp8_dynamic"])
     parser.add_argument("--prompt", required=True)
@@ -64,6 +65,7 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--drop-reference-frame", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-intermediate-windows", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-clip", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clip-preprocess", choices=["diffsynth", "diffuser"], default="diffuser")
     parser.add_argument("--use-repaired-context", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--vary-seed-by-window", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--init-latent-mode", choices=["noise", "add_noise"], default="noise")
@@ -219,6 +221,8 @@ def repair_cmd(args: argparse.Namespace) -> int:
         component_paths["transformer"] = args.transformer_path
     if args.image_encoder_path:
         component_paths["image_encoder"] = args.image_encoder_path
+    if args.image_processor_path:
+        component_paths["image_processor"] = args.image_processor_path
 
     server_args = ServerArgs.from_kwargs(**_server_args_kwargs(args, component_paths))
     resolved_num_frames = resolve_videoedit_num_frames(
@@ -259,6 +263,7 @@ def repair_cmd(args: argparse.Namespace) -> int:
         drop_reference_frame=args.drop_reference_frame,
         keep_intermediate_windows=args.keep_intermediate_windows,
         use_clip=args.use_clip,
+        clip_preprocess=args.clip_preprocess,
         use_repaired_context=args.use_repaired_context,
         vary_seed_by_window=args.vary_seed_by_window,
         init_latent_mode=args.init_latent_mode,
