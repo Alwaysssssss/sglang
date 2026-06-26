@@ -34,6 +34,47 @@ def _edge_feather_blend(
     return np.clip(gen * feather + orig_crop * (1 - feather), 0, 255)
 
 
+def _adain_boundary(
+    gen: np.ndarray,
+    orig: np.ndarray,
+    mask_bin: np.ndarray,
+    boundary_dilate: int = 15,
+    feather_ksize: int = 41,
+    eps: float = 1e-5,
+) -> np.ndarray:
+    mask_uint8 = (mask_bin > 0.5).astype(np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
+    mask_d = cv2.dilate(mask_uint8, kernel, iterations=boundary_dilate)
+    boundary = (mask_d - mask_uint8).astype(np.float32)
+
+    if boundary.sum() < 10:
+        return gen
+
+    out = gen.copy().astype(np.float32)
+    for c in range(3):
+        g = gen[:, :, c].astype(np.float32)
+        o = orig[:, :, c].astype(np.float32)
+
+        g_sum = mask_bin.sum()
+        if g_sum < 1:
+            continue
+        g_mean = (g * mask_bin).sum() / (g_sum + eps)
+        g_std = np.sqrt(((g - g_mean) ** 2 * mask_bin).sum() / (g_sum + eps) + eps)
+
+        b_sum = boundary.sum()
+        o_mean = (o * boundary).sum() / (b_sum + eps)
+        o_std = np.sqrt(((o - o_mean) ** 2 * boundary).sum() / (b_sum + eps) + eps)
+
+        g_std = max(g_std, 1.0)
+        corrected = (g - g_mean) / g_std * o_std + o_mean
+
+        k = feather_ksize if feather_ksize % 2 == 1 else feather_ksize + 1
+        weight = cv2.GaussianBlur(boundary, (k, k), sigmaX=k / 3.0)
+        out[:, :, c] = g * (1 - weight) + corrected * weight
+
+    return np.clip(out, 0, 255)
+
+
 def paste_back(
     original_frames: list[Image.Image],
     generated_frames: list[Image.Image],
@@ -44,7 +85,6 @@ def paste_back(
     feather_px: int = 15,
     adain_boundary_dilate: int = 0,
 ) -> list[Image.Image]:
-    del adain_boundary_dilate
     gen_resized = resize_frames(generated_frames, crop_h, crop_w)
     result_frames: list[Image.Image] = []
     for orig, gen, mask in zip(original_frames, gen_resized, mask_frames, strict=False):
@@ -55,6 +95,7 @@ def paste_back(
                 mask_frame=mask,
                 bbox=bbox,
                 feather_px=feather_px,
+                adain_boundary_dilate=adain_boundary_dilate,
             )
         )
     return result_frames
@@ -66,6 +107,7 @@ def paste_back_frame(
     mask_frame,
     bbox: tuple[int, int, int, int],
     feather_px: int = 15,
+    adain_boundary_dilate: int = 0,
 ) -> Image.Image:
     x_min, y_min, _, _ = bbox
     orig_np = np.array(original_frame).astype(np.float32)
@@ -82,6 +124,12 @@ def paste_back_frame(
     mask_np = cv2.resize(mask_np, (w, h))
     mask_bin = (mask_np > 0.5).astype(np.float32)
     orig_crop = orig_np[y_min:y_end, x_min:x_end]
+    gen_np = _adain_boundary(
+        gen_np,
+        orig_crop,
+        mask_bin,
+        boundary_dilate=adain_boundary_dilate,
+    )
     blended = _edge_feather_blend(orig_crop, gen_np, mask_bin, feather_px=feather_px)
     result_np = orig_np.copy()
     result_np[y_min:y_end, x_min:x_end] = blended

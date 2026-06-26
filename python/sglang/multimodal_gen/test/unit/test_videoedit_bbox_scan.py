@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+    expand_bbox,
     prepare_global_inputs,
     scan_global_bbox,
 )
@@ -33,6 +34,36 @@ def _write_test_video(path: Path, frame_count: int, size: tuple[int, int]) -> No
 
 
 class TestVideoEditBBoxScan(unittest.TestCase):
+    def test_expand_bbox_uses_scaled_target_area(self):
+        self.assertEqual(
+            expand_bbox((40, 30, 60, 50), height=100, width=120, scale=2.5),
+            (25, 15, 75, 65),
+        )
+
+    def test_expand_bbox_compensates_when_height_exceeds_frame(self):
+        self.assertEqual(
+            expand_bbox((40, 30, 60, 70), height=80, width=200, scale=3.0),
+            (5, 0, 95, 80),
+        )
+
+    def test_expand_bbox_compensates_when_width_exceeds_frame(self):
+        self.assertEqual(
+            expand_bbox((40, 30, 100, 50), height=120, width=120, scale=3.0),
+            (0, 0, 120, 90),
+        )
+
+    def test_expand_bbox_uses_full_frame_when_both_axes_exceed(self):
+        self.assertEqual(
+            expand_bbox((40, 30, 100, 90), height=100, width=120, scale=3.0),
+            (0, 0, 120, 100),
+        )
+
+    def test_expand_bbox_shifts_edge_crop_inside_frame(self):
+        self.assertEqual(
+            expand_bbox((0, 0, 20, 20), height=100, width=100, scale=2.5),
+            (0, 0, 50, 50),
+        )
+
     def test_bbox_scan_matches_eager_prepare_geometry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = Path(temp_dir) / "video.avi"

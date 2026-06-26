@@ -54,7 +54,7 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dynamic-cfg-max-step", type=int, default=15)
     parser.add_argument("--dynamic-cfg-min", type=float, default=1.0)
     parser.add_argument("--bbox-padding", type=int, default=0)
-    parser.add_argument("--bbox-expand-scale", type=float, default=1.2)
+    parser.add_argument("--bbox-expand-scale", type=float, default=2.5)
     parser.add_argument("--dilate-px", type=int, default=15)
     parser.add_argument("--mask-scale", type=float, default=1.2)
     parser.add_argument("--feather-px", type=int, default=15)

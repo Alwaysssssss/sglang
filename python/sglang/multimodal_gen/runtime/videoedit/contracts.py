@@ -13,6 +13,7 @@ class VideoEditWindowSpec:
     reflected_count: int = 0
     stride: int | None = None
     reference_prev_local_idx: int | None = None
+    reference_prev_local_count: int = 0
     reference_global_index: int | None = None
     overlap_mask_zero_count: int = 0
     commit_start_local_idx: int = 0

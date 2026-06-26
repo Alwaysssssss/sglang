@@ -87,16 +87,19 @@ def build_videoedit_window_specs(
         reflected_count = sum(1 for i in raw_indices if i >= num_frames)
         if uses_previous_reference and overlap_commit_mode == "weighted":
             reference_prev_local_idx = weighted_stride
+            reference_prev_local_count = 1
             reference_global_index = start_index - 1
             overlap_mask_zero_count = 1
             commit_start_local_idx = 1
         elif uses_previous_reference:
             reference_prev_local_idx = stride
+            reference_prev_local_count = overlap
             reference_global_index = start_index
             overlap_mask_zero_count = overlap
             commit_start_local_idx = overlap
         else:
             reference_prev_local_idx = None
+            reference_prev_local_count = 0
             reference_global_index = None
             overlap_mask_zero_count = 0
             commit_start_local_idx = 0
@@ -111,6 +114,7 @@ def build_videoedit_window_specs(
                 reflected_count=reflected_count,
                 stride=stride,
                 reference_prev_local_idx=reference_prev_local_idx,
+                reference_prev_local_count=reference_prev_local_count,
                 reference_global_index=reference_global_index,
                 overlap_mask_zero_count=overlap_mask_zero_count,
                 commit_start_local_idx=commit_start_local_idx,

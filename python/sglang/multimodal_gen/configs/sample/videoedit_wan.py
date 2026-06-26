@@ -59,7 +59,7 @@ class WanVideoEditSamplingParams(SamplingParams):
     dynamic_cfg_min: float = 1.0
 
     bbox_padding: int = 0
-    bbox_expand_scale: float = 1.2
+    bbox_expand_scale: float = 2.5
     dilate_px: int = 15
     mask_scale: float = 1.2
     feather_px: int = 15

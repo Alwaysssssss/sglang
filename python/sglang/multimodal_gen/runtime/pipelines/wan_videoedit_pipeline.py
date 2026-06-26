@@ -288,32 +288,47 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         params: WanVideoEditSamplingParams,
         window_spec: Any,
         frames: list[Image.Image],
-    ) -> tuple[bool, int | None]:
+    ) -> tuple[bool, int | None, int]:
         if not self._uses_previous_window_reference(params, window_spec):
-            return False, None
+            return False, None, 0
         if not frames:
-            return False, None
+            return False, None, 0
         if (
             params.runtime_prev_window_index != window_spec.window_index - 1
             or params.runtime_prev_window_output_frames is None
         ):
-            return False, None
+            return False, None, 0
 
         ref_local_idx = getattr(window_spec, "reference_prev_local_idx", None)
         if ref_local_idx is None:
             ref_local_idx = params.infer_len - int(params.overlap)
-        if 0 <= ref_local_idx < len(params.runtime_prev_window_output_frames):
-            frames[0] = params.runtime_prev_window_output_frames[ref_local_idx]
-            return True, ref_local_idx
-        return False, ref_local_idx
+        ref_count = int(getattr(window_spec, "reference_prev_local_count", 1) or 1)
+        ref_count = min(ref_count, len(frames))
+        ref_end = ref_local_idx + ref_count
+        if (
+            ref_count > 0
+            and 0 <= ref_local_idx
+            and ref_end <= len(params.runtime_prev_window_output_frames)
+        ):
+            for local_idx, prev_local_idx in enumerate(range(ref_local_idx, ref_end)):
+                frames[local_idx] = params.runtime_prev_window_output_frames[
+                    prev_local_idx
+                ]
+            return True, ref_local_idx, ref_count
+        return False, ref_local_idx, 0
 
     def _zero_reference_context_masks(
         self,
         params: WanVideoEditSamplingParams,
         window_spec: Any,
         masks: list[Image.Image],
+        reference_from_previous_window: bool,
     ) -> int:
-        if not self._uses_previous_window_reference(params, window_spec) or not masks:
+        if (
+            not reference_from_previous_window
+            or not self._uses_previous_window_reference(params, window_spec)
+            or not masks
+        ):
             return 0
         zero_count = min(
             int(getattr(window_spec, "overlap_mask_zero_count", 0)),
@@ -334,11 +349,11 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         frames = self._apply_repaired_context_if_enabled(
             params, window_spec.input_indices, source_frames
         )
-        reference_from_previous_window, ref_local_idx = (
+        reference_from_previous_window, ref_local_idx, ref_count = (
             self._apply_previous_window_reference(params, window_spec, frames)
         )
         zeroed_overlap_mask_count = self._zero_reference_context_masks(
-            params, window_spec, masks
+            params, window_spec, masks, reference_from_previous_window
         )
         params.runtime_window_frames = frames
         params.runtime_window_masks = masks
@@ -352,6 +367,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     "stride": getattr(window_spec, "stride", None),
                     "reference_from_previous_window": reference_from_previous_window,
                     "reference_prev_local_idx": ref_local_idx,
+                    "reference_prev_local_count": ref_count,
                     "reference_global_index": getattr(
                         window_spec, "reference_global_index", None
                     )
@@ -477,6 +493,9 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     "stride": getattr(spec, "stride", None),
                     "reference_prev_local_idx": getattr(
                         spec, "reference_prev_local_idx", None
+                    ),
+                    "reference_prev_local_count": getattr(
+                        spec, "reference_prev_local_count", 0
                     ),
                     "reference_global_index": getattr(
                         spec, "reference_global_index", None

@@ -68,6 +68,7 @@ class TestVideoEditWindowing(unittest.TestCase):
         self.assertEqual(specs[1].start_index, 76)
         self.assertEqual(specs[1].stride, 76)
         self.assertEqual(specs[1].reference_prev_local_idx, 76)
+        self.assertEqual(specs[1].reference_prev_local_count, 5)
         self.assertEqual(specs[1].reference_global_index, 76)
         self.assertEqual(specs[1].overlap_mask_zero_count, 5)
         self.assertEqual(specs[1].commit_start_local_idx, 5)
@@ -92,6 +93,7 @@ class TestVideoEditWindowing(unittest.TestCase):
         self.assertEqual([spec.start_index for spec in specs], [0, 71, 141])
         self.assertEqual(specs[1].input_indices[:12], [70] + list(range(71, 82)))
         self.assertEqual(specs[1].reference_prev_local_idx, 70)
+        self.assertEqual(specs[1].reference_prev_local_count, 1)
         self.assertEqual(specs[1].reference_global_index, 70)
         self.assertEqual(specs[1].overlap_mask_zero_count, 1)
         self.assertEqual(specs[1].commit_start_local_idx, 1)
@@ -136,7 +138,7 @@ class TestVideoEditWindowing(unittest.TestCase):
             list(range(152, 162)) + [160, 159],
         )
 
-    def test_materialize_window_uses_previous_stride_frame_as_reference(self):
+    def test_materialize_window_uses_previous_overlap_frames_as_reference(self):
         pipeline = object.__new__(WanVideoEditPipeline)
         params = types.SimpleNamespace(
             runtime_frame_provider=None,
@@ -173,7 +175,15 @@ class TestVideoEditWindowing(unittest.TestCase):
         )
         self.assertEqual(
             np.asarray(params.runtime_window_frames[1])[0, 0].tolist(),
-            [77, 1, 2],
+            [200, 77, 0],
+        )
+        self.assertEqual(
+            np.asarray(params.runtime_window_frames[4])[0, 0].tolist(),
+            [200, 80, 0],
+        )
+        self.assertEqual(
+            np.asarray(params.runtime_window_frames[5])[0, 0].tolist(),
+            [81, 1, 2],
         )
         for local_idx in range(5):
             self.assertEqual(int(np.asarray(params.runtime_window_masks[local_idx]).sum()), 0)
@@ -182,6 +192,7 @@ class TestVideoEditWindowing(unittest.TestCase):
         metadata = params.runtime_window_materialize_metadata[0]
         self.assertTrue(metadata["reference_from_previous_window"])
         self.assertEqual(metadata["reference_prev_local_idx"], 76)
+        self.assertEqual(metadata["reference_prev_local_count"], 5)
         self.assertEqual(metadata["reference_global_index"], 76)
         self.assertEqual(metadata["zeroed_overlap_mask_count"], 5)
         self.assertEqual(metadata["commit_start_local_idx"], 5)
@@ -232,9 +243,50 @@ class TestVideoEditWindowing(unittest.TestCase):
         metadata = params.runtime_window_materialize_metadata[0]
         self.assertTrue(metadata["reference_from_previous_window"])
         self.assertEqual(metadata["reference_prev_local_idx"], 70)
+        self.assertEqual(metadata["reference_prev_local_count"], 1)
         self.assertEqual(metadata["reference_global_index"], 70)
         self.assertEqual(metadata["zeroed_overlap_mask_count"], 1)
         self.assertEqual(metadata["commit_start_local_idx"], 1)
+
+    def test_materialize_window_keeps_masks_when_previous_reference_missing(self):
+        pipeline = object.__new__(WanVideoEditPipeline)
+        params = types.SimpleNamespace(
+            runtime_frame_provider=None,
+            runtime_resized_frames=[
+                _rgb_frame((idx % 256, 1, 2)) for idx in range(156)
+            ],
+            runtime_resized_masks=[_mask(255) for _ in range(156)],
+            use_repaired_context=False,
+            runtime_accum_frames=[
+                np.zeros((4, 4, 3), dtype=np.float32) for _ in range(156)
+            ],
+            runtime_accum_weights=np.zeros((156,), dtype=np.float32),
+            runtime_num_input_frames=156,
+            runtime_prev_window_index=None,
+            runtime_prev_window_output_frames=None,
+            runtime_window_materialize_metadata=[],
+            overlap_commit_mode="native_skip",
+            overlap=5,
+            infer_len=81,
+        )
+        window_spec = build_videoedit_window_specs(
+            num_frames=156,
+            infer_len=81,
+            overlap=5,
+        )[1]
+
+        pipeline._materialize_window_inputs(params, window_spec)
+
+        self.assertEqual(
+            np.asarray(params.runtime_window_frames[0])[0, 0].tolist(),
+            [76, 1, 2],
+        )
+        self.assertGreater(int(np.asarray(params.runtime_window_masks[0]).sum()), 0)
+        metadata = params.runtime_window_materialize_metadata[0]
+        self.assertFalse(metadata["reference_from_previous_window"])
+        self.assertEqual(metadata["reference_prev_local_count"], 0)
+        self.assertIsNone(metadata["reference_global_index"])
+        self.assertEqual(metadata["zeroed_overlap_mask_count"], 0)
 
     def test_commit_window_output_skips_native_overlap_prefix(self):
         pipeline = object.__new__(WanVideoEditPipeline)

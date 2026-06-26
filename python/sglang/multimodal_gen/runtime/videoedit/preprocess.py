@@ -261,18 +261,55 @@ def expand_bbox(
     bbox: tuple[int, int, int, int],
     height: int,
     width: int,
-    scale: float = 0.3,
+    scale: float = 2.5,
 ) -> tuple[int, int, int, int]:
     if scale <= 0:
         return bbox
     x_min, y_min, x_max, y_max = bbox
     crop_w = x_max - x_min
     crop_h = y_max - y_min
+    cx = (x_min + x_max) / 2.0
+    cy = (y_min + y_max) / 2.0
+
+    target_h = crop_h * scale
+    target_w = crop_w * scale
+    target_area = target_h * target_w
+
+    if target_h > height and target_w > width:
+        target_h, target_w = float(height), float(width)
+    elif target_h > height:
+        target_h = float(height)
+        target_w = min(float(width), target_area / height)
+    elif target_w > width:
+        target_w = float(width)
+        target_h = min(float(height), target_area / width)
+
+    target_h_i = round(target_h)
+    target_w_i = round(target_w)
+
+    new_x_min = round(cx - target_w / 2)
+    new_y_min = round(cy - target_h / 2)
+    new_x_max = new_x_min + target_w_i
+    new_y_max = new_y_min + target_h_i
+
+    if new_x_min < 0:
+        new_x_max -= new_x_min
+        new_x_min = 0
+    if new_y_min < 0:
+        new_y_max -= new_y_min
+        new_y_min = 0
+    if new_x_max > width:
+        new_x_min -= new_x_max - width
+        new_x_max = width
+    if new_y_max > height:
+        new_y_min -= new_y_max - height
+        new_y_max = height
+
     return (
-        max(0, int(x_min - crop_w * scale)),
-        max(0, int(y_min - crop_h * scale)),
-        min(width, int(x_max + crop_w * scale)),
-        min(height, int(y_max + crop_h * scale)),
+        max(0, new_x_min),
+        max(0, new_y_min),
+        min(width, new_x_max),
+        min(height, new_y_max),
     )
 
 
@@ -364,7 +401,7 @@ def scan_global_bbox(
     bbox_padding: int = 0,
     dilate_px: int = 15,
     mask_scale: float = 1.2,
-    bbox_expand_scale: float = 1.2,
+    bbox_expand_scale: float = 2.5,
     align: int = 16,
 ) -> dict:
     from sglang.multimodal_gen.runtime.videoedit.stream_decoder import (
@@ -458,7 +495,7 @@ def prepare_global_inputs(
     bbox_padding: int = 0,
     dilate_px: int = 15,
     mask_scale: float = 1.2,
-    bbox_expand_scale: float = 1.2,
+    bbox_expand_scale: float = 2.5,
     align: int = 16,
     debug_dir: str | None = None,
     scanned_geometry: dict | None = None,

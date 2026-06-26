@@ -278,7 +278,6 @@ class WindowFrameProvider:
         feather_px: int,
         adain_boundary_dilate: int,
     ) -> list[Image.Image]:
-        del adain_boundary_dilate
         resized_generated = [
             resize_frame(frame, self.crop_h, self.crop_w) for frame in generated_frames
         ]
@@ -313,6 +312,7 @@ class WindowFrameProvider:
                         mask_frame=cropped_mask,
                         bbox=self.bbox,
                         feather_px=feather_px,
+                        adain_boundary_dilate=adain_boundary_dilate,
                     )
                 )
         finally:
