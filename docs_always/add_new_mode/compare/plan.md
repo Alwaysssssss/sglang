@@ -5,11 +5,31 @@
 - SGLang stages：`python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py`
 - SGLang VideoEdit runtime：`python/sglang/multimodal_gen/runtime/videoedit/`
 - SGLang DiT/VAE：`python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py`、`wan_videoedit.py`、`runtime/models/vaes/wanvae.py`
+
+
+## VideoEdit原始算法仓库的实现
+
 - VideoEdit-diffusers：`/mnt/shanhai-ai/liuh/VideoEdit-diffusers/infer.py`
 - VideoEdit-diffusers pipeline/model：`pipelines/pipeline_wan_edit.py`、`models/transformer_wan.py`、`models/autoencoder_kl_wan.py`、`models/flow_match.py`
 - VideoEdit-diffusers utils：`utils/preprocess.py`、`utils/postprocess.py`
 
-## sglang的运行环境
+执行脚本
+
+```bash
+python3 infer.py --output_dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/compare/origin_video_edit_diffusers --output_name result --chunks 1 --clip_preprocess diffsynth
+```
+
+最终结果视频结果在
+
+/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/compare/origin_video_edit_diffusers 目录下
+
+视频名称 
+
+result.mp4
+
+
+
+## sglang VideoEdit 
 
 ```bash
 python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
@@ -53,3 +73,5 @@ python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --warmup-steps 1 \
   --perf-dump-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/1080p_videoedit_perf_1gpu_default.json
 ```
+
+##  VideoEdit-diffusers 运行环境
