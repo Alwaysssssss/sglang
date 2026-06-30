@@ -33,70 +33,6 @@ _VIVIDVR_CONNECTOR_SEQUENCE_PARALLEL_ATTENTION_BACKENDS = frozenset(
     {AttentionBackendEnum.FA, AttentionBackendEnum.FA2}
 )
 
-# Spatial pooling of control states BEFORE all-gather (Path B)
-_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE_ENV = "SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE"
-_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE_DEFAULT = 1  # default to no pooling for quality-safe SP
-_COGVIDEOX_SPATIAL_H = 30   # patch grid height after patch_embed
-_COGVIDEOX_SPATIAL_W = 45   # patch grid width after patch_embed
-_COGVIDEOX_PER_FRAME_TOKENS = _COGVIDEOX_SPATIAL_H * _COGVIDEOX_SPATIAL_W  # 1350
-
-
-def get_vividvr_connector_control_pool_size() -> int:
-    """Return the spatial pool size for control state compression before all-gather.
-
-    0 or 1 = no compression. Default 1 keeps the quality-safe path unless pooling is
-    explicitly requested via environment override.
-    """
-    val = os.environ.get(_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE_ENV, "").strip()
-    if not val:
-        return _VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE_DEFAULT
-    try:
-        return int(val)
-    except ValueError:
-        return _VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE_DEFAULT
-
-
-def _pool_control_state_2d(
-    x: torch.Tensor,
-    pool_size: int,
-) -> torch.Tensor:
-    """Spatially pool a control state tensor using 2D patch layout.
-
-    Args:
-        x: (B, seq_len, hidden_dim) where seq_len = num_frames * 30 * 45
-        pool_size: spatial downsampling factor (e.g. 2 → 30×45 → 15×22 per frame)
-
-    Returns:
-        (B, pooled_seq_len, hidden_dim)
-    """
-    if pool_size <= 1 or x.shape[1] <= 0:
-        return x
-
-    B = x.shape[0]
-    seq_len = x.shape[1]
-    C = x.shape[2]
-    h, w = _COGVIDEOX_SPATIAL_H, _COGVIDEOX_SPATIAL_W
-    per_frame = h * w  # 1350
-
-    total_frames = seq_len // per_frame
-    if total_frames <= 0 or seq_len % per_frame != 0:
-        return x  # not divisible by per-frame tokens, skip
-
-    hp = max(1, h // pool_size)
-    wp = max(1, w // pool_size)
-
-    # (B, F*H*W, C) → (B, F, H, W, C) → (B*F, C, H, W)
-    x = x.reshape(B, total_frames, h, w, C)
-    x = x.permute(0, 1, 4, 2, 3).reshape(B * total_frames, C, h, w)
-
-    x = F.adaptive_avg_pool2d(x, (hp, wp))
-
-    # (B*F, C, hp, wp) → (B, F, C, hp*wp) → (B, F*hp*wp, C)
-    x = x.reshape(B, total_frames, C, hp * wp)
-    x = x.permute(0, 1, 3, 2).reshape(B, total_frames * hp * wp, C)
-
-    return x.contiguous()
-
 
 def zero_module(module: nn.Module) -> nn.Module:
     for parameter in module.parameters():
@@ -471,35 +407,10 @@ def build_vividvr_connector_control_states(
     if context_mode == _VIVIDVR_CONNECTOR_SP_CONTEXT_MODE_DEFERRED_GLOBAL:
         return tuple((state.contiguous(),) for state in scaled_local_states)
 
-    # eager_global: spatially pool control states BEFORE all-gather (Path B)
-    pool_size = get_vividvr_connector_control_pool_size()
-    if pool_size > 1:
-        pooled_states = tuple(
-            _pool_control_state_2d(s, pool_size) for s in scaled_local_states
-        )
-        global_control_states = restore_vividvr_connector_global_control_states(
-            pooled_states,
-            shard_state,
-        )
-        # one-shot diagnostic (module-level, once per step total)
-        _tag = "_ctrl_pool_reported"
-        if not getattr(build_vividvr_connector_control_states, _tag, False):
-            setattr(build_vividvr_connector_control_states, _tag, True)
-            sp_rank = get_sp_parallel_rank()
-            orig_len = scaled_local_states[0].shape[1]
-            pooled_len = global_control_states[0].shape[1]
-            ratio = orig_len / pooled_len if pooled_len > 0 else 0
-            print(
-                f"[CTRL POOL rank={sp_rank}] pool_size={pool_size} "
-                f"local={orig_len} → pooled_local={pooled_states[0].shape[1]} "
-                f"→ all_gather → global={pooled_len} tokens "
-                f"({ratio:.1f}× compression vs unpooled all-gather)"
-            )
-    else:
-        global_control_states = restore_vividvr_connector_global_control_states(
-            scaled_local_states,
-            shard_state,
-        )
+    global_control_states = restore_vividvr_connector_global_control_states(
+        scaled_local_states,
+        shard_state,
+    )
     return tuple(
         (
             scaled_local_states[index].contiguous(),
