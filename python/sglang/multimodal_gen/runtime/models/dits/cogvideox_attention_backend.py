@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -29,6 +30,18 @@ _COGVIDEOX_FLASHINFER_ROPE_CACHE: dict[tuple[object, ...], torch.Tensor | None] 
 _COGVIDEOX_LAYERNORM_KERNEL_CACHE: dict[tuple[int, torch.dtype, str], bool] = {}
 
 
+@dataclass(frozen=True)
+class CogVideoXAttentionRuntimeChoice:
+    semantics: str
+    kernel: str
+
+    @property
+    def effective_backend(self) -> str:
+        if self.semantics == "ulysses_sp":
+            return f"{self.kernel}_sp"
+        return self.kernel
+
+
 def normalize_cogvideox_attention_backend(backend: str | None) -> str | None:
     if backend is None:
         return None
@@ -45,10 +58,12 @@ def normalize_cogvideox_attention_backend(backend: str | None) -> str | None:
         "fa_sp": "fa_sp",
         "sp_fa": "fa_sp",
         "usp": "fa_sp",
-        "native": "native",
-        "torch_native": "native",
-        "torch_sdpa": "native",
-        "sdpa": "native",
+        "sdpa_sp": "sdpa_sp",
+        "sp_sdpa": "sdpa_sp",
+        "native": "sdpa",
+        "torch_native": "sdpa",
+        "torch_sdpa": "sdpa",
+        "sdpa": "sdpa",
         "sage": "sage_attn",
         "sage_attn": "sage_attn",
         "sage_attn_3": "sage_attn_3",
@@ -56,6 +71,29 @@ def normalize_cogvideox_attention_backend(backend: str | None) -> str | None:
         "xformers_memory_efficient": "xformers",
     }
     return alias_map.get(normalized, normalized)
+
+
+def resolve_cogvideox_attention_runtime_choice(
+    backend: str | None,
+    *,
+    sp_enabled: bool,
+) -> CogVideoXAttentionRuntimeChoice:
+    normalized_backend = normalize_cogvideox_attention_backend(backend) or "fa"
+
+    if normalized_backend.endswith("_sp"):
+        normalized_backend = normalized_backend.removesuffix("_sp")
+
+    if normalized_backend not in {"fa", "sdpa"}:
+        raise ValueError(
+            "CogVideoX/VividVR attention backend "
+            f"{backend!r} is not supported yet. Supported backends: fa, sdpa."
+        )
+
+    semantics = "ulysses_sp" if sp_enabled else "local"
+    return CogVideoXAttentionRuntimeChoice(
+        semantics=semantics,
+        kernel=normalized_backend,
+    )
 
 
 def _prepare_cogvideox_qkv(
@@ -330,15 +368,18 @@ def _apply_cogvideox_image_rope(
             raise RuntimeError(
                 "FlashInfer RoPE fast path was selected without a compatible CogVideoX cos/sin cache."
             )
-        q_image, k_image = apply_flashinfer_rope_qk_inplace(
-            q_image.transpose(1, 2),
-            k_image.transpose(1, 2),
-            cos_sin_cache,
-            is_neox=False,
-        )
-        query[:, :, text_seq_length:] = q_image.transpose(1, 2)
-        key[:, :, text_seq_length:] = k_image.transpose(1, 2)
-        return query, key
+        try:
+            q_image, k_image = apply_flashinfer_rope_qk_inplace(
+                q_image.transpose(1, 2),
+                k_image.transpose(1, 2),
+                cos_sin_cache,
+                is_neox=False,
+            )
+            query[:, :, text_seq_length:] = q_image.transpose(1, 2)
+            key[:, :, text_seq_length:] = k_image.transpose(1, 2)
+            return query, key
+        except Exception:
+            pass
 
     query[:, :, text_seq_length:] = apply_rotary_emb(
         q_image,
@@ -375,6 +416,29 @@ class CogVideoXNativeAttnProcessor:
         )
 
 
+class CogVideoXSDPAAttnProcessor:
+    _attention_backend = "sdpa"
+
+    def __init__(self):
+        self._processor = CogVideoXAttnProcessor2_0()
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._processor(
+            attn=attn,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attention_mask,
+            image_rotary_emb=image_rotary_emb,
+        )
+
+
 class CogVideoXFlashAttnProcessor:
     _attention_backend = "fa"
 
@@ -386,10 +450,10 @@ class CogVideoXFlashAttnProcessor:
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The sglang flash kernel path does not support arbitrary masks on this
-        # processor, so keep native SDPA as the exact fallback if masks show up.
+        # The flash kernel path does not support arbitrary masks on this
+        # processor, so fall back to the local SDPA implementation if masks show up.
         if attention_mask is not None:
-            return CogVideoXNativeAttnProcessor()(
+            return CogVideoXSDPAAttnProcessor()(
                 attn=attn,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -405,7 +469,7 @@ class CogVideoXFlashAttnProcessor:
         )
 
         if query.dtype not in (torch.float16, torch.bfloat16):
-            return CogVideoXNativeAttnProcessor()(
+            return CogVideoXSDPAAttnProcessor()(
                 attn=attn,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -439,7 +503,7 @@ class CogVideoXFlashAttnProcessor:
         return hidden_states, encoder_hidden_states
 
 
-class CogVideoXSPFlashAttnProcessor:
+class CogVideoXSPAttnProcessor:
     """SP-aware CogVideoX joint-attention processor using Ulysses all-to-all.
 
     When sequence parallelism (SP) is enabled (sp_world_size > 1), text tokens
@@ -453,7 +517,14 @@ class CogVideoXSPFlashAttnProcessor:
     flash-attention path so single-GPU and non-SP deployments are unaffected.
     """
 
-    _attention_backend = "fa_sp"
+    def __init__(self, kernel: str = "fa"):
+        normalized_kernel = normalize_cogvideox_attention_backend(kernel)
+        if normalized_kernel not in {"fa", "sdpa"}:
+            raise ValueError(
+                f"Unsupported CogVideoX SP attention kernel {kernel!r}; expected 'fa' or 'sdpa'."
+            )
+        self.kernel = normalized_kernel
+        self._attention_backend = f"{self.kernel}_sp"
 
     def __call__(
         self,
@@ -468,7 +539,12 @@ class CogVideoXSPFlashAttnProcessor:
             get_sp_world_size() if model_parallel_is_initialized() else 1
         )
         if sp_size <= 1:
-            return CogVideoXFlashAttnProcessor()(
+            local_processor: object
+            if self.kernel == "fa":
+                local_processor = CogVideoXFlashAttnProcessor()
+            else:
+                local_processor = CogVideoXSDPAAttnProcessor()
+            return local_processor(
                 attn=attn,
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -497,6 +573,7 @@ class CogVideoXSPFlashAttnProcessor:
         usp_attn = _get_cogvideox_sp_usp_attention(
             num_heads=num_heads,
             head_size=head_dim,
+            kernel=self.kernel,
         )
 
         # USPAttention expects [B, S_local, H, D] input.
@@ -531,6 +608,7 @@ def _get_cogvideox_sp_usp_attention(
     *,
     num_heads: int,
     head_size: int,
+    kernel: str,
 ) -> USPAttention:
     """Create a cached USPAttention instance for CogVideoX SP joint attention.
 
@@ -538,41 +616,51 @@ def _get_cogvideox_sp_usp_attention(
     Ulysses all-to-all pipeline runs when SP is active.  When SP is not active
     (world_size == 1), USPAttention internally degrades to local attention.
     """
+    if kernel == "fa":
+        supported_attention_backends = {
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.FA2,
+        }
+    elif kernel == "sdpa":
+        supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
+    else:
+        raise ValueError(
+            f"Unsupported CogVideoX SP attention kernel {kernel!r}; expected 'fa' or 'sdpa'."
+        )
+
     return USPAttention(
         num_heads=num_heads,
         head_size=head_size,
         softmax_scale=None,
         causal=False,
-        supported_attention_backends={
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.FA2,
-        },
-        prefix=f"cogvideox_sp_attn_{num_heads}_{head_size}",
+        supported_attention_backends=supported_attention_backends,
+        prefix=f"cogvideox_sp_attn_{kernel}_{num_heads}_{head_size}",
     )
 
 
 def build_cogvideox_attention_processor(backend: str) -> object:
     normalized_backend = normalize_cogvideox_attention_backend(backend)
-    if normalized_backend == "native":
-        return CogVideoXNativeAttnProcessor()
     if normalized_backend == "fa":
         return CogVideoXFlashAttnProcessor()
+    if normalized_backend == "sdpa":
+        return CogVideoXSDPAAttnProcessor()
     if normalized_backend == "fa_sp":
-        return CogVideoXSPFlashAttnProcessor()
+        return CogVideoXSPAttnProcessor(kernel="fa")
+    if normalized_backend == "sdpa_sp":
+        return CogVideoXSPAttnProcessor(kernel="sdpa")
 
     raise ValueError(
         "CogVideoX/VividVR attention backend "
-        f"{backend!r} is not supported yet. Supported backends: native, fa, fa_sp."
+        f"{backend!r} is not supported yet. Supported backends: fa, sdpa, fa_sp, sdpa_sp."
     )
 
 
 def set_cogvideox_attention_backend(module: nn.Module, backend: str) -> str:
     normalized_backend = normalize_cogvideox_attention_backend(backend)
-    processor = build_cogvideox_attention_processor(backend)
     applied = 0
     for child in module.modules():
         if isinstance(child, Attention):
-            child.set_processor(type(processor)())
+            child.set_processor(build_cogvideox_attention_processor(backend))
             applied += 1
 
     if applied == 0:

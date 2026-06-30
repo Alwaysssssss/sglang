@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
     inspect_cogvideox_qk_norm_rope_fusion,
     inspect_cogvideox_qkv_fusion,
     normalize_cogvideox_attention_backend,
+    resolve_cogvideox_attention_runtime_choice,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import (
     enable_cogvideox_modulation_fusion,
@@ -383,9 +384,20 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         controlnet = self.get_module("controlnet")
         requested_backend = server_args.attention_backend
         resolved_backend = normalize_cogvideox_attention_backend(requested_backend)
+        sp_degree = max(
+            getattr(server_args, "sp_degree", None) or 1,
+            getattr(server_args, "ulysses_degree", None) or 1,
+        )
+        sp_enabled = sp_degree > 1
+        runtime_choice = resolve_cogvideox_attention_runtime_choice(
+            requested_backend,
+            sp_enabled=sp_enabled,
+        )
         return {
             "attention_backend_requested": requested_backend,
             "attention_backend_resolved": resolved_backend,
+            "attention_backend_semantics": runtime_choice.semantics,
+            "attention_backend_kernel": runtime_choice.kernel,
             "attention_backend_transformer": _inspect_module_attention_backend(
                 transformer
             ),
@@ -515,76 +527,75 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
     def _apply_attention_backend(self, server_args: ServerArgs) -> None:
         requested_backend = server_args.attention_backend
 
-        # Detect whether sequence parallelism (SP) is configured so we can
-        # automatically upgrade to the SP-aware attention path when needed.
         sp_degree = max(
             getattr(server_args, "sp_degree", None) or 1,
             getattr(server_args, "ulysses_degree", None) or 1,
         )
         sp_enabled = sp_degree > 1
-
-        if requested_backend is None:
-            if sp_enabled:
-                # SP is active but no attention backend was specified.
-                # Default to the SP-aware flash-attention path so that
-                # joint self-attention remains mathematically equivalent
-                # to the single-GPU baseline.
-                resolved_backend = "fa_sp"
-                logger.info(
-                    "VividVR SP is enabled (sp_degree=%s); auto-selecting 'fa_sp' "
-                    "attention backend for equivalent distributed joint attention.",
-                    sp_degree,
-                )
-            else:
-                logger.info(
-                    "VividVR attention backend not specified; using component defaults."
-                )
-                return
-        else:
-            resolved_backend = normalize_cogvideox_attention_backend(requested_backend)
-            # When the user requested plain 'fa' but SP is active, silently
-            # upgrade to 'fa_sp' so the distributed attention stays functionally
-            # equivalent to the single-GPU baseline.
-            if resolved_backend == "fa" and sp_enabled:
-                logger.info(
-                    "VividVR SP is enabled (sp_degree=%s); upgrading attention "
-                    "backend from 'fa' to 'fa_sp' for equivalent distributed "
-                    "joint attention.",
-                    sp_degree,
-                )
-                resolved_backend = "fa_sp"
-
-        if resolved_backend is None:
-            return
+        runtime_choice = resolve_cogvideox_attention_runtime_choice(
+            requested_backend,
+            sp_enabled=sp_enabled,
+        )
 
         components = {
             "transformer": self.get_module("transformer"),
             "controlnet": self.get_module("controlnet"),
         }
-        for component_name, component in components.items():
-            if component is None:
-                logger.warning(
-                    "Skipping attention backend '%s' for %s because the component is not loaded.",
-                    resolved_backend,
-                    component_name,
-                )
-                continue
-            if not hasattr(component, "set_attention_backend"):
-                logger.warning(
-                    "Skipping attention backend '%s' for %s because the component does not expose set_attention_backend().",
-                    resolved_backend,
-                    component_name,
-                )
-                continue
-            component.set_attention_backend(resolved_backend)
-            applied_backend = _inspect_module_attention_backend(component)
-            logger.info(
-                "Applied attention backend '%s' (requested='%s') to VividVR %s; effective_backend=%s.",
-                resolved_backend,
-                requested_backend,
-                component_name,
-                applied_backend,
+        effective_candidates = [runtime_choice.effective_backend]
+        if runtime_choice.kernel == "fa":
+            fallback_backend = (
+                "sdpa_sp" if runtime_choice.semantics == "ulysses_sp" else "sdpa"
             )
+            effective_candidates.append(fallback_backend)
+
+        last_error: Exception | None = None
+        for candidate_backend in effective_candidates:
+            try:
+                for component_name, component in components.items():
+                    if component is None:
+                        logger.warning(
+                            "Skipping attention backend '%s' for %s because the component is not loaded.",
+                            candidate_backend,
+                            component_name,
+                        )
+                        continue
+                    if not hasattr(component, "set_attention_backend"):
+                        logger.warning(
+                            "Skipping attention backend '%s' for %s because the component does not expose set_attention_backend().",
+                            candidate_backend,
+                            component_name,
+                        )
+                        continue
+                    component.set_attention_backend(candidate_backend)
+                    applied_backend = _inspect_module_attention_backend(component)
+                    logger.info(
+                        "Applied VividVR attention backend candidate='%s' "
+                        "(requested='%s', semantics='%s', kernel='%s') to %s; effective_backend=%s.",
+                        candidate_backend,
+                        requested_backend,
+                        runtime_choice.semantics,
+                        runtime_choice.kernel,
+                        component_name,
+                        applied_backend,
+                    )
+                return
+            except Exception as exc:
+                last_error = exc
+                if candidate_backend == effective_candidates[-1]:
+                    raise
+                logger.warning(
+                    "VividVR attention backend candidate '%s' failed for requested='%s' "
+                    "(semantics='%s', kernel='%s'); falling back to '%s'. error=%s",
+                    candidate_backend,
+                    requested_backend,
+                    runtime_choice.semantics,
+                    runtime_choice.kernel,
+                    effective_candidates[effective_candidates.index(candidate_backend) + 1],
+                    exc,
+                )
+
+        if last_error is not None:
+            raise last_error
 
     def _apply_qkv_fusion(self, server_args: ServerArgs) -> None:
         if not getattr(server_args, "enable_cogvideox_qkv_fusion", False):
