@@ -9,15 +9,15 @@
 ## 项目背景
 
 - 当前工作的主线不是从零设计一个新模型，而是把原版 `/home/zhiheng/Vivid-VR` 以原生、可维护的方式集成到 `sglang.multimodal_gen` 中。
-- 这条线经历过一次仓库误清空和恢复；`Phase A / B / C` 已恢复并建立了稳定基线，当前继续推进的是 `Phase D` 和 `Phase E`。
-- 当前稳定基线是 `Phase C` 单 clip 路径；后续所有改动默认都要保护这条基线，避免回归。
-- `Phase D` 的重点是长视频 `clip split / merge / temporal orchestration` 以及公平 benchmark；截至目前，这部分代码和 benchmark 流程已具备，并已完成正式验收，作为 `Phase E` 的长视频语义基线。
-- `Phase E` 的重点不是再发明新语义，而是在 `Phase D` 语义对齐基础上做性能收口、默认配置收口和回归验收，逐步进入 release gate。
-- 当前 `Phase E` 的 `130f / 20 step` 长视频 `serve` benchmark 与加速消融已经完成，默认配置已经收口到单卡 `single_gpu_fa_compile` 和双卡 `dual_gpu_fa_eager_compile`。
-- 当前仍未完成的主问题有两条：
-  - 原版 `/home/zhiheng/Vivid-VR` 的 caption 目前只能在原版环境中稳定正确产出；在 `sglang` 的 `.venv` 中会因依赖版本差异导致 caption 输出异常，后续可能需要补一条“通信交换生成 caption”的桥接路径。
-  - `serve` 服务接口的部分输入参数契约仍需按需求继续收口，当前不能默认视为已经完全稳定。
-- 下一步优先任务是解决原版 caption 模型环境不兼容问题；默认方向应是建立独立 caption bridge 或 sidecar 生成路径，而不是直接改坏 `/home/zhiheng/sglang/.venv` 的主推理依赖。
+- 这条线经历过一次仓库误清空和恢复；`Phase A / B / C / D / E` 目前都已完成收口，并形成了稳定基线。
+- 当前稳定基线包括：
+  - `Phase C` 单 clip 主语义基线
+  - `Phase D` 长视频 `clip split / merge / temporal orchestration` 语义基线
+  - `Phase E` 默认配置、性能组合、服务契约与正式验收基线
+- `Phase E` 的 `130f / 20 step` 长视频 `serve` benchmark、加速消融、默认配置收口与服务语义收口都已完成；当前默认正式配置固定为单卡 `single_gpu_fa_compile` 和双卡 `dual_gpu_fa_eager_compile`。
+- caption 环境兼容问题已经通过独立 caption bridge / sidecar 路径解决；主推理环境保持在 `/home/zhiheng/sglang/.venv`，caption sidecar 固定使用独立环境 `/home/zhiheng/sglang/.venv-vividvr-caption`。
+- `serve` 服务接口的对外请求契约、对象存储上传、回调、取消、输入清理与进度查询语义已经完成收口，当前实现可正式对外提供服务。
+- 后续默认工作重点不是再补主链缺口，而是在已验收基线上做回归维护、配置守护、问题修复和必要的服务侧增量演进。
 - `Vivid-VR` 在 `sglang` 中必须作为原生模型集成运行；推理时不要依赖原版仓库的运行时代码。
 - 允许继续复用原版仓库中的外部资源，例如：
   - checkpoint
@@ -28,37 +28,34 @@
 
 ## 当前阶段任务
 
-- `Phase C` 代表当前单 clip 稳定基线，目标是把原版 `Vivid-VR` 的单段视频编辑主链语义稳定迁移到 `sglang` 中，并通过现有单 clip 验收。
-- `Phase C` 必须守住的关键语义包括：
+- 当前阶段默认已从“主链补齐”进入“正式服务维护与回归守护”阶段。
+- `Phase C` 仍是必须保护的单 clip 稳定基线；后续所有改动默认都不能破坏它。
+- `Phase C` 必须持续守住的关键语义包括：
   - prompt 默认来自 `/home/zhiheng/Vivid-VR/input/720p/prompt.txt`
   - 不走 live `CogVLM2`
   - `prompt_embed_shape` 保持 `226` 长度，不回退到 `512`
   - VAE tiling 默认值保持 `240 / 360`
   - preprocess 保留未 padding 的 `reference_video`
   - decode / postprocess 保留 `drop first 3 frames + crop padding + AdaIN/reference color fix`
-- `Phase D` 不是单纯“优化”，而是要继续对齐原版 `Vivid-VR` 的长视频主语义。
-- `Phase D` 的核心任务包括：
+- `Phase D` 长视频主语义已经验收完成；后续任务默认是保护而不是重做。必须持续守住的关键能力包括：
   - 长视频 `clip split`
   - 多 clip 的 timestep 级时序编排
   - 跨 clip latent merge
   - clip trim / stitch
   - 使用原版 caption sidecar 的公平 benchmark
-- 对 `Phase D` 的默认理解应是“补齐原版长视频语义”，不是随意做一个能跑的近似实现。
-- 目前 `Phase D` 代码路径、helper、测试和 benchmark 工具已经具备，且长视频公平验收已完成；后续默认应在该语义基线上推进 `Phase E`，不要破坏 `Phase C` 与 `Phase D` 的已验收结果。
-- 如果本轮任务没有明确要求推进 `Phase D`，默认仍应先保护 `Phase C` 已验收结果。
-- `Phase E` 代表“性能收口 + 回归验收”阶段，不应被理解成脱离语义基线的随意调参。
-- `Phase E` 的核心任务包括：
-  - 收口默认推理配置，例如 `dtype`、attention backend、VAE tiling / slicing、offload 策略、是否启用 compile
-  - 基于稳定实现做 profile，形成可复用的性能结论
-  - 建立可重复运行的 regression 套件
-  - 让验收逐步从阶段性对齐进入 strict 或接近 strict 的 release gate
+- 如果本轮任务没有明确要求改动长视频主链，默认只做最小必要修改，并优先保护 `Phase C` 与 `Phase D` 的已验收结果。
+- `Phase E` 当前已进入“正式配置固定 + 服务可用 + 回归维护”状态；默认任务包括：
+  - 守住默认推理配置，不随意改动 `dtype`、attention backend、VAE tiling / slicing、offload 策略、compile 策略
+  - 守住对外服务契约，不随意改动请求字段、回调、取消、对象存储、输入清理和进度查询语义
+  - 基于稳定实现做回归验证、问题修复和必要的性能复核
+  - 在新增需求进入主线前，先确认是否会破坏既有正式服务口径
 - 当前 `Phase E` 日常 benchmark 默认固定为与 `Phase D` 相同 reference 对象的 `130f / 20 step` 长视频口径；`50 step` 只保留给阶段性最终回归。
 - 当前 `Phase E` 单卡默认正式配置固定为 `single_gpu_fa_compile`，也就是 `--attention-backend fa` + `--enable-torch-compile`。
 - 当前双卡 `SP` 默认质量口径要求 connector context mode 走 `eager_global`，并保持 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`；也就是默认恢复 full global control context，且默认不启用 control pooling。只有在明确做历史 `v1` 对比或性能实验时，才显式切回 `deferred_global` 或打开 pool 压缩。
 - 当前 `Phase E` 双卡默认正式配置固定为 `dual_gpu_fa_eager_compile`，也就是 `--attention-backend fa` + `SP=2` + `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` + `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1` + `--enable-torch-compile`；在双卡 `SP` 下运行时有效 backend 记为 `fa_sp`。
 - 单卡正式 benchmark 或正式对比时，必须保证同一时刻只有一个单卡推理进程在跑，避免并发占用把单卡耗时拉长，造成不公平对比。
-- 推进 `Phase E` 时，默认前提是不能破坏 `Phase C` 已验收基线，也不要用性能优化引入新的长视频语义回归。
-- 如果任务明确属于 `Phase E`，先确认当前 benchmark 和验收口径是否已经固定；如果默认参数、后端或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
+- 后续任何服务侧、性能侧或接口侧修改，默认前提都是不能破坏 `Phase C / D / E` 已验收基线。
+- 如果默认参数、后端、服务契约或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
 
 ## 文档入口与实现指引
 

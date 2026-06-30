@@ -56,6 +56,14 @@ class _PipelineHookModule(_DummyCogVideoXAttentionModule):
         set_cogvideox_attention_backend(self, backend)
 
 
+class _FailingFAAttentionModule(_PipelineHookModule):
+    def set_attention_backend(self, backend: str) -> None:
+        normalized = normalize_cogvideox_attention_backend(backend)
+        if normalized in {"fa", "fa_sp"}:
+            raise RuntimeError("flash init failed")
+        super().set_attention_backend(backend)
+
+
 class _CompileTrackingModule(nn.Module):
     def __init__(self):
         super().__init__()
@@ -110,12 +118,13 @@ class TestVividVRAttentionBackend(unittest.TestCase):
     def test_normalize_attention_backend_aliases(self):
         self.assertEqual(normalize_cogvideox_attention_backend("fa3"), "fa")
         self.assertEqual(normalize_cogvideox_attention_backend("flash"), "fa")
-        self.assertEqual(normalize_cogvideox_attention_backend("torch_sdpa"), "native")
+        self.assertEqual(normalize_cogvideox_attention_backend("torch_sdpa"), "sdpa")
+        self.assertEqual(normalize_cogvideox_attention_backend("sdpa"), "sdpa")
         self.assertEqual(
             normalize_cogvideox_attention_backend("sage_attn"), "sage_attn"
         )
 
-    def test_set_attention_backend_replaces_processors(self):
+    def test_set_attention_backend_replaces_processors_for_fa_and_sdpa(self):
         module = _DummyCogVideoXAttentionModule()
 
         set_cogvideox_attention_backend(module, "fa")
@@ -123,8 +132,7 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         self.assertIsInstance(module.attn.processor, CogVideoXFlashAttnProcessor)
 
         set_cogvideox_attention_backend(module, "torch_sdpa")
-        self.assertEqual(inspect_cogvideox_attention_backend(module), "native")
-        self.assertIsInstance(module.attn.processor, CogVideoXNativeAttnProcessor)
+        self.assertEqual(inspect_cogvideox_attention_backend(module), "sdpa")
 
     def test_unsupported_attention_backend_raises(self):
         module = _DummyCogVideoXAttentionModule()
@@ -154,6 +162,119 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         self.assertEqual(inspect_cogvideox_attention_backend(controlnet), "fa")
         self.assertEqual(debug["attention_backend_transformer"], "fa")
         self.assertEqual(debug["attention_backend_controlnet"], "fa")
+
+    def test_vividvr_pipeline_routes_sp_fa_and_sdpa_to_sp_semantics(self):
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        controlnet = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+
+        pipeline._apply_attention_backend(
+            SimpleNamespace(
+                attention_backend="fa",
+                sp_degree=2,
+                ulysses_degree=2,
+            )
+        )
+        fa_debug = pipeline._build_runtime_acceleration_debug(
+            SimpleNamespace(
+                attention_backend="fa",
+                sp_degree=2,
+                ulysses_degree=2,
+                enable_torch_compile=False,
+                enable_cogvideox_qkv_fusion=False,
+                cogvideox_qkv_fusion_targets="transformer",
+            )
+        )
+        self.assertEqual(fa_debug["attention_backend_transformer"], "fa_sp")
+        self.assertEqual(fa_debug["attention_backend_controlnet"], "fa_sp")
+
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        controlnet = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+        pipeline._apply_attention_backend(
+            SimpleNamespace(
+                attention_backend="sdpa",
+                sp_degree=2,
+                ulysses_degree=2,
+            )
+        )
+        sdpa_debug = pipeline._build_runtime_acceleration_debug(
+            SimpleNamespace(
+                attention_backend="sdpa",
+                sp_degree=2,
+                ulysses_degree=2,
+                enable_torch_compile=False,
+                enable_cogvideox_qkv_fusion=False,
+                cogvideox_qkv_fusion_targets="transformer",
+            )
+        )
+        self.assertEqual(sdpa_debug["attention_backend_transformer"], "sdpa_sp")
+        self.assertEqual(sdpa_debug["attention_backend_controlnet"], "sdpa_sp")
+
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        controlnet = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+        pipeline._apply_attention_backend(
+            SimpleNamespace(
+                attention_backend="fa",
+                sp_degree=1,
+                ulysses_degree=1,
+            )
+        )
+        local_debug = pipeline._build_runtime_acceleration_debug(
+            SimpleNamespace(
+                attention_backend="fa",
+                sp_degree=1,
+                ulysses_degree=1,
+                enable_torch_compile=False,
+                enable_cogvideox_qkv_fusion=False,
+                cogvideox_qkv_fusion_targets="transformer",
+            )
+        )
+        self.assertEqual(local_debug["attention_backend_transformer"], "fa")
+        self.assertEqual(local_debug["attention_backend_controlnet"], "fa")
+
+    def test_vividvr_pipeline_falls_back_from_sp_fa_to_sp_sdpa(self):
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _FailingFAAttentionModule()
+        controlnet = _FailingFAAttentionModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+
+        pipeline._apply_attention_backend(
+            SimpleNamespace(
+                attention_backend="fa",
+                sp_degree=2,
+                ulysses_degree=2,
+            )
+        )
+        debug = pipeline._build_runtime_acceleration_debug(
+            SimpleNamespace(
+                attention_backend="fa",
+                sp_degree=2,
+                ulysses_degree=2,
+                enable_torch_compile=False,
+                enable_cogvideox_qkv_fusion=False,
+                cogvideox_qkv_fusion_targets="transformer",
+            )
+        )
+
+        self.assertEqual(debug["attention_backend_transformer"], "sdpa_sp")
+        self.assertEqual(debug["attention_backend_controlnet"], "sdpa_sp")
 
     def test_qkv_fusion_matches_unfused_projections(self):
         module = _DummyCogVideoXAttentionModule()

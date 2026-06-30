@@ -6,14 +6,13 @@
 
 - **准备输入资源**
   - 外部调用默认使用 `videoUrl`，且该地址必须能被 serve 所在机器访问。
-  - 如果调用方和服务在同一台机器，也可直接传 `video_input_path` 本地路径。
 - **提交 Vivid-VR 任务**
   - 请求方法为 `POST`，路径为 `/v1/videos/repairs/flowcut`。
   - 请求头必须包含 `Content-Type: application/json`。
-  - 请求体必须包含 `taskId`、`callbackUrl`，以及 `videoUrl` 或 `video_input_path` 二选一。
-- **配置 caption 来源**
-  - 传 `captionFilePath` 时，服务直接使用该 sidecar caption 文件。
-  - 不传 `captionFilePath` 时，若服务启动时启用了 caption bridge，则会先生成 sidecar caption，再进入推理。
+  - 请求体必须包含 `taskId`、`callbackUrl` 和 `videoUrl`。
+- **确认 caption bridge 已启用**
+  - 当前对外请求不再接收 `captionFilePath`。
+  - 服务启动时应启用 caption bridge，由服务端先生成 sidecar caption，再进入推理。
 - **配置输出**
   - 传 `minioConfig` 时，结果会上传到对象存储。
   - 可用 `outputObjectKey` 和 `outputBucket` 指定对象路径和 bucket。
@@ -53,8 +52,7 @@
 - 接口是异步任务接口，提交成功只表示任务已被接受，不表示推理完成。
 - 当前默认并发为 1。已有任务运行时，新请求会返回 `code: 2`。
 - `callbackUrl` 当前为必填字段；服务会用它发送阶段进度和最终结果回调。
-- 外部调用推荐使用 `videoUrl`；`video_input_path` 主要用于同机调试或验收。
-- `prompt` 字段当前保留为兼容字段，Vivid-VR 实际推理默认读取服务启动时的 `--prompt-file-path`。
+- 外部调用输入字段固定使用 `videoUrl`。
 - `upscale` 表示**原版 Vivid-VR 的输入预缩放语义**。
 - FlowCut 专用接口当前没有独立的 `content` 下载路由；本地输出模式请通过详情/进度接口中的 `file_path` 读取结果。
 
@@ -72,7 +70,7 @@ Content-Type: application/json
 下面示例模拟真实外部请求：
 
 - 使用 `videoUrl`
-- 不传 `captionFilePath`，由服务端 caption bridge 自动生成 sidecar caption
+- 由服务端 caption bridge 自动生成 sidecar caption
 - 结果上传到对象存储
 - 显式传 `upscale: 1.0`，保持当前已验收基线
 
@@ -95,18 +93,10 @@ curl -v --fail-with-body -X POST "http://10.51.28.123:30000/v1/videos/repairs/fl
     "outputObjectKey":"outputs/vividvr-demo-001",
     "outputBucket":"flowcut-results",
     "numInferenceSteps":20,
-    "seed":42,
     "numTemporalProcessFrames":121,
-    "upscale":1.0,
-    "perfDumpPath":"/tmp/vividvr-demo-001_perf.json"
+    "upscale":1.0
   }'
 ```
-
-如果调用方已经持有 sidecar caption，也可以显式传：
-
-- `captionFilePath`
-
-这样服务会跳过 caption bridge，直接进入推理。
 
 ### 2.3 请求体字段
 
@@ -114,35 +104,19 @@ curl -v --fail-with-body -X POST "http://10.51.28.123:30000/v1/videos/repairs/fl
 | --- | --- | --- | --- | --- |
 | `taskId` | string | 是 | 无 | 任务唯一 ID。后续查询、回调、取消都用它。 |
 | `callbackUrl` | string | 是 | 无 | 服务主动回调地址。当前实现要求必填。 |
-| `videoUrl` | string | 二选一 | 无 | 待处理输入视频 URL。外部调用推荐用这个字段。 |
-| `video_input_path` | string | 二选一 | 无 | 本地输入视频路径。主要用于同机调试或验收。 |
+| `videoUrl` | string | 是 | 无 | 待处理输入视频 URL。 |
 | `timeout` | int | 否 | `300` | `0` 和未传都会归一为 `300`；`-1` 表示不设置超时；`<-1` 非法。 |
-| `captionFilePath` | string | 否 | 无 | 现成的 sidecar caption 文件路径；传了就直接使用。 |
 | `minioConfig` | object | 否 | 无 | 对象存储配置。传了之后服务会把结果上传到对象存储。 |
 | `outputObjectKey` | string | 否 | 自动生成 | 输出对象路径；未带扩展名时，服务会补成输入视频的扩展名。 |
 | `outputBucket` | string | 否 | `minioConfig.bucketName` | 结果输出 bucket；优先级高于 `minioConfig.bucketName`。 |
 | `outputPath` | string | 否 | 服务端 `output_path` | 本地持久输出路径。若显式给了文件名，扩展名会收口为输入视频扩展名。 |
 | `outputStorage` | string | 否 | `local` | 兼容字段。当前实际是否上传对象存储，主要由 `minioConfig / outputObjectKey / outputBucket` 决定。 |
-| `prompt` | string | 否 | 无 | 兼容字段。当前 Vivid-VR 实际推理默认读取服务启动参数中的 `prompt_file_path`。 |
-| `negative_prompt` | string | 否 | 模型默认负向 prompt | 覆盖默认负向 prompt。 |
 | `model` | string | 否 | `VividVR` | 主要用于响应元信息，不用于动态切换 pipeline。 |
-| `num_frames` | int | 否 | 输入视频全长 | 要处理的帧数；未传时使用输入视频可用帧。 |
 | `numInferenceSteps` | int | 否 | `50` | 扩散采样步数。 |
-| `guidanceScale` | float | 否 | `6.0` | CFG 引导强度。 |
-| `seed` | int | 否 | `42` | 随机种子，用于结果复现。 |
-| `generatorDevice` | string | 否 | 服务默认 | 指定随机数生成设备。 |
 | `dtype` | string | 否 | `bf16` | 推理精度，当前支持 `bf16 / fp16 / fp32`。 |
 | `numTemporalProcessFrames` | int | 否 | `121` | temporal clip 长度，必须满足 `(value - 1) % 8 == 0`。 |
 | `restorationGuidanceScale` | float | 否 | `-1.0` | Vivid-VR restoration guidance 参数。 |
 | `upscale` | float | 否 | `1.0` | 原版 Vivid-VR 输入预缩放语义。`0.0` 表示把短边缩放到 `1024`；`1.0` 表示不缩放；其他正数表示按倍率预缩放。 |
-| `enable_teacache` | bool | 否 | `false` | 是否启用 TeaCache。 |
-| `enableFrameInterpolation` | bool | 否 | `false` | 是否启用后处理插帧。 |
-| `frameInterpolationExp` | int | 否 | `1` | 插帧倍数指数，`1=2x`、`2=4x`。 |
-| `frameInterpolationScale` | float | 否 | `1.0` | RIFE 插帧 scale。 |
-| `frameInterpolationModelPath` | string | 否 | 服务默认 | 插帧模型路径。 |
-| `outputQuality` | string | 否 | `default` | 输出压缩质量语义，如 `maximum / high / medium / low / default`。 |
-| `outputCompression` | int | 否 | 由 `outputQuality` 推导 | 直接指定输出压缩级别。 |
-| `perfDumpPath` | string | 否 | 无 | 性能指标 JSON 落盘路径。 |
 
 #### `upscale` 说明
 
@@ -151,13 +125,14 @@ curl -v --fail-with-body -X POST "http://10.51.28.123:30000/v1/videos/repairs/fl
 > - `upscale` 发生在模型读入控制视频之后、进入主推理之前。
 > - 如果目标是复现当前已验收基线，建议显式传 `upscale: 1.0`。
 
-#### caption 来源说明
+#### 服务端固定默认值说明
 
-> **captionFilePath 和 caption bridge 只会走其中一条**
+> **`prompt` 和 `negative_prompt` 当前由服务端固定，不作为对外请求字段**
 >
-> - 传 `captionFilePath`：服务直接使用现成 sidecar caption。
-> - 不传 `captionFilePath`：若服务启动时启用了 `--vividvr-caption-bridge`，会先调用 sidecar 服务生成 caption 文件。
-> - 如果既不传 `captionFilePath`，服务又没有开启 caption bridge，任务仍可被接受，但主链可能缺少 caption sidecar，是否可跑通取决于服务启动配置。
+> - `prompt` 默认读取服务启动参数 `--prompt-file-path` 指向的文本文件。
+> - 当前默认 `prompt` 文件路径是 `/home/zhiheng/Vivid-VR/input/720p/prompt.txt`。
+> - `negative_prompt` 默认值为：
+>   `painting, oil painting, illustration, drawing, art, sketch, oil painting, cartoon, CG Style, 3D render, unreal engine, blurring, dirty, messy, worst quality, low quality, frames, watermark, signature, jpeg artifacts, deformed, lowres, over-smooth`
 
 #### 输出扩展名说明
 
@@ -173,7 +148,6 @@ curl -v --fail-with-body -X POST "http://10.51.28.123:30000/v1/videos/repairs/fl
 >
 > - `input_save_path` 为空：服务使用临时 request workdir；任务完成或取消后会清理输入副本、caption sidecar 和 manifest/progress 文件。
 > - `input_save_path` 非空：服务使用持久 request workdir；服务侧输入缓存会保留。
-> - 无论哪种情况，服务都不会删除调用方原始本地 `video_input_path` 文件。
 
 #### 字段别名
 
@@ -184,24 +158,14 @@ curl -v --fail-with-body -X POST "http://10.51.28.123:30000/v1/videos/repairs/fl
 | `taskId` | `task_id` |
 | `callbackUrl` | `callback_url` |
 | `videoUrl` | `video_url` |
-| `captionFilePath` | `caption_file_path` |
 | `minioConfig` | `minio_config` |
 | `outputStorage` | `output_storage` |
 | `outputPath` | `output_path` |
 | `outputBucket` | `output_bucket` |
 | `outputObjectKey` | `output_object_key` |
 | `numInferenceSteps` | `num_inference_steps` |
-| `guidanceScale` | `guidance_scale` |
-| `generatorDevice` | `generator_device` |
 | `numTemporalProcessFrames` | `num_temporal_process_frames` |
 | `restorationGuidanceScale` | `restoration_guidance_scale` |
-| `enableFrameInterpolation` | `enable_frame_interpolation` |
-| `frameInterpolationExp` | `frame_interpolation_exp` |
-| `frameInterpolationScale` | `frame_interpolation_scale` |
-| `frameInterpolationModelPath` | `frame_interpolation_model_path` |
-| `outputQuality` | `output_quality` |
-| `outputCompression` | `output_compression` |
-| `perfDumpPath` | `perf_dump_path` |
 
 ### 2.4 MinIO / S3 配置
 
@@ -476,8 +440,6 @@ DELETE http://10.51.28.123:30000/v1/videos/repairs/flowcut/{taskId}
 
 以下字段虽然当前请求模型接受，但不建议新接入方依赖它们来驱动语义：
 
-- `prompt`
-  - 当前不会覆盖服务启动时的 `prompt_file_path` 内容。
 - `model`
   - 当前主要用于元信息，不用于切换底层模型实现。
 - `outputStorage`
@@ -495,14 +457,8 @@ DELETE http://10.51.28.123:30000/v1/videos/repairs/flowcut/{taskId}
 - 传 `timeout: -1`
 - 传 `minioConfig`
 - 传 `outputObjectKey`
+- 传 `numInferenceSteps`
+- 传 `numTemporalProcessFrames`
 - 显式传 `upscale: 1.0`
 
 这样最接近当前已验收的外部服务链路。
-
-### 7.2 显式 replay 请求
-
-如果你们已经有固定 caption sidecar，希望绕过 caption bridge 做更稳定的回放验收，则建议再补：
-
-- `captionFilePath`
-
-这样能减少外部 sidecar 服务对结果的影响。
