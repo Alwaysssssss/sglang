@@ -22,6 +22,15 @@ from sglang.multimodal_gen.utils import STR_BACKEND_ENV_VAR, resolve_obj_by_qual
 logger = init_logger(__name__)
 
 
+_ATTENTION_BACKEND_NAME_ALIASES = {
+    "sdpa": "TORCH_SDPA",
+}
+
+
+def _normalize_backend_name_for_enum_lookup(backend_name: str) -> str:
+    return _ATTENTION_BACKEND_NAME_ALIASES.get(backend_name.lower(), backend_name)
+
+
 def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
     """
     Convert a string backend name to a _Backend enum value.
@@ -32,6 +41,7 @@ def backend_name_to_enum(backend_name: str) -> AttentionBackendEnum | None:
             loaded.
     """
     assert backend_name is not None
+    backend_name = _normalize_backend_name_for_enum_lookup(backend_name).upper()
     return (
         AttentionBackendEnum[backend_name]
         if backend_name in AttentionBackendEnum.__members__
@@ -122,10 +132,11 @@ def _cached_get_attn_backend(
         # Check the server arguments for a backend override
         server_args = get_global_server_args()
         if server_args.attention_backend is not None:
+            backend_name = _normalize_backend_name_for_enum_lookup(
+                server_args.attention_backend
+            )
             try:
-                selected_backend = AttentionBackendEnum[
-                    server_args.attention_backend.upper()
-                ]
+                selected_backend = AttentionBackendEnum[backend_name.upper()]
 
             except KeyError:
                 raise ValueError(

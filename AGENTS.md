@@ -15,6 +15,7 @@
   - `Phase D` 长视频 `clip split / merge / temporal orchestration` 语义基线
   - `Phase E` 默认配置、性能组合、服务契约与正式验收基线
 - `Phase E` 的 `130f / 20 step` 长视频 `serve` benchmark、加速消融、默认配置收口与服务语义收口都已完成；当前默认正式配置固定为单卡 `single_gpu_fa_compile` 和双卡 `dual_gpu_fa_eager_compile`。
+- `2026-06-30` 已完成一轮运行时语义清理：双卡 connector control pooling 已从运行时删除，双卡 `SP` 下旧的本地 `native` 错误语义也已删除；当前对外 `--attention-backend` 只保留 `fa` / `sdpa`，双卡运行时统一自动进入同一条 Ulysses 分布式 joint-attention 语义。
 - caption 环境兼容问题已经通过独立 caption bridge / sidecar 路径解决；主推理环境保持在 `/home/zhiheng/sglang/.venv`，caption sidecar 固定使用独立环境 `/home/zhiheng/sglang/.venv-vividvr-caption`。
 - `serve` 服务接口的对外请求契约、对象存储上传、回调、取消、输入清理与进度查询语义已经完成收口，当前实现可正式对外提供服务。
 - 后续默认工作重点不是再补主链缺口，而是在已验收基线上做回归维护、配置守护、问题修复和必要的服务侧增量演进。
@@ -53,6 +54,11 @@
 - 当前 `Phase E` 单卡默认正式配置固定为 `single_gpu_fa_compile`，也就是 `--attention-backend fa` + `--enable-torch-compile`。
 - 当前双卡 `SP` 默认质量口径要求 connector context mode 走 `eager_global`；control pooling 已删除，`eager_global` 现在固定恢复 full global control context。只有在明确做历史 `v1` 对比或性能实验时，才显式切回 `deferred_global`。
 - 当前 `Phase E` 双卡默认正式配置固定为 `dual_gpu_fa_eager_compile`，也就是 `--attention-backend fa` + `SP=2` + `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` + `--enable-torch-compile`；用户侧 `--attention-backend` 只指定 `fa` 或 `sdpa`，双卡 `SP` 下运行时会自动解析到 Ulysses 分布式 joint-attention 语义，对应有效 backend 分别记为 `fa_sp` 或 `sdpa_sp`。
+- 当前 `Phase E` 额外保留一条已验收的双卡兼容验证口径 `dual_gpu_sdpa_eager_compile`。它不是历史 `torch_sdpa -> native` 坏路径的延续，而是“请求 backend 为 `sdpa`，双卡运行时仍走 Ulysses 语义，只把底层 kernel 切到 `sdpa_sp`”。
+- 如果 `Phase E` 后续任务涉及双卡 `attention backend`、`SP` 或 `connector context` 语义，默认要同时保护三条已验收配置：
+  - `single_gpu_fa_compile`
+  - `dual_gpu_fa_eager_compile`
+  - `dual_gpu_sdpa_eager_compile`
 - 单卡正式 benchmark 或正式对比时，必须保证同一时刻只有一个单卡推理进程在跑，避免并发占用把单卡耗时拉长，造成不公平对比。
 - 后续任何服务侧、性能侧或接口侧修改，默认前提都是不能破坏 `Phase C / D / E` 已验收基线。
 - 如果默认参数、后端、服务契约或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。
@@ -148,6 +154,7 @@
 - 当前 `Phase E` 长视频默认配置已经固定为：
   - 单卡：`single_gpu_fa_compile`
   - 双卡：`dual_gpu_fa_eager_compile`
+- 双卡 `sdpa` 现在只作为兼容验证口径保留，不是新的默认配置；对应命令和 `serve` 验收入口统一维护在 `/home/zhiheng/sglang/docs_xzh/run_command/vividvr_default_run_and_serve_commands.md`。
 - 对应的单卡/双卡直接运行命令、`serve` 拉起命令和 `curl` 请求命令统一维护在 `/home/zhiheng/sglang/docs_xzh/run_command/vividvr_default_run_and_serve_commands.md`。
 - 在 `tmux` 中启动的推荐命令如下：
 

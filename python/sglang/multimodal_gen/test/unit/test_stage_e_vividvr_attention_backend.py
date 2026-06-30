@@ -10,6 +10,9 @@ from diffusers.models.attention_processor import CogVideoXAttnProcessor2_0
 from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXBlock
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    backend_name_to_enum,
+)
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
     CogVideoXFlashAttnProcessor,
     CogVideoXNativeAttnProcessor,
@@ -30,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import 
     enable_cogvideox_modulation_fusion,
     inspect_cogvideox_modulation_fusion,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import VividVRPipeline
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import (
     _maybe_torch_compile_module,
@@ -122,6 +126,13 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         self.assertEqual(normalize_cogvideox_attention_backend("sdpa"), "sdpa")
         self.assertEqual(
             normalize_cogvideox_attention_backend("sage_attn"), "sage_attn"
+        )
+
+    def test_selector_accepts_sdpa_alias(self):
+        self.assertEqual(backend_name_to_enum("sdpa"), AttentionBackendEnum.TORCH_SDPA)
+        self.assertEqual(
+            backend_name_to_enum("torch_sdpa"),
+            AttentionBackendEnum.TORCH_SDPA,
         )
 
     def test_set_attention_backend_replaces_processors_for_fa_and_sdpa(self):
