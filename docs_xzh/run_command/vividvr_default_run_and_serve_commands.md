@@ -9,8 +9,8 @@
 - 本地 `offline / benchmark` 默认 `upscale=1.0`，与原版 `/home/zhiheng/Vivid-VR` 的 `up1` 语义对齐
 - 双卡默认质量口径固定：
   - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`
-  - `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`
-  - 请求侧 `--attention-backend fa`，双卡 `SP=2` 运行时有效 backend 记为 `fa_sp`
+  - control pooling 已删除，`eager_global` 现在固定恢复 full global control context
+  - 请求侧 `--attention-backend` 只指定 `fa` 或 `sdpa`；双卡 `SP=2` 运行时自动进入 Ulysses 语义，对应有效 backend 记为 `fa_sp` 或 `sdpa_sp`
 
 共同输入：
 
@@ -71,7 +71,7 @@ tmux attach -r -t vividvr_single_default
 
 ```bash
 tmux new-session -d -s vividvr_dual_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && /home/zhiheng/sglang/.venv/bin/torchrun --nproc_per_node=2 --master_port=30062 python/sglang/multimodal_gen/tools/run_vividvr_inference.py \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && /home/zhiheng/sglang/.venv/bin/torchrun --nproc_per_node=2 --master_port=30062 python/sglang/multimodal_gen/tools/run_vividvr_inference.py \
     --input-video /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4 \
     --caption-file /home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt \
     --prompt-file /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
@@ -181,7 +181,7 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
@@ -226,7 +226,7 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31191/health
 
 ```bash
 tmux new-session -d -s vividvr_serve_single_default \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/result_videos/service_benchmark Vivid_Acceptance/captions/service_sidecars && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \

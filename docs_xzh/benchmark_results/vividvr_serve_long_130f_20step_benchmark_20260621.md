@@ -13,7 +13,7 @@
 - 哪些组合虽然更快，但已经偏离单卡质量基线。
 - 哪个双卡组合作为默认配置最合适。
 
-本轮正式结论只保留 `dual eager_global + pool=1` 口径，不再纳入 `deferred_global`。原因很直接：当前只有 `eager_global` 的双卡路径能稳定保持与单卡基本一致的质量。
+本轮正式结论只保留 `dual eager_global` 口径，不再纳入 `deferred_global`。这份文档记录的是 `2026-06-21` 当时的历史 benchmark：彼时运行时还暴露 `control pool` 开关，因此表格里仍会看到 `pool=1`。自 `2026-06-30` 起，control pooling 已从运行时删除，`eager_global` 现在固定恢复 full global control context。
 
 ## 2. 固定测试条件
 
@@ -37,12 +37,12 @@
 - 正式 benchmark 只统计第 2 次请求，`warmup` 时间不计入正式结果。
 - 单卡正式验收严格串行执行，同一时刻只允许 1 个推理进程，避免双进程抢占导致单卡数据失真。
 - 本文采用的单卡数据全部来自串行重跑结果。更早那轮并行单卡尝试已经废弃，不计入任何正式结论。
-- 双卡全部固定 `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` 与 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`。
+- 双卡全部固定 `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`。历史 benchmark 当时还显式带 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`，但该开关现已删除。
 
 ### 2.4 术语说明
 
-- 文中 `sdpa` 是表格简写；实际服务启动参数使用的是 `--attention-backend torch_sdpa`。
-- 文中双卡 `fa` 组表示“请求 backend 为 `fa`”；在 `SP=2` 下运行时实际走的是 `fa_sp` 路径。
+- 文中 `sdpa` 是表格简写；当时实际服务启动参数使用的是 `--attention-backend torch_sdpa`。在 `2026-06-21` 这轮历史 benchmark 里，双卡 `torch_sdpa` 仍会错误落到本地 `native` 语义，因此出现明显 SSIM 漂移；`2026-06-30` 清理后，双卡 `sdpa` 应解析到正确的 `sdpa_sp` 语义。
+- 文中双卡 `fa` 组表示“请求 backend 为 `fa`”；在 `SP=2` 下运行时实际走的是 `fa_sp` 路径。`2026-06-30` 之后，对外请求仍只指定 `fa/sdpa`，双卡运行时统一自动进入同一条 Ulysses 分布式语义。
 
 ## 3. 环境信息
 
@@ -62,7 +62,7 @@
 
 ## 4. 正式配置矩阵
 
-| 标识 | GPU | attention backend | context mode | compile | control pool | 备注 |
+| 标识 | GPU | attention backend | context mode | compile | historical control pool | 备注 |
 | --- | ---: | --- | --- | --- | ---: | --- |
 | `single_gpu_sdpa_no_compile` | 1 | `torch_sdpa` | `N/A` | off | 1 | 单卡串行正式值 |
 | `single_gpu_fa_no_compile` | 1 | `fa` | `N/A` | off | 1 | 单卡串行正式值 |
@@ -159,7 +159,7 @@
 
 - `SP=2`
 - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`
-- `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`
+- control pooling 已删除；当前 `eager_global` 固定恢复 full global control context
 - `attention backend = fa`，运行时实际进入 `fa_sp`
 - `torch.compile = on`
 
@@ -183,7 +183,7 @@
 - `dual_gpu_sdpa_eager_no_compile`
 - `dual_gpu_sdpa_eager_compile`
 
-这两组虽然更快，但 `ssim_mean` 都跌到 `0.966x`，与单卡基线不再属于“基本一致”的质量水平，因此不应作为默认推理模式。
+这两组在 `2026-06-21` 这轮历史 benchmark 中虽然更快，但 `ssim_mean` 都跌到 `0.966x`，与单卡基线不再属于“基本一致”的质量水平，因此当时不应作为默认推理模式。`2026-06-30` 之后，双卡 `sdpa` 已不应再复用这条历史坏路径；若再次验证，预期应落到正确的 `sdpa_sp` 语义簇。
 
 ## 11. 产物与脚本
 
@@ -221,4 +221,4 @@
 - 双卡质量安全纯推理加速：`1.7644x`
 - 双卡最快但不推荐默认的激进配置：`dual_gpu_sdpa_eager_compile`
 
-如果后续只允许保留一条双卡默认路径，应直接固定为 `FA + eager_global + pool=1 + compile`，而不是继续使用 `sdpa` 路径追求更高但不稳定的表观速度。
+如果后续只允许保留一条双卡默认路径，应直接固定为 `FA + eager_global + compile`，而不是继续使用 `sdpa` 路径追求更高但不稳定的表观速度。`pool=1` 只属于这份历史 benchmark 生成时的旧运行时写法，不再是当前契约。

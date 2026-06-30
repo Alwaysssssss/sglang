@@ -51,8 +51,8 @@
   - 在新增需求进入主线前，先确认是否会破坏既有正式服务口径
 - 当前 `Phase E` 日常 benchmark 默认固定为与 `Phase D` 相同 reference 对象的 `130f / 20 step` 长视频口径；`50 step` 只保留给阶段性最终回归。
 - 当前 `Phase E` 单卡默认正式配置固定为 `single_gpu_fa_compile`，也就是 `--attention-backend fa` + `--enable-torch-compile`。
-- 当前双卡 `SP` 默认质量口径要求 connector context mode 走 `eager_global`，并保持 `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`；也就是默认恢复 full global control context，且默认不启用 control pooling。只有在明确做历史 `v1` 对比或性能实验时，才显式切回 `deferred_global` 或打开 pool 压缩。
-- 当前 `Phase E` 双卡默认正式配置固定为 `dual_gpu_fa_eager_compile`，也就是 `--attention-backend fa` + `SP=2` + `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` + `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1` + `--enable-torch-compile`；在双卡 `SP` 下运行时有效 backend 记为 `fa_sp`。
+- 当前双卡 `SP` 默认质量口径要求 connector context mode 走 `eager_global`；control pooling 已删除，`eager_global` 现在固定恢复 full global control context。只有在明确做历史 `v1` 对比或性能实验时，才显式切回 `deferred_global`。
+- 当前 `Phase E` 双卡默认正式配置固定为 `dual_gpu_fa_eager_compile`，也就是 `--attention-backend fa` + `SP=2` + `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` + `--enable-torch-compile`；用户侧 `--attention-backend` 只指定 `fa` 或 `sdpa`，双卡 `SP` 下运行时会自动解析到 Ulysses 分布式 joint-attention 语义，对应有效 backend 分别记为 `fa_sp` 或 `sdpa_sp`。
 - 单卡正式 benchmark 或正式对比时，必须保证同一时刻只有一个单卡推理进程在跑，避免并发占用把单卡耗时拉长，造成不公平对比。
 - 后续任何服务侧、性能侧或接口侧修改，默认前提都是不能破坏 `Phase C / D / E` 已验收基线。
 - 如果默认参数、后端、服务契约或回归指标发生变化，必须同步更新文档和 `AGENTS.md`。

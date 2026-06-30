@@ -20,7 +20,7 @@
   - `--attention-backend fa`
   - `--sp-degree 2`
   - `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`
-  - `SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1`
+  - control pooling 已删除，`eager_global` 固定恢复 full global control context
   - `--enable-torch-compile`
 - 正式请求必须传 `callbackUrl`
 - 如果希望“默认不保留本地结果”真正成立，请求方必须传 `minioConfig`
@@ -97,7 +97,7 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_formal \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
@@ -148,7 +148,7 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31191/health
 
 ```bash
 tmux new-session -d -s vividvr_serve_single_formal \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_CONTROL_POOL_SIZE=1 && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && CUDA_VISIBLE_DEVICES=0 /home/zhiheng/sglang/.venv/bin/sglang serve \
     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
     --model-id VividVR \
     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
