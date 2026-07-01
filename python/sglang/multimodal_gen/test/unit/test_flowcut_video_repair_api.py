@@ -122,12 +122,40 @@ def test_build_vividvr_kwargs_keeps_phase_e_defaults_optional(tmp_path):
 
     assert kwargs["request_id"] == "job-1"
     assert kwargs["video_input_path"] == "/tmp/input.mp4"
-    assert kwargs["prompt"] == "restore the video"
     assert kwargs["caption_source"] == "caption_file"
     assert kwargs["caption_file_path"] == "/tmp/caption.txt"
+    assert "prompt" not in kwargs
+    assert "prompt_file_path" not in kwargs
     assert "reference_video_path" not in kwargs
     assert kwargs["num_inference_steps"] == 20
     assert kwargs["seed"] == 42
+
+
+def test_build_vividvr_kwargs_caption_file_mode_does_not_require_prompt_file(tmp_path):
+    server_args = SimpleNamespace(
+        prompt_file_path=None,
+        pipeline_config=SimpleNamespace(default_prompt_file_path=None),
+    )
+    req = VideoRepairRequest(
+        task_id="job-1",
+        video_input_path="/tmp/input.mp4",
+        caption_file_path="/tmp/caption.txt",
+        seed=42,
+    )
+
+    kwargs = video_repair_shared.build_vividvr_repair_kwargs(
+        request_id="job-1",
+        req=req,
+        server_args=server_args,
+        video_input_path="/tmp/input.mp4",
+        output_dir=str(tmp_path),
+        output_file_name="job-1.mp4",
+    )
+
+    assert kwargs["caption_source"] == "caption_file"
+    assert kwargs["caption_file_path"] == "/tmp/caption.txt"
+    assert "prompt" not in kwargs
+    assert "prompt_file_path" not in kwargs
 
 
 def test_build_vividvr_kwargs_forwards_original_upscale_contract(tmp_path):

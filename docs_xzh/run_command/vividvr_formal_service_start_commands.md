@@ -117,7 +117,6 @@ tmux new-session -d -s vividvr_serve_dual_formal \
     --strict-ports \
     --input-save-path "" \
     --output-path "" \
-    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
     --vividvr-caption-bridge \
     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
     --vividvr-caption-sidecar-timeout 1800 \
@@ -141,6 +140,8 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31191/health
 ```json
 {"status":"ok"}
 ```
+
+当前正式 bridge 服务不再要求 `--prompt-file-path`。如果 caption sidecar 成功产出 caption 文件，主服务会直接以该文件为 prompt 来源。
 
 ## 6. 可选：正式单卡主服务
 
@@ -167,7 +168,6 @@ tmux new-session -d -s vividvr_serve_single_formal \
     --strict-ports \
     --input-save-path "" \
     --output-path "" \
-    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
     --vividvr-caption-bridge \
     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
     --vividvr-caption-sidecar-timeout 1800 \

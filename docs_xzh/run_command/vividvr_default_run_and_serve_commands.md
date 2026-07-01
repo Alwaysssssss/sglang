@@ -200,7 +200,6 @@ tmux new-session -d -s vividvr_serve_dual_default \
     --scheduler-port 56191 \
     --strict-ports \
     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
     --vividvr-caption-bridge \
     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
@@ -219,6 +218,8 @@ tmux attach -r -t vividvr_serve_dual_default
 ```bash
 curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31191/health
 ```
+
+当前 `--vividvr-caption-bridge` 服务链路不再要求 `--prompt-file-path`。bridge 成功后，主服务直接使用 sidecar 生成的 `caption_file_path` 作为 prompt 来源。
 
 ### 3.4 单卡主服务命令
 
@@ -245,7 +246,6 @@ tmux new-session -d -s vividvr_serve_single_default \
     --scheduler-port 56190 \
     --strict-ports \
     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-    --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
     --vividvr-caption-bridge \
     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \

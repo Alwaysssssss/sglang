@@ -90,12 +90,9 @@ def build_vividvr_repair_kwargs(
     output_dir: str,
     output_file_name: str,
 ) -> Dict[str, Any]:
-    vividvr_prompt_file_path = _resolve_vividvr_prompt_file_path(server_args)
     vividvr_kwargs = {
         "request_id": request_id,
         "video_input_path": video_input_path,
-        "prompt": read_prompt_file(vividvr_prompt_file_path),
-        "prompt_file_path": vividvr_prompt_file_path,
         "output_path": output_dir,
         "output_file_name": output_file_name,
         "seed": req.seed,
@@ -108,6 +105,10 @@ def build_vividvr_repair_kwargs(
         "upscaling_scale": req.upscaling_scale,
         "perf_dump_path": req.perf_dump_path,
     }
+    if req.caption_file_path is None:
+        vividvr_prompt_file_path = _resolve_vividvr_prompt_file_path(server_args)
+        vividvr_kwargs["prompt"] = read_prompt_file(vividvr_prompt_file_path)
+        vividvr_kwargs["prompt_file_path"] = vividvr_prompt_file_path
     if req.output_quality not in (None, "default"):
         vividvr_kwargs["output_quality"] = req.output_quality
     if req.negative_prompt is not None:

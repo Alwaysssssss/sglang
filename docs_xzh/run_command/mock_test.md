@@ -188,13 +188,14 @@ tmux new-session -d -s vividvr_flowcut_bridge_mock_service \
      --strict-ports \
      --input-save-path "" \
      --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
-     --prompt-file-path /home/zhiheng/Vivid-VR/input/720p/prompt.txt \
      --vividvr-caption-bridge \
      --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
      --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
      --vividvr-caption-sidecar-timeout 1800 \
      2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_bridge_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
+
+这里故意不再传 `--prompt-file-path`。当前 bridge 链路下，主服务会直接消费 caption sidecar 产出的 `caption_file_path`，不再要求服务启动时预置固定 `prompt.txt`。
 
 健康检查：
 

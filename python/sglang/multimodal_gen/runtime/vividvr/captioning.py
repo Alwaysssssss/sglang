@@ -51,16 +51,9 @@ def _caption_file_context(
 ) -> dict[str, Any]:
     caption_file_path = resolve_caption_file_path(params)
     caption_texts = read_caption_file(caption_file_path)
-    prompt_file_path = None
-    if (
-        params.prompt_file_path is not None
-        or params.prompt_path is not None
-        or pipeline_config.default_prompt_file_path is not None
-    ):
-        prompt_file_path = resolve_prompt_file_path(params, pipeline_config)
 
     return {
-        "prompt_file_path": prompt_file_path,
+        "prompt_file_path": None,
         "caption_file_path": caption_file_path,
         "caption_texts": caption_texts,
         "prompt_text": caption_texts[0],

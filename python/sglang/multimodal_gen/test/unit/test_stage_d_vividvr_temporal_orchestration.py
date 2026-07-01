@@ -522,6 +522,7 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         self.assertEqual(prompt_context["caption_backend"], "caption_file")
         self.assertEqual(prompt_context["caption_file_path"], str(caption_file))
         self.assertEqual(prompt_context["caption_texts"], ["caption a", "caption b"])
+        self.assertIsNone(prompt_context["prompt_file_path"])
         self.assertTrue(prompt_context["model_prompt_text"].startswith("caption a "))
 
     def test_postprocess_module_fallback_returns_original_output(self):

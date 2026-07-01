@@ -127,6 +127,7 @@
 - 做原版 `Vivid-VR` 公平对比时，必须优先保证原版 caption 语义正确；如果 `sglang` 环境里的 `transformers` 版本会导致 `CogVLM2` caption 异常，禁止继续用 `sglang` 的环境跑原版。
 - 解决 caption 环境不兼容时，禁止为了让 caption 在 `sglang/.venv` 内运行而随意降级或替换主推理依赖；应保持 sidecar 作为 `sglang` 仓库内代码启动的独立 HTTP 服务，并固定使用 `/home/zhiheng/sglang/.venv-vividvr-caption`。
 - caption bridge 的输出应统一保存为 sidecar caption 文件，并由 `sglang` 原生 Vivid-VR 推理链消费；不要让 `sglang` 推理运行时直接依赖原版仓库的运行时代码。
+- 当前 `--vividvr-caption-bridge` 服务链路下，主服务不再要求 `--prompt-file-path`；如果 sidecar 已成功产出 `caption_file_path`，该 caption 文件就是唯一 prompt 来源，不应再把固定 `prompt.txt` 与用户视频请求绑定。
 - caption bridge 验收至少要确认 sidecar 行数、顺序与 temporal clip 切分一致，并用已有 Phase C/D/E 轻量回归确认没有破坏主推理路径。
 
 ## 在 tmux 中做推理验收

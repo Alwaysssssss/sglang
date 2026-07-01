@@ -183,6 +183,25 @@ class TestSamplingParamsSubclass(unittest.TestCase):
         self.assertEqual(params.prompt_path, "/tmp/server_prompt.txt")
         self.assertEqual(params.prompt_file_path, "/tmp/server_prompt.txt")
 
+    def test_vividvr_from_user_kwargs_caption_file_mode_clears_prompt_file_defaults(self):
+        server_args = SimpleNamespace(
+            pipeline_config=VividVRPipelineConfig(),
+            output_path=None,
+            num_gpus=1,
+            comfyui_mode=False,
+            prompt_file_path="/tmp/server_prompt.txt",
+        )
+
+        params = VividVRSamplingParams.from_user_kwargs(
+            server_args,
+            video_input_path="/tmp/input.mp4",
+            caption_file_path="/tmp/captions.txt",
+        )
+
+        self.assertEqual(params.caption_source, "caption_file")
+        self.assertIsNone(params.prompt_path)
+        self.assertIsNone(params.prompt_file_path)
+
     def test_output_file_name_supports_callable_teacache_params(self):
         def coefficients_callback(_: TeaCacheParams) -> list[float]:
             return [1.0, 2.0, 3.0, 4.0, 5.0]

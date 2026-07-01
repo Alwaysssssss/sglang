@@ -206,7 +206,10 @@ class VividVRSamplingParams(SamplingParams):
     def from_user_kwargs(cls, server_args, *args, **kwargs) -> "VividVRSamplingParams":
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
-        if (
+        if user_kwargs.get("caption_file_path") not in (None, ""):
+            user_kwargs.setdefault("prompt_path", None)
+            user_kwargs.setdefault("prompt_file_path", None)
+        elif (
             "prompt_path" not in user_kwargs
             and "prompt_file_path" not in user_kwargs
             and getattr(server_args, "prompt_file_path", None) is not None
