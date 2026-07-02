@@ -1,11 +1,6 @@
 
 # Wan VideoEdit推理流程对比
 
-- SGLang pipeline：`python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py`
-- SGLang stages：`python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py`
-- SGLang VideoEdit runtime：`python/sglang/multimodal_gen/runtime/videoedit/`
-- SGLang DiT/VAE：`python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py`、`wan_videoedit.py`、`runtime/models/vaes/wanvae.py`
-
 
 ## VideoEdit原始算法仓库的实现
 
@@ -27,11 +22,27 @@ python3 infer.py --output_dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/
 
 result.mp4
 
+该算法已经在其他机器完成运行，在这个环境中之需要使用即可，不需要在运行
+
 
 
 ## sglang VideoEdit 
 
+- SGLang pipeline：`python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py`
+- SGLang stages：`python/sglang/multimodal_gen/runtime/pipelines_core/stages/model_specific_stages/videoedit_wan.py`
+- SGLang VideoEdit runtime：`python/sglang/multimodal_gen/runtime/videoedit/`
+- SGLang DiT/VAE：`python/sglang/multimodal_gen/runtime/models/dits/wanvideo.py`、`wan_videoedit.py`、`runtime/models/vaes/wanvae.py`
+
 ```bash
+source /mnt/shanhai-ai/shanhai-workspace/zhouhao6/env/sglang/bin/activate
+cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
+
+需完善参数，保证和
+
+python3 infer.py --output_dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/compare/origin_video_edit_diffusers --output_name result --chunks 1 --clip_preprocess diffsynth
+
+这个参数一致
+
 python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --model-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model \
   --transformer-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/video_diffusers/pretrain_models/VideoEdit-diffusers-model/transformer \
@@ -40,38 +51,20 @@ python -m sglang.multimodal_gen.runtime.videoedit.cli repair \
   --mask-input-path /mnt/shanhai-ai/liuh/VideoEdit-diffusers/test_videos/lh/mask_1080_merged.mp4 \
   --reference-image-path /mnt/shanhai-ai/liuh/VideoEdit-diffusers/test_videos/lh/reg.png \
   --output-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/compare \
-  --output-file-name sglang_wan_videoedit_mp4 \
+  --output-file-name result \
   --num-gpus 2 \
   --sp-degree 2 \
   --num-frames 80 \
   --infer-len 81 \
-  --overlap 10 \
-  --num-inference-steps 40 \
-  --guidance-scale 5.0 \
-  --seed 42 \
-  --generator-device cpu \
-  --dtype bf16 \
-  --bbox-expand-scale 0.3 \
-  --dilate-px 0 \
-  --mask-scale 1.0 \
-  --bbox-padding 0 \
-  --feather-px 0 \
-  --adain-boundary-dilate 0 \
-  --enable-paste-back \
-  --no-drop-reference-frame \
-  --use-clip \
-  --use-repaired-context \
-  --init-latent-mode noise \
-  --mask-downsample-mode nearest \
-  --overlap-commit-mode native_skip \
-  --tail-padding-mode native_reverse_mirror \
-  --decode-mode stream \
-  --no-enable-torch-compile \
-  --no-enable-frame-interpolation \
-  --no-enable-upscaling \
+  --overlap 9 \
+  --num-inference-steps 10 \
   --warmup \
   --warmup-steps 1 \
   --perf-dump-path /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/outputs/1080p_videoedit_perf_1gpu_default.json
 ```
 
-##  VideoEdit-diffusers 运行环境
+## 对比方案
+
+- 原始算法已经完成运行，只对比最后视频结果
+  - 注意首帧问题，可能原始算法首帧没有剔除，需要通过源码判断
+  
