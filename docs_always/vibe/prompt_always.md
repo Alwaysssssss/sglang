@@ -398,4 +398,21 @@ export HTTPS_PROXY="http://localhost:10909"
 export ALL_PROXY="http://localhost:10909"
 codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers
 
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/shanhai-workspace/zhouhao6/VideoEdit-diffusers
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+codex --dangerously-bypass-approvals-and-sandbox --add-dir /mnt/shanhai-ai/liuh/VideoEdit-diffusers
+
+export HTTP_PROXY="http://localhost:10909"
+export HTTPS_PROXY="http://localhost:10909"
+export ALL_PROXY="http://localhost:10909"
+curl -fsSL https://github.com/SaladDay/cc-switch-cli/releases/latest/download/install.sh | bash
+
+
+
 

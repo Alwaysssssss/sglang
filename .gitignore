@@ -292,3 +292,5 @@ wheel/
 
 tmp/
 output_tyx/
+
+*.python-version
