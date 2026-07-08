@@ -16,8 +16,6 @@ RUN apt-get update && apt-get install -y sudo && \
 # Set up oh-my-zsh for devuser
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
-    cp /root/.vimrc /home/devuser/.vimrc && \
-    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
     sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
     chown -R devuser:devuser /home/devuser/
 
@@ -32,4 +30,8 @@ USER devuser
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install rust
+
+ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
+
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
