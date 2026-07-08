@@ -9,6 +9,44 @@ from sglang.multimodal_gen.tools.run_vividvr_inference import (
 
 
 class TestVividVRRuntimeSnapshot(unittest.TestCase):
+    def test_runtime_snapshot_includes_sp4_fields(self):
+        args = Namespace(
+            attention_backend="fa",
+            use_runai_model_streamer=None,
+            use_vividvr_vae_decode_tiling=False,
+        )
+        server_args = ServerArgs(model_path="/tmp/model", disable_autocast=False)
+        server_args.pipeline_config.vae_tiling = False
+
+        snapshot = build_runtime_config_snapshot(
+            args=args,
+            server_args=server_args,
+            debug={
+                "enable_sequence_shard": True,
+                "sp_world_size": 4,
+                "sp_rank": 0,
+                "sp_sequence_tokens_global": 17552,
+                "sp_sequence_tokens_local": 4388,
+                "sp_sequence_tokens_pad": 0,
+                "connector_context_mode": "sp_exact_distributed_control_attention",
+                "denoise_loop_local_compute_ms": 18234.5,
+                "denoise_loop_sp_comm_ms": 3112.0,
+            },
+        )
+
+        self.assertTrue(snapshot["enable_sequence_shard"])
+        self.assertEqual(snapshot["sp_world_size"], 4)
+        self.assertEqual(snapshot["sp_rank"], 0)
+        self.assertEqual(snapshot["sp_sequence_tokens_global"], 17552)
+        self.assertEqual(snapshot["sp_sequence_tokens_local"], 4388)
+        self.assertEqual(snapshot["sp_sequence_tokens_pad"], 0)
+        self.assertEqual(
+            snapshot["connector_context_mode"],
+            "sp_exact_distributed_control_attention",
+        )
+        self.assertEqual(snapshot["denoise_loop_local_compute_ms"], 18234.5)
+        self.assertEqual(snapshot["denoise_loop_sp_comm_ms"], 3112.0)
+
     def test_runtime_snapshot_includes_e31_e32_helper_fields(self):
         args = Namespace(
             attention_backend="fa",
