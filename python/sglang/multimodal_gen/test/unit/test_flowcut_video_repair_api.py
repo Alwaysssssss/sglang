@@ -8,6 +8,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
+from sglang.multimodal_gen.configs.pipeline_configs.vividvr import (
+    VividVRPipelineConfig,
+)
 from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_repair_shared
 from sglang.multimodal_gen.runtime.entrypoints.openai import vividvr_flowcut_api
@@ -15,6 +19,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import VideoRepai
 from sglang.multimodal_gen.runtime.entrypoints.openai.vividvr_flowcut_protocol import (
     FlowCutMinIOConfig,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def _make_test_client():
@@ -26,13 +31,17 @@ def _make_test_client():
 def _make_vivid_server_args(tmp_path, *, prompt_file=None, **overrides):
     prompt_file = prompt_file or tmp_path / "prompt.txt"
     prompt_file.write_text("restore the video", encoding="utf-8")
+    pipeline_config = VividVRPipelineConfig(default_prompt_file_path=str(prompt_file))
     values = {
         "input_save_path": str(tmp_path / "flowcut_work"),
         "output_path": str(tmp_path / "outputs"),
         "prompt_file_path": str(prompt_file),
-        "pipeline_config": SimpleNamespace(default_prompt_file_path=str(prompt_file)),
+        "pipeline_config": pipeline_config,
         "model_id": "vividvr",
         "pipeline_class_name": "CogVideoXVividVRControlNetPipeline",
+        "num_gpus": 1,
+        "comfyui_mode": False,
+        "attention_backend_config": SimpleNamespace(VSA_sparsity=0.0),
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -156,6 +165,53 @@ def test_build_vividvr_kwargs_caption_file_mode_does_not_require_prompt_file(tmp
     assert kwargs["caption_file_path"] == "/tmp/caption.txt"
     assert "prompt" not in kwargs
     assert "prompt_file_path" not in kwargs
+
+
+def test_prepare_request_accepts_caption_file_mode_without_prompt(tmp_path):
+    server_args = _make_vivid_server_args(tmp_path)
+    req = VideoRepairRequest(
+        task_id="job-1",
+        video_input_path="/tmp/input.mp4",
+        caption_file_path="/tmp/caption.txt",
+        seed=42,
+    )
+
+    kwargs = video_repair_shared.build_vividvr_repair_kwargs(
+        request_id="job-1",
+        req=req,
+        server_args=server_args,
+        video_input_path="/tmp/input.mp4",
+        output_dir=str(tmp_path),
+        output_file_name="job-1.mp4",
+    )
+    sampling_params = VividVRSamplingParams.from_user_kwargs(server_args, **kwargs)
+
+    batch = prepare_request(server_args=server_args, sampling_params=sampling_params)
+
+    assert batch.prompt == ""
+    assert batch.caption_file_path == "/tmp/caption.txt"
+
+
+def test_retrieve_vividvr_flowcut_video_repair_allows_fractional_progress():
+    client = _make_test_client()
+
+    async def seed_job():
+        await vividvr_flowcut_api.VIDEO_STORE.upsert(
+            "task-fractional-progress",
+            {
+                "id": "task-fractional-progress",
+                "status": "running",
+                "progress": 9.5,
+                "created_at": 123,
+            },
+        )
+
+    asyncio.run(seed_job())
+
+    response = client.get("/v1/videos/repairs/flowcut/task-fractional-progress")
+
+    assert response.status_code == 200
+    assert response.json()["progress"] == 9.5
 
 
 def test_build_vividvr_kwargs_forwards_original_upscale_contract(tmp_path):

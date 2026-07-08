@@ -4,6 +4,73 @@ set -euo pipefail
 REPO_ROOT="/home/zhiheng/sglang"
 VENV_PATH="${REPO_ROOT}/.venv-vividvr-caption"
 REQUIREMENTS_PATH="${REPO_ROOT}/python/requirements-vividvr-caption.txt"
+PYPI_INDEX_URL="${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+PYTORCH_OFFICIAL_INDEX_URL="https://download.pytorch.org/whl/cu121"
+PYTORCH_EXTRA_INDEX_URL="${PYTORCH_EXTRA_INDEX_URL:-${PYTORCH_OFFICIAL_INDEX_URL}}"
+BITSANDBYTES_VERSION="${BITSANDBYTES_VERSION:-0.44.1}"
+BITSANDBYTES_INDEX_URL="${BITSANDBYTES_INDEX_URL:-${PYPI_INDEX_URL}}"
+BITSANDBYTES_WHEEL_PATH="${BITSANDBYTES_WHEEL_PATH:-}"
+PYTHON_DEV_HEADERS_ROOT="${PYTHON_DEV_HEADERS_ROOT:-${HOME}/tmp_py310_headers}"
+
+NO_PROXY_ENV=(
+  env
+  -u http_proxy
+  -u https_proxy
+  -u HTTP_PROXY
+  -u HTTPS_PROXY
+  -u all_proxy
+  -u ALL_PROXY
+  -u no_proxy
+  -u NO_PROXY
+)
+
+ensure_python_dev_headers() {
+  local version="3.10"
+  local package="libpython${version}-dev"
+  local extract_root="${PYTHON_DEV_HEADERS_ROOT}/extracted/${package}"
+  local include_dir="${extract_root}/usr/include/python${version}"
+  local deb_dir="${PYTHON_DEV_HEADERS_ROOT}/debs"
+
+  if [[ -f "${include_dir}/Python.h" ]]; then
+    return 0
+  fi
+
+  if ! command -v apt >/dev/null 2>&1; then
+    echo "apt is not available; cannot fetch ${package} without sudo" >&2
+    return 1
+  fi
+
+  if ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "dpkg-deb is not available; cannot extract ${package}" >&2
+    return 1
+  fi
+
+  mkdir -p "${deb_dir}" "${extract_root}"
+
+  (
+    cd "${deb_dir}"
+    rm -f "${package}"_*.deb
+    "${NO_PROXY_ENV[@]}" apt download "${package}"
+  )
+
+  local deb_path
+  deb_path="$(find "${deb_dir}" -maxdepth 1 -name "${package}_*.deb" | head -n 1)"
+  if [[ -z "${deb_path}" ]]; then
+    echo "failed to download ${package}" >&2
+    return 1
+  fi
+
+  rm -rf "${extract_root}"
+  mkdir -p "${extract_root}"
+  dpkg-deb -x "${deb_path}" "${extract_root}"
+
+  if [[ ! -f "${include_dir}/Python.h" ]]; then
+    echo "downloaded ${package}, but Python.h is still missing" >&2
+    return 1
+  fi
+
+  echo "Prepared Python dev headers at ${extract_root}"
+}
 
 if [[ ! -f "${REQUIREMENTS_PATH}" ]]; then
   echo "requirements file not found: ${REQUIREMENTS_PATH}" >&2
@@ -27,7 +94,8 @@ else
 fi
 
 if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
-  "${UV_BIN}" venv \
+  "${NO_PROXY_ENV[@]}" "${UV_BIN}" venv \
+    --default-index "${PYPI_INDEX_URL}" \
     --seed \
     --python "${PYTHON_BOOTSTRAP}" \
     "${VENV_PATH}"
@@ -47,16 +115,52 @@ fi
 
 printf '%s\n' "${REPO_ROOT}/python" > "${SITE_PACKAGES_PATH}/sglang_local_repo.pth"
 
-"${UV_BIN}" pip install \
+TEMP_REQUIREMENTS_PATH="$(mktemp)"
+trap 'rm -f "${TEMP_REQUIREMENTS_PATH}"' EXIT
+awk \
+  -v pytorch_extra_index_url="${PYTORCH_EXTRA_INDEX_URL}" \
+  -v pytorch_official_index_url="${PYTORCH_OFFICIAL_INDEX_URL}" '
+    $0 == "--extra-index-url https://download.pytorch.org/whl/cu121" {
+      print "--extra-index-url " pytorch_extra_index_url
+      if (pytorch_extra_index_url != pytorch_official_index_url) {
+        print "--extra-index-url " pytorch_official_index_url
+      }
+      next
+    }
+    $0 == "bitsandbytes==0.44.1" {
+      next
+    }
+    { print }
+  ' "${REQUIREMENTS_PATH}" > "${TEMP_REQUIREMENTS_PATH}"
+
+"${NO_PROXY_ENV[@]}" "${UV_BIN}" pip install \
   --python "${VENV_PATH}/bin/python" \
   --upgrade \
+  --index-url "${PYPI_INDEX_URL}" \
   --index-strategy unsafe-best-match \
   pip setuptools wheel
 
-"${UV_BIN}" pip install \
+echo "Installing caption dependencies from ${PYPI_INDEX_URL} with PyTorch index ${PYTORCH_EXTRA_INDEX_URL}"
+"${NO_PROXY_ENV[@]}" "${UV_BIN}" pip install \
   --python "${VENV_PATH}/bin/python" \
+  --index-url "${PYPI_INDEX_URL}" \
   --index-strategy unsafe-best-match \
-  -r "${REQUIREMENTS_PATH}"
+  -r "${TEMP_REQUIREMENTS_PATH}"
+
+if [[ -n "${BITSANDBYTES_WHEEL_PATH}" ]]; then
+  echo "Installing bitsandbytes from local wheel ${BITSANDBYTES_WHEEL_PATH}"
+  "${NO_PROXY_ENV[@]}" "${UV_BIN}" pip install \
+    --python "${VENV_PATH}/bin/python" \
+    --no-deps \
+    "${BITSANDBYTES_WHEEL_PATH}"
+else
+  echo "Installing bitsandbytes ${BITSANDBYTES_VERSION} from ${BITSANDBYTES_INDEX_URL}"
+  "${NO_PROXY_ENV[@]}" "${UV_BIN}" pip install \
+    --python "${VENV_PATH}/bin/python" \
+    --index-url "${BITSANDBYTES_INDEX_URL}" \
+    --index-strategy unsafe-best-match \
+    "bitsandbytes==${BITSANDBYTES_VERSION}"
+fi
 
 # Match the original Vivid-VR caption runtime even though the latest wheel
 # metadata now advertises a stricter numpy floor than the working upstream env.
@@ -70,19 +174,26 @@ ORIG_SITE_PACKAGES="/home/zhiheng/Vivid-VR/.venv/lib/python3.10/site-packages"
 OPENCV_SOURCE_DIR=""
 OPENCV_DIST_INFO_DIR=""
 OPENCV_LIBS_DIR=""
-if [[ -d "${ORIG_SITE_PACKAGES}/cv2" && -d "${ORIG_SITE_PACKAGES}/opencv_python-4.13.0.92.dist-info" ]]; then
+if [[ -d "${ORIG_SITE_PACKAGES}/cv2" && -d "${ORIG_SITE_PACKAGES}/opencv_python-4.13.0.92.dist-info" && -d "${ORIG_SITE_PACKAGES}/opencv_python.libs" ]]; then
   OPENCV_SOURCE_DIR="${ORIG_SITE_PACKAGES}/cv2"
   OPENCV_DIST_INFO_DIR="${ORIG_SITE_PACKAGES}/opencv_python-4.13.0.92.dist-info"
   OPENCV_LIBS_DIR="${ORIG_SITE_PACKAGES}/opencv_python.libs"
 else
-  OPENCV_SOURCE_DIR="$(find "${HOME}/.cache/uv/archive-v0" -path '*/cv2' | head -n 1)"
-  OPENCV_DIST_INFO_DIR="$(find "${HOME}/.cache/uv/archive-v0" -path '*/opencv_python-4.13.0.92.dist-info' | head -n 1)"
-  OPENCV_LIBS_DIR="$(find "${HOME}/.cache/uv/archive-v0" -path '*/opencv_python.libs' | head -n 1)"
+  while IFS= read -r opencv_dist_info_candidate; do
+    opencv_archive_root="$(dirname "${opencv_dist_info_candidate}")"
+    if [[ -d "${opencv_archive_root}/cv2" && -d "${opencv_archive_root}/opencv_python.libs" ]]; then
+      OPENCV_SOURCE_DIR="${opencv_archive_root}/cv2"
+      OPENCV_DIST_INFO_DIR="${opencv_dist_info_candidate}"
+      OPENCV_LIBS_DIR="${opencv_archive_root}/opencv_python.libs"
+      break
+    fi
+  done < <(find "${HOME}/.cache/uv/archive-v0" -path '*/opencv_python-4.13.0.92.dist-info')
 fi
 
 if [[ -z "${OPENCV_SOURCE_DIR}" || -z "${OPENCV_DIST_INFO_DIR}" || -z "${OPENCV_LIBS_DIR}" ]]; then
-  "${UV_BIN}" pip install \
+  "${NO_PROXY_ENV[@]}" "${UV_BIN}" pip install \
     --python "${VENV_PATH}/bin/python" \
+    --index-url "${PYPI_INDEX_URL}" \
     --index-strategy unsafe-best-match \
     --no-deps \
     opencv-python==4.13.0.92
@@ -91,6 +202,8 @@ else
   cp -a "${OPENCV_DIST_INFO_DIR}" "${SITE_PACKAGES_PATH}/"
   cp -a "${OPENCV_LIBS_DIR}" "${SITE_PACKAGES_PATH}/"
 fi
+
+ensure_python_dev_headers || true
 
 env -u PYTHONPATH "${VENV_PATH}/bin/python" - <<'PY'
 import importlib.util

@@ -76,7 +76,7 @@ class VideoResponse(BaseModel):
     object: str = "video"
     model: str = "sora-2"
     status: str = "queued"
-    progress: int = 0
+    progress: float = 0.0
     created_at: int = Field(default_factory=lambda: int(time.time()))
     size: str = ""
     seconds: str = "4"

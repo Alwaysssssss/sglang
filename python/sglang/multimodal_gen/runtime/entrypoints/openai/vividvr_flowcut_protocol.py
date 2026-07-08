@@ -170,7 +170,7 @@ class VividVRFlowCutVideoResponse(BaseModel):
     object: str = "video"
     model: str = "VividVR"
     status: str = "queued"
-    progress: int = 0
+    progress: float = 0.0
     created_at: int
     size: str = ""
     seconds: str = ""

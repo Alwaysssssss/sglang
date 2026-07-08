@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -126,3 +127,23 @@ class TestVideoRepairAPI(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "prompt is required")
+
+    def test_retrieve_video_allows_fractional_progress(self):
+        async def seed_job():
+            await video_api.VIDEO_STORE.upsert(
+                "task-fractional-progress",
+                {
+                    "id": "task-fractional-progress",
+                    "status": "running",
+                    "progress": 9.5,
+                    "created_at": 123,
+                },
+            )
+
+        asyncio.run(seed_job())
+
+        with TestClient(self.app) as client:
+            response = client.get("/v1/videos/task-fractional-progress")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["progress"], 9.5)

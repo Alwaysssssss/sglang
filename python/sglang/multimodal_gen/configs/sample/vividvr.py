@@ -207,6 +207,9 @@ class VividVRSamplingParams(SamplingParams):
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
         if user_kwargs.get("caption_file_path") not in (None, ""):
+            # Keep caption_file mode independent from prompt-file semantics while
+            # satisfying the generic request contract that still expects a string prompt.
+            user_kwargs.setdefault("prompt", "")
             user_kwargs.setdefault("prompt_path", None)
             user_kwargs.setdefault("prompt_file_path", None)
         elif (

@@ -57,13 +57,94 @@ bash python/sglang/multimodal_gen/tools/setup_vividvr_caption_env.sh
 /home/zhiheng/sglang/.venv-vividvr-caption
 ```
 
-## 4. 启动 caption sidecar
+## 4. 首次部署前检查 `torch.compile` 的 Python 头文件
+
+双卡正式默认配置包含 `--enable-torch-compile`。在新服务器上，如果系统缺少与
+`/home/zhiheng/sglang/.venv/bin/python` 对应版本的 CPython 开发头文件，首次
+compile 可能在 Triton/C 扩展编译阶段报 `Python.h: No such file or directory`。
+
+这不是 Vivid-VR 代码问题，而是主机缺少 Python dev headers。
+
+### 4.1 先确认 `.venv` 里的 Python 次版本
+
+```bash
+/home/zhiheng/sglang/.venv/bin/python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+```
+
+当前仓库默认环境通常是 `3.10`，所以新服务器上优先安装匹配的开发包。
+
+### 4.2 推荐解法：直接安装匹配版本的 Python 开发包
+
+Ubuntu / Debian：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3.10-dev
+```
+
+如果发行版没有拆成 `python3.10-dev`，也可以安装：
+
+```bash
+sudo apt-get install -y libpython3.10-dev
+```
+
+安装完成后，可用下面的命令确认头文件已就位：
+
+```bash
+/home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import sysconfig
+print(sysconfig.get_config_var("INCLUDEPY"))
+PY
+```
+
+再检查：
+
+```bash
+ls "$(/home/zhiheng/sglang/.venv/bin/python - <<'PY'
+import sysconfig
+print(sysconfig.get_config_var("INCLUDEPY"))
+PY
+)/Python.h"
+```
+
+只要 `Python.h` 存在，通常就不需要额外设置 `CPATH`。
+
+### 4.3 兜底解法：无法安装系统包时，手动提供匹配版本头文件
+
+如果正式主机不能直接 `apt install`，至少要把与 `.venv` 解释器版本完全一致的
+CPython 头文件准备到某个固定目录，然后在启动服务前导出：
+
+```bash
+export CPATH=/path/to/python3.10/include/python3.10:/path/to/python3.10/include${CPATH:+:$CPATH}
+export C_INCLUDE_PATH=/path/to/python3.10/include/python3.10:/path/to/python3.10/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
+```
+
+本次验收机上的临时兜底方式就是这样处理的。核心要求只有两个：
+
+- 头文件版本必须与 `/home/zhiheng/sglang/.venv/bin/python` 的 minor version 一致
+- `Python.h` 必须能被 compile 阶段的编译器直接找到
+
+如果版本不一致，例如 `.venv` 是 `3.10`，却给了 `3.11` 的 headers，后续仍然可能
+出现编译失败或更隐蔽的 ABI 问题，不建议这样混用。
+
+### 4.4 正式部署建议
+
+正式长期部署优先采用 `4.2` 的系统包方案，不要把临时解压目录当成长期依赖。
+
+推荐顺序：
+
+1. 先确认 `.venv` Python 次版本
+2. 安装同版本 `pythonX.Y-dev` / `libpythonX.Y-dev`
+3. 用一次 `sglang serve --enable-torch-compile` 的冷启动验证 compile 能正常开始
+4. 只有在系统包无法安装时，才退回到 `CPATH` / `C_INCLUDE_PATH` 兜底方案
+
+## 5. 启动 caption sidecar
 
 先起 sidecar，再起主服务。
 
 ```bash
 tmux new-session -d -s vividvr_caption_sidecar \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 --cogvlm2-ckpt-path /home/zhiheng/ckpts/cogvlm2-llama3-caption 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
 查看 sidecar：
@@ -84,7 +165,7 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
 {"status":"ok"}
 ```
 
-## 5. 启动正式双卡主服务
+## 6. 启动正式双卡主服务
 
 这条命令是当前推荐的正式常驻服务命令。
 
@@ -94,6 +175,7 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
 - `--output-path ""`：不保留本地持久输出目录
 - 不传 `--vividvr-caption-work-dir`：bridge caption 默认跟随 request 临时 workdir
 - `--host 0.0.0.0`：允许外部请求接入当前主机
+- 如果新主机还没安装匹配版本的 Python dev headers，可临时补 `CPATH` 和 `C_INCLUDE_PATH`
 
 ```bash
 tmux new-session -d -s vividvr_serve_dual_formal \
@@ -143,7 +225,39 @@ curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31191/health
 
 当前正式 bridge 服务不再要求 `--prompt-file-path`。如果 caption sidecar 成功产出 caption 文件，主服务会直接以该文件为 prompt 来源。
 
-## 6. 可选：正式单卡主服务
+如果需要临时给 compile 补头文件，可把上面的命令改成下面这种写法：
+
+```bash
+tmux new-session -d -s vividvr_serve_dual_formal \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export PYTHONUNBUFFERED=1 && export PYTHONPATH=python && export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && export CPATH=/path/to/python3.10/include/python3.10:/path/to/python3.10/include${CPATH:+:$CPATH} && export C_INCLUDE_PATH=/path/to/python3.10/include/python3.10:/path/to/python3.10/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH} && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv/bin/sglang serve \
+    --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+    --model-id VividVR \
+    --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+    --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
+    --attention-backend fa \
+    --num-gpus 2 \
+    --tp-size 1 \
+    --sp-degree 2 \
+    --ulysses-degree 2 \
+    --ring-degree 1 \
+    --enable-torch-compile \
+    --dist-timeout 3600 \
+    --host 0.0.0.0 \
+    --port 31191 \
+    --master-port 30191 \
+    --scheduler-port 56191 \
+    --strict-ports \
+    --input-save-path "" \
+    --output-path "" \
+    --vividvr-caption-bridge \
+    --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+    --vividvr-caption-sidecar-timeout 1800 \
+    2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_dual_formal_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+这只是过渡方案。正式机器稳定后，还是应回到 `4.2` 的系统包安装方式。
+
+## 7. 可选：正式单卡主服务
 
 如果临时只启单卡，可用下面这条。其余部署约束不变。
 
@@ -174,7 +288,7 @@ tmux new-session -d -s vividvr_serve_single_formal \
     2>&1 | tee Vivid_Acceptance/logs/vividvr_serve_single_formal_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
-## 7. 正式请求约束
+## 8. 正式请求约束
 
 正式主机虽然默认不保留本地输入和本地结果，但这依赖请求方遵守下面的约束。
 
@@ -229,7 +343,7 @@ curl --fail-with-body -X POST "http://127.0.0.1:31191/v1/videos/repairs/flowcut"
 - `outputObjectKey` 如果不带后缀，服务会自动补成输入视频的扩展名
 - `upscale` 是原版 Vivid-VR 的输入预缩放语义，不是后处理超分开关
 
-## 8. 正式运行时的预期行为
+## 9. 正式运行时的预期行为
 
 在本文件这套正式命令下，默认预期如下：
 
@@ -242,7 +356,7 @@ curl --fail-with-body -X POST "http://127.0.0.1:31191/v1/videos/repairs/flowcut"
 
 如果请求方没有传 `minioConfig`，则不应再宣称“默认不保留本地结果”；这时结果可能保留在临时工作目录中，行为不满足本文件的正式部署目标。
 
-## 9. 常用查询与取消
+## 10. 常用查询与取消
 
 提交后可用下面几条接口：
 

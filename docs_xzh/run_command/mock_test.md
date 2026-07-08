@@ -153,7 +153,7 @@ tmux attach -r -t vividvr_flowcut_callback_receiver
 
 ```bash
 tmux new-session -d -s vividvr_caption_sidecar_mock \
-  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_mock_$(date -u +%Y%m%dT%H%M%SZ).log'
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && CUDA_VISIBLE_DEVICES=0,1 /home/zhiheng/sglang/.venv-vividvr-caption/bin/python python/sglang/multimodal_gen/tools/run_vividvr_caption_sidecar.py --host 127.0.0.1 --port 31200 --parallel-workers 2 --worker-devices cuda:0,cuda:1 --cogvlm2-ckpt-path /home/zhiheng/ckpts/cogvlm2-llama3-caption 2>&1 | tee Vivid_Acceptance/logs/vividvr_caption_sidecar_mock_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
 健康检查：
@@ -162,24 +162,31 @@ tmux new-session -d -s vividvr_caption_sidecar_mock \
 curl --noproxy '*' --silent --show-error --fail http://127.0.0.1:31200/health
 ```
 
-再起 bridge 主服务：
+再起双卡 bridge 主服务：
 
 ```bash
-tmux new-session -d -s vividvr_flowcut_bridge_mock_service \
+tmux new-session -d -s vividvr_flowcut_bridge_mock_service_dual \
   'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/captions/service_sidecars && \
-   export CUDA_VISIBLE_DEVICES=1 && \
+   export CUDA_VISIBLE_DEVICES=0,1 && \
    export PYTHONUNBUFFERED=1 && \
    export PYTHONPATH=python && \
    export NO_PROXY=127.0.0.1,localhost && \
    export AWS_EC2_METADATA_DISABLED=true && \
    export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
    /home/zhiheng/sglang/.venv/bin/sglang serve \
-     --model-path /home/zhiheng/Vivid-VR/ckpts/CogVideoX1.5-5B \
+     --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
      --model-id VividVR \
      --pipeline-class-name CogVideoXVividVRControlNetPipeline \
-     --component-paths.vividvr /home/zhiheng/Vivid-VR/ckpts/Vivid-VR \
-     --num-gpus 1 \
+     --component-paths.vividvr /home/zhiheng/ckpts/Vivid-VR \
+     --num-gpus 2 \
+     --tp-size 1 \
+     --sp-degree 2 \
+     --ulysses-degree 2 \
+     --ring-degree 1 \
+     --enable-torch-compile \
+     --dist-timeout 3600 \
      --attention-backend fa \
      --host 127.0.0.1 \
      --port 31221 \
@@ -192,10 +199,68 @@ tmux new-session -d -s vividvr_flowcut_bridge_mock_service \
      --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
      --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
      --vividvr-caption-sidecar-timeout 1800 \
-     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_bridge_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_bridge_mock_service_dual_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
+这里的双卡口径与当前正式默认配置一致：`--attention-backend fa` + `SP=2` + `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global` + `--enable-torch-compile`。
+
 这里故意不再传 `--prompt-file-path`。当前 bridge 链路下，主服务会直接消费 caption sidecar 产出的 `caption_file_path`，不再要求服务启动时预置固定 `prompt.txt`。
+
+健康检查：
+
+```bash
+curl --noproxy '*' --silent --show-error --fail "${BRIDGE_BASE_URL}/health"
+```
+
+### 5.2 可选四卡 bridge 主服务配置
+
+如果机器上有 4 张卡，且这次只是想做本地 mock/manual test 的四卡服务验证，可以保留上面的 caption sidecar 启动方式不变，只把主服务切到下面这条四卡配置。
+
+注意：
+
+- 这条四卡命令是本地服务验证变体，不是当前 `Phase E` 的正式默认配置。
+- 四卡请求仍然走同一条 `FlowCut` 服务契约；这里只是把主服务的并行度从 `SP=2` 扩到 `SP=4`。
+- 如果你要复用第 6 节之后的请求命令，先把 `BRIDGE_BASE_URL` 改到 `http://127.0.0.1:31222`。
+
+```bash
+export BRIDGE_BASE_URL=http://127.0.0.1:31222
+
+tmux new-session -d -s vividvr_flowcut_bridge_mock_service_quad \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/captions/service_sidecars && \
+   export CUDA_VISIBLE_DEVICES=0,1,2,3 && \
+   export PYTHONUNBUFFERED=1 && \
+   export PYTHONPATH=python && \
+   export NO_PROXY=127.0.0.1,localhost && \
+   export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+   /home/zhiheng/sglang/.venv/bin/sglang serve \
+     --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+     --model-id VividVR \
+     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+     --component-paths.vividvr /home/zhiheng/ckpts/Vivid-VR \
+     --num-gpus 4 \
+     --tp-size 1 \
+     --sp-degree 4 \
+     --ulysses-degree 4 \
+     --ring-degree 1 \
+     --enable-torch-compile \
+     --dist-timeout 3600 \
+     --attention-backend fa \
+     --host 127.0.0.1 \
+     --port 31222 \
+     --master-port 30222 \
+     --scheduler-port 56222 \
+     --strict-ports \
+     --input-save-path "" \
+     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --vividvr-caption-bridge \
+     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+     --vividvr-caption-sidecar-timeout 1800 \
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_bridge_mock_service_quad_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
 
 健康检查：
 
@@ -558,7 +623,7 @@ find /tmp -maxdepth 2 -type d -name "${TASK_ID}" 2>/dev/null
 ## 9. 停止服务
 
 ```bash
-tmux kill-session -t vividvr_flowcut_bridge_mock_service
+tmux kill-session -t vividvr_flowcut_bridge_mock_service_dual
 tmux kill-session -t vividvr_caption_sidecar_mock
 tmux kill-session -t vividvr_flowcut_callback_receiver
 tmux kill-session -t vividvr_moto_s3
