@@ -102,6 +102,56 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def _usp_input_all_to_all_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return q, k, v
+
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("Packed USP Q/K/V inputs must all be 4D tensors.")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError(
+            f"Packed USP Q/K/V shapes must match, got {q.shape}, {k.shape}, {v.shape}."
+        )
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("Packed USP Q/K/V dtypes must match.")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("Packed USP Q/K/V devices must match.")
+
+    batch, seq_local, heads_global, head_size = q.shape
+    if heads_global % world_size != 0:
+        raise ValueError(
+            f"heads_global ({heads_global}) must be divisible by world_size ({world_size})."
+        )
+
+    heads_local = heads_global // world_size
+    packed = torch.stack((q, k, v), dim=0)
+    packed = packed.permute(3, 0, 1, 2, 4).contiguous()
+    packed = _usp_all_to_all_single(packed)
+    packed = packed.reshape(
+        world_size,
+        heads_local,
+        3,
+        batch,
+        seq_local,
+        head_size,
+    )
+    packed = packed.permute(2, 3, 0, 4, 1, 5).contiguous()
+    packed = packed.reshape(
+        3,
+        batch,
+        seq_local * world_size,
+        heads_local,
+        head_size,
+    )
+    q_out, k_out, v_out = packed.unbind(dim=0)
+    return q_out, k_out, v_out
+
+
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
