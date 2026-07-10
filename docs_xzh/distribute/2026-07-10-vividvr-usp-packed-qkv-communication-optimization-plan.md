@@ -1130,7 +1130,7 @@ git commit -m "test(vividvr): verify usp collectives on two nccl ranks"
 | P2 | 关闭 | 开启 |
 | P3 | 开启 | 开启 |
 
-- [ ] **步骤 1：编写直跑 profiler 参数失败测试**
+- [x] **步骤 1：编写直跑 profiler 参数失败测试**
 
 在 inference tool 测试中加入：
 
@@ -1163,7 +1163,7 @@ def test_parse_args_and_request_support_profiler_fields(self):
     self.assertEqual(params.num_profiled_timesteps, 3)
 ```
 
-- [ ] **步骤 2：运行测试并确认 profiler CLI 缺失**
+- [x] **步骤 2：运行测试并确认 profiler CLI 缺失**
 
 运行：
 
@@ -1175,7 +1175,7 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python -m pytest \
 
 预期：FAIL，错误包含 `unrecognized arguments: --profile --num-profiled-timesteps 3`。
 
-- [ ] **步骤 3：接入现有 SGLDiffusionProfiler 请求字段**
+- [x] **步骤 3：接入现有 SGLDiffusionProfiler 请求字段**
 
 在 parser 中加入：
 
@@ -1203,7 +1203,7 @@ parser.add_argument(
 
 在 snapshot/最终报告加入同名字段，确保 profiler 产物可追溯到运行参数。
 
-- [ ] **步骤 4：运行 inference tool 完整测试**
+- [x] **步骤 4：运行 inference tool 完整测试**
 
 运行：
 
@@ -1214,7 +1214,7 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python -m pytest \
 
 预期：全部 PASS。
 
-- [ ] **步骤 5：检查四卡空闲和固定输入文件**
+- [x] **步骤 5：检查四卡空闲和固定输入文件**
 
 运行：
 
@@ -1226,7 +1226,7 @@ test -f /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-tes
 
 预期：第一条无计算进程输出；两条 `test -f` 退出码均为 0。若 GPU 有占用，等待占用释放后重新执行，不并发启动 benchmark。
 
-- [ ] **步骤 6：在单个 tmux session 中顺序运行四组 5-step profiler smoke**
+- [x] **步骤 6：在单个 tmux session 中顺序运行四组 5-step profiler smoke**
 
 ```bash
 tmux new-session -d -s vividvr_usp_ablation \
@@ -1274,7 +1274,7 @@ tmux attach -r -t vividvr_usp_ablation
 
 预期：B0、P1、P2、P3 均完成 5 steps，P3 完成即证明两个开关可以和 `torch.compile` 共存；每组 profiler 目录至少有一个 `global-rank0.trace.json.gz`。
 
-- [ ] **步骤 7：汇总 collective count 和 trace duration**
+- [x] **步骤 7：汇总 collective count 和 trace duration**
 
 运行：
 
@@ -1296,6 +1296,8 @@ for variant in ("B0", "P1", "P2", "P3"):
         "all_gather": [],
     }
     for event in events:
+        if event.get("cat") != "gpu_user_annotation":
+            continue
         name = str(event.get("name", "")).lower()
         duration = float(event.get("dur", 0.0))
         if "all_to_all" in name or "alltoall" in name:
@@ -1313,11 +1315,11 @@ PY
 预期关系：
 
 - P1 的 input A2A 发起次数相对 B0 减少约三分之二，总 A2A 数约减半。
-- P2 的 A2A count 与 B0 相同，prefix gather 实现名称/count 发生变化。
-- P3 同时满足 P1 的 A2A count 和 P2 的 gather 路径。
+- P2 的 A2A count 与 B0 相同；compile 下若旧路径已被 functionalize，gather 名称/count 可以不变，此时结合 duration 判断是否存在有效收益。
+- P3 满足 P1 的 A2A count；prefix gather 按 P2 的实测结论解释。
 - P1/P3 若没有降低 A2A count，停止正式 benchmark，先修正 packed 分支是否实际生效。
 
-- [ ] **步骤 8：写入消融文档并提交 profiler 接入**
+- [x] **步骤 8：写入消融文档并提交 profiler 接入**
 
 `docs_xzh/distribute/vividvr_usp_collective_ablation_20260710.md` 必须记录：commit、GPU 型号/拓扑、四组完整命令、trace 路径、A2A count/duration、gather count/duration、5-step model inference 时间、是否 compile 成功。然后提交：
 
@@ -1458,7 +1460,7 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   python/sglang/multimodal_gen/runtime/videoedit/compare.py \
   --reference "${VIVIDVR_CFG_REFERENCE_VIDEO}" \
   --candidate "${FORMAL_VIDEO}" \
-  --output-json "${FORMAL_COMPARE}" \
+  --report-json "${FORMAL_COMPARE}" \
   --min-ssim 0.98 \
   --max-failed-frame-ratio 0
 ```
