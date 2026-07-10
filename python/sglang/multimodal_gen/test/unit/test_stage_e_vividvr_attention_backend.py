@@ -16,6 +16,10 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
     CogVideoXFlashAttnProcessor,
     CogVideoXNativeAttnProcessor,
+    CogVideoXSDPAAttnProcessor,
+    CogVideoXSPAttnProcessor,
+    _get_cogvideox_sp_usp_attention,
+    configure_cogvideox_usp_collectives,
     enable_cogvideox_qk_norm_fusion,
     enable_cogvideox_qk_norm_rope_fusion,
     _prepare_cogvideox_qkv,
@@ -24,6 +28,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
     enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
     inspect_cogvideox_qkv_fusion,
+    inspect_cogvideox_usp_collectives,
     normalize_cogvideox_attention_backend,
     set_cogvideox_attention_backend,
 )
@@ -144,6 +149,62 @@ class TestVividVRAttentionBackend(unittest.TestCase):
 
         set_cogvideox_attention_backend(module, "torch_sdpa")
         self.assertEqual(inspect_cogvideox_attention_backend(module), "sdpa")
+
+    def test_sp_processor_stores_usp_collective_flags(self):
+        processor = CogVideoXSPAttnProcessor(
+            kernel="fa",
+            use_packed_qkv_a2a=True,
+            use_prefix_all_gather_into_tensor=True,
+        )
+
+        self.assertTrue(processor.use_packed_qkv_a2a)
+        self.assertTrue(processor.use_prefix_all_gather_into_tensor)
+
+    @patch(
+        "sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend.USPAttention"
+    )
+    def test_usp_factory_forwards_collective_flags(self, usp_cls):
+        _get_cogvideox_sp_usp_attention.cache_clear()
+
+        _get_cogvideox_sp_usp_attention(
+            num_heads=48,
+            head_size=64,
+            kernel="fa",
+            use_packed_qkv_a2a=True,
+            use_prefix_all_gather_into_tensor=False,
+        )
+
+        self.assertTrue(usp_cls.call_args.kwargs["use_packed_qkv_a2a"])
+        self.assertFalse(
+            usp_cls.call_args.kwargs["use_prefix_all_gather_into_tensor"]
+        )
+        _get_cogvideox_sp_usp_attention.cache_clear()
+
+    def test_configure_usp_collectives_only_updates_sp_processors(self):
+        module = nn.Module()
+        module.sp_attention = _DummyCogVideoXAttentionModule()
+        module.local_attention = _DummyCogVideoXAttentionModule()
+        set_cogvideox_attention_backend(module.sp_attention, "fa_sp")
+        set_cogvideox_attention_backend(module.local_attention, "sdpa")
+
+        applied = configure_cogvideox_usp_collectives(
+            module,
+            use_packed_qkv_a2a=True,
+            use_prefix_all_gather_into_tensor=False,
+        )
+
+        self.assertEqual(applied, 1)
+        self.assertEqual(
+            inspect_cogvideox_usp_collectives(module),
+            {
+                "packed_qkv_a2a": True,
+                "prefix_all_gather_into_tensor": False,
+            },
+        )
+        self.assertIsInstance(
+            module.local_attention.attn.processor,
+            CogVideoXSDPAAttnProcessor,
+        )
 
     def test_unsupported_attention_backend_raises(self):
         module = _DummyCogVideoXAttentionModule()

@@ -517,7 +517,13 @@ class CogVideoXSPAttnProcessor:
     flash-attention path so single-GPU and non-SP deployments are unaffected.
     """
 
-    def __init__(self, kernel: str = "fa"):
+    def __init__(
+        self,
+        kernel: str = "fa",
+        *,
+        use_packed_qkv_a2a: bool = False,
+        use_prefix_all_gather_into_tensor: bool = False,
+    ):
         normalized_kernel = normalize_cogvideox_attention_backend(kernel)
         if normalized_kernel not in {"fa", "sdpa"}:
             raise ValueError(
@@ -525,6 +531,10 @@ class CogVideoXSPAttnProcessor:
             )
         self.kernel = normalized_kernel
         self._attention_backend = f"{self.kernel}_sp"
+        self.use_packed_qkv_a2a = use_packed_qkv_a2a
+        self.use_prefix_all_gather_into_tensor = (
+            use_prefix_all_gather_into_tensor
+        )
 
     def __call__(
         self,
@@ -574,6 +584,10 @@ class CogVideoXSPAttnProcessor:
             num_heads=num_heads,
             head_size=head_dim,
             kernel=self.kernel,
+            use_packed_qkv_a2a=self.use_packed_qkv_a2a,
+            use_prefix_all_gather_into_tensor=(
+                self.use_prefix_all_gather_into_tensor
+            ),
         )
 
         # USPAttention expects [B, S_local, H, D] input.
@@ -603,12 +617,14 @@ class CogVideoXSPAttnProcessor:
         return hidden_states, encoder_hidden_states
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=16)
 def _get_cogvideox_sp_usp_attention(
     *,
     num_heads: int,
     head_size: int,
     kernel: str,
+    use_packed_qkv_a2a: bool = False,
+    use_prefix_all_gather_into_tensor: bool = False,
 ) -> USPAttention:
     """Create a cached USPAttention instance for CogVideoX SP joint attention.
 
@@ -635,6 +651,8 @@ def _get_cogvideox_sp_usp_attention(
         causal=False,
         supported_attention_backends=supported_attention_backends,
         prefix=f"cogvideox_sp_attn_{kernel}_{num_heads}_{head_size}",
+        use_packed_qkv_a2a=use_packed_qkv_a2a,
+        use_prefix_all_gather_into_tensor=use_prefix_all_gather_into_tensor,
     )
 
 
@@ -669,6 +687,54 @@ def set_cogvideox_attention_backend(module: nn.Module, backend: str) -> str:
         )
 
     return normalized_backend
+
+
+def configure_cogvideox_usp_collectives(
+    module: nn.Module,
+    *,
+    use_packed_qkv_a2a: bool,
+    use_prefix_all_gather_into_tensor: bool,
+) -> int:
+    applied = 0
+    for child in module.modules():
+        if not isinstance(child, Attention):
+            continue
+        processor = child.processor
+        if not isinstance(processor, CogVideoXSPAttnProcessor):
+            continue
+        processor.use_packed_qkv_a2a = use_packed_qkv_a2a
+        processor.use_prefix_all_gather_into_tensor = (
+            use_prefix_all_gather_into_tensor
+        )
+        applied += 1
+    if applied == 0:
+        raise ValueError("No CogVideoX SP attention processors were found.")
+    return applied
+
+
+def inspect_cogvideox_usp_collectives(
+    module: nn.Module | None,
+) -> dict[str, bool] | None:
+    if module is None:
+        return None
+    states = {
+        (
+            child.processor.use_packed_qkv_a2a,
+            child.processor.use_prefix_all_gather_into_tensor,
+        )
+        for child in module.modules()
+        if isinstance(child, Attention)
+        and isinstance(child.processor, CogVideoXSPAttnProcessor)
+    }
+    if not states:
+        return None
+    if len(states) != 1:
+        raise RuntimeError("CogVideoX SP collective configuration is inconsistent.")
+    packed, prefix_gather = states.pop()
+    return {
+        "packed_qkv_a2a": packed,
+        "prefix_all_gather_into_tensor": prefix_gather,
+    }
 
 
 def _can_fuse_attention_qkv(attn: Attention) -> bool:
