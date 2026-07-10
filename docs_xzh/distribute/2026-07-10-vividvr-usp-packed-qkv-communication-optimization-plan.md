@@ -1337,6 +1337,17 @@ git commit -m "perf(vividvr): profile usp collective variants"
 - 产物：`Vivid_Acceptance/indicator/service_benchmark/${FORMAL_TASK_ID}_compare.json`
 - 产物：`Vivid_Acceptance/indicator/service_benchmark/${FORMAL_TASK_ID}_acceptance_summary.json`
 - 产物：`Vivid_Acceptance/result_videos/service_benchmark/${FORMAL_TASK_ID}.mp4`
+- 产物：`Vivid_Acceptance/result_videos/service_benchmark/downloads/${FORMAL_TASK_ID}.bridge-downloaded.mp4`
+- 产物：`Vivid_Acceptance/logs/mock_callback_*.jsonl`
+
+**正式验收执行合同：**
+
+- 任务 8 的服务与请求验收必须以 `docs_xzh/run_command/mock_test.md` 为准，不能只运行内部 acceptance helper 代替正式服务链路。
+- 严格按该文档第 3、4 节启动 Moto S3 和 callback receiver，并确认 `flowcut` bucket 已创建。
+- 严格按第 5.3 节启动固定 caption sidecar mock，再使用同节的四卡 `CFG=2 x SP=2` `sglang serve` 命令启动主服务；P3 只在该命令上追加 `--enable-usp-packed-qkv-a2a` 与 `--enable-usp-prefix-all-gather-into-tensor`。
+- warmup 和 formal 都必须按第 6 节通过外部 `POST /v1/videos/repairs/flowcut` 提交，包含必填 `callbackUrl`、`outputObjectKey` 和 `minioConfig`，轮询到 completed，并验证 callback 终态与 Moto S3 对象上传。
+- 正式质量对比必须使用从 Moto S3 下载的 `bridge-downloaded.mp4`，而不是只使用服务本地 `output_path`，从而覆盖正式 FlowCut 对外契约。
+- 上述 Moto、callback、caption mock、P3 主服务、warmup 和 formal 推理进程均在命名清晰的独立 `tmux` session 中启动；启动前记录只读 attach 命令。
 
 - [ ] **步骤 1：执行最终静态和自动化回归**
 
@@ -1359,9 +1370,9 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=python \
 
 预期：`git diff --check` 无输出；pytest 全部 PASS；torchrun 输出 bitwise exact PASS。
 
-- [ ] **步骤 2：启动 P3 四卡正式服务**
+- [ ] **步骤 2：按 mock 服务链启动依赖和 P3 四卡正式服务**
 
-先确认 `31232`、`30232`、`56232` 未占用且 GPU 无计算进程，然后运行：
+先严格执行 `docs_xzh/run_command/mock_test.md` 第 3、4、5.3 节：启动 `vividvr_moto_s3`、`vividvr_flowcut_callback_receiver`、固定 caption 的 `vividvr_caption_sidecar_mock`，创建 `flowcut` bucket，并分别通过 S3 列表、callback 监听端口与 caption `/health` 检查。然后确认 `31232`、`30232`、`56232` 未占用且 GPU 无本任务外计算进程，再运行：
 
 ```bash
 tmux new-session -d -s vividvr_usp_p3_formal_service \
@@ -1372,6 +1383,7 @@ tmux new-session -d -s vividvr_usp_p3_formal_service \
    export PYTHONPATH=python && \
    export NO_PROXY=127.0.0.1,localhost && \
    export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
    export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
    /home/zhiheng/sglang/.venv/bin/sglang serve \
@@ -1388,6 +1400,10 @@ tmux new-session -d -s vividvr_usp_p3_formal_service \
      --host 127.0.0.1 --port 31232 --master-port 30232 --scheduler-port 56232 \
      --strict-ports --input-save-path "" \
      --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --vividvr-caption-bridge \
+     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+     --vividvr-caption-sidecar-timeout 1800 \
      2>&1 | tee Vivid_Acceptance/logs/vividvr_usp_p3_formal_service_$(date -u +%Y%m%dT%H%M%SZ).log'
 ```
 
@@ -1399,59 +1415,42 @@ tmux attach -r -t vividvr_usp_p3_formal_service
 
 预期：服务 ready；启动日志显示 effective backend `fa_sp`，两个 USP 优化在 transformer/controlnet 均为 `True`。
 
-- [ ] **步骤 3：提交一次完整 warmup 请求**
+- [ ] **步骤 3：按外部 FlowCut 契约提交一次完整 warmup 请求**
 
-服务 ready 后运行：
+服务 ready 后，在 `vividvr_usp_p3_warmup` tmux session 中严格执行 `docs_xzh/run_command/mock_test.md` 第 6.1 至 6.4 节。请求必须使用下面的任务 ID 与路径，并包含文档中的 `callbackUrl`、`outputObjectKey`、`perf_dump_path` 和完整 `minioConfig`；固定 caption 由 sidecar mock 经 HTTP bridge 产出，请求中不直接传 `caption_file`：
 
 ```bash
 export WARMUP_TASK_ID=vividvr-usp-p3-warmup-$(date -u +%Y%m%dT%H%M%SZ)
-tmux new-session -d -s vividvr_usp_p3_warmup \
-  "cd /home/zhiheng/sglang && export PYTHONPATH=python && \
-   /home/zhiheng/sglang/.venv/bin/python \
-   python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
-   --base-url http://127.0.0.1:31232 \
-   --task-id ${WARMUP_TASK_ID} \
-   --input-video /home/zhiheng/input/test_video_long_960x720_130f.mp4 \
-   --caption-file /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt \
-   --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/${WARMUP_TASK_ID}.mp4 \
-   --perf-dump-path /home/zhiheng/sglang/Vivid_Acceptance/indicator/service_benchmark/${WARMUP_TASK_ID}_perf.json \
-   --num-inference-steps 20 --seed 42 --num-temporal-process-frames 121 --upscale 1.0 \
-   2>&1 | tee Vivid_Acceptance/logs/${WARMUP_TASK_ID}.log"
+export BRIDGE_BASE_URL=http://127.0.0.1:31232
+export CALLBACK_BASE_URL=http://127.0.0.1:39090
+export MOTO_S3_ENDPOINT=127.0.0.1:4566
+export MOTO_S3_BUCKET=flowcut
+export MOTO_S3_ACCESS_KEY=test
+export MOTO_S3_SECRET_KEY=test
 ```
 
 只读查看：`tmux attach -r -t vividvr_usp_p3_warmup`。
 
-预期：任务 completed，输出 130 帧；该请求只用于 compile/cache warmup，不计入正式性能。
+预期：任务 completed，输出 130 帧，callback 最终 `status=succeeded`，S3 中存在带 `.mp4` 后缀的对象；该请求只用于 compile/cache warmup，不计入正式性能。
 
-- [ ] **步骤 4：warmup 完成后提交正式请求**
+- [ ] **步骤 4：按外部 FlowCut 契约提交正式请求**
 
-确认 warmup session 已退出，再运行：
+确认 warmup session 已退出，再在 `vividvr_usp_p3_formal` tmux session 中重复 `mock_test.md` 第 6.1 至 6.4 节。除了任务 ID 和产物路径外，请求字段必须与 warmup 完全一致；完成后按第 6.4 节从 Moto S3 下载对象：
 
 ```bash
 export FORMAL_TASK_ID=vividvr-usp-p3-formal-$(date -u +%Y%m%dT%H%M%SZ)
-tmux new-session -d -s vividvr_usp_p3_formal \
-  "cd /home/zhiheng/sglang && export PYTHONPATH=python && \
-   /home/zhiheng/sglang/.venv/bin/python \
-   python/sglang/multimodal_gen/tools/run_flowcut_vividvr_service_acceptance.py \
-   --base-url http://127.0.0.1:31232 \
-   --task-id ${FORMAL_TASK_ID} \
-   --input-video /home/zhiheng/input/test_video_long_960x720_130f.mp4 \
-   --caption-file /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt \
-   --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/${FORMAL_TASK_ID}.mp4 \
-   --perf-dump-path /home/zhiheng/sglang/Vivid_Acceptance/indicator/service_benchmark/${FORMAL_TASK_ID}_perf.json \
-   --num-inference-steps 20 --seed 42 --num-temporal-process-frames 121 --upscale 1.0 \
-   2>&1 | tee Vivid_Acceptance/logs/${FORMAL_TASK_ID}.log"
+export DOWNLOADED_RESULT_VIDEO=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/downloads/${FORMAL_TASK_ID}.bridge-downloaded.mp4
 ```
 
 只读查看：`tmux attach -r -t vividvr_usp_p3_formal`。
 
-预期：任务 completed；perf JSON 的 debug 同时满足 `cfg_world_size=2`、`sp_world_size=2`、`attention_backend_transformer=fa_sp`、两个 USP effective 开关为 `True`。
+预期：任务 completed；callback 最终 succeeded；Moto S3 对象存在且可下载；perf JSON 的 debug 同时满足 `cfg_world_size=2`、`sp_world_size=2`、`attention_backend_transformer=fa_sp`、两个 USP effective 开关为 `True`。
 
 - [ ] **步骤 5：执行固定 reference SSIM 对比**
 
 ```bash
 export VIVIDVR_CFG_REFERENCE_VIDEO=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/downloads/quad-test-video-long-960x720-130f-run2-20260708T060202Z.bridge-downloaded.mp4
-export FORMAL_VIDEO=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/${FORMAL_TASK_ID}.mp4
+export FORMAL_VIDEO=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/downloads/${FORMAL_TASK_ID}.bridge-downloaded.mp4
 export FORMAL_COMPARE=/home/zhiheng/sglang/Vivid_Acceptance/indicator/service_benchmark/${FORMAL_TASK_ID}_compare.json
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   python/sglang/multimodal_gen/runtime/videoedit/compare.py \
