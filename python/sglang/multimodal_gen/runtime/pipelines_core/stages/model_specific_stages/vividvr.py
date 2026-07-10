@@ -14,9 +14,14 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.runtime.distributed import (
+    cfg_model_parallel_all_reduce,
     get_local_torch_device,
     get_sp_group,
     get_world_group,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -24,7 +29,10 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_common import (
     get_vividvr_connector_sp_context_mode,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    PipelineStage,
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -36,7 +44,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.common import (
     randn_tensor_with_generator_device,
 )
@@ -95,6 +103,43 @@ def _runtime_compute_device() -> torch.device:
     # CPU offload may temporarily park modules on CPU, but VividVR denoising
     # should still prepare compute tensors on the active local accelerator.
     return get_local_torch_device()
+
+
+def _resolve_vividvr_parallel_mode(server_args: ServerArgs) -> str:
+    requested = getattr(server_args, "vividvr_parallel_mode", "auto")
+    enable_cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
+    sp_degree = int(getattr(server_args, "sp_degree", 1) or 1)
+
+    if requested == "auto":
+        if enable_cfg_parallel and sp_degree > 1:
+            return "cfg_sp"
+        if enable_cfg_parallel:
+            return "cfg"
+        if sp_degree > 1:
+            return "sp"
+        return "single"
+
+    expected_by_mode = {
+        "single": (False, False),
+        "sp": (False, True),
+        "cfg": (True, False),
+        "cfg_sp": (True, True),
+    }
+    if requested not in expected_by_mode:
+        raise ValueError(
+            "Invalid vividvr_parallel_mode configuration: "
+            f"vividvr_parallel_mode={requested!r}"
+        )
+
+    expected = expected_by_mode[requested]
+    actual = (enable_cfg_parallel, sp_degree > 1)
+    if actual != expected:
+        raise ValueError(
+            "Invalid vividvr_parallel_mode configuration: "
+            f"vividvr_parallel_mode={requested!r}, "
+            f"enable_cfg_parallel={enable_cfg_parallel}, sp_degree={sp_degree}"
+        )
+    return requested
 
 
 def _resolve_attn_backend_cls(
@@ -262,6 +307,8 @@ class VividVRInputValidationStage(PipelineStage):
         params = _vividvr_params(batch)
         params.reset_runtime()
         params._validate_with_pipeline_config(server_args.pipeline_config)
+        debug = batch.extra.setdefault("vividvr_debug", {})
+        debug["vividvr_parallel_mode"] = _resolve_vividvr_parallel_mode(server_args)
         return batch
 
 
@@ -769,6 +816,78 @@ class VividVRDenoisingStage(PipelineStage):
         self.attn_metadata_builder = None
         self._cached_fa_attn_metadata = None
 
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        if get_global_server_args().enable_cfg_parallel:
+            return StageParallelismType.CFG_PARALLEL
+        return StageParallelismType.REPLICATED
+
+    @staticmethod
+    def _select_cfg_model_input(
+        tensor: torch.Tensor,
+        *,
+        do_classifier_free_guidance: bool,
+        enable_cfg_parallel: bool,
+    ) -> torch.Tensor:
+        if do_classifier_free_guidance and not enable_cfg_parallel:
+            return torch.cat([tensor] * 2)
+        return tensor
+
+    @staticmethod
+    def _select_cfg_prompt_embeds(
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        prompt_slice: slice,
+        *,
+        do_classifier_free_guidance: bool,
+        enable_cfg_parallel: bool,
+        cfg_rank: int,
+    ) -> tuple[torch.Tensor, str]:
+        tile_prompt_embeds = prompt_embeds[prompt_slice]
+        if not do_classifier_free_guidance:
+            return tile_prompt_embeds, "none"
+        if negative_prompt_embeds is None:
+            raise ValueError("VividVR negative prompt embeds are required for CFG")
+        if enable_cfg_parallel:
+            if cfg_rank == 0:
+                return tile_prompt_embeds, "cond"
+            if cfg_rank == 1:
+                return negative_prompt_embeds[prompt_slice], "uncond"
+            raise ValueError(
+                f"VividVR CFG parallel only supports cfg_rank 0/1, got {cfg_rank}"
+            )
+        return (
+            torch.cat([negative_prompt_embeds[prompt_slice], tile_prompt_embeds], dim=0),
+            "serial",
+        )
+
+    @staticmethod
+    def _combine_cfg_noise_pred(
+        noise_pred: torch.Tensor,
+        *,
+        guidance_scale: float,
+        do_classifier_free_guidance: bool,
+        enable_cfg_parallel: bool,
+        cfg_rank: int,
+        all_reduce_fn=cfg_model_parallel_all_reduce,
+    ) -> torch.Tensor:
+        if not do_classifier_free_guidance:
+            return noise_pred
+        if enable_cfg_parallel:
+            if cfg_rank == 0:
+                partial = float(guidance_scale) * noise_pred
+            elif cfg_rank == 1:
+                partial = (1.0 - float(guidance_scale)) * noise_pred
+            else:
+                raise ValueError(
+                    f"VividVR CFG parallel only supports cfg_rank 0/1, got {cfg_rank}"
+                )
+            return all_reduce_fn(partial)
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        return noise_pred_uncond + float(guidance_scale) * (
+            noise_pred_text - noise_pred_uncond
+        )
+
     def _prepare_runtime_module(
         self,
         module: torch.nn.Module,
@@ -1027,6 +1146,34 @@ class VividVRDenoisingStage(PipelineStage):
         target_dtype = denoising_state["target_dtype"]
         debug = batch.extra.setdefault("vividvr_debug", {})
         sequence_shard_enabled = bool(debug.get("enable_sequence_shard", False))
+        enable_cfg_parallel = bool(getattr(server_args, "enable_cfg_parallel", False))
+        cfg_rank = 0
+        cfg_world_size = 1
+        if enable_cfg_parallel:
+            cfg_rank = int(get_classifier_free_guidance_rank())
+            cfg_world_size = int(get_classifier_free_guidance_world_size())
+            if cfg_world_size != 2:
+                raise ValueError(
+                    "VividVR CFG parallel requires cfg world size 2, "
+                    f"got {cfg_world_size}"
+                )
+        cfg_branch_for_debug = None
+        if enable_cfg_parallel:
+            cfg_branch_for_debug = "cond" if cfg_rank == 0 else "uncond"
+        debug.update(
+            {
+                "vividvr_parallel_mode": _resolve_vividvr_parallel_mode(server_args),
+                "cfg_parallel_enabled": enable_cfg_parallel,
+                "cfg_rank": cfg_rank if enable_cfg_parallel else None,
+                "cfg_world_size": cfg_world_size if enable_cfg_parallel else None,
+                "cfg_branch": cfg_branch_for_debug,
+                "cfg_combine_formula": (
+                    "guidance_scale * cond + (1 - guidance_scale) * uncond"
+                    if enable_cfg_parallel and do_classifier_free_guidance
+                    else "serial_uncond_plus_guidance_delta"
+                ),
+            }
+        )
 
         timestep = timesteps[timestep_index]
         attn_metadata = self._build_runtime_attn_metadata(
@@ -1052,31 +1199,30 @@ class VividVRDenoisingStage(PipelineStage):
             image_rotary_emb = self._prepare_image_rotary_emb(tile_latents)
             timestep_expand = timestep.expand(tile_latents.shape[0])
 
-            latent_model_input = (
-                torch.cat([tile_latents] * 2)
-                if do_classifier_free_guidance
-                else tile_latents
+            latent_model_input = self._select_cfg_model_input(
+                tile_latents,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                enable_cfg_parallel=enable_cfg_parallel,
             )
             latent_model_input = self.scheduler.scale_model_input(
                 latent_model_input,
                 timestep,
             )
 
-            control_model_input = (
-                torch.cat([tile_control_latents] * 2)
-                if do_classifier_free_guidance
-                else tile_control_latents
+            control_model_input = self._select_cfg_model_input(
+                tile_control_latents,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                enable_cfg_parallel=enable_cfg_parallel,
             )
-            tile_prompt_embeds = prompt_embeds[prompt_slice]
-            if do_classifier_free_guidance:
-                if negative_prompt_embeds is None:
-                    raise ValueError(
-                        "VividVR negative prompt embeds are required for CFG"
-                    )
-                tile_prompt_embeds = torch.cat(
-                    [negative_prompt_embeds[prompt_slice], tile_prompt_embeds],
-                    dim=0,
-                )
+            tile_prompt_embeds, cfg_branch = self._select_cfg_prompt_embeds(
+                prompt_embeds,
+                negative_prompt_embeds,
+                prompt_slice,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                enable_cfg_parallel=enable_cfg_parallel,
+                cfg_rank=cfg_rank,
+            )
+            debug["cfg_branch"] = cfg_branch
 
             concat_latent_model_input = torch.cat(
                 [latent_model_input, control_model_input],
@@ -1138,11 +1284,13 @@ class VividVRDenoisingStage(PipelineStage):
                 )[0]
 
             noise_pred = noise_pred.float()
-            if do_classifier_free_guidance:
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + float(guidance_scale) * (
-                    noise_pred_text - noise_pred_uncond
-                )
+            noise_pred = self._combine_cfg_noise_pred(
+                noise_pred,
+                guidance_scale=guidance_scale,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                enable_cfg_parallel=enable_cfg_parallel,
+                cfg_rank=cfg_rank,
+            )
 
             tile_latents, tile_old_pred_original_sample = self.scheduler.step(
                 noise_pred,

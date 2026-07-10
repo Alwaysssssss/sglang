@@ -31,8 +31,8 @@ export OUTPUT_DIR=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_be
 export INDICATOR_DIR=/home/zhiheng/sglang/Vivid_Acceptance/indicator/service_benchmark
 export CAPTION_SIDECAR_DIR=/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars
 
-export INPUT_VIDEO_130F=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.mp4
-export CAPTION_FILE=/home/zhiheng/Vivid-VR/input/720p_long/test_video_long_960x720_130f.txt
+export INPUT_VIDEO_130F=/home/zhiheng/input/test_video_long_960x720_130f.mp4
+export CAPTION_FILE=/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt
 export PROMPT_FILE=/home/zhiheng/Vivid-VR/input/720p/prompt.txt
 
 export MOTO_S3_ENDPOINT=127.0.0.1:4566
@@ -170,7 +170,9 @@ tmux new-session -d -s vividvr_flowcut_bridge_mock_service_dual \
    export CUDA_VISIBLE_DEVICES=0,1 && \
    export PYTHONUNBUFFERED=1 && \
    export PYTHONPATH=python && \
-   export NO_PROXY=127.0.0.1,localhost && \
+     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+     export NO_PROXY=127.0.0.1,localhost && \
+     export no_proxy=127.0.0.1,localhost && \
    export AWS_EC2_METADATA_DISABLED=true && \
    export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
    export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
@@ -230,7 +232,9 @@ tmux new-session -d -s vividvr_flowcut_bridge_mock_service_quad \
    export CUDA_VISIBLE_DEVICES=0,1,2,3 && \
    export PYTHONUNBUFFERED=1 && \
    export PYTHONPATH=python && \
-   export NO_PROXY=127.0.0.1,localhost && \
+     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && \
+     export NO_PROXY=127.0.0.1,localhost && \
+     export no_proxy=127.0.0.1,localhost && \
    export AWS_EC2_METADATA_DISABLED=true && \
    export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
    export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
@@ -267,6 +271,190 @@ tmux new-session -d -s vividvr_flowcut_bridge_mock_service_quad \
 ```bash
 curl --noproxy '*' --silent --show-error --fail "${BRIDGE_BASE_URL}/health"
 ```
+
+### 5.3 CFG parallel v2 等价验收服务配置
+
+下面两条服务只用于 CFG parallel v2 等价与性能验收，不替代当前正式默认的双卡 `SP=2 + eager_global` 配置。`--vividvr-parallel-mode` 是服务启动级守护参数；纯 SP 路径仍然保留，可继续用 5.1 的双卡命令或 5.2 的四卡 SP-only 命令。
+
+CFG 等价验收推荐使用固定 caption sidecar mock，避免 caption 模型 GPU 占用和 caption 随机性影响 DiT 性能与质量判断。该 mock 仍遵守 sidecar HTTP 契约，会把 `${CAPTION_FILE}` 逐字写入请求给出的 `output_caption_path`：
+
+```bash
+tmux new-session -d -s vividvr_caption_sidecar_mock \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs && export CAPTION_FILE=/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt && /home/zhiheng/sglang/.venv/bin/python - <<'"'"'PY'"'"'
+import json
+import os
+import shutil
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+caption_file = Path(os.environ["CAPTION_FILE"]).expanduser()
+captions = caption_file.read_text(encoding="utf-8").splitlines()
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        if self.path != "/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = b"{\"status\":\"ok\"}"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        if self.path != "/v1/vividvr/captions":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        req = json.loads(self.rfile.read(length).decode("utf-8"))
+        expected = int(req["expected_caption_count"])
+        if expected != len(captions):
+            raise RuntimeError(f"expected_caption_count={expected}, captions={len(captions)}")
+        output = Path(req["output_caption_path"]).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(caption_file, output)
+        payload = {
+            "caption_file_path": str(output),
+            "caption_count": len(captions),
+            "manifest_path": req["manifest_path"],
+            "mode": "mock",
+            "worker_count": 0,
+            "fallback_used": False,
+            "request_id": None,
+            "total_clip_count": len(captions),
+            "assigned_clip_indices_by_worker": {},
+            "timing": {"mock": True},
+        }
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        return
+
+print(json.dumps({"caption_mock": "http://127.0.0.1:31200", "caption_file": str(caption_file), "caption_count": len(captions)}), flush=True)
+ThreadingHTTPServer(("127.0.0.1", 31200), Handler).serve_forever()
+PY'
+```
+
+CFG-only 两卡服务：
+
+```bash
+export BRIDGE_BASE_URL=http://127.0.0.1:31231
+
+tmux new-session -d -s vividvr_flowcut_cfg_only_mock_service \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/captions/service_sidecars && \
+   export CUDA_VISIBLE_DEVICES=0,1 && \
+   export PYTHONUNBUFFERED=1 && \
+   export PYTHONPATH=python && \
+   export NO_PROXY=127.0.0.1,localhost && \
+   export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+   /home/zhiheng/sglang/.venv/bin/sglang serve \
+     --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+     --model-id VividVR \
+     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+     --component-paths.vividvr /home/zhiheng/ckpts/Vivid-VR \
+     --num-gpus 2 \
+     --tp-size 1 \
+     --sp-degree 1 \
+     --ulysses-degree 1 \
+     --ring-degree 1 \
+     --enable-cfg-parallel \
+     --vividvr-parallel-mode cfg \
+     --enable-torch-compile \
+     --dist-timeout 3600 \
+     --attention-backend fa \
+     --host 127.0.0.1 \
+     --port 31231 \
+     --master-port 30231 \
+     --scheduler-port 56231 \
+     --strict-ports \
+     --input-save-path "" \
+     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --vividvr-caption-bridge \
+     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+     --vividvr-caption-sidecar-timeout 1800 \
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_cfg_only_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+四卡 `CFG=2 x SP=2` 服务：
+
+```bash
+export BRIDGE_BASE_URL=http://127.0.0.1:31232
+
+tmux new-session -d -s vividvr_flowcut_cfg2_sp2_mock_service \
+  'cd /home/zhiheng/sglang && mkdir -p Vivid_Acceptance/logs Vivid_Acceptance/captions/service_sidecars && \
+   export CUDA_VISIBLE_DEVICES=0,1,2,3 && \
+   export PYTHONUNBUFFERED=1 && \
+   export PYTHONPATH=python && \
+   export NO_PROXY=127.0.0.1,localhost && \
+   export AWS_EC2_METADATA_DISABLED=true && \
+   export SGLANG_FLOWCUT_PROGRESS_INTERVAL_SECONDS=5 && \
+   export SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global && \
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
+   /home/zhiheng/sglang/.venv/bin/sglang serve \
+     --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+     --model-id VividVR \
+     --pipeline-class-name CogVideoXVividVRControlNetPipeline \
+     --component-paths.vividvr /home/zhiheng/ckpts/Vivid-VR \
+     --num-gpus 4 \
+     --tp-size 1 \
+     --sp-degree 2 \
+     --ulysses-degree 2 \
+     --ring-degree 1 \
+     --enable-cfg-parallel \
+     --vividvr-parallel-mode cfg_sp \
+     --enable-torch-compile \
+     --dist-timeout 3600 \
+     --attention-backend fa \
+     --host 127.0.0.1 \
+     --port 31232 \
+     --master-port 30232 \
+     --scheduler-port 56232 \
+     --strict-ports \
+     --input-save-path "" \
+     --output-path /home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark \
+     --vividvr-caption-bridge \
+     --vividvr-caption-sidecar-url http://127.0.0.1:31200 \
+     --vividvr-caption-work-dir /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars \
+     --vividvr-caption-sidecar-timeout 1800 \
+     2>&1 | tee Vivid_Acceptance/logs/vividvr_flowcut_cfg2_sp2_mock_service_$(date -u +%Y%m%dT%H%M%SZ).log'
+```
+
+启动服务后必须提交两次完整推理：第一次仅作为 torch compile warmup，第二次才记录正式用时。正式质量对比使用上一轮四卡 reference：
+
+```bash
+export VIVIDVR_CFG_REFERENCE_VIDEO=/home/zhiheng/sglang/Vivid_Acceptance/result_videos/service_benchmark/downloads/quad-test-video-long-960x720-130f-run2-20260708T060202Z.bridge-downloaded.mp4
+```
+
+compare 门槛固定为每帧 SSIM 不低于 0.98：
+
+```bash
+PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
+  python/sglang/multimodal_gen/runtime/videoedit/compare.py \
+  --reference "${VIVIDVR_CFG_REFERENCE_VIDEO}" \
+  --candidate "${DOWNLOADED_RESULT_VIDEO}" \
+  --output-json "${INDICATOR_DIR}/${TASK_ID}.compare.json" \
+  --min-ssim 0.98 \
+  --max-failed-frame-ratio 0
+```
+
+验收通过条件：
+
+- `vividvr_debug.vividvr_parallel_mode` 分别为 `cfg` 或 `cfg_sp`
+- CFG-only 阶段 `cfg_parallel_enabled=true`、`cfg_world_size=2`、`sp_world_size=1`
+- `CFG=2 x SP=2` 阶段 `cfg_parallel_enabled=true`、`cfg_world_size=2`、`sp_world_size=2`
+- compare JSON 中 `summary.ssim_mean > 0.98`、`summary.ssim_min >= 0.98`、`summary.pass_compare == true`
 
 ## 6. caption bridge 成功链路
 

@@ -233,6 +233,7 @@ class GPUWorker:
 
             req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
+            result_extra = getattr(result, "extra", {}) or {}
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -324,7 +325,10 @@ class GPUWorker:
                 PerformanceLogger.dump_benchmark_report(
                     file_path=req.perf_dump_path,
                     metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
+                    meta={
+                        "model": self.server_args.model_path,
+                        "vividvr_debug": result_extra.get("vividvr_debug", {}),
+                    },
                     tag="server_perf_dump",
                 )
         except Exception as e:

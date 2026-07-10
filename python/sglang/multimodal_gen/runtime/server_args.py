@@ -132,6 +132,7 @@ class ServerArgs:
     dp_degree: int = 1
     # cfg parallel
     enable_cfg_parallel: bool = False
+    vividvr_parallel_mode: str = "auto"
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -669,6 +670,18 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_cfg_parallel,
             help="Enable cfg parallel.",
+        )
+        parser.add_argument(
+            "--vividvr-parallel-mode",
+            type=str,
+            choices=["auto", "single", "sp", "cfg", "cfg_sp"],
+            default=ServerArgs.vividvr_parallel_mode,
+            help=(
+                "VividVR parallel mode guard. auto preserves existing behavior. "
+                "single requires no CFG parallel and sp-degree=1; sp requires no CFG "
+                "parallel and sp-degree>1; cfg requires CFG parallel and sp-degree=1; "
+                "cfg_sp requires CFG parallel and sp-degree>1."
+            ),
         )
         parser.add_argument(
             "--data-parallel-size",
