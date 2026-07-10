@@ -46,6 +46,47 @@ class TestVividVRInferenceTool(unittest.TestCase):
         self.assertFalse(args.use_runai_model_streamer)
         self.assertFalse(args.use_vividvr_vae_decode_tiling)
 
+    def test_usp_collective_flags_default_disabled(self):
+        argv = ["run_vividvr_inference.py", "--input-video", "/tmp/input.mp4"]
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertFalse(args.enable_usp_packed_qkv_a2a)
+        self.assertFalse(args.enable_usp_prefix_all_gather_into_tensor)
+
+    def test_build_server_args_propagates_usp_collective_flags(self):
+        argv = [
+            "run_vividvr_inference.py",
+            "--input-video",
+            "/tmp/input.mp4",
+            "--enable-usp-packed-qkv-a2a",
+            "--enable-usp-prefix-all-gather-into-tensor",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        server_args = build_server_args(args)
+
+        self.assertTrue(server_args.enable_usp_packed_qkv_a2a)
+        self.assertTrue(server_args.enable_usp_prefix_all_gather_into_tensor)
+
+    def test_runtime_snapshot_records_usp_collective_flags(self):
+        args = Namespace(
+            attention_backend="fa",
+            use_runai_model_streamer=None,
+            use_vividvr_vae_decode_tiling=None,
+        )
+        server_args = ServerArgs(
+            model_path="/tmp/model",
+            enable_usp_packed_qkv_a2a=True,
+            enable_usp_prefix_all_gather_into_tensor=False,
+        )
+
+        snapshot = build_runtime_config_snapshot(args=args, server_args=server_args)
+
+        self.assertTrue(snapshot["enable_usp_packed_qkv_a2a"])
+        self.assertFalse(snapshot["enable_usp_prefix_all_gather_into_tensor"])
+
     def test_parse_args_supports_qk_norm_rope_fusion_flags(self):
         argv = [
             "run_vividvr_inference.py",
@@ -148,6 +189,8 @@ class TestVividVRInferenceTool(unittest.TestCase):
             text_encoder_cpu_offload=False,
             vae_cpu_offload=False,
             enable_torch_compile=False,
+            enable_usp_packed_qkv_a2a=False,
+            enable_usp_prefix_all_gather_into_tensor=False,
             enable_cogvideox_modulation_fusion=False,
             cogvideox_modulation_fusion_targets="transformer",
             enable_cogvideox_qkv_fusion=False,
@@ -341,6 +384,8 @@ class TestVividVRInferenceTool(unittest.TestCase):
             text_encoder_cpu_offload=False,
             vae_cpu_offload=False,
             enable_torch_compile=True,
+            enable_usp_packed_qkv_a2a=True,
+            enable_usp_prefix_all_gather_into_tensor=False,
             enable_cogvideox_modulation_fusion=False,
             cogvideox_modulation_fusion_targets="transformer",
             enable_cogvideox_qkv_fusion=False,
@@ -387,6 +432,8 @@ class TestVividVRInferenceTool(unittest.TestCase):
         self.assertEqual(payload["distributed_env"]["rank"], 0)
         self.assertEqual(payload["distributed_env"]["local_rank"], 0)
         self.assertEqual(payload["upscale"], 0.0)
+        self.assertTrue(payload["enable_usp_packed_qkv_a2a"])
+        self.assertFalse(payload["enable_usp_prefix_all_gather_into_tensor"])
 
     def test_build_request_forwards_original_upscale_contract(self):
         args = Namespace(

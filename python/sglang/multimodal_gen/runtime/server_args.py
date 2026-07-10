@@ -175,6 +175,8 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_usp_packed_qkv_a2a: bool = False
+    enable_usp_prefix_all_gather_into_tensor: bool = False
     enable_cogvideox_modulation_fusion: bool = False
     cogvideox_modulation_fusion_targets: str = "transformer"
     enable_cogvideox_qkv_fusion: bool = False
@@ -731,6 +733,18 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-usp-packed-qkv-a2a",
+            action=StoreBoolean,
+            default=ServerArgs.enable_usp_packed_qkv_a2a,
+            help="Pack USP Q/K/V input all-to-all into one functional collective.",
+        )
+        parser.add_argument(
+            "--enable-usp-prefix-all-gather-into-tensor",
+            action=StoreBoolean,
+            default=ServerArgs.enable_usp_prefix_all_gather_into_tensor,
+            help="Use functional all_gather_into_tensor for USP replicated-prefix output.",
         )
         parser.add_argument(
             "--enable-cogvideox-qkv-fusion",

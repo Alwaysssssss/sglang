@@ -196,6 +196,12 @@ def build_runtime_config_snapshot(
             else runai_streamer_env.strip().lower() in {"1", "true", "yes", "on"}
         ),
         "enable_torch_compile": bool(server_args.enable_torch_compile),
+        "enable_usp_packed_qkv_a2a": bool(
+            server_args.enable_usp_packed_qkv_a2a
+        ),
+        "enable_usp_prefix_all_gather_into_tensor": bool(
+            server_args.enable_usp_prefix_all_gather_into_tensor
+        ),
         "torch_compile_mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE")
         if server_args.enable_torch_compile
         else None,
@@ -377,6 +383,10 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         text_encoder_cpu_offload=args.text_encoder_cpu_offload,
         vae_cpu_offload=args.vae_cpu_offload,
         enable_torch_compile=args.enable_torch_compile,
+        enable_usp_packed_qkv_a2a=args.enable_usp_packed_qkv_a2a,
+        enable_usp_prefix_all_gather_into_tensor=(
+            args.enable_usp_prefix_all_gather_into_tensor
+        ),
         enable_cogvideox_modulation_fusion=args.enable_cogvideox_modulation_fusion,
         cogvideox_modulation_fusion_targets=args.cogvideox_modulation_fusion_targets,
         enable_cogvideox_qkv_fusion=args.enable_cogvideox_qkv_fusion,
@@ -759,6 +769,18 @@ def parse_args() -> argparse.Namespace:
         help="Enable or disable torch.compile for the native pipeline.",
     )
     parser.add_argument(
+        "--enable-usp-packed-qkv-a2a",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pack USP Q/K/V input all-to-all into one collective.",
+    )
+    parser.add_argument(
+        "--enable-usp-prefix-all-gather-into-tensor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use a tensor-form functional gather for USP replicated-prefix output.",
+    )
+    parser.add_argument(
         "--warmup",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -958,6 +980,10 @@ def build_dry_run_payload(
         "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
         "vae_cpu_offload": args.vae_cpu_offload,
         "enable_torch_compile": args.enable_torch_compile,
+        "enable_usp_packed_qkv_a2a": args.enable_usp_packed_qkv_a2a,
+        "enable_usp_prefix_all_gather_into_tensor": (
+            args.enable_usp_prefix_all_gather_into_tensor
+        ),
         "enable_cogvideox_modulation_fusion": args.enable_cogvideox_modulation_fusion,
         "cogvideox_modulation_fusion_targets": args.cogvideox_modulation_fusion_targets,
         "enable_cogvideox_qkv_fusion": args.enable_cogvideox_qkv_fusion,
@@ -1112,6 +1138,10 @@ def main() -> int:
             "restoration_guidance_scale": args.restoration_guidance_scale,
             "num_temporal_process_frames": args.num_temporal_process_frames,
             "dtype": args.dtype,
+            "enable_usp_packed_qkv_a2a": args.enable_usp_packed_qkv_a2a,
+            "enable_usp_prefix_all_gather_into_tensor": (
+                args.enable_usp_prefix_all_gather_into_tensor
+            ),
             "prompt_path": str(args.prompt_file) if args.prompt_file is not None else None,
             "caption_file_path": str(args.caption_file) if args.caption_file is not None else None,
             "caption_source": "caption_file" if args.caption_file is not None else "prompt_file",
