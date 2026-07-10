@@ -87,7 +87,7 @@ class SGLDiffusionProfiler:
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=self.num_active_steps,
+                    active=num_actual_steps,
                     repeat=1,
                 ),
             )
@@ -113,12 +113,9 @@ class SGLDiffusionProfiler:
 
     def step_denoising_step(self):
         if not self.full_profile:
-            if self.num_active_steps >= 0:
+            if self.num_active_steps > 0:
                 self._step()
                 self.num_active_steps -= 1
-            else:
-                # early exit when enough steps are captured, to reduce the trace file size
-                self.stop(dump_rank=0)
 
     @classmethod
     def get_instance(cls) -> "SGLDiffusionProfiler":

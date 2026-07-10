@@ -1029,7 +1029,7 @@ class VividVRDenoisingStage(PipelineStage):
                 "denoising_device_type": device.type,
                 "denoising_autocast_enabled": bool(autocast_enabled),
                 "device_placement_helper": "DenoisingStage._manage_device_placement",
-                "denoising_step_profile_helper": None,
+                "denoising_step_profile_helper": "DenoisingStage.step_profile",
                 "attn_metadata_enabled": False,
                 "attn_metadata_backend": None,
                 "attn_metadata_builder": None,
@@ -1353,6 +1353,7 @@ class VividVRDenoisingStage(PipelineStage):
                         params.restoration_guidance_scale
                     ),
                 )
+                DenoisingStage.step_profile(self)
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
                 )
@@ -1757,6 +1758,7 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
                             denoising_states,
                             merge_plan,
                         )
+                DenoisingStage.step_profile(self.denoising_stage)
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
                 )

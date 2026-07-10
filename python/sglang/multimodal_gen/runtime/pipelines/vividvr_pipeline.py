@@ -57,6 +57,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
     VividVRConditionEncodingStage,
     VividVRDecodingStage,
@@ -1406,6 +1409,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                             denoising_states,
                             merge_plan,
                         )
+                DenoisingStage.step_profile(self.denoising_stage)
                 params.runtime_progress = float(timestep_index + 1) / float(
                     len(params.runtime_timesteps)
                 )

@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipeli
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import VividVRPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
+    VividVRMultiClipDenoisingStage,
     VividVRTilingPreparationStage,
 )
 from sglang.multimodal_gen.runtime.vividvr.captioning import (
@@ -69,6 +70,86 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             ],
             [(0, 30), (31, 30), (31, 0)],
         )
+
+    def test_multiclip_denoising_profiles_once_per_timestep(self):
+        params = self._make_vividvr_params(
+            num_frames=130,
+            num_temporal_process_frames=121,
+            num_inference_steps=2,
+        )
+        params.runtime_timesteps = torch.tensor([2.0, 1.0])
+        clip_states = [
+            {
+                "latents": torch.zeros(1, 2, 1, 1, 1),
+                "control_latents": torch.zeros(1, 2, 1, 1, 1),
+                "tiled_prompt_embeds": torch.zeros(1, 1, 1),
+                "tiled_negative_prompt_embeds": None,
+                "do_classifier_free_guidance": False,
+                "tiling_infos": [],
+            }
+            for _ in range(2)
+        ]
+        batch = SimpleNamespace(
+            sampling_params=params,
+            extra={"vividvr_long_video_runtime": {"clip_states": clip_states}},
+            metrics={},
+            perf_dump_path=None,
+            request_id="profile-once-per-timestep",
+        )
+
+        class _DummyProgressBar:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def update(self):
+                return None
+
+        class _DummyDenoisingStage:
+            def __init__(self):
+                self.run_calls = 0
+
+            def prepare_denoising_state(self, _batch, _server_args, **kwargs):
+                return {"latents": kwargs["latents"]}
+
+            def progress_bar(self, total):
+                self.total = total
+                return _DummyProgressBar()
+
+            def run_denoising_step(self, *_args, **_kwargs):
+                self.run_calls += 1
+
+        denoising_stage = _DummyDenoisingStage()
+        stage = object.__new__(VividVRMultiClipDenoisingStage)
+        stage.denoising_stage = denoising_stage
+        stage.vae_scale_factor_temporal = 4
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.vividvr.build_vividvr_temporal_latent_merge_plan",
+                return_value=SimpleNamespace(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.vividvr.merge_vividvr_temporal_latent_states"
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.vividvr.write_vividvr_runtime_progress"
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages."
+                "model_specific_stages.vividvr.DenoisingStage.step_profile"
+            ) as step_profile,
+        ):
+            result = stage.forward(batch, SimpleNamespace())
+
+        self.assertIs(result, batch)
+        self.assertEqual(denoising_stage.run_calls, 4)
+        self.assertEqual(step_profile.call_count, 2)
 
     def test_build_vividvr_tiled_prompt_lists_matches_tile_count(self):
         tiled_prompts = build_vividvr_tiled_prompt_lists(
