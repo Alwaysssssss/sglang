@@ -6,7 +6,8 @@
 - prefix `all_gather_into_tensor` 开关没有减少当前 compile 正式路径的 collective：B0 和 P2 均为 `300` 次 gather，GPU annotation 总时长分别为 `46.734 ms` 和 `47.088 ms`。原因是旧的 tensor-list `dist.all_gather` 已被 Dynamo functionalize 为 coalesced tensor gather。
 - P1/P2/P3 相对 B0 的 130 帧 smoke 视频均通过 `SSIM >= 0.98` 门槛；P3 的 `SSIM mean=0.991444`、`min=0.988110`，无失败帧。
 - packed 优化降低了 launch count，但 5-step steady median 没有可测收益：B0 为 `9487.627 ms/step`，P1 为 `9523.407 ms/step`。profiler 中三步 A2A 总量只减少约 `101.242 ms`，不足以支持仅凭 smoke 推断正式耗时能从基线 `194.2424s` 降至 `175s`。
-- 两个开关继续保持默认关闭。是否接受 P3 取决于后续严格按 `docs_xzh/run_command/mock_test.md` 执行的 warmup + formal 服务验收。
+- 正式服务验收中，P3 去噪耗时为 `194.128929s`，相对 `194.2424s` 基线只减少 `0.113471s`（`0.0584%`），未达到 `<175s` 的性能门槛；质量仍通过，`SSIM mean=0.984879`、`min=0.980405`。
+- 第一阶段结论是“collective launch 优化与数值正确性成立，但端到端性能不晋级”。两个开关继续保持默认关闭，不修改正式默认命令和 handover 基线。
 
 ## 代码与 profiler 修复
 
@@ -103,16 +104,46 @@ reference 为 B0 smoke 输出，candidate 为同轮 P1/P2/P3 输出，比较 130
 - `Vivid_Acceptance/indicator/usp_ablation/P2_vs_B0_compare.json`
 - `Vivid_Acceptance/indicator/usp_ablation/P3_vs_B0_compare.json`
 
-## 下一步与接受条件
+## 正式服务验收
 
-正式验收必须完全走 `docs_xzh/run_command/mock_test.md` 的 Moto S3、callback receiver、固定 caption sidecar mock、四卡服务、外部 FlowCut POST、进度轮询、callback、S3 上传与下载路径。先 warmup，再在同一服务实例上提交 formal。
+正式验收严格使用 `docs_xzh/run_command/mock_test.md` 的 Moto S3、callback receiver、固定 caption sidecar mock、四卡 `sglang serve` 和外部 FlowCut POST 链路。服务配置为 `CFG=2 x SP=2`、`fa_sp`、`eager_global`、`torch.compile`，并在 transformer/controlnet 上同时开启 packed QKV A2A 和 prefix `all_gather_into_tensor`。
 
-P3 只有同时满足以下条件才通过第一阶段验收：
+- warmup task：`vividvr-usp-p3-warmup-20260710T052818Z`。
+- formal task：`vividvr-usp-p3-formal-20260710T053636Z`。
+- 服务日志：`Vivid_Acceptance/logs/vividvr_usp_p3_formal_service_20260710T052556Z.log`。
+- callback 日志：`Vivid_Acceptance/logs/mock_callback_20260710T052514Z.jsonl`。
+- formal perf：`Vivid_Acceptance/indicator/service_benchmark/vividvr-usp-p3-formal-20260710T053636Z_perf.json`。
+- formal compare：`Vivid_Acceptance/indicator/service_benchmark/vividvr-usp-p3-formal-20260710T053636Z_compare.json`。
+- acceptance summary：`Vivid_Acceptance/indicator/service_benchmark/vividvr-usp-p3-formal-20260710T053636Z_acceptance_summary.json`。
+- S3 下载视频：`Vivid_Acceptance/result_videos/service_benchmark/downloads/vividvr-usp-p3-formal-20260710T053636Z.bridge-downloaded.mp4`。
+- caption/manifest：`Vivid_Acceptance/captions/service_sidecars/vividvr-usp-p3-formal-20260710T053636Z.{txt,manifest.json}`。
 
-- `model_inference_runtime_seconds < 175.0`，基线为 `194.2424s`。
-- 固定 July 8 reference 的 `SSIM mean >= 0.98` 且 `SSIM min >= 0.98`。
-- CFG world size 2、SP world size 2、有效 backend `fa_sp`。
-- transformer/controlnet 的两个 USP effective 开关均为 `true`。
-- callback 终态 succeeded，Moto S3 对象存在并可下载。
+warmup 用于完成 compile/cache，不计入性能。formal 在同一服务实例上执行，结果如下：
 
-任一门禁失败时，本轮只记录实验结论，不修改正式默认命令和 handover 基线；两个开关继续默认关闭。
+| 指标 | 结果 | 门槛 | 结论 |
+|---|---:|---:|---|
+| model inference / denoising | `194.128929s` | `<175.0s` | FAIL |
+| 相对 `194.2424s` 基线 | `-0.113471s`（`-0.0584%`） | - | 基本持平 |
+| total runtime | `353.864116s` | 记录项 | - |
+| long preparation | `59.857291s` | 记录项 | - |
+| decode | `98.368664s` | 记录项 | - |
+| SSIM mean | `0.984879` | `>=0.98` | PASS |
+| SSIM min | `0.980405` | `>=0.98` | PASS |
+| 帧数 / 失败帧 | `130 / 0` | `130 / 0` | PASS |
+
+运行时 debug 同时确认：
+
+- `vividvr_parallel_mode=cfg_sp`、CFG world size 2、SP world size 2。
+- transformer/controlnet effective backend 均为 `fa_sp`。
+- transformer/controlnet 的 `packed_qkv_a2a` 和 `prefix_all_gather_into_tensor` 均为 `true`。
+- 输出 130 帧，`prompt_embed_shape=[1,226,4096]`，未破坏既有 VividVR 语义。
+- callback 终态为 `succeeded`；Moto S3 对象 `bridge-semantic-check/vividvr-usp-p3-formal-20260710T053636Z.mp4` 存在，大小 `5,751,035` bytes，并通过 boto3 下载后完成 SSIM。
+- 请求临时目录在完成后已清理。
+
+当前 Moto mock 对象 ACL 只有 owner `FULL_CONTROL`，因此返回的未签名裸 `result_url` 直接 `curl` 为 `403`；`mock_test.md` 提供的 boto3 认证下载路径通过。该现象与 USP collective 优化无关，但正式服务契约后续若要求裸 URL 可直接下载，需要单独修正 mock ACL 或改为 presigned URL。
+
+## 验收结论与后续边界
+
+P3 已证明 collective count、数值质量、并行拓扑和服务链路正确，但正式去噪耗时未低于 `175s`，因此第一阶段不通过性能验收。本轮不修改 `docs_xzh/run_command/vividvr_default_run_and_serve_commands.md` 和 handover 的正式基线，两个实验开关继续默认关闭。
+
+profiler 显示 packed QKV A2A 仍有约 `20%` 的 A2A annotation duration 收益，但它在完整去噪中的占比不足。若继续优化，应另写独立计划评估按 head bucket 的异步 A2A/attention overlap，并重新定义 buffer 生命周期、stream/event 同步、compile graph break、bucket 消融和数值门槛；不得直接在当前默认路径上启用。
