@@ -110,6 +110,41 @@ class TestVividVRInferenceTool(unittest.TestCase):
         )
         self.assertEqual(snapshot["usp_transformer"], snapshot["usp_controlnet"])
 
+    def test_parse_args_and_request_support_profiler_fields(self):
+        argv = [
+            "run_vividvr_inference.py",
+            "--input-video",
+            "/tmp/input.mp4",
+            "--profile",
+            "--num-profiled-timesteps",
+            "3",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertTrue(args.profile)
+        self.assertEqual(args.num_profiled_timesteps, 3)
+
+        server_args = ServerArgs(
+            model_path="/tmp/model",
+            pipeline_config=VividVRPipelineConfig(),
+        )
+        with patch(
+            "sglang.multimodal_gen.tools.run_vividvr_inference.prepare_request",
+            side_effect=lambda _server_args, params: params,
+        ):
+            params = build_request(
+                server_args=server_args,
+                args=args,
+                output_file_name="profile.mp4",
+            )
+
+        self.assertTrue(params.profile)
+        self.assertEqual(params.num_profiled_timesteps, 3)
+        snapshot = build_runtime_config_snapshot(args=args, server_args=server_args)
+        self.assertTrue(snapshot["profile"])
+        self.assertEqual(snapshot["num_profiled_timesteps"], 3)
+
     def test_parse_args_supports_qk_norm_rope_fusion_flags(self):
         argv = [
             "run_vividvr_inference.py",

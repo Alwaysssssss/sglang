@@ -202,6 +202,10 @@ def build_runtime_config_snapshot(
         "enable_usp_prefix_all_gather_into_tensor": bool(
             server_args.enable_usp_prefix_all_gather_into_tensor
         ),
+        "profile": bool(getattr(args, "profile", False)),
+        "num_profiled_timesteps": int(
+            getattr(args, "num_profiled_timesteps", 5)
+        ),
         "usp_packed_qkv_a2a_requested": bool(
             server_args.enable_usp_packed_qkv_a2a
         ),
@@ -442,6 +446,10 @@ def build_request(
         "enable_temporal_tiling": args.enable_temporal_tiling,
         "tile_size": args.tile_size,
         "tile_stride": args.tile_stride,
+        "profile": bool(getattr(args, "profile", False)),
+        "num_profiled_timesteps": int(
+            getattr(args, "num_profiled_timesteps", 5)
+        ),
     }
     if args.prompt_file is not None:
         request_kwargs["prompt_file_path"] = str(args.prompt_file)
@@ -789,6 +797,18 @@ def parse_args() -> argparse.Namespace:
         help="Use a tensor-form functional gather for USP replicated-prefix output.",
     )
     parser.add_argument(
+        "--profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the existing denoising-stage torch profiler.",
+    )
+    parser.add_argument(
+        "--num-profiled-timesteps",
+        type=int,
+        default=5,
+        help="Number of denoising timesteps captured after one profiler warmup step.",
+    )
+    parser.add_argument(
         "--warmup",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -992,6 +1012,10 @@ def build_dry_run_payload(
         "enable_usp_prefix_all_gather_into_tensor": (
             args.enable_usp_prefix_all_gather_into_tensor
         ),
+        "profile": bool(getattr(args, "profile", False)),
+        "num_profiled_timesteps": int(
+            getattr(args, "num_profiled_timesteps", 5)
+        ),
         "enable_cogvideox_modulation_fusion": args.enable_cogvideox_modulation_fusion,
         "cogvideox_modulation_fusion_targets": args.cogvideox_modulation_fusion_targets,
         "enable_cogvideox_qkv_fusion": args.enable_cogvideox_qkv_fusion,
@@ -1150,6 +1174,8 @@ def main() -> int:
             "enable_usp_prefix_all_gather_into_tensor": (
                 args.enable_usp_prefix_all_gather_into_tensor
             ),
+            "profile": args.profile,
+            "num_profiled_timesteps": args.num_profiled_timesteps,
             "prompt_path": str(args.prompt_file) if args.prompt_file is not None else None,
             "caption_file_path": str(args.caption_file) if args.caption_file is not None else None,
             "caption_source": "caption_file" if args.caption_file is not None else "prompt_file",
