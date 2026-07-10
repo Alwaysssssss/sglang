@@ -1,4 +1,5 @@
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -6,7 +7,9 @@ import torch
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_input_all_to_all_qkv,
+    _usp_prefix_all_gather,
 )
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -80,3 +83,47 @@ def test_packed_qkv_requires_divisible_heads():
     ):
         with pytest.raises(ValueError, match="must be divisible"):
             _usp_input_all_to_all_qkv(q, q, q)
+
+
+def test_usp_input_selector_uses_packed_helper_when_enabled():
+    attention = SimpleNamespace(use_packed_qkv_a2a=True)
+    q = torch.randn(1, 3, 4, 8)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.layer._usp_input_all_to_all_qkv",
+        return_value=(q + 1, k + 1, v + 1),
+    ) as packed:
+        actual = USPAttention._input_all_to_all_qkv(attention, q, k, v)
+    packed.assert_called_once_with(q, k, v)
+    torch.testing.assert_close(actual[0], q + 1)
+
+
+def test_usp_input_selector_keeps_three_legacy_calls_when_disabled():
+    attention = SimpleNamespace(use_packed_qkv_a2a=False)
+    q = torch.randn(1, 3, 4, 8)
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.layer._usp_input_all_to_all",
+        side_effect=lambda x, head_dim: x + 1,
+    ) as legacy:
+        actual = USPAttention._input_all_to_all_qkv(attention, q, q, q)
+    assert legacy.call_count == 3
+    assert all(call.kwargs == {"head_dim": 2} for call in legacy.call_args_list)
+    assert all(torch.equal(x, q + 1) for x in actual)
+
+
+def test_prefix_all_gather_uses_functional_collective_on_head_dim():
+    x = torch.randn(1, 5, 2, 8)
+    expected = torch.randn(1, 5, 4, 8)
+    fake_group = MagicMock()
+    fake_sp_group = MagicMock(ulysses_group=fake_group)
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.usp.get_sp_group",
+        return_value=fake_sp_group,
+    ), patch(
+        "sglang.multimodal_gen.runtime.layers.usp.ft_c.all_gather_tensor",
+        return_value=expected,
+    ) as gather:
+        actual = _usp_prefix_all_gather(x)
+    gather.assert_called_once_with(x.contiguous(), gather_dim=2, group=fake_group)
+    assert actual is expected

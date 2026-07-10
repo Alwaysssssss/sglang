@@ -46,6 +46,18 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _usp_prefix_all_gather(x: torch.Tensor) -> torch.Tensor:
+    ulysses_pg = get_sp_group().ulysses_group
+    if ulysses_pg is None:
+        raise RuntimeError("Ulysses process group is not initialized.")
+    gathered = ft_c.all_gather_tensor(
+        x.contiguous(),
+        gather_dim=2,
+        group=ulysses_pg,
+    )
+    return _maybe_wait(gathered)
+
+
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.

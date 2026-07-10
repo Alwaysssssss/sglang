@@ -25,7 +25,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
+    _usp_input_all_to_all_qkv,
     _usp_output_all_to_all,
+    _usp_prefix_all_gather,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -338,6 +340,8 @@ class USPAttention(nn.Module):
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
+        use_packed_qkv_a2a: bool = False,
+        use_prefix_all_gather_into_tensor: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -392,6 +396,24 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.use_packed_qkv_a2a = use_packed_qkv_a2a
+        self.use_prefix_all_gather_into_tensor = (
+            use_prefix_all_gather_into_tensor
+        )
+
+    def _input_all_to_all_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_packed_qkv_a2a:
+            return _usp_input_all_to_all_qkv(q, k, v)
+        return (
+            _usp_input_all_to_all(q, head_dim=2),
+            _usp_input_all_to_all(k, head_dim=2),
+            _usp_input_all_to_all(v, head_dim=2),
+        )
 
     def forward(
         self,
@@ -443,9 +465,7 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            q, k, v = self._input_all_to_all_qkv(q, k, v)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -494,9 +514,11 @@ class USPAttention(nn.Module):
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
         v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
 
-        q_shard = _usp_input_all_to_all(q_shard, head_dim=2)
-        k_shard = _usp_input_all_to_all(k_shard, head_dim=2)
-        v_shard = _usp_input_all_to_all(v_shard, head_dim=2)
+        q_shard, k_shard, v_shard = self._input_all_to_all_qkv(
+            q_shard,
+            k_shard,
+            v_shard,
+        )
 
         h_local = q_shard.shape[2]
         h_start = sp_rank * h_local
@@ -516,13 +538,16 @@ class USPAttention(nn.Module):
 
         out_shard = _usp_output_all_to_all(out_shard, head_dim=2)
 
-        gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
-        torch.distributed.all_gather(
-            gathered,
-            out_rep.contiguous(),
-            group=get_sp_group().ulysses_group,
-        )
-        out_rep = torch.cat(gathered, dim=2)
+        if self.use_prefix_all_gather_into_tensor:
+            out_rep = _usp_prefix_all_gather(out_rep)
+        else:
+            gathered = [torch.empty_like(out_rep) for _ in range(sp_size)]
+            torch.distributed.all_gather(
+                gathered,
+                out_rep.contiguous(),
+                group=get_sp_group().ulysses_group,
+            )
+            out_rep = torch.cat(gathered, dim=2)
 
         return torch.cat([out_rep, out_shard], dim=1)
 
