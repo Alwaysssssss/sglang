@@ -1245,6 +1245,8 @@ tmux new-session -d -s vividvr_usp_ablation \
      /home/zhiheng/sglang/.venv/bin/torchrun \
        --nproc_per_node=4 --master_port=30310 \
        python/sglang/multimodal_gen/tools/run_vividvr_inference.py \
+       --cogvideox-ckpt-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+       --vividvr-ckpt-path /home/zhiheng/ckpts/Vivid-VR \
        --input-video /home/zhiheng/input/test_video_long_960x720_130f.mp4 \
        --caption-file /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt \
        --output-dir /home/zhiheng/sglang/Vivid_Acceptance/result_videos/usp_ablation \
