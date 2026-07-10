@@ -82,10 +82,33 @@ class TestVividVRInferenceTool(unittest.TestCase):
             enable_usp_prefix_all_gather_into_tensor=False,
         )
 
-        snapshot = build_runtime_config_snapshot(args=args, server_args=server_args)
+        snapshot = build_runtime_config_snapshot(
+            args=args,
+            server_args=server_args,
+            debug={
+                "usp_transformer": {
+                    "packed_qkv_a2a": True,
+                    "prefix_all_gather_into_tensor": False,
+                },
+                "usp_controlnet": {
+                    "packed_qkv_a2a": True,
+                    "prefix_all_gather_into_tensor": False,
+                },
+            },
+        )
 
         self.assertTrue(snapshot["enable_usp_packed_qkv_a2a"])
         self.assertFalse(snapshot["enable_usp_prefix_all_gather_into_tensor"])
+        self.assertTrue(snapshot["usp_packed_qkv_a2a_requested"])
+        self.assertFalse(snapshot["usp_prefix_all_gather_into_tensor_requested"])
+        self.assertEqual(
+            snapshot["usp_transformer"],
+            {
+                "packed_qkv_a2a": True,
+                "prefix_all_gather_into_tensor": False,
+            },
+        )
+        self.assertEqual(snapshot["usp_transformer"], snapshot["usp_controlnet"])
 
     def test_parse_args_supports_qk_norm_rope_fusion_flags(self):
         argv = [

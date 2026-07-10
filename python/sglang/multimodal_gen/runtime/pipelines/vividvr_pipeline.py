@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
     CogVideoXVividVRTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
+    configure_cogvideox_usp_collectives,
     enable_cogvideox_qk_norm_fusion,
     enable_cogvideox_qk_norm_rope_fusion,
     enable_cogvideox_qkv_fusion,
@@ -37,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
     inspect_cogvideox_qk_norm_fusion,
     inspect_cogvideox_qk_norm_rope_fusion,
     inspect_cogvideox_qkv_fusion,
+    inspect_cogvideox_usp_collectives,
     normalize_cogvideox_attention_backend,
     resolve_cogvideox_attention_runtime_choice,
 )
@@ -404,6 +406,18 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             "attention_backend_controlnet": _inspect_module_attention_backend(
                 controlnet
             ),
+            "usp_packed_qkv_a2a_requested": bool(
+                getattr(server_args, "enable_usp_packed_qkv_a2a", False)
+            ),
+            "usp_prefix_all_gather_into_tensor_requested": bool(
+                getattr(
+                    server_args,
+                    "enable_usp_prefix_all_gather_into_tensor",
+                    False,
+                )
+            ),
+            "usp_transformer": inspect_cogvideox_usp_collectives(transformer),
+            "usp_controlnet": inspect_cogvideox_usp_collectives(controlnet),
             "torch_compile_requested": bool(server_args.enable_torch_compile),
             "torch_compile_transformer": _inspect_module_torch_compile(transformer),
             "torch_compile_controlnet": _inspect_module_torch_compile(controlnet),
@@ -596,6 +610,50 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
 
         if last_error is not None:
             raise last_error
+
+    def _apply_usp_collective_optimizations(self, server_args: ServerArgs) -> None:
+        use_packed_qkv_a2a = bool(
+            getattr(server_args, "enable_usp_packed_qkv_a2a", False)
+        )
+        use_prefix_all_gather_into_tensor = bool(
+            getattr(
+                server_args,
+                "enable_usp_prefix_all_gather_into_tensor",
+                False,
+            )
+        )
+        if not use_packed_qkv_a2a and not use_prefix_all_gather_into_tensor:
+            return
+
+        ulysses_degree = getattr(server_args, "ulysses_degree", None) or 1
+        if ulysses_degree <= 1:
+            raise ValueError(
+                "USP collective optimizations require a Ulysses degree greater than 1."
+            )
+
+        for component_name in ("transformer", "controlnet"):
+            component = self.get_module(component_name)
+            if component is None:
+                logger.warning(
+                    "Skipping USP collective optimizations for %s because the component is not loaded.",
+                    component_name,
+                )
+                continue
+            applied = configure_cogvideox_usp_collectives(
+                component,
+                use_packed_qkv_a2a=use_packed_qkv_a2a,
+                use_prefix_all_gather_into_tensor=(
+                    use_prefix_all_gather_into_tensor
+                ),
+            )
+            logger.info(
+                "Applied USP collective optimizations to %s processors=%d "
+                "packed_qkv_a2a=%s prefix_all_gather_into_tensor=%s.",
+                component_name,
+                applied,
+                use_packed_qkv_a2a,
+                use_prefix_all_gather_into_tensor,
+            )
 
     def _apply_qkv_fusion(self, server_args: ServerArgs) -> None:
         if not getattr(server_args, "enable_cogvideox_qkv_fusion", False):
@@ -905,6 +963,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_module("transformer", transformer)
         self.add_module("controlnet", controlnet)
         self._apply_attention_backend(server_args)
+        self._apply_usp_collective_optimizations(server_args)
         self._apply_qk_norm_fusion(server_args)
         self._apply_qk_norm_rope_fusion(server_args)
         self._apply_modulation_fusion(server_args)

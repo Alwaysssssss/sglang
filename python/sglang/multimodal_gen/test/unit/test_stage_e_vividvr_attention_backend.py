@@ -235,6 +235,56 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         self.assertEqual(debug["attention_backend_transformer"], "fa")
         self.assertEqual(debug["attention_backend_controlnet"], "fa")
 
+    def test_usp_collective_optimization_rejects_single_rank(self):
+        pipeline = object.__new__(VividVRPipeline)
+        pipeline.modules = {
+            "transformer": _PipelineHookModule(),
+            "controlnet": _PipelineHookModule(),
+        }
+
+        with self.assertRaisesRegex(ValueError, "Ulysses degree greater than 1"):
+            pipeline._apply_usp_collective_optimizations(
+                SimpleNamespace(
+                    attention_backend="fa",
+                    sp_degree=1,
+                    ulysses_degree=1,
+                    enable_usp_packed_qkv_a2a=True,
+                    enable_usp_prefix_all_gather_into_tensor=False,
+                )
+            )
+
+    def test_runtime_debug_reports_requested_and_effective_usp_collectives(self):
+        pipeline = object.__new__(VividVRPipeline)
+        transformer = _PipelineHookModule()
+        controlnet = _PipelineHookModule()
+        pipeline.modules = {
+            "transformer": transformer,
+            "controlnet": controlnet,
+        }
+        server_args = SimpleNamespace(
+            attention_backend="fa",
+            sp_degree=2,
+            ulysses_degree=2,
+            enable_torch_compile=False,
+            enable_cogvideox_qkv_fusion=False,
+            cogvideox_qkv_fusion_targets="transformer",
+            enable_usp_packed_qkv_a2a=True,
+            enable_usp_prefix_all_gather_into_tensor=False,
+        )
+
+        pipeline._apply_attention_backend(server_args)
+        pipeline._apply_usp_collective_optimizations(server_args)
+        debug = pipeline._build_runtime_acceleration_debug(server_args)
+
+        expected = {
+            "packed_qkv_a2a": True,
+            "prefix_all_gather_into_tensor": False,
+        }
+        self.assertTrue(debug["usp_packed_qkv_a2a_requested"])
+        self.assertFalse(debug["usp_prefix_all_gather_into_tensor_requested"])
+        self.assertEqual(debug["usp_transformer"], expected)
+        self.assertEqual(debug["usp_controlnet"], expected)
+
     def test_vividvr_pipeline_routes_sp_fa_and_sdpa_to_sp_semantics(self):
         pipeline = object.__new__(VividVRPipeline)
         transformer = _PipelineHookModule()

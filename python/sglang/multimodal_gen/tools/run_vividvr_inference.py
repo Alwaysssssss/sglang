@@ -202,6 +202,14 @@ def build_runtime_config_snapshot(
         "enable_usp_prefix_all_gather_into_tensor": bool(
             server_args.enable_usp_prefix_all_gather_into_tensor
         ),
+        "usp_packed_qkv_a2a_requested": bool(
+            server_args.enable_usp_packed_qkv_a2a
+        ),
+        "usp_prefix_all_gather_into_tensor_requested": bool(
+            server_args.enable_usp_prefix_all_gather_into_tensor
+        ),
+        "usp_transformer": _json_ready(debug.get("usp_transformer")),
+        "usp_controlnet": _json_ready(debug.get("usp_controlnet")),
         "torch_compile_mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE")
         if server_args.enable_torch_compile
         else None,
