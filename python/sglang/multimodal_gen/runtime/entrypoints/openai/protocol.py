@@ -202,6 +202,8 @@ class VideoRepairRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     perf_dump_path: Optional[str] = None
+    denoise_trace_path: Optional[str] = None
+    teacache_residual_trace_path: Optional[str] = None
 
 
 class VideoListResponse(BaseModel):

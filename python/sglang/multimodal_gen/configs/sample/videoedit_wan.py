@@ -87,6 +87,9 @@ class WanVideoEditSamplingParams(SamplingParams):
     guidance_scale: float = 5.0
     num_inference_steps: int = 40
     enable_teacache: bool = True
+    teacache_trace_path: str | None = None
+    denoise_trace_path: str | None = None
+    teacache_residual_trace_path: str | None = None
     negative_prompt: str | None = DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT
     teacache_params: TeaCacheParams = field(
         default_factory=build_videoedit_teacache_params

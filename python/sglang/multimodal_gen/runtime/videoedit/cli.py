@@ -55,7 +55,7 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dynamic-cfg-max-step", type=int, default=15)
     parser.add_argument("--dynamic-cfg-min", type=float, default=1.0)
     parser.add_argument("--bbox-padding", type=int, default=0)
-    parser.add_argument("--bbox-expand-scale", type=float, default=2.5)
+    parser.add_argument("--bbox-expand-scale", type=float, default=1.6)
     parser.add_argument("--dilate-px", type=int, default=15)
     parser.add_argument("--mask-scale", type=float, default=1.2)
     parser.add_argument("--feather-px", type=int, default=15)
@@ -80,6 +80,8 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--teacache-thresh", type=float, default=0.3)
     parser.add_argument("--teacache-start-skipping", type=_int_or_float, default=5)
     parser.add_argument("--teacache-end-skipping", type=_int_or_float, default=1.0)
+    parser.add_argument("--teacache-trace-path")
+    parser.add_argument("--denoise-trace-path")
     parser.add_argument("--enable-frame-interpolation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--frame-interpolation-exp", type=int, default=1)
     parser.add_argument("--frame-interpolation-scale", type=float, default=1.0)
@@ -274,6 +276,8 @@ def repair_cmd(args: argparse.Namespace) -> int:
         output_quality=args.output_quality,
         output_compression=args.output_compression,
         enable_teacache=args.enable_teacache,
+        teacache_trace_path=args.teacache_trace_path,
+        denoise_trace_path=args.denoise_trace_path,
         teacache_params=build_videoedit_teacache_params(
             teacache_thresh=args.teacache_thresh,
             start_skipping=args.teacache_start_skipping,

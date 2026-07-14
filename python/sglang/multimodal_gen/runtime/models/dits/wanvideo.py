@@ -2,14 +2,22 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import math
+import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.configs.sample.wan_teacache import (
+    _wan_1_3b_coefficients,
+    _wan_14b_coefficients,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -56,11 +64,131 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    get_is_main_process,
+    init_logger,
+)
 from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+
+def _poly_eval(coefficients: list[float], x: float) -> float:
+    result = 0.0
+    for coefficient in coefficients:
+        result = result * x + float(coefficient)
+    return result
+
+
+def _metric_float(value: torch.Tensor) -> float | None:
+    result = float(value.detach().cpu().item())
+    return result if math.isfinite(result) else None
+
+
+def _tensor_pair_stats(
+    current: torch.Tensor | None,
+    previous: torch.Tensor | None,
+) -> dict[str, Any]:
+    if current is None:
+        return {"available": False}
+
+    stats: dict[str, Any] = {
+        "available": True,
+        "numel": int(current.numel()),
+        "shape": list(current.shape),
+    }
+    if previous is None:
+        stats["has_previous"] = False
+        return stats
+
+    stats["has_previous"] = True
+    stats["previous_shape"] = list(previous.shape)
+    if current.shape != previous.shape:
+        stats["shape_changed"] = True
+        return stats
+
+    current_f = current.detach().float()
+    previous_f = previous.detach().to(device=current.device).float()
+    diff = current_f - previous_f
+    eps = torch.tensor(1.0e-12, device=current.device, dtype=torch.float32)
+
+    current_abs_mean = current_f.abs().mean()
+    previous_abs_mean = previous_f.abs().mean()
+    diff_abs_mean = diff.abs().mean()
+    current_rms = current_f.square().mean().sqrt()
+    previous_rms = previous_f.square().mean().sqrt()
+    rmse = diff.square().mean().sqrt()
+    current_norm = torch.linalg.vector_norm(current_f)
+    previous_norm = torch.linalg.vector_norm(previous_f)
+    diff_norm = torch.linalg.vector_norm(diff)
+    norm_product = current_norm * previous_norm
+
+    cosine_similarity = None
+    norm_product_value = _metric_float(norm_product)
+    if norm_product_value is not None and norm_product_value > 0.0:
+        cosine = (current_f * previous_f).sum() / torch.maximum(norm_product, eps)
+        cosine_similarity = _metric_float(cosine)
+
+    stats.update(
+        {
+            "shape_changed": False,
+            "current_abs_mean": _metric_float(current_abs_mean),
+            "previous_abs_mean": _metric_float(previous_abs_mean),
+            "mean_abs_delta": _metric_float(diff_abs_mean),
+            "relative_l1": _metric_float(
+                diff_abs_mean / torch.maximum(previous_abs_mean, eps)
+            ),
+            "current_rms": _metric_float(current_rms),
+            "previous_rms": _metric_float(previous_rms),
+            "rmse": _metric_float(rmse),
+            "relative_l2": _metric_float(rmse / torch.maximum(previous_rms, eps)),
+            "current_norm": _metric_float(current_norm),
+            "previous_norm": _metric_float(previous_norm),
+            "delta_norm": _metric_float(diff_norm),
+            "relative_norm": _metric_float(
+                diff_norm / torch.maximum(previous_norm, eps)
+            ),
+            "cosine_similarity": cosine_similarity,
+            "cosine_distance": None
+            if cosine_similarity is None
+            else 1.0 - cosine_similarity,
+        }
+    )
+    return stats
+
+
+def _relative_l1_stats(
+    current: torch.Tensor | None,
+    previous: torch.Tensor | None,
+) -> dict[str, Any]:
+    if current is None:
+        return {"available": False}
+    stats: dict[str, Any] = {
+        "available": True,
+        "numel": int(current.numel()),
+        "shape": list(current.shape),
+    }
+    if previous is None:
+        stats["has_previous"] = False
+        return stats
+    stats["has_previous"] = True
+    stats["previous_shape"] = list(previous.shape)
+    if current.shape != previous.shape:
+        stats["shape_changed"] = True
+        return stats
+
+    current_f = current.detach().float()
+    previous_f = previous.detach().to(device=current.device).float()
+    previous_abs_mean = previous_f.abs().mean()
+    eps = torch.tensor(1.0e-12, device=current.device, dtype=torch.float32)
+    rel_l1 = (current_f - previous_f).abs().mean() / torch.maximum(
+        previous_abs_mean, eps
+    )
+    stats["relative_l1"] = _metric_float(rel_l1)
+    stats["previous_abs_mean"] = _metric_float(previous_abs_mean)
+    stats["current_abs_mean"] = _metric_float(current_f.abs().mean())
+    return stats
 
 
 def _normalize_encoder_hidden_states_image(
@@ -951,6 +1079,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # For type checking
 
         self.cnt = 0
+        self._teacache_proxy_validation_states: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
         self.__post_init__()
 
         # misc
@@ -994,6 +1125,402 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         w_idx = rem % width_local
         positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
         return self.rotary_emb.forward_uncached(positions)
+
+    def _get_teacache_residual_trace_path(self, forward_batch: Any) -> str | None:
+        sampling_params = getattr(forward_batch, "sampling_params", None)
+        if sampling_params is not None:
+            path = getattr(sampling_params, "teacache_residual_trace_path", None)
+            if path:
+                return path
+        path = getattr(forward_batch, "teacache_residual_trace_path", None)
+        return path or None
+
+    def _reset_teacache_proxy_validation_state(self) -> None:
+        self._teacache_proxy_validation_states = {}
+
+    def _wan_teacache_coefficients(
+        self,
+        *,
+        model_size: str,
+        use_ret_steps: bool,
+    ) -> list[float]:
+        params = TeaCacheParams(
+            teacache_thresh=0.0,
+            use_ret_steps=use_ret_steps,
+        )
+        if model_size == "1.3b":
+            return _wan_1_3b_coefficients(params)
+        if model_size == "14b":
+            return _wan_14b_coefficients(params)
+        raise ValueError(f"Unsupported Wan TeaCache model size: {model_size}")
+
+    def _first_block_modulated_hidden_proxy(
+        self,
+        hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.blocks:
+            return None
+        block = self.blocks[0]
+        if not hasattr(block, "norm1") or not hasattr(block, "scale_shift_table"):
+            return None
+        if timestep_proj.dim() == 4:
+            e = block.scale_shift_table.unsqueeze(0) + timestep_proj.float()
+            shift_msa, scale_msa, *_ = e.chunk(6, dim=2)
+            shift_msa = shift_msa.squeeze(2)
+            scale_msa = scale_msa.squeeze(2)
+        else:
+            e = block.scale_shift_table + timestep_proj.float()
+            shift_msa, scale_msa, *_ = e.chunk(6, dim=1)
+        return block.norm1(hidden_states, shift_msa, scale_msa)
+
+    def _build_teacache_proxy_candidates(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        temb: torch.Tensor,
+        threshold: float,
+    ) -> list[dict[str, Any]]:
+        wan14_ret = self._wan_teacache_coefficients(
+            model_size="14b", use_ret_steps=True
+        )
+        wan14_temb = self._wan_teacache_coefficients(
+            model_size="14b", use_ret_steps=False
+        )
+        wan13_ret = self._wan_teacache_coefficients(
+            model_size="1.3b", use_ret_steps=True
+        )
+        wan13_temb = self._wan_teacache_coefficients(
+            model_size="1.3b", use_ret_steps=False
+        )
+
+        candidates: list[dict[str, Any]] = [
+            {
+                "name": "wan14_i2v_timestep_proj",
+                "description": "Current VideoEdit/Wan I2V 14B TeaCache proxy.",
+                "tensor": timestep_proj,
+                "coefficients": wan14_ret,
+                "coefficients_source": "wan_14b_use_ret_steps_true",
+                "decision_threshold": threshold,
+            },
+            {
+                "name": "wan14_t2v_temb",
+                "description": "Wan 14B non-ret/t2v-style time embedding proxy.",
+                "tensor": temb,
+                "coefficients": wan14_temb,
+                "coefficients_source": "wan_14b_use_ret_steps_false",
+                "decision_threshold": threshold,
+            },
+            {
+                "name": "wan13_timestep_proj",
+                "description": "Wan 1.3B ret-step proxy evaluated on VideoEdit tensors.",
+                "tensor": timestep_proj,
+                "coefficients": wan13_ret,
+                "coefficients_source": "wan_1p3b_use_ret_steps_true",
+                "decision_threshold": threshold,
+            },
+            {
+                "name": "wan13_temb",
+                "description": "Wan 1.3B non-ret time embedding proxy.",
+                "tensor": temb,
+                "coefficients": wan13_temb,
+                "coefficients_source": "wan_1p3b_use_ret_steps_false",
+                "decision_threshold": threshold,
+            },
+            {
+                "name": "patch_hidden_channel_mean",
+                "description": "Content-aware patched hidden-state channel mean.",
+                "tensor": hidden_states.detach().float().mean(dim=1),
+                "coefficients": [1.0, 0.0],
+                "coefficients_source": "identity",
+                "decision_threshold": threshold,
+            },
+        ]
+
+        first_block_modulated = self._first_block_modulated_hidden_proxy(
+            hidden_states,
+            timestep_proj,
+        )
+        if first_block_modulated is not None:
+            if os.environ.get("SGLANG_TEACACHE_PROXY_INCLUDE_FULL_HIDDEN") == "1":
+                candidates.append(
+                    {
+                        "name": "first_block_modulated_hidden",
+                        "description": (
+                            "Exact paper-style first-block modulated hidden proxy: "
+                            "norm(x) * (1 + scale) + shift."
+                        ),
+                        "tensor": first_block_modulated,
+                        "coefficients": [1.0, 0.0],
+                        "coefficients_source": "identity",
+                        "decision_threshold": threshold,
+                    }
+                )
+            candidates.append(
+                {
+                    "name": "first_block_modulated_channel_mean",
+                    "description": (
+                        "Pooled paper-style first-block modulated hidden proxy: "
+                        "mean over tokens after norm(x) * (1 + scale) + shift."
+                    ),
+                    "tensor": first_block_modulated.detach().float().mean(dim=1),
+                    "coefficients": [1.0, 0.0],
+                    "coefficients_source": "identity",
+                    "decision_threshold": threshold,
+                }
+            )
+
+        return candidates
+
+    def _compute_teacache_proxy_candidate_metrics(
+        self,
+        *,
+        name: str,
+        branch: str,
+        tensor: torch.Tensor,
+        coefficients: list[float],
+        coefficients_source: str,
+        decision_threshold: float,
+        is_boundary_step: bool,
+    ) -> dict[str, Any]:
+        state_key = (name, branch)
+        state = self._teacache_proxy_validation_states.setdefault(
+            state_key,
+            {
+                "previous_tensor": None,
+                "accumulated": 0.0,
+            },
+        )
+
+        previous_tensor = state["previous_tensor"]
+        rel_stats = _relative_l1_stats(tensor, previous_tensor)
+        rel_l1 = rel_stats.get("relative_l1")
+        accumulated_before = float(state["accumulated"])
+        rescaled_l1 = None
+        candidate_accumulated = None
+
+        if is_boundary_step or rel_l1 is None:
+            action = "compute"
+            accumulated_after = 0.0
+        else:
+            rescaled_l1 = _poly_eval(coefficients, float(rel_l1))
+            candidate_accumulated = accumulated_before + float(rescaled_l1)
+            if candidate_accumulated >= decision_threshold:
+                action = "compute"
+                accumulated_after = 0.0
+            else:
+                action = "skip"
+                accumulated_after = candidate_accumulated
+
+        state["previous_tensor"] = tensor.detach().clone()
+        state["accumulated"] = float(accumulated_after)
+
+        return {
+            "name": name,
+            "branch": branch,
+            "shape": list(tensor.shape),
+            "numel": int(tensor.numel()),
+            "coefficients_source": coefficients_source,
+            "coefficients": [float(value) for value in coefficients],
+            "decision_threshold": float(decision_threshold),
+            "relative_l1": rel_l1,
+            "relative_l1_stats": rel_stats,
+            "rescaled_l1": rescaled_l1,
+            "accumulated_before": accumulated_before,
+            "candidate_accumulated": candidate_accumulated,
+            "accumulated_after": float(accumulated_after),
+            "would_action": action,
+            "would_skip": action == "skip",
+        }
+
+    def _prepare_teacache_proxy_candidates(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        temb: torch.Tensor,
+        is_boundary_step: bool,
+        threshold: float,
+        branch: str,
+    ) -> dict[str, Any]:
+        candidates = self._build_teacache_proxy_candidates(
+            hidden_states=hidden_states,
+            timestep_proj=timestep_proj,
+            temb=temb,
+            threshold=threshold,
+        )
+        proxy_metrics = {}
+        for candidate in candidates:
+            proxy_metrics[candidate["name"]] = (
+                self._compute_teacache_proxy_candidate_metrics(
+                    name=candidate["name"],
+                    branch=branch,
+                    tensor=candidate["tensor"],
+                    coefficients=candidate["coefficients"],
+                    coefficients_source=candidate["coefficients_source"],
+                    decision_threshold=candidate["decision_threshold"],
+                    is_boundary_step=is_boundary_step,
+                )
+            )
+        return proxy_metrics
+
+    def _prepare_teacache_residual_validation(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        temb: torch.Tensor,
+    ) -> dict[str, Any] | None:
+        """Simulate TeaCache decisions during a full-forward run.
+
+        This is intentionally enabled only when real TeaCache is disabled. It validates
+        whether the current proxy would skip/compute correctly on the clean trajectory.
+        """
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+        if forward_batch is None or getattr(forward_batch, "enable_teacache", False):
+            return None
+        trace_path = self._get_teacache_residual_trace_path(forward_batch)
+        if not trace_path or getattr(forward_batch, "teacache_params", None) is None:
+            return None
+
+        current_timestep = int(forward_context.current_timestep)
+        is_cfg_negative = bool(getattr(forward_batch, "is_cfg_negative", False))
+        if current_timestep == 0 and not is_cfg_negative:
+            self.reset_teacache_state()
+            self._reset_teacache_proxy_validation_state()
+
+        teacache_params = forward_batch.teacache_params
+        num_inference_steps = int(forward_batch.num_inference_steps)
+        do_cfg = bool(getattr(forward_batch, "do_classifier_free_guidance", False))
+        use_ret_steps = teacache_params.use_ret_steps
+        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
+            num_inference_steps,
+            do_cfg,
+        )
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+        modulated_inp = timestep_proj if use_ret_steps else temb
+        branch = "uncond" if is_cfg_negative else "cond"
+
+        self.is_cfg_negative = is_cfg_negative
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=modulated_inp,
+            is_boundary_step=is_boundary_step,
+            coefficients=teacache_params.get_coefficients(),
+            teacache_thresh=teacache_params.teacache_thresh,
+            force_enabled=True,
+        )
+        cached_residual = (
+            self.previous_residual_negative
+            if is_cfg_negative and self._supports_cfg_cache
+            else self.previous_residual
+        )
+
+        sampling_params = getattr(forward_batch, "sampling_params", None)
+        window_spec = getattr(sampling_params, "runtime_window_spec", None)
+        return {
+            "trace_path": trace_path,
+            "request_id": getattr(forward_batch, "request_id", None),
+            "window_index": getattr(sampling_params, "runtime_window_index", None),
+            "window_start_index": getattr(window_spec, "start_index", None),
+            "window_end_index": getattr(window_spec, "end_index", None),
+            "denoise_step": current_timestep,
+            "num_inference_steps": num_inference_steps,
+            "branch": branch,
+            "is_cfg_negative": is_cfg_negative,
+            "do_cfg": do_cfg,
+            "raw_forward_index": int(self.cnt),
+            "would_skip": not should_calc,
+            "would_action": "compute" if should_calc else "skip",
+            "is_boundary_step": bool(is_boundary_step),
+            "start_skipping": int(start_skipping),
+            "end_skipping": int(end_skipping),
+            "threshold": float(teacache_params.teacache_thresh),
+            "use_ret_steps": use_ret_steps,
+            "rel_l1": self._teacache_last_rel_l1,
+            "rescaled_l1": self._teacache_last_rescaled_l1,
+            "accumulated_before": self._teacache_last_accumulated_before,
+            "candidate_accumulated": self._teacache_last_candidate_accumulated,
+            "accumulated_after": self._current_teacache_accumulated(),
+            "proxy_candidates": self._prepare_teacache_proxy_candidates(
+                hidden_states=hidden_states,
+                timestep_proj=timestep_proj,
+                temb=temb,
+                is_boundary_step=bool(is_boundary_step),
+                threshold=float(teacache_params.teacache_thresh),
+                branch=branch,
+            ),
+            "cached_residual": cached_residual,
+            "should_calc": should_calc,
+        }
+
+    def _write_teacache_residual_validation_trace(
+        self,
+        validation: dict[str, Any],
+        *,
+        residual_error: dict[str, Any],
+    ) -> None:
+        if not get_is_main_process():
+            return
+        record = {
+            "event": "teacache_residual_validation",
+            "request_id": validation["request_id"],
+            "window_index": validation["window_index"],
+            "window_start_index": validation["window_start_index"],
+            "window_end_index": validation["window_end_index"],
+            "denoise_step": validation["denoise_step"],
+            "num_inference_steps": validation["num_inference_steps"],
+            "branch": validation["branch"],
+            "is_cfg_negative": validation["is_cfg_negative"],
+            "do_cfg": validation["do_cfg"],
+            "raw_forward_index": validation["raw_forward_index"],
+            "would_skip": validation["would_skip"],
+            "would_action": validation["would_action"],
+            "is_boundary_step": validation["is_boundary_step"],
+            "start_skipping": validation["start_skipping"],
+            "end_skipping": validation["end_skipping"],
+            "threshold": validation["threshold"],
+            "use_ret_steps": validation["use_ret_steps"],
+            "rel_l1": validation["rel_l1"],
+            "rescaled_l1": validation["rescaled_l1"],
+            "accumulated_before": validation["accumulated_before"],
+            "candidate_accumulated": validation["candidate_accumulated"],
+            "accumulated_after": validation["accumulated_after"],
+            "proxy_candidates": validation.get("proxy_candidates"),
+            "cached_residual_available": bool(
+                validation["cached_residual"] is not None
+            ),
+            "residual_error": residual_error,
+        }
+        path = Path(validation["trace_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _finalize_teacache_residual_validation(
+        self,
+        validation: dict[str, Any] | None,
+        *,
+        hidden_states: torch.Tensor,
+        original_hidden_states: torch.Tensor,
+    ) -> None:
+        if validation is None:
+            return
+        current_residual = hidden_states.squeeze(0) - original_hidden_states
+        residual_error = _tensor_pair_stats(
+            current_residual,
+            validation["cached_residual"],
+        )
+        self._write_teacache_residual_validation_trace(
+            validation,
+            residual_error=residual_error,
+        )
+        if validation["should_calc"]:
+            if validation["is_cfg_negative"] and self._supports_cfg_cache:
+                self.previous_residual_negative = current_residual
+            else:
+                self.previous_residual = current_residual
 
     def forward(
         self,
@@ -1144,17 +1671,28 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
+        residual_validation = self._prepare_teacache_residual_validation(
+            hidden_states=hidden_states,
+            timestep_proj=timestep_proj,
+            temb=temb,
+        )
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
             # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
+            if self.enable_teacache or residual_validation is not None:
                 original_hidden_states = hidden_states.clone()
 
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                )
+            if residual_validation is not None:
+                self._finalize_teacache_residual_validation(
+                    residual_validation,
+                    hidden_states=hidden_states,
+                    original_hidden_states=original_hidden_states,
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
@@ -1236,6 +1774,14 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             is_boundary_step=is_boundary_step,
             coefficients=ctx.coefficients,
             teacache_thresh=ctx.teacache_thresh,
+        )
+        self._record_teacache_decision_trace(
+            ctx=ctx,
+            should_calc=should_calc,
+            is_boundary_step=is_boundary_step,
+            start_skipping=start_skipping,
+            end_skipping=end_skipping,
+            use_ret_steps=use_ret_steps,
         )
 
         return not should_calc

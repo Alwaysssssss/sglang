@@ -17,7 +17,11 @@ References:
   https://arxiv.org/abs/2411.14324
 """
 
+import json
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -145,6 +149,10 @@ class TeaCacheMixin:
         self.previous_modulated_input: torch.Tensor | None = None
         self.previous_residual: torch.Tensor | None = None
         self.accumulated_rel_l1_distance: float = 0.0
+        self._teacache_last_rel_l1: float | None = None
+        self._teacache_last_rescaled_l1: float | None = None
+        self._teacache_last_accumulated_before: float | None = None
+        self._teacache_last_candidate_accumulated: float | None = None
 
         self.is_cfg_negative = False
         # CFG-specific fields initialized to None (created when CFG is used)
@@ -162,6 +170,10 @@ class TeaCacheMixin:
         self.previous_modulated_input = None
         self.previous_residual = None
         self.accumulated_rel_l1_distance = 0.0
+        self._teacache_last_rel_l1 = None
+        self._teacache_last_rescaled_l1 = None
+        self._teacache_last_accumulated_before = None
+        self._teacache_last_candidate_accumulated = None
         self.is_cfg_negative = False
         self.enable_teacache = True
         # CFG negative cache fields (always reset, may be unused)
@@ -195,6 +207,10 @@ class TeaCacheMixin:
 
         # Defensive check: if previous input is not set, force calculation
         if prev_modulated_inp is None:
+            self._teacache_last_rel_l1 = None
+            self._teacache_last_rescaled_l1 = None
+            self._teacache_last_accumulated_before = None
+            self._teacache_last_candidate_accumulated = None
             return 0.0, True
 
         # Compute relative L1 distance
@@ -209,13 +225,18 @@ class TeaCacheMixin:
             if self.is_cfg_negative
             else self.accumulated_rel_l1_distance
         )
-        accumulated_rel_l1_distance = accumulated_rel_l1_distance + rescale_func(rel_l1)
+        rescaled_l1 = float(rescale_func(rel_l1))
+        candidate_accumulated = accumulated_rel_l1_distance + rescaled_l1
+        self._teacache_last_rel_l1 = float(rel_l1)
+        self._teacache_last_rescaled_l1 = rescaled_l1
+        self._teacache_last_accumulated_before = float(accumulated_rel_l1_distance)
+        self._teacache_last_candidate_accumulated = float(candidate_accumulated)
 
-        if accumulated_rel_l1_distance >= teacache_thresh:
+        if candidate_accumulated >= teacache_thresh:
             # Threshold exceeded: force compute and reset accumulator
             return 0.0, True
         # Cache hit: keep accumulated distance
-        return accumulated_rel_l1_distance, False
+        return candidate_accumulated, False
 
     def _compute_teacache_decision(
         self,
@@ -223,6 +244,7 @@ class TeaCacheMixin:
         is_boundary_step: bool,
         coefficients: list[float],
         teacache_thresh: float,
+        force_enabled: bool = False,
     ) -> bool:
         """
         Compute cache decision for TeaCache.
@@ -236,10 +258,14 @@ class TeaCacheMixin:
         Returns:
             True if forward computation is needed, False to use cache.
         """
-        if not self.enable_teacache:
+        if not self.enable_teacache and not force_enabled:
             return True
 
         if is_boundary_step:
+            self._teacache_last_rel_l1 = None
+            self._teacache_last_rescaled_l1 = None
+            self._teacache_last_accumulated_before = None
+            self._teacache_last_candidate_accumulated = None
             new_accum, should_calc = 0.0, True
         else:
             new_accum, should_calc = self._compute_l1_and_decide(
@@ -257,6 +283,93 @@ class TeaCacheMixin:
             self.accumulated_rel_l1_distance_negative = new_accum
 
         return should_calc
+
+    def _get_teacache_trace_path(self, forward_batch: Any) -> str | None:
+        """Return the optional JSONL trace path for TeaCache decisions."""
+        path = None
+        sampling_params = getattr(forward_batch, "sampling_params", None)
+        if sampling_params is not None:
+            path = getattr(sampling_params, "teacache_trace_path", None)
+        if not path:
+            path = getattr(forward_batch, "teacache_trace_path", None)
+        if not path:
+            path = os.environ.get("SGLANG_TEACACHE_TRACE_PATH")
+        return path
+
+    def _current_teacache_accumulated(self) -> float:
+        if self.is_cfg_negative and self._supports_cfg_cache:
+            return float(self.accumulated_rel_l1_distance_negative)
+        return float(self.accumulated_rel_l1_distance)
+
+    def _record_teacache_decision_trace(
+        self,
+        *,
+        ctx: TeaCacheContext,
+        should_calc: bool,
+        is_boundary_step: bool,
+        start_skipping: int,
+        end_skipping: int,
+        use_ret_steps: bool | None,
+    ) -> None:
+        """Append one TeaCache decision record when tracing is enabled."""
+        try:
+            from sglang.multimodal_gen.runtime.managers.forward_context import (
+                get_forward_context,
+            )
+            from sglang.multimodal_gen.runtime.utils.logging_utils import (
+                get_is_main_process,
+            )
+
+            if not get_is_main_process():
+                return
+
+            forward_batch = get_forward_context().forward_batch
+            if forward_batch is None:
+                return
+            trace_path = self._get_teacache_trace_path(forward_batch)
+            if not trace_path:
+                return
+
+            sampling_params = getattr(forward_batch, "sampling_params", None)
+            window_spec = getattr(sampling_params, "runtime_window_spec", None)
+            window_index = getattr(sampling_params, "runtime_window_index", None)
+            branch = "uncond" if ctx.is_cfg_negative else "cond"
+            record = {
+                "event": "teacache_decision",
+                "time": time.time(),
+                "request_id": getattr(forward_batch, "request_id", None),
+                "model": self.__class__.__name__,
+                "window_index": window_index,
+                "window_start_index": getattr(window_spec, "start_index", None),
+                "window_end_index": getattr(window_spec, "end_index", None),
+                "denoise_step": int(ctx.current_timestep),
+                "num_inference_steps": int(ctx.num_inference_steps),
+                "branch": branch,
+                "is_cfg_negative": bool(ctx.is_cfg_negative),
+                "do_cfg": bool(ctx.do_cfg),
+                "raw_forward_index": int(self.cnt),
+                "skipped": not should_calc,
+                "action": "compute" if should_calc else "skip",
+                "is_boundary_step": bool(is_boundary_step),
+                "start_skipping": int(start_skipping),
+                "end_skipping": int(end_skipping),
+                "threshold": float(ctx.teacache_thresh),
+                "use_ret_steps": use_ret_steps,
+                "rel_l1": self._teacache_last_rel_l1,
+                "rescaled_l1": self._teacache_last_rescaled_l1,
+                "accumulated_before": self._teacache_last_accumulated_before,
+                "candidate_accumulated": self._teacache_last_candidate_accumulated,
+                "accumulated_after": self._current_teacache_accumulated(),
+            }
+
+            path = Path(trace_path)
+            if path.parent and str(path.parent) != ".":
+                path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            # Tracing must never affect generation correctness.
+            return
 
     def _get_teacache_context(self) -> TeaCacheContext | None:
         """

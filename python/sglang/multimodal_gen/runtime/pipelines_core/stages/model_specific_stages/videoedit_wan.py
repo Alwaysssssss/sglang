@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 import math
+import os
+from pathlib import Path
 import weakref
 from typing import Any
 
@@ -15,6 +18,12 @@ from sglang.multimodal_gen.configs.sample.videoedit_wan import (
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    feat_idx as wan_vae_feat_idx,
+    first_chunk as wan_vae_first_chunk,
+    forward_context as wan_vae_forward_context,
+    unpatchify as wan_vae_unpatchify,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -28,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import get_is_main_process
 from sglang.multimodal_gen.runtime.videoedit.preprocess import prepare_window_inputs
 from sglang.multimodal_gen.runtime.videoedit.progress import (
     build_window_progress_payload,
@@ -131,6 +141,62 @@ def _decode_vae_for_videoedit(
     return _ensure_tensor_decode_output(decoded)
 
 
+def _can_stream_wan_vae_decode(vae: torch.nn.Module) -> bool:
+    return bool(
+        getattr(vae, "use_feature_cache", False)
+        and hasattr(vae, "clear_cache")
+        and hasattr(vae, "post_quant_conv")
+        and hasattr(vae, "decoder")
+        and hasattr(vae, "config")
+    )
+
+
+def _decode_vae_for_videoedit_streaming(
+    vae: torch.nn.Module,
+    latents: torch.Tensor,
+) -> torch.Tensor:
+    if os.environ.get("VIDEOEDIT_FORCE_TILED_VAE_DECODE") == "1":
+        original_use_feature_cache = getattr(vae, "use_feature_cache", None)
+        if original_use_feature_cache is not None:
+            vae.use_feature_cache = False
+        try:
+            return _decode_vae_for_videoedit(vae, latents)
+        finally:
+            if original_use_feature_cache is not None:
+                vae.use_feature_cache = original_use_feature_cache
+            if hasattr(vae, "clear_cache"):
+                vae.clear_cache()
+
+    if not _can_stream_wan_vae_decode(vae):
+        return _decode_vae_for_videoedit(vae, latents)
+
+    vae.clear_cache()
+    decoded_slices: list[torch.Tensor] = []
+    try:
+        with wan_vae_forward_context(
+            feat_cache_arg=vae._feat_map, feat_idx_arg=vae._conv_idx
+        ):
+            for latent_idx in range(latents.shape[2]):
+                wan_vae_feat_idx.set(0)
+                wan_vae_first_chunk.set(latent_idx == 0)
+                latent_slice = latents[:, :, latent_idx : latent_idx + 1, :, :]
+                decoded_slice = vae.decoder(vae.post_quant_conv(latent_slice))
+                if vae.config.patch_size is not None:
+                    decoded_slice = wan_vae_unpatchify(
+                        decoded_slice, patch_size=vae.config.patch_size
+                    )
+                decoded_slice = torch.clamp(decoded_slice.float(), min=-1.0, max=1.0)
+                decoded_slices.append(decoded_slice.cpu())
+                del decoded_slice
+                del latent_slice
+    finally:
+        vae.clear_cache()
+
+    if not decoded_slices:
+        raise ValueError("VideoEdit VAE decode produced no frame slices")
+    return torch.cat(decoded_slices, dim=2)
+
+
 def _ensure_tensor_transformer_output(transformer_output: Any) -> torch.Tensor:
     if isinstance(transformer_output, torch.Tensor):
         return transformer_output
@@ -142,6 +208,101 @@ def _ensure_tensor_transformer_output(transformer_output: Any) -> torch.Tensor:
         "VideoEdit transformer output must be a tensor, tuple, or object with .sample; "
         f"got {type(transformer_output).__name__}"
     )
+
+
+def _trace_tensor_snapshot(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.detach().clone()
+
+
+def _trace_float(value: torch.Tensor) -> float | None:
+    result = float(value.detach().cpu().item())
+    return result if math.isfinite(result) else None
+
+
+def _tensor_change_stats(
+    current: torch.Tensor | None, previous: torch.Tensor | None
+) -> dict[str, Any]:
+    if current is None:
+        return {"available": False}
+
+    stats: dict[str, Any] = {
+        "available": True,
+        "numel": int(current.numel()),
+        "shape": list(current.shape),
+    }
+    if previous is None:
+        stats["has_previous"] = False
+        return stats
+
+    stats["has_previous"] = True
+    stats["previous_shape"] = list(previous.shape)
+    if current.shape != previous.shape:
+        stats["shape_changed"] = True
+        return stats
+
+    current_f = current.detach().float()
+    previous_f = previous.detach().to(device=current.device).float()
+    diff = current_f - previous_f
+    eps = torch.tensor(1.0e-12, device=current.device, dtype=torch.float32)
+
+    current_abs_mean = current_f.abs().mean()
+    previous_abs_mean = previous_f.abs().mean()
+    diff_abs_mean = diff.abs().mean()
+    current_rms = current_f.square().mean().sqrt()
+    previous_rms = previous_f.square().mean().sqrt()
+    rmse = diff.square().mean().sqrt()
+    current_norm = torch.linalg.vector_norm(current_f)
+    previous_norm = torch.linalg.vector_norm(previous_f)
+    diff_norm = torch.linalg.vector_norm(diff)
+    norm_product = current_norm * previous_norm
+
+    cosine_similarity = None
+    cosine_distance = None
+    norm_product_value = _trace_float(norm_product)
+    if norm_product_value is not None and norm_product_value > 0.0:
+        cosine = (current_f * previous_f).sum() / torch.maximum(norm_product, eps)
+        cosine_similarity = _trace_float(cosine)
+        cosine_distance = None if cosine_similarity is None else 1.0 - cosine_similarity
+
+    stats.update(
+        {
+            "shape_changed": False,
+            "current_abs_mean": _trace_float(current_abs_mean),
+            "previous_abs_mean": _trace_float(previous_abs_mean),
+            "mean_abs_delta": _trace_float(diff_abs_mean),
+            "relative_l1": _trace_float(
+                diff_abs_mean / torch.maximum(previous_abs_mean, eps)
+            ),
+            "current_rms": _trace_float(current_rms),
+            "previous_rms": _trace_float(previous_rms),
+            "rmse": _trace_float(rmse),
+            "relative_l2": _trace_float(rmse / torch.maximum(previous_rms, eps)),
+            "current_norm": _trace_float(current_norm),
+            "previous_norm": _trace_float(previous_norm),
+            "delta_norm": _trace_float(diff_norm),
+            "relative_norm": _trace_float(
+                diff_norm / torch.maximum(previous_norm, eps)
+            ),
+            "cosine_similarity": cosine_similarity,
+            "cosine_distance": cosine_distance,
+        }
+    )
+    return stats
+
+
+def _write_videoedit_denoise_trace(
+    params: WanVideoEditSamplingParams,
+    record: dict[str, Any],
+) -> None:
+    if not params.denoise_trace_path or not get_is_main_process():
+        return
+
+    trace_path = Path(params.denoise_trace_path)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    with trace_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _transformer_cache_context(transformer: torch.nn.Module, name: str):
@@ -609,6 +770,14 @@ class VideoEditDenoisingStage(DenoisingStage):
         batch.is_cfg_negative = False
         self._maybe_enable_cache_dit(params.runtime_effective_num_inference_steps, batch)
 
+        trace_enabled = bool(params.denoise_trace_path) and get_is_main_process()
+        previous_latent_model_input = None
+        previous_latents_before_step = None
+        previous_latents_after_step = None
+        previous_noise_pred_cond = None
+        previous_noise_pred_uncond = None
+        previous_noise_pred_guided = None
+
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -635,6 +804,7 @@ class VideoEditDenoisingStage(DenoisingStage):
                         [latents, params.runtime_cond_masks, params.runtime_cond_latents],
                         dim=1,
                     ).to(target_dtype)
+                    latents_before_step = latents
                     timestep = t_device.to(dtype=target_dtype).expand(latents.shape[0])
                     attn_metadata = self._build_attn_metadata(
                         i,
@@ -660,8 +830,10 @@ class VideoEditDenoisingStage(DenoisingStage):
                                     return_dict=False,
                                 )
                             )
+                    noise_pred_cond = noise_pred
                     check_request_timeout(batch)
 
+                    noise_uncond = None
                     if do_cfg:
                         if params.runtime_negative_prompt_embeds is None:
                             raise ValueError("Negative prompt embeds are required for CFG")
@@ -689,6 +861,54 @@ class VideoEditDenoisingStage(DenoisingStage):
                         batch.is_cfg_negative = False
 
                     latents = self.scheduler.step(noise_pred, t_device, latents)
+                    if trace_enabled:
+                        _write_videoedit_denoise_trace(
+                            params,
+                            {
+                                "event": "videoedit_denoise_step",
+                                "request_id": params.request_id,
+                                "window_index": params.runtime_window_index,
+                                "window_start_index": getattr(
+                                    params.runtime_window_spec, "start_index", None
+                                ),
+                                "window_end_index": getattr(
+                                    params.runtime_window_spec, "end_index", None
+                                ),
+                                "step": int(i),
+                                "num_inference_steps": int(len(timesteps)),
+                                "timestep": int(t_host.item()),
+                                "guidance_scale": float(current_cfg),
+                                "do_cfg": bool(do_cfg),
+                                "latent_model_input_change": _tensor_change_stats(
+                                    latent_model_input, previous_latent_model_input
+                                ),
+                                "latents_before_scheduler_change": _tensor_change_stats(
+                                    latents_before_step, previous_latents_before_step
+                                ),
+                                "noise_pred_cond_change": _tensor_change_stats(
+                                    noise_pred_cond, previous_noise_pred_cond
+                                ),
+                                "noise_pred_uncond_change": _tensor_change_stats(
+                                    noise_uncond, previous_noise_pred_uncond
+                                ),
+                                "noise_pred_guided_change": _tensor_change_stats(
+                                    noise_pred, previous_noise_pred_guided
+                                ),
+                                "latents_after_scheduler_change": _tensor_change_stats(
+                                    latents, previous_latents_after_step
+                                ),
+                            },
+                        )
+                        previous_latent_model_input = _trace_tensor_snapshot(
+                            latent_model_input
+                        )
+                        previous_latents_before_step = _trace_tensor_snapshot(
+                            latents_before_step
+                        )
+                        previous_latents_after_step = _trace_tensor_snapshot(latents)
+                        previous_noise_pred_cond = _trace_tensor_snapshot(noise_pred_cond)
+                        previous_noise_pred_uncond = _trace_tensor_snapshot(noise_uncond)
+                        previous_noise_pred_guided = _trace_tensor_snapshot(noise_pred)
                     params.runtime_latents = latents
                     batch.latents = latents
                     params.runtime_progress = float(i + 1) / float(len(timesteps))
@@ -731,6 +951,8 @@ class VideoEditDecodingStage(PipelineStage):
         if server_args.pipeline_config.vae_tiling:
             self.vae.enable_tiling()
         latents = params.runtime_latents.to(device=device).to(dtype=vae_dtype)
+        batch.latents = None
+        params.runtime_latents = None
         autocast_enabled = vae_dtype != torch.float32 and not server_args.disable_autocast
         with torch.autocast(
             device_type=current_platform.device_type,
@@ -738,7 +960,8 @@ class VideoEditDecodingStage(PipelineStage):
             enabled=autocast_enabled,
         ):
             latents = _denormalize_vae_latents(latents, self.vae)
-            decoded = _decode_vae_for_videoedit(self.vae, latents)
+            decoded = _decode_vae_for_videoedit_streaming(self.vae, latents)
+        del latents
         decoded_frames = (decoded / 2 + 0.5).clamp(0, 1)[0].permute(1, 0, 2, 3)
         params.runtime_decoded_video_tensor = decoded_frames
 

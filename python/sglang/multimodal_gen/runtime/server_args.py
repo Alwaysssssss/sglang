@@ -136,6 +136,7 @@ class ServerArgs:
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
+    scheduler_response_timeout: int | None = 6000  # 100 minutes
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -684,6 +685,13 @@ class ServerArgs:
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+        )
+        parser.add_argument(
+            "--scheduler-response-timeout",
+            type=int,
+            default=ServerArgs.scheduler_response_timeout,
+            help="Timeout in seconds for the HTTP/ZMQ frontend waiting for a scheduler result. "
+            "Use <= 0 for no timeout.",
         )
 
         # Prompt text file for batch processing

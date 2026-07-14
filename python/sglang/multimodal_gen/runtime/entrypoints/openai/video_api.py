@@ -104,6 +104,8 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
     "teacacheThresh": "teacache_thresh",
     "teacacheStartSkipping": "teacache_start_skipping",
     "teacacheEndSkipping": "teacache_end_skipping",
+    "denoiseTracePath": "denoise_trace_path",
+    "teacacheResidualTracePath": "teacache_residual_trace_path",
     "minioConfig": "minio_config",
     "outputObjectKey": "output_object_key",
 }
@@ -1044,6 +1046,8 @@ async def create_video_repair(request: Request):
             output_quality=req.output_quality,
             output_compression=req.output_compression,
             perf_dump_path=req.perf_dump_path,
+            denoise_trace_path=req.denoise_trace_path,
+            teacache_residual_trace_path=req.teacache_residual_trace_path,
             progress_path=progress_path,
         )
         output_object_key = None
