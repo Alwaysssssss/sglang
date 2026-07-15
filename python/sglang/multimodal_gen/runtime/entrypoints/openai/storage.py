@@ -44,6 +44,34 @@ def normalize_object_key(key: str) -> str:
     return normalized
 
 
+def is_cos_storage_config(config: Any) -> bool:
+    provider = str(getattr(config, "provider", None) or "").strip().lower()
+    if provider:
+        return provider == "cos"
+
+    endpoint = normalize_endpoint(
+        config.endpoint, bool(getattr(config, "secure", False))
+    )
+    hostname = (urlparse(endpoint).hostname or "").lower()
+    return hostname.endswith(".myqcloud.com") and (
+        hostname.startswith("cos.") or ".cos." in hostname
+    )
+
+
+def apply_object_key_prefix(key: str, prefix: Optional[str]) -> str:
+    normalized_key = normalize_object_key(key)
+    normalized_prefix = (prefix or "").strip().strip("/")
+    if not normalized_prefix:
+        return normalized_key
+
+    normalized_prefix = normalize_object_key(normalized_prefix)
+    if normalized_key == normalized_prefix or normalized_key.startswith(
+        f"{normalized_prefix}/"
+    ):
+        return normalized_key
+    return f"{normalized_prefix}/{normalized_key}"
+
+
 def _content_type_for_path(local_path: str) -> str:
     ext = os.path.splitext(local_path)[1].lower()
     return _CONTENT_TYPES.get(ext, "application/octet-stream")

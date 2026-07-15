@@ -15,6 +15,8 @@ import sglang.multimodal_gen.runtime.entrypoints.openai.storage as storage_mod
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import (
     CloudStorage,
     RequestCloudStorage,
+    apply_object_key_prefix,
+    is_cos_storage_config,
     normalize_endpoint,
     normalize_object_key,
 )
@@ -48,6 +50,37 @@ def test_normalize_object_key_rejects_empty_and_parent_segments():
         normalize_object_key("")
     with pytest.raises(ValueError):
         normalize_object_key("outputs/../demo.mp4")
+
+
+def test_is_cos_storage_config_prefers_provider_and_falls_back_to_endpoint():
+    provider_config = SimpleNamespace(
+        provider="cos", endpoint="storage.example.com", secure=True
+    )
+    assert is_cos_storage_config(provider_config)
+
+    legacy_config = SimpleNamespace(
+        provider=None, endpoint="cos.ap-beijing.myqcloud.com", secure=True
+    )
+    assert is_cos_storage_config(legacy_config)
+
+    virtual_hosted_config = SimpleNamespace(
+        provider=None,
+        endpoint="vrs-mms-1258229344.cos.ap-beijing.myqcloud.com",
+        secure=True,
+    )
+    assert is_cos_storage_config(virtual_hosted_config)
+
+    explicit_mos_config = SimpleNamespace(
+        provider="mos", endpoint="cos.ap-beijing.myqcloud.com", secure=True
+    )
+    assert not is_cos_storage_config(explicit_mos_config)
+
+
+def test_apply_object_key_prefix_normalizes_and_avoids_duplicates():
+    key = "2026/07/15/031101_task.mov"
+    assert apply_object_key_prefix(key, "/flowcut/") == f"flowcut/{key}"
+    assert apply_object_key_prefix(f"flowcut/{key}", "/flowcut") == (f"flowcut/{key}")
+    assert apply_object_key_prefix(key, None) == key
 
 
 def test_request_cloud_storage_parses_minio_http_url():

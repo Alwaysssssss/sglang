@@ -126,6 +126,8 @@ class VideoRepairMinioConfig(BaseModel):
     secret_key: str
     secure: bool = False
     region: str = "us-east-1"
+    provider: Optional[str] = None
+    prefix: Optional[str] = None
 
 
 def default_video_repair_output_object_key(

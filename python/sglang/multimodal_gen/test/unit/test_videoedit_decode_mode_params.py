@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     default_video_repair_output_object_key,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
+    _apply_video_repair_output_prefix,
     _build_video_repair_callback_payload,
     _failed_video_repair_submission_job,
     _job_reason,
@@ -193,6 +194,55 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(
             _with_video_extension("jobs/result", ".mov"),
             "jobs/result.mov",
+        )
+
+    def test_cos_minio_aliases_and_output_prefix(self):
+        payload = _normalize_video_repair_payload(
+            {
+                "taskId": "task-1",
+                "prompt": "repair video",
+                "video_input_path": "/tmp/video.mp4",
+                "mask_input_path": "/tmp/mask.mp4",
+                "minioConfig": {
+                    "provider": "cos",
+                    "prefix": "/flowcut",
+                    "endpoint": "cos.ap-beijing.myqcloud.com",
+                    "bucket": "vrs-mms-1258229344",
+                    "rootUser": "test-access-key",
+                    "rootPass": "test-secret-key",
+                    "region": "ap-beijing",
+                    "useSSL": True,
+                },
+            }
+        )
+        request = VideoRepairRequest(**payload)
+        config = request.minio_config
+
+        self.assertEqual(config.provider, "cos")
+        self.assertEqual(config.prefix, "/flowcut")
+        self.assertEqual(config.bucket_name, "vrs-mms-1258229344")
+        self.assertEqual(config.access_key, "test-access-key")
+        self.assertEqual(config.secret_key, "test-secret-key")
+        self.assertTrue(config.secure)
+
+        generated_key = "2026/07/15/031101_task-1.mov"
+        self.assertEqual(
+            _apply_video_repair_output_prefix(request, generated_key),
+            f"flowcut/{generated_key}",
+        )
+        self.assertEqual(
+            _apply_video_repair_output_prefix(request, f"flowcut/{generated_key}"),
+            f"flowcut/{generated_key}",
+        )
+        self.assertEqual(
+            _apply_video_repair_output_prefix(request, "outputs/result.mov"),
+            "flowcut/outputs/result.mov",
+        )
+
+        config.provider = "mos"
+        self.assertEqual(
+            _apply_video_repair_output_prefix(request, generated_key),
+            generated_key,
         )
 
     def test_video_repair_request_accepts_stream(self):

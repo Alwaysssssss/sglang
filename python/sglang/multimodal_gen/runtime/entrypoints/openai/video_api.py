@@ -40,7 +40,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import (
     RequestCloudStorage,
+    apply_object_key_prefix,
     cloud_storage,
+    is_cos_storage_config,
     normalize_object_key,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
@@ -104,9 +106,13 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
 }
 
 _VIDEO_REPAIR_MINIO_FIELD_ALIASES = {
+    "bucket": "bucket_name",
     "bucketName": "bucket_name",
+    "rootUser": "access_key",
     "accessKey": "access_key",
+    "rootPass": "secret_key",
     "secretKey": "secret_key",
+    "useSSL": "secure",
 }
 
 
@@ -634,6 +640,15 @@ def _with_video_extension(path: str, extension: str | None) -> str:
     return f"{path}{extension}"
 
 
+def _apply_video_repair_output_prefix(
+    req: VideoRepairRequest, object_key: str
+) -> str:
+    config = req.minio_config
+    if config is None or not is_cos_storage_config(config):
+        return object_key
+    return apply_object_key_prefix(object_key, config.prefix)
+
+
 def _split_output_path(
     output_path: str | None,
     job_id: str,
@@ -935,6 +950,9 @@ async def create_video_repair(request: Request):
                     request_id,
                     extension=output_ext,
                 )
+            )
+            output_object_key = _apply_video_repair_output_prefix(
+                req, output_object_key
             )
         req.output_object_key = output_object_key
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)
