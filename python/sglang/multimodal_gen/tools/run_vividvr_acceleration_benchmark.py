@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
+import shutil
+import socket
 import statistics
+import subprocess
 import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 REPO_ROOT = Path("/home/zhiheng/sglang")
@@ -613,6 +619,426 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
+GpuSample = Mapping[int, float]
+
+
+def _run_command(
+    command: Sequence[str], **kwargs: Any
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(list(command), check=False, text=True, **kwargs)
+
+
+class _NvmlMemoryProvider:
+    def __init__(self, gpu_ids: Sequence[int]):
+        from sglang.multimodal_gen.utils import import_pynvml
+
+        self._gpu_ids = tuple(gpu_ids)
+        self._pynvml = import_pynvml()
+        self._pynvml.nvmlInit()
+
+    def __call__(self) -> dict[int, float]:
+        result: dict[int, float] = {}
+        for gpu_id in self._gpu_ids:
+            handle = self._pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            memory = self._pynvml.nvmlDeviceGetMemoryInfo(handle)
+            result[gpu_id] = float(memory.used) / (1024.0**2)
+        return result
+
+    def close(self) -> None:
+        self._pynvml.nvmlShutdown()
+
+
+def _sample_gpu_memory_with_nvidia_smi(
+    gpu_ids: Sequence[int], command_runner: CommandRunner = _run_command
+) -> dict[int, float]:
+    completed = command_runner(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise BenchmarkDataError(
+            "nvidia-smi memory sampling failed: "
+            f"{(completed.stderr or '').strip()}"
+        )
+    selected = set(gpu_ids)
+    result: dict[int, float] = {}
+    for line in (completed.stdout or "").splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 2:
+            continue
+        gpu_id = int(fields[0])
+        if gpu_id in selected:
+            result[gpu_id] = float(fields[1])
+    if set(result) != selected:
+        raise BenchmarkDataError(
+            f"nvidia-smi did not report selected GPUs: {sorted(selected - set(result))}"
+        )
+    return result
+
+
+class GpuMemorySampler:
+    def __init__(
+        self,
+        gpu_ids: Sequence[int],
+        *,
+        sample_provider: Iterator[GpuSample] | Callable[[], GpuSample] | None = None,
+        sampling_backend: str | None = None,
+        interval_seconds: float = 0.25,
+        command_runner: CommandRunner = _run_command,
+    ):
+        self.gpu_ids = tuple(gpu_ids)
+        self.interval_seconds = interval_seconds
+        self._iterator = (
+            sample_provider
+            if sample_provider is not None and hasattr(sample_provider, "__next__")
+            else None
+        )
+        self._callable = (
+            sample_provider
+            if callable(sample_provider) and self._iterator is None
+            else None
+        )
+        self._nvml_provider: _NvmlMemoryProvider | None = None
+        if sample_provider is None:
+            try:
+                self._nvml_provider = _NvmlMemoryProvider(self.gpu_ids)
+                self._callable = self._nvml_provider
+                default_backend = "nvml"
+            except Exception:
+                self._callable = lambda: _sample_gpu_memory_with_nvidia_smi(
+                    self.gpu_ids, command_runner
+                )
+                default_backend = "nvidia-smi"
+        else:
+            default_backend = "injected"
+        self.sampling_backend = sampling_backend or default_backend
+        self._peaks = {gpu_id: 0.0 for gpu_id in self.gpu_ids}
+        self._sample_count = 0
+        self._errors: list[str] = []
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def sample_once(self) -> bool:
+        try:
+            if self._iterator is not None:
+                sample = next(self._iterator)
+            elif self._callable is not None:
+                sample = self._callable()
+            else:
+                raise BenchmarkDataError("GPU sampler has no sample provider")
+        except StopIteration:
+            return False
+        except Exception as error:
+            self._errors.append(f"{type(error).__name__}: {error}")
+            return False
+        missing = set(self.gpu_ids) - set(sample)
+        if missing:
+            self._errors.append(f"sample missing GPU IDs {sorted(missing)}")
+            return False
+        for gpu_id in self.gpu_ids:
+            self._peaks[gpu_id] = max(self._peaks[gpu_id], float(sample[gpu_id]))
+        self._sample_count += 1
+        return True
+
+    def _sample_loop(self) -> None:
+        while not self._stop_event.is_set():
+            self.sample_once()
+            self._stop_event.wait(self.interval_seconds)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise BenchmarkConfigError("GPU memory sampler is already running")
+        self.sample_once()
+        self._thread = threading.Thread(
+            target=self._sample_loop,
+            name="vividvr-gpu-memory-sampler",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_seconds * 4))
+            self._thread = None
+        self.sample_once()
+        if self._nvml_provider is not None:
+            try:
+                self._nvml_provider.close()
+            finally:
+                self._nvml_provider = None
+        return self.result()
+
+    def result(self) -> dict[str, Any]:
+        max_peak = max(self._peaks.values(), default=0.0)
+        return {
+            "device_ids": list(self.gpu_ids),
+            "per_gpu_peak_mib": {
+                str(gpu_id): peak for gpu_id, peak in self._peaks.items()
+            },
+            "max_single_gpu_peak_mib": max_peak,
+            "max_single_gpu_peak_gib": max_peak / 1024.0,
+            "sample_count": self._sample_count,
+            "sampling_backend": self.sampling_backend,
+            "sampling_errors": list(self._errors),
+        }
+
+
+class TmuxManager:
+    _SESSION_PATTERN = re.compile(r"^vividvr_accel_[A-Za-z0-9_-]+$")
+
+    def __init__(
+        self,
+        *,
+        batch_id: str,
+        ownership_dir: Path,
+        command_runner: CommandRunner = _run_command,
+    ):
+        self.batch_id = batch_id
+        self.ownership_dir = ownership_dir
+        self.command_runner = command_runner
+
+    def _owner_path(self, session: str) -> Path:
+        if not self._SESSION_PATTERN.fullmatch(session):
+            raise BenchmarkConfigError(f"unsafe tmux session name: {session!r}")
+        return self.ownership_dir / f"{session}.json"
+
+    def _read_owner(self, session: str) -> dict[str, Any] | None:
+        owner_path = self._owner_path(session)
+        try:
+            value = json.loads(owner_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as error:
+            raise BenchmarkConfigError(
+                f"cannot read tmux ownership file {owner_path}: {error}"
+            ) from error
+        return value if isinstance(value, dict) else None
+
+    def start(
+        self,
+        session: str,
+        command: Sequence[str],
+        log_path: Path,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        owner_path = self._owner_path(session)
+        self.ownership_dir.mkdir(parents=True, exist_ok=True)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ownership = {
+            "batch_id": self.batch_id,
+            "session": session,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            with owner_path.open("x", encoding="utf-8") as output:
+                json.dump(ownership, output, ensure_ascii=False)
+                output.write("\n")
+        except FileExistsError as error:
+            raise BenchmarkConfigError(
+                f"tmux ownership file already exists: {owner_path}"
+            ) from error
+
+        environment_command = ["env"]
+        environment_command.extend(
+            f"{key}={value}" for key, value in sorted((environment or {}).items())
+        )
+        environment_command.extend(command)
+        shell_command = (
+            f"{shlex.join(environment_command)} 2>&1 | tee {shlex.quote(str(log_path))}"
+        )
+        completed = self.command_runner(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "bash",
+                "-lc",
+                shell_command,
+            ],
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            owner_path.unlink(missing_ok=True)
+            raise BenchmarkError(
+                f"failed to start tmux session {session}: "
+                f"{(completed.stderr or '').strip()}"
+            )
+
+    def stop(self, session: str) -> None:
+        owner = self._read_owner(session)
+        if not owner or owner.get("batch_id") != self.batch_id:
+            return
+        completed = self.command_runner(
+            ["tmux", "kill-session", "-t", session], capture_output=True
+        )
+        stderr = (completed.stderr or "").lower()
+        if completed.returncode != 0 and "can't find session" not in stderr:
+            raise BenchmarkError(
+                f"failed to stop owned tmux session {session}: "
+                f"{(completed.stderr or '').strip()}"
+            )
+        self._owner_path(session).unlink(missing_ok=True)
+
+    def cleanup_owned(self) -> None:
+        if not self.ownership_dir.exists():
+            return
+        for owner_path in sorted(self.ownership_dir.glob("vividvr_accel_*.json")):
+            session = owner_path.stem
+            owner = self._read_owner(session)
+            if owner and owner.get("batch_id") == self.batch_id:
+                self.stop(session)
+
+
+def _port_is_available(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _gpu_processes(
+    gpu_ids: Sequence[int], command_runner: CommandRunner = _run_command
+) -> dict[int, list[dict[str, Any]]]:
+    gpu_query = command_runner(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,uuid",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+    )
+    if gpu_query.returncode != 0:
+        raise BenchmarkConfigError(
+            f"nvidia-smi GPU query failed: {(gpu_query.stderr or '').strip()}"
+        )
+    uuid_to_index: dict[str, int] = {}
+    for line in (gpu_query.stdout or "").splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) == 2:
+            uuid_to_index[fields[1]] = int(fields[0])
+    missing = set(gpu_ids) - set(uuid_to_index.values())
+    if missing:
+        raise BenchmarkConfigError(f"configured GPU IDs do not exist: {sorted(missing)}")
+
+    process_query = command_runner(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=gpu_uuid,pid,process_name",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+    )
+    if process_query.returncode != 0:
+        raise BenchmarkConfigError(
+            "nvidia-smi compute process query failed: "
+            f"{(process_query.stderr or '').strip()}"
+        )
+    selected = set(gpu_ids)
+    result: dict[int, list[dict[str, Any]]] = {}
+    for line in (process_query.stdout or "").splitlines():
+        fields = [field.strip() for field in line.split(",", maxsplit=2)]
+        if len(fields) != 3 or fields[0] not in uuid_to_index:
+            continue
+        gpu_id = uuid_to_index[fields[0]]
+        if gpu_id in selected:
+            result.setdefault(gpu_id, []).append(
+                {"pid": int(fields[1]), "process_name": fields[2]}
+            )
+    return result
+
+
+def run_preflight(
+    config: BenchmarkConfig,
+    *,
+    check_runtime_resources: bool,
+    command_runner: CommandRunner = _run_command,
+    which: Callable[[str], str | None] = shutil.which,
+    port_checker: Callable[[str, int], bool] = _port_is_available,
+    gpu_process_checker: Callable[
+        [Sequence[int]], Mapping[int, Sequence[Mapping[str, Any]]]
+    ]
+    | None = None,
+) -> dict[str, Any]:
+    required_paths = {
+        "python_executable": config.python_executable,
+        "sglang_executable": config.python_executable.parent / "sglang",
+        "model_path": config.model_path,
+        "vividvr_path": config.vividvr_path,
+        "input_video": config.input_video,
+        "caption_file": config.caption_file,
+        "reference_video": config.reference_video,
+    }
+    missing_paths = [name for name, path in required_paths.items() if not path.exists()]
+    if missing_paths:
+        raise BenchmarkConfigError(
+            "missing required paths: "
+            + ", ".join(f"{name}={required_paths[name]}" for name in missing_paths)
+        )
+    required_binaries = ("tmux", "ffmpeg")
+    missing_binaries = [name for name in required_binaries if which(name) is None]
+    moto_server = config.python_executable.parent / "moto_server"
+    if not moto_server.exists():
+        missing_binaries.append(str(moto_server))
+    if missing_binaries:
+        raise BenchmarkConfigError(
+            f"missing required executables: {', '.join(missing_binaries)}"
+        )
+    if len(config.gpu_ids) < max(scheme.gpu_count for scheme in SCHEMES.values()):
+        raise BenchmarkConfigError("the full benchmark matrix requires four GPU IDs")
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "required_paths": {name: str(path) for name, path in required_paths.items()},
+        "gpu_ids": list(config.gpu_ids),
+        "runtime_resources_checked": check_runtime_resources,
+    }
+    if not check_runtime_resources:
+        return result
+
+    ports = (
+        config.service_port,
+        config.master_port,
+        config.scheduler_port,
+        config.caption_port,
+        config.callback_port,
+        config.s3_port,
+    )
+    occupied_ports = [port for port in ports if not port_checker(config.host, port)]
+    if occupied_ports:
+        raise BenchmarkConfigError(f"occupied ports: {occupied_ports}")
+    checker = gpu_process_checker or (
+        lambda gpu_ids: _gpu_processes(gpu_ids, command_runner)
+    )
+    gpu_processes = checker(config.gpu_ids)
+    if gpu_processes:
+        details = "; ".join(
+            f"GPU {gpu_id}: "
+            + ", ".join(
+                f"pid {process.get('pid')} ({process.get('process_name')})"
+                for process in processes
+            )
+            for gpu_id, processes in sorted(gpu_processes.items())
+            if processes
+        )
+        if details:
+            raise BenchmarkConfigError(f"selected GPUs have active processes: {details}")
+    result["ports"] = list(ports)
+    result["gpu_processes"] = {}
+    return result
 
 
 def build_service_environment(

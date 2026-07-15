@@ -1,4 +1,5 @@
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import pytest
 
@@ -6,14 +7,17 @@ from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     BenchmarkDataError,
     BenchmarkConfig,
     BenchmarkConfigError,
+    GpuMemorySampler,
     SCHEMES,
     SchemeStatus,
+    TmuxManager,
     VIVIDVR_STAGE_NAMES,
     atomic_write_json,
     build_unsupported_record,
     build_service_command,
     build_service_environment,
     compute_derived_metrics,
+    run_preflight,
     summarize_perf,
     validate_effective_config,
 )
@@ -319,3 +323,164 @@ def test_atomic_write_json_replaces_complete_payload(tmp_path: Path):
         "complete": True,
     }
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_gpu_sampler_aggregates_per_device_peaks():
+    sampler = GpuMemorySampler(
+        [0, 1],
+        sample_provider=iter(
+            [
+                {0: 1000.0, 1: 900.0},
+                {0: 1100.0, 1: 1200.0},
+            ]
+        ),
+        sampling_backend="fixture",
+    )
+    assert sampler.sample_once()
+    assert sampler.sample_once()
+    assert not sampler.sample_once()
+
+    result = sampler.result()
+    assert result["per_gpu_peak_mib"] == {"0": 1100.0, "1": 1200.0}
+    assert result["max_single_gpu_peak_mib"] == 1200.0
+    assert result["max_single_gpu_peak_gib"] == pytest.approx(1200.0 / 1024.0)
+    assert result["sample_count"] == 2
+    assert result["sampling_backend"] == "fixture"
+
+
+class FakeCommandRunner:
+    def __init__(self, *, stdout: str = ""):
+        self.calls: list[list[str]] = []
+        self.stdout = stdout
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(list(command))
+        return CompletedProcess(command, 0, stdout=self.stdout, stderr="")
+
+
+def test_tmux_manager_only_kills_owned_sessions(tmp_path: Path):
+    fake = FakeCommandRunner()
+    manager = TmuxManager(
+        batch_id="batch", ownership_dir=tmp_path, command_runner=fake
+    )
+
+    manager.stop("vividvr_accel_batch_R0_service")
+    assert fake.calls == []
+
+    foreign = tmp_path / "vividvr_accel_batch_R1_service.json"
+    foreign.write_text(
+        '{"batch_id":"someone-else","session":"vividvr_accel_batch_R1_service"}',
+        encoding="utf-8",
+    )
+    manager.stop("vividvr_accel_batch_R1_service")
+    assert fake.calls == []
+    assert foreign.exists()
+
+
+def test_tmux_manager_starts_and_stops_owned_session(tmp_path: Path):
+    fake = FakeCommandRunner()
+    manager = TmuxManager(
+        batch_id="batch", ownership_dir=tmp_path, command_runner=fake
+    )
+    log_path = tmp_path / "logs/service.log"
+
+    manager.start(
+        "vividvr_accel_batch_R0_service",
+        ["python", "server.py", "--value", "two words"],
+        log_path,
+        environment={"CUDA_VISIBLE_DEVICES": "0"},
+    )
+    assert fake.calls[0][:4] == [
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+    ]
+    owner = tmp_path / "vividvr_accel_batch_R0_service.json"
+    assert owner.exists()
+
+    manager.stop("vividvr_accel_batch_R0_service")
+    assert fake.calls[-1] == [
+        "tmux",
+        "kill-session",
+        "-t",
+        "vividvr_accel_batch_R0_service",
+    ]
+    assert not owner.exists()
+
+
+def make_existing_config(tmp_path: Path) -> BenchmarkConfig:
+    config = make_config(tmp_path)
+    for directory in (config.model_path, config.vividvr_path):
+        directory.mkdir(parents=True)
+    for file_path in (
+        config.python_executable,
+        config.python_executable.parent / "sglang",
+        config.python_executable.parent / "moto_server",
+        config.input_video,
+        config.caption_file,
+        config.reference_video,
+    ):
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.touch()
+    return config
+
+
+def test_preflight_read_only_mode_checks_paths_without_runtime_commands(
+    tmp_path: Path,
+):
+    config = make_existing_config(tmp_path)
+    fake = FakeCommandRunner()
+
+    result = run_preflight(
+        config,
+        check_runtime_resources=False,
+        command_runner=fake,
+        which=lambda executable: f"/usr/bin/{executable}",
+    )
+
+    assert result["ok"] is True
+    assert result["runtime_resources_checked"] is False
+    assert fake.calls == []
+
+
+def test_preflight_rejects_missing_required_path(tmp_path: Path):
+    config = make_existing_config(tmp_path)
+    config.reference_video.unlink()
+
+    with pytest.raises(BenchmarkConfigError, match="reference_video"):
+        run_preflight(
+            config,
+            check_runtime_resources=False,
+            which=lambda executable: f"/usr/bin/{executable}",
+        )
+
+
+def test_preflight_rejects_busy_port_before_service_start(tmp_path: Path):
+    config = make_existing_config(tmp_path)
+
+    with pytest.raises(BenchmarkConfigError, match="occupied ports.*31221"):
+        run_preflight(
+            config,
+            check_runtime_resources=True,
+            command_runner=FakeCommandRunner(),
+            which=lambda executable: f"/usr/bin/{executable}",
+            port_checker=lambda host, port: port != 31221,
+            gpu_process_checker=lambda gpu_ids: {},
+        )
+
+
+def test_preflight_rejects_unknown_gpu_processes(tmp_path: Path):
+    config = make_existing_config(tmp_path)
+
+    with pytest.raises(BenchmarkConfigError, match="GPU 2.*pid 991"):
+        run_preflight(
+            config,
+            check_runtime_resources=True,
+            command_runner=FakeCommandRunner(),
+            which=lambda executable: f"/usr/bin/{executable}",
+            port_checker=lambda host, port: True,
+            gpu_process_checker=lambda gpu_ids: {
+                2: [{"pid": 991, "process_name": "foreign.py"}]
+            },
+        )
