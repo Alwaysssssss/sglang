@@ -8,9 +8,15 @@ execution, and result serialization.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import os
+import statistics
+import tempfile
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import Any, Mapping
 
 
 REPO_ROOT = Path("/home/zhiheng/sglang")
@@ -22,6 +28,10 @@ class BenchmarkError(RuntimeError):
 
 class BenchmarkConfigError(BenchmarkError):
     """Raised before execution when a benchmark configuration is invalid."""
+
+
+class BenchmarkDataError(BenchmarkError):
+    """Raised when runtime evidence does not match the experiment contract."""
 
 
 class SchemeStatus(str, Enum):
@@ -216,6 +226,393 @@ SCHEMES: dict[str, Scheme] = {
         controls=("R4", "R5"),
     ),
 }
+
+
+VIVIDVR_STAGE_NAMES = (
+    "VividVRInputValidationStage",
+    "VividVRPromptPreparationStage",
+    "VividVRTemporalWindowPlanningStage",
+    "VividVRLongClipPreparationStage",
+    "VividVRTimestepPreparationStage",
+    "VividVRMultiClipDenoisingStage",
+    "VividVRMultiClipDecodeTrimStage",
+    "VividVRTemporalStitchPostprocessStage",
+)
+
+
+@dataclass(frozen=True)
+class PerfSummary:
+    model_inference_runtime_seconds: float
+    stage_seconds: dict[str, float]
+    unclassified_seconds: float
+    denoising_runtime_seconds: float
+    denoise_fraction: float
+    temporal_clip_count: int
+    inference_step_count: int
+    mean_step_seconds: float
+    steady_step_median_seconds: float | None
+
+
+def _required_number(payload: Mapping[str, Any], key: str) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchmarkDataError(f"{key} must be numeric, got {value!r}")
+    return float(value)
+
+
+def summarize_perf(perf: Mapping[str, Any]) -> PerfSummary:
+    total_seconds = _required_number(perf, "total_duration_ms") / 1000.0
+    raw_steps = perf.get("steps")
+    if not isinstance(raw_steps, list):
+        raise BenchmarkDataError("steps must be a list")
+
+    stage_seconds: dict[str, float] = {}
+    for item in raw_steps:
+        if not isinstance(item, Mapping):
+            raise BenchmarkDataError("each stage entry must be an object")
+        name = item.get("name")
+        if name not in VIVIDVR_STAGE_NAMES:
+            continue
+        if name in stage_seconds:
+            raise BenchmarkDataError(f"duplicate stage in perf dump: {name}")
+        stage_seconds[str(name)] = _required_number(item, "duration_ms") / 1000.0
+    missing = [name for name in VIVIDVR_STAGE_NAMES if name not in stage_seconds]
+    if missing:
+        raise BenchmarkDataError(f"missing stages in perf dump: {', '.join(missing)}")
+    stage_seconds = {name: stage_seconds[name] for name in VIVIDVR_STAGE_NAMES}
+
+    raw_denoise_steps = perf.get("denoise_steps_ms")
+    if not isinstance(raw_denoise_steps, list) or not raw_denoise_steps:
+        raise BenchmarkDataError("denoise_steps_ms must be a non-empty list")
+    per_step_seconds = [
+        _required_number(item, "duration_ms") / 1000.0
+        for item in raw_denoise_steps
+        if isinstance(item, Mapping)
+    ]
+    if len(per_step_seconds) != len(raw_denoise_steps):
+        raise BenchmarkDataError("each denoise step entry must be an object")
+
+    debug = perf.get("meta", {}).get("vividvr_debug", {})
+    if not isinstance(debug, Mapping):
+        raise BenchmarkDataError("meta.vividvr_debug must be an object")
+    clip_count = debug.get("num_clips")
+    if isinstance(clip_count, bool) or not isinstance(clip_count, int):
+        raise BenchmarkDataError("meta.vividvr_debug.num_clips must be an integer")
+
+    denoising_seconds = stage_seconds["VividVRMultiClipDenoisingStage"]
+    classified_seconds = sum(stage_seconds.values())
+    unclassified_seconds = total_seconds - classified_seconds
+    if unclassified_seconds < -1e-6:
+        raise BenchmarkDataError(
+            "sum of stage durations exceeds total_duration_ms: "
+            f"{classified_seconds:.6f}s > {total_seconds:.6f}s"
+        )
+    return PerfSummary(
+        model_inference_runtime_seconds=total_seconds,
+        stage_seconds=stage_seconds,
+        unclassified_seconds=max(0.0, unclassified_seconds),
+        denoising_runtime_seconds=denoising_seconds,
+        denoise_fraction=(
+            denoising_seconds / total_seconds if total_seconds > 0 else 0.0
+        ),
+        temporal_clip_count=clip_count,
+        inference_step_count=len(per_step_seconds),
+        mean_step_seconds=statistics.fmean(per_step_seconds),
+        steady_step_median_seconds=(
+            statistics.median(per_step_seconds[1:])
+            if len(per_step_seconds) > 1
+            else None
+        ),
+    )
+
+
+def validate_effective_config(
+    scheme: Scheme, perf: Mapping[str, Any]
+) -> dict[str, Any]:
+    if not scheme.executable:
+        raise BenchmarkDataError(f"cannot validate unsupported scheme {scheme.scheme_id}")
+    debug = perf.get("meta", {}).get("vividvr_debug", {})
+    if not isinstance(debug, Mapping):
+        raise BenchmarkDataError("meta.vividvr_debug must be an object")
+
+    mismatches: list[str] = []
+    requested = debug.get("attention_backend_requested")
+    if requested != scheme.backend:
+        mismatches.append(
+            f"requested backend expected {scheme.backend!r}, observed {requested!r}"
+        )
+    for component in ("transformer", "controlnet"):
+        observed = debug.get(f"attention_backend_{component}")
+        if observed != scheme.expected_effective_backend:
+            mismatches.append(
+                "effective backend for "
+                f"{component} expected {scheme.expected_effective_backend!r}, "
+                f"observed {observed!r}"
+            )
+    observed_mode = debug.get("vividvr_parallel_mode")
+    if observed_mode != scheme.parallel_mode:
+        mismatches.append(
+            f"parallel mode expected {scheme.parallel_mode!r}, observed {observed_mode!r}"
+        )
+    observed_sp = debug.get("sp_world_size")
+    if observed_sp != scheme.sp_degree:
+        mismatches.append(
+            f"SP world size expected {scheme.sp_degree}, observed {observed_sp!r}"
+        )
+    observed_cfg = debug.get("cfg_parallel_enabled")
+    if bool(observed_cfg) is not scheme.cfg_parallel:
+        mismatches.append(
+            f"CFG parallel expected {scheme.cfg_parallel}, observed {observed_cfg!r}"
+        )
+    compile_values = [
+        debug.get("torch_compile_requested"),
+        debug.get("torch_compile_transformer"),
+        debug.get("torch_compile_controlnet"),
+    ]
+    if scheme.compile_enabled and compile_values != [True, True, True]:
+        mismatches.append(
+            "torch.compile expected requested/applied on transformer and controlnet, "
+            f"observed {compile_values!r}"
+        )
+    if not scheme.compile_enabled and bool(compile_values[0]):
+        mismatches.append(
+            f"torch.compile expected disabled, observed requested={compile_values[0]!r}"
+        )
+    fusion_values = [
+        debug.get("modulation_fusion_requested"),
+        debug.get("modulation_fusion_transformer"),
+        debug.get("modulation_fusion_controlnet"),
+    ]
+    if scheme.modulation_fusion and fusion_values != [True, True, True]:
+        mismatches.append(
+            "modulation fusion expected requested/applied on transformer and "
+            f"controlnet, observed {fusion_values!r}"
+        )
+    if not scheme.modulation_fusion and bool(fusion_values[0]):
+        mismatches.append(
+            "modulation fusion expected disabled, "
+            f"observed requested={fusion_values[0]!r}"
+        )
+    if mismatches:
+        raise BenchmarkDataError("; ".join(mismatches))
+    return {
+        "requested_backend": requested,
+        "effective_backend": scheme.expected_effective_backend,
+        "parallel_mode": observed_mode,
+        "sp_world_size": observed_sp,
+        "cfg_parallel_enabled": bool(observed_cfg),
+        "torch_compile_applied": scheme.compile_enabled,
+        "modulation_fusion_applied": scheme.modulation_fusion,
+    }
+
+
+def _successful_seconds(record: Mapping[str, Any] | None) -> float | None:
+    if not record or record.get("status") != "succeeded":
+        return None
+    value = record.get("timings", {}).get("model_inference_runtime_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return float(value)
+
+
+def _quality_passed(record: Mapping[str, Any] | None) -> bool:
+    return bool(record and record.get("quality", {}).get("pass_compare") is True)
+
+
+def compute_derived_metrics(
+    scheme: Scheme,
+    formal_records: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    current_seconds = _successful_seconds(formal_records.get(scheme.scheme_id))
+    baseline_seconds = _successful_seconds(formal_records.get("R0"))
+    control_candidates = [
+        control
+        for control in scheme.controls
+        if _successful_seconds(formal_records.get(control)) is not None
+        and _quality_passed(formal_records.get(control))
+    ]
+    control_id = (
+        min(
+            control_candidates,
+            key=lambda item: _successful_seconds(formal_records[item]) or float("inf"),
+        )
+        if control_candidates
+        else None
+    )
+    control_seconds = (
+        _successful_seconds(formal_records.get(control_id)) if control_id else None
+    )
+    gpu_seconds = (
+        scheme.gpu_count * current_seconds if current_seconds is not None else None
+    )
+    baseline_gpu_seconds = baseline_seconds
+    return {
+        "cumulative_speedup_vs_r0": (
+            baseline_seconds / current_seconds
+            if baseline_seconds is not None and current_seconds is not None
+            else None
+        ),
+        "cumulative_speedup_reason": (
+            None
+            if baseline_seconds is not None and current_seconds is not None
+            else "missing_successful_r0_or_current_formal_record"
+        ),
+        "control_scheme_id": control_id,
+        "incremental_speedup": (
+            control_seconds / current_seconds
+            if control_seconds is not None and current_seconds is not None
+            else None
+        ),
+        "incremental_speedup_reason": (
+            None
+            if control_seconds is not None and current_seconds is not None
+            else "missing_quality_passing_control_or_current_formal_record"
+        ),
+        "gpu_seconds": gpu_seconds,
+        "resource_efficiency_vs_r0": (
+            baseline_gpu_seconds / gpu_seconds
+            if baseline_gpu_seconds is not None and gpu_seconds is not None
+            else None
+        ),
+        "resource_efficiency_reason": (
+            None
+            if baseline_gpu_seconds is not None and gpu_seconds is not None
+            else "missing_successful_r0_or_current_formal_record"
+        ),
+    }
+
+
+def _scheme_payload(scheme: Scheme) -> dict[str, Any]:
+    payload = asdict(scheme)
+    payload["status"] = scheme.status.value
+    payload["expected_effective_backend"] = scheme.expected_effective_backend
+    payload["cfg_parallel"] = scheme.cfg_parallel
+    return payload
+
+
+def build_unsupported_record(
+    scheme: Scheme,
+    config: BenchmarkConfig,
+    *,
+    batch_id: str,
+) -> dict[str, Any]:
+    if scheme.executable:
+        raise BenchmarkConfigError(
+            f"{scheme.scheme_id} is executable; unsupported record is invalid"
+        )
+    return {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "status": "unsupported",
+        "run_role": None,
+        "scheme": _scheme_payload(scheme),
+        "capability": {
+            "status": scheme.status.value,
+            "reason": scheme.unsupported_reason,
+        },
+        "inputs": {
+            "input_video": str(config.input_video),
+            "caption_file": str(config.caption_file),
+            "prompt_source": "caption_sidecar_file_only",
+            "reference_video": str(config.reference_video),
+            "num_frames": 130,
+            "temporal_process_frames": 121,
+            "inference_steps": 20,
+            "seed": 42,
+            "guidance_scale": 6.0,
+            "restoration_guidance_scale": -1.0,
+            "upscale": 1.0,
+            "dtype": "bfloat16",
+        },
+        "runtime": {
+            "requested_backend": scheme.backend,
+            "effective_backend": None,
+            "effective_backend_reason": "scheme_not_executable",
+            "compile_applied": None,
+            "parallel_topology": scheme.parallel_mode,
+            "fusion": None,
+            "cache": None,
+            "quantization": None,
+        },
+        "timings": {
+            "total_runtime_seconds": None,
+            "model_inference_runtime_seconds": None,
+            "denoising_runtime_seconds": None,
+            "denoise_fraction": None,
+            "stage_seconds": {name: None for name in VIVIDVR_STAGE_NAMES},
+            "unclassified_seconds": None,
+            "temporal_clip_count": None,
+            "inference_step_count": None,
+            "mean_step_seconds": None,
+            "steady_step_median_seconds": None,
+            "sp_communication_seconds": None,
+            "sp_communication_reason": "not_profiled",
+            "cfg_communication_seconds": None,
+            "cfg_communication_reason": "not_profiled",
+            "cache_executed_steps": None,
+            "cache_skipped_steps": None,
+            "cache_steps_reason": "scheme_not_executable",
+        },
+        "gpu_memory": {
+            "device_ids": list(config.gpu_ids[: scheme.gpu_count]),
+            "per_gpu_peak_mib": None,
+            "max_single_gpu_peak_mib": None,
+            "max_single_gpu_peak_gib": None,
+            "sampling_backend": None,
+            "reason": "scheme_not_executable",
+        },
+        "quality": {
+            "pass_compare": None,
+            "ssim_mean": None,
+            "ssim_min": None,
+            "failed_frame_ratio": None,
+            "reason": "scheme_not_executable",
+        },
+        "derived": {
+            "cumulative_speedup_vs_r0": None,
+            "incremental_speedup": None,
+            "control_scheme_id": None,
+            "gpu_seconds": None,
+            "resource_efficiency_vs_r0": None,
+            "reason": "scheme_not_executable",
+        },
+        "artifacts": {
+            "perf_json": None,
+            "result_video": None,
+            "compare_json": None,
+            "service_log": None,
+        },
+        "reproducibility": {
+            "repo_root": str(config.repo_root),
+            "python_executable": str(config.python_executable),
+            "model_path": str(config.model_path),
+            "vividvr_path": str(config.vividvr_path),
+            "service_command": None,
+            "service_environment": None,
+            "config_fingerprint": None,
+        },
+    }
+
+
+def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as output:
+            json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def build_service_environment(

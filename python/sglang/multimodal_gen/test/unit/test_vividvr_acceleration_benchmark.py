@@ -3,12 +3,19 @@ from pathlib import Path
 import pytest
 
 from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
+    BenchmarkDataError,
     BenchmarkConfig,
     BenchmarkConfigError,
     SCHEMES,
     SchemeStatus,
+    VIVIDVR_STAGE_NAMES,
+    atomic_write_json,
+    build_unsupported_record,
     build_service_command,
     build_service_environment,
+    compute_derived_metrics,
+    summarize_perf,
+    validate_effective_config,
 )
 
 
@@ -133,3 +140,182 @@ def test_distributed_environment_uses_selected_gpus_and_global_context(tmp_path:
 def test_unsupported_scheme_cannot_build_service_command(tmp_path: Path):
     with pytest.raises(BenchmarkConfigError, match="R8.*unsupported"):
         build_service_command(SCHEMES["R8"], make_config(tmp_path))
+
+
+def make_perf_fixture(
+    *,
+    requested_backend: str = "fa",
+    effective_backend: str = "fa_sp",
+    mode: str = "sp",
+    sp_world_size: int = 2,
+    cfg_enabled: bool = False,
+    compile_enabled: bool = True,
+    modulation_fusion: bool = False,
+) -> dict:
+    stage_ms = {
+        "VividVRInputValidationStage": 100.0,
+        "VividVRPromptPreparationStage": 100.0,
+        "VividVRTemporalWindowPlanningStage": 100.0,
+        "VividVRLongClipPreparationStage": 200.0,
+        "VividVRTimestepPreparationStage": 100.0,
+        "VividVRMultiClipDenoisingStage": 8000.0,
+        "VividVRMultiClipDecodeTrimStage": 100.0,
+        "VividVRTemporalStitchPostprocessStage": 100.0,
+    }
+    return {
+        "total_duration_ms": 10000.0,
+        "steps": [
+            {"name": name, "duration_ms": duration_ms}
+            for name, duration_ms in stage_ms.items()
+        ],
+        "denoise_steps_ms": [
+            {"step": 0, "duration_ms": 600.0},
+            {"step": 1, "duration_ms": 300.0},
+            {"step": 2, "duration_ms": 400.0},
+            {"step": 3, "duration_ms": 500.0},
+        ],
+        "meta": {
+            "vividvr_debug": {
+                "num_clips": 2,
+                "attention_backend_requested": requested_backend,
+                "attention_backend_transformer": effective_backend,
+                "attention_backend_controlnet": effective_backend,
+                "vividvr_parallel_mode": mode,
+                "sp_world_size": sp_world_size,
+                "cfg_parallel_enabled": cfg_enabled,
+                "torch_compile_requested": compile_enabled,
+                "torch_compile_transformer": compile_enabled,
+                "torch_compile_controlnet": compile_enabled,
+                "modulation_fusion_requested": modulation_fusion,
+                "modulation_fusion_transformer": (
+                    True if modulation_fusion else None
+                ),
+                "modulation_fusion_controlnet": (
+                    True if modulation_fusion else None
+                ),
+            }
+        },
+    }
+
+
+def test_summarize_perf_computes_table_metrics():
+    summary = summarize_perf(make_perf_fixture())
+
+    assert tuple(summary.stage_seconds) == VIVIDVR_STAGE_NAMES
+    assert summary.model_inference_runtime_seconds == 10.0
+    assert summary.denoising_runtime_seconds == 8.0
+    assert summary.unclassified_seconds == pytest.approx(1.2)
+    assert summary.denoise_fraction == pytest.approx(0.8)
+    assert summary.mean_step_seconds == pytest.approx(0.45)
+    assert summary.steady_step_median_seconds == pytest.approx(0.4)
+    assert summary.temporal_clip_count == 2
+    assert summary.inference_step_count == 4
+
+
+def test_summarize_perf_rejects_missing_or_duplicate_stages():
+    perf = make_perf_fixture()
+    perf["steps"].pop()
+    with pytest.raises(BenchmarkDataError, match="missing stages"):
+        summarize_perf(perf)
+
+    perf = make_perf_fixture()
+    perf["steps"].append(perf["steps"][0])
+    with pytest.raises(BenchmarkDataError, match="duplicate stage"):
+        summarize_perf(perf)
+
+
+def test_validate_effective_config_accepts_distributed_compile_and_fusion():
+    validate_effective_config(
+        SCHEMES["R99"], make_perf_fixture(modulation_fusion=True)
+    )
+
+
+def test_validate_effective_config_rejects_wrong_sp_backend():
+    with pytest.raises(BenchmarkDataError, match="effective backend"):
+        validate_effective_config(
+            SCHEMES["R3"], make_perf_fixture(effective_backend="fa")
+        )
+
+
+def test_validate_effective_config_rejects_compile_not_applied():
+    perf = make_perf_fixture()
+    perf["meta"]["vividvr_debug"]["torch_compile_controlnet"] = False
+    with pytest.raises(BenchmarkDataError, match="torch.compile"):
+        validate_effective_config(SCHEMES["R3"], perf)
+
+
+def formal_record(seconds: float, *, quality_passed: bool = True) -> dict:
+    return {
+        "status": "succeeded",
+        "timings": {"model_inference_runtime_seconds": seconds},
+        "quality": {"pass_compare": quality_passed},
+    }
+
+
+def test_compute_derived_metrics_uses_r0_and_declared_control():
+    records = {
+        "R0": formal_record(20.0),
+        "R1": formal_record(10.0),
+        "R2": formal_record(8.0),
+    }
+    derived = compute_derived_metrics(SCHEMES["R2"], records)
+
+    assert derived["cumulative_speedup_vs_r0"] == pytest.approx(2.5)
+    assert derived["control_scheme_id"] == "R1"
+    assert derived["incremental_speedup"] == pytest.approx(1.25)
+    assert derived["gpu_seconds"] == pytest.approx(8.0)
+    assert derived["resource_efficiency_vs_r0"] == pytest.approx(2.5)
+
+
+def test_r100_derived_metrics_select_fastest_quality_passing_control():
+    records = {
+        "R0": formal_record(20.0),
+        "R4": formal_record(5.0),
+        "R5": formal_record(4.0, quality_passed=False),
+        "R100": formal_record(3.0),
+    }
+    derived = compute_derived_metrics(SCHEMES["R100"], records)
+
+    assert derived["control_scheme_id"] == "R4"
+    assert derived["incremental_speedup"] == pytest.approx(5.0 / 3.0)
+    assert derived["gpu_seconds"] == pytest.approx(12.0)
+
+
+def test_unsupported_record_contains_every_table_section(tmp_path: Path):
+    record = build_unsupported_record(
+        SCHEMES["R8"], make_config(tmp_path), batch_id="batch"
+    )
+
+    assert record["status"] == "unsupported"
+    assert record["capability"]["reason"] == SCHEMES["R8"].unsupported_reason
+    assert set(record) >= {
+        "schema_version",
+        "batch_id",
+        "scheme",
+        "capability",
+        "inputs",
+        "runtime",
+        "timings",
+        "gpu_memory",
+        "quality",
+        "derived",
+        "artifacts",
+        "reproducibility",
+    }
+    assert tuple(record["timings"]["stage_seconds"]) == VIVIDVR_STAGE_NAMES
+    assert record["timings"]["sp_communication_seconds"] is None
+    assert record["timings"]["sp_communication_reason"] == "not_profiled"
+
+
+def test_atomic_write_json_replaces_complete_payload(tmp_path: Path):
+    path = tmp_path / "nested/result.json"
+    atomic_write_json(path, {"value": 1})
+    atomic_write_json(path, {"value": 2, "complete": True})
+
+    import json
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "value": 2,
+        "complete": True,
+    }
+    assert not list(path.parent.glob("*.tmp"))
