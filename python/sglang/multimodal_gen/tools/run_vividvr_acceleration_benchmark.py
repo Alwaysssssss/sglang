@@ -114,6 +114,7 @@ class BenchmarkConfig:
     request_timeout_seconds: int = 21600
     poll_interval_seconds: float = 10.0
     s3_bucket: str = "flowcut"
+    allow_idle_gpu_processes: bool = False
 
 
 def _scheme(
@@ -1083,6 +1084,43 @@ def _gpu_processes(
     return result
 
 
+def _gpu_utilization(
+    gpu_ids: Sequence[int], command_runner: CommandRunner = _run_command
+) -> dict[int, float]:
+    utilization_query = command_runner(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+    )
+    if utilization_query.returncode != 0:
+        raise BenchmarkConfigError(
+            "nvidia-smi GPU utilization query failed: "
+            f"{(utilization_query.stderr or '').strip()}"
+        )
+    selected = set(gpu_ids)
+    result: dict[int, float] = {}
+    for line in (utilization_query.stdout or "").splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 2:
+            continue
+        try:
+            gpu_id = int(fields[0])
+            utilization = float(fields[1])
+        except ValueError:
+            continue
+        if gpu_id in selected:
+            result[gpu_id] = utilization
+    missing = selected - set(result)
+    if missing:
+        raise BenchmarkConfigError(
+            f"missing utilization data for configured GPU IDs: {sorted(missing)}"
+        )
+    return result
+
+
 def run_preflight(
     config: BenchmarkConfig,
     *,
@@ -1092,6 +1130,10 @@ def run_preflight(
     port_checker: Callable[[str, int], bool] = _port_is_available,
     gpu_process_checker: Callable[
         [Sequence[int]], Mapping[int, Sequence[Mapping[str, Any]]]
+    ]
+    | None = None,
+    gpu_utilization_checker: Callable[
+        [Sequence[int]], Mapping[int, float]
     ]
     | None = None,
 ) -> dict[str, Any]:
@@ -1142,8 +1184,17 @@ def run_preflight(
     checker = gpu_process_checker or (
         lambda gpu_ids: _gpu_processes(gpu_ids, command_runner)
     )
-    gpu_processes = checker(config.gpu_ids)
-    if gpu_processes:
+    gpu_processes = {
+        gpu_id: list(processes)
+        for gpu_id, processes in checker(config.gpu_ids).items()
+        if processes
+    }
+    result["gpu_process_policy"] = (
+        "allow_existing_when_idle"
+        if config.allow_idle_gpu_processes
+        else "require_no_existing_processes"
+    )
+    if gpu_processes and not config.allow_idle_gpu_processes:
         details = "; ".join(
             f"GPU {gpu_id}: "
             + ", ".join(
@@ -1155,8 +1206,32 @@ def run_preflight(
         )
         if details:
             raise BenchmarkConfigError(f"selected GPUs have active processes: {details}")
+    if gpu_processes:
+        utilization_checker = gpu_utilization_checker or (
+            lambda gpu_ids: _gpu_utilization(gpu_ids, command_runner)
+        )
+        gpu_utilization = dict(utilization_checker(config.gpu_ids))
+        missing = set(config.gpu_ids) - set(gpu_utilization)
+        if missing:
+            raise BenchmarkConfigError(
+                f"missing utilization data for configured GPU IDs: {sorted(missing)}"
+            )
+        active = {
+            gpu_id: utilization
+            for gpu_id, utilization in gpu_utilization.items()
+            if gpu_id in config.gpu_ids and utilization != 0
+        }
+        if active:
+            details = "; ".join(
+                f"GPU {gpu_id} utilization is {utilization:g}%"
+                for gpu_id, utilization in sorted(active.items())
+            )
+            raise BenchmarkConfigError(
+                "selected GPUs with existing processes must be idle: " + details
+            )
+        result["gpu_utilization_percent"] = gpu_utilization
     result["ports"] = list(ports)
-    result["gpu_processes"] = {}
+    result["gpu_processes"] = gpu_processes
     return result
 
 
@@ -1754,6 +1829,7 @@ class TmuxBenchmarkLifecycle:
 
     def _create_s3_bucket(self) -> None:
         import boto3
+        from botocore.config import Config
 
         client = boto3.client(
             "s3",
@@ -1761,6 +1837,7 @@ class TmuxBenchmarkLifecycle:
             aws_access_key_id="test",
             aws_secret_access_key="test",
             region_name="us-east-1",
+            config=Config(proxies={}),
         )
         client.create_bucket(Bucket=self.config.s3_bucket)
 
@@ -2253,6 +2330,14 @@ def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
         default=",".join(str(item) for item in BenchmarkConfig.gpu_ids),
         help="Comma-separated physical GPU IDs, in allocation order.",
     )
+    parser.add_argument(
+        "--allow-idle-gpu-processes",
+        action="store_true",
+        help=(
+            "Allow existing compute processes on selected GPUs only when every "
+            "selected GPU reports exactly 0%% utilization."
+        ),
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -2298,6 +2383,7 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         reference_video=args.reference_video.expanduser().resolve(),
         output_root=args.output_root.expanduser().resolve(),
         gpu_ids=gpu_ids,
+        allow_idle_gpu_processes=args.allow_idle_gpu_processes,
     )
 
 
@@ -2307,7 +2393,7 @@ def _selected_schemes(args: argparse.Namespace) -> list[Scheme]:
 
 
 def _config_cli_arguments(config: BenchmarkConfig) -> list[str]:
-    return [
+    arguments = [
         "--model-path",
         str(config.model_path),
         "--vividvr-path",
@@ -2323,6 +2409,9 @@ def _config_cli_arguments(config: BenchmarkConfig) -> list[str]:
         "--gpu-ids",
         ",".join(str(item) for item in config.gpu_ids),
     ]
+    if config.allow_idle_gpu_processes:
+        arguments.append("--allow-idle-gpu-processes")
+    return arguments
 
 
 def _launch_detached_batch(

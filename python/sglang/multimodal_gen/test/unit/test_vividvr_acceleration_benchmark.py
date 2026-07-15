@@ -14,8 +14,11 @@ from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     RunRole,
     SCHEMES,
     SchemeStatus,
+    TmuxBenchmarkLifecycle,
     TmuxManager,
     VIVIDVR_STAGE_NAMES,
+    _config_cli_arguments,
+    _config_from_args,
     atomic_write_json,
     build_dry_run_report,
     build_request_payload,
@@ -490,6 +493,93 @@ def test_preflight_rejects_unknown_gpu_processes(tmp_path: Path):
                 2: [{"pid": 991, "process_name": "foreign.py"}]
             },
         )
+
+
+def test_preflight_allows_existing_processes_when_explicitly_enabled_and_idle(
+    tmp_path: Path,
+):
+    config = make_existing_config(tmp_path)
+    config = BenchmarkConfig(
+        **{
+            **config.__dict__,
+            "allow_idle_gpu_processes": True,
+        }
+    )
+
+    result = run_preflight(
+        config,
+        check_runtime_resources=True,
+        command_runner=FakeCommandRunner(),
+        which=lambda executable: f"/usr/bin/{executable}",
+        port_checker=lambda host, port: True,
+        gpu_process_checker=lambda gpu_ids: {
+            6: [{"pid": 991, "process_name": "resident.py"}]
+        },
+        gpu_utilization_checker=lambda gpu_ids: {gpu_id: 0 for gpu_id in gpu_ids},
+    )
+
+    assert result["gpu_process_policy"] == "allow_existing_when_idle"
+    assert result["gpu_utilization_percent"] == {4: 0, 5: 0, 6: 0, 7: 0}
+    assert result["gpu_processes"][6][0]["pid"] == 991
+
+
+def test_preflight_rejects_existing_processes_when_any_selected_gpu_is_active(
+    tmp_path: Path,
+):
+    config = make_existing_config(tmp_path)
+    config = BenchmarkConfig(
+        **{
+            **config.__dict__,
+            "allow_idle_gpu_processes": True,
+        }
+    )
+
+    with pytest.raises(BenchmarkConfigError, match="GPU 6 utilization is 1%"):
+        run_preflight(
+            config,
+            check_runtime_resources=True,
+            command_runner=FakeCommandRunner(),
+            which=lambda executable: f"/usr/bin/{executable}",
+            port_checker=lambda host, port: True,
+            gpu_process_checker=lambda gpu_ids: {
+                6: [{"pid": 991, "process_name": "resident.py"}]
+            },
+            gpu_utilization_checker=lambda gpu_ids: {
+                gpu_id: 1 if gpu_id == 6 else 0 for gpu_id in gpu_ids
+            },
+        )
+
+
+def test_allow_idle_gpu_processes_flag_is_propagated_to_detached_batch():
+    args = parse_args(["run-all", "--allow-idle-gpu-processes"])
+
+    config = _config_from_args(args)
+
+    assert config.allow_idle_gpu_processes is True
+    assert "--allow-idle-gpu-processes" in _config_cli_arguments(config)
+
+
+def test_s3_bucket_creation_explicitly_disables_proxy(monkeypatch, tmp_path: Path):
+    import boto3
+
+    captured: dict[str, object] = {}
+
+    class FakeS3Client:
+        def create_bucket(self, *, Bucket: str):
+            captured["bucket"] = Bucket
+
+    def fake_client(service_name: str, **kwargs):
+        captured["service_name"] = service_name
+        captured["client_kwargs"] = kwargs
+        return FakeS3Client()
+
+    monkeypatch.setattr(boto3, "client", fake_client)
+    lifecycle = TmuxBenchmarkLifecycle(make_config(tmp_path), "test-batch")
+
+    lifecycle._create_s3_bucket()
+
+    assert captured["bucket"] == "flowcut"
+    assert captured["client_kwargs"]["config"].proxies == {}
 
 
 class FakeLifecycle:
