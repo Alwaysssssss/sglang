@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed VividVR acceleration benchmark matrix.
-
-The public CLI and lifecycle orchestration are added incrementally below.  The
-experiment registry in this module is the source of truth shared by dry-run,
-execution, and result serialization.
-"""
+"""Run the fixed VividVR acceleration benchmark matrix end to end."""
 
 from __future__ import annotations
 
@@ -552,7 +547,7 @@ def build_unsupported_record(
             "requested_backend": scheme.backend,
             "effective_backend": None,
             "effective_backend_reason": "scheme_not_executable",
-            "compile_applied": None,
+            "torch_compile_applied": None,
             "parallel_topology": scheme.parallel_mode,
             "fusion": None,
             "cache": None,
@@ -636,6 +631,110 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _deep_fill_defaults(
+    value: Mapping[str, Any], defaults: Mapping[str, Any]
+) -> dict[str, Any]:
+    result = dict(value)
+    for key, default in defaults.items():
+        if key not in result:
+            result[key] = default
+        elif isinstance(result[key], Mapping) and isinstance(default, Mapping):
+            result[key] = _deep_fill_defaults(result[key], default)
+    return result
+
+
+def _complete_executable_record(
+    record: Mapping[str, Any], scheme: Scheme, config: BenchmarkConfig
+) -> dict[str, Any]:
+    """Keep failure and fixture records schema-compatible with successful runs."""
+
+    defaults: dict[str, Any] = {
+        "capability": {"status": "executable", "reason": None},
+        "inputs": {
+            "input_video": str(config.input_video),
+            "caption_file": str(config.caption_file),
+            "prompt_source": "caption_sidecar_file_only",
+            "reference_video": str(config.reference_video),
+            "num_frames": 130,
+            "temporal_process_frames": 121,
+            "inference_steps": 20,
+            "seed": 42,
+            "guidance_scale": 6.0,
+            "restoration_guidance_scale": -1.0,
+            "upscale": 1.0,
+            "dtype": "bfloat16",
+        },
+        "runtime": {
+            "requested_backend": scheme.backend,
+            "effective_backend": None,
+            "effective_backend_reason": "request_did_not_produce_valid_perf",
+            "torch_compile_applied": None,
+            "parallel_topology": scheme.parallel_mode,
+            "fusion": None,
+            "cache": "disabled",
+            "quantization": "disabled",
+        },
+        "timings": {
+            "total_runtime_seconds": None,
+            "model_inference_runtime_seconds": None,
+            "denoising_runtime_seconds": None,
+            "denoise_fraction": None,
+            "stage_seconds": {name: None for name in VIVIDVR_STAGE_NAMES},
+            "unclassified_seconds": None,
+            "temporal_clip_count": None,
+            "inference_step_count": None,
+            "mean_step_seconds": None,
+            "steady_step_median_seconds": None,
+            "sp_communication_seconds": None,
+            "sp_communication_reason": "not_profiled",
+            "cfg_communication_seconds": None,
+            "cfg_communication_reason": "not_profiled",
+            "cache_executed_steps": None,
+            "cache_skipped_steps": None,
+            "cache_steps_reason": "cache_disabled_or_unsupported",
+        },
+        "gpu_memory": {
+            "device_ids": list(config.gpu_ids[: scheme.gpu_count]),
+            "per_gpu_peak_mib": None,
+            "max_single_gpu_peak_mib": None,
+            "max_single_gpu_peak_gib": None,
+            "sampling_backend": None,
+            "reason": "request_did_not_produce_complete_memory_metrics",
+        },
+        "quality": {
+            "pass_compare": None,
+            "ssim_mean": None,
+            "ssim_min": None,
+            "failed_frame_ratio": None,
+            "reason": "formal_compare_not_completed",
+        },
+        "derived": {
+            "cumulative_speedup_vs_r0": None,
+            "incremental_speedup": None,
+            "control_scheme_id": None,
+            "gpu_seconds": None,
+            "resource_efficiency_vs_r0": None,
+            "reason": "request_not_successful",
+        },
+        "artifacts": {
+            "perf_json": None,
+            "result_video": None,
+            "compare_json": None,
+            "service_log": None,
+        },
+        "reproducibility": {
+            "repo_root": str(config.repo_root),
+            "python_executable": str(config.python_executable),
+            "model_path": str(config.model_path),
+            "vividvr_path": str(config.vividvr_path),
+            "service_command": build_service_command(scheme, config),
+            "service_environment": build_service_environment(scheme, config),
+            "config_fingerprint": None,
+        },
+    }
+    return _deep_fill_defaults(record, defaults)
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -1200,7 +1299,7 @@ class BenchmarkRunner:
         role: RunRole,
         fingerprint: str,
     ) -> dict[str, Any]:
-        stamped = dict(record)
+        stamped = _complete_executable_record(record, scheme, self.config)
         stamped.setdefault("schema_version", 1)
         stamped["batch_id"] = self.batch_id
         stamped["recorded_at"] = datetime.now(timezone.utc).isoformat()

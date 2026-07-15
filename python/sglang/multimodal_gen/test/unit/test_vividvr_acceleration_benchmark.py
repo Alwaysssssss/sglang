@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -323,8 +324,6 @@ def test_atomic_write_json_replaces_complete_payload(tmp_path: Path):
     atomic_write_json(path, {"value": 1})
     atomic_write_json(path, {"value": 2, "complete": True})
 
-    import json
-
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "value": 2,
         "complete": True,
@@ -594,6 +593,25 @@ def test_runner_skips_formal_after_warmup_failure_and_continues(tmp_path: Path):
     ]
     assert result["schemes"]["R2"]["status"] == "failed"
     assert result["schemes"]["R3"]["status"] == "succeeded"
+    failed_record = json.loads(
+        (tmp_path / "outputs/batch/records/R2_warmup.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {
+        "schema_version",
+        "scheme",
+        "capability",
+        "inputs",
+        "runtime",
+        "timings",
+        "gpu_memory",
+        "quality",
+        "artifacts",
+        "derived",
+        "reproducibility",
+    }.issubset(failed_record)
+    assert tuple(failed_record["timings"]["stage_seconds"]) == VIVIDVR_STAGE_NAMES
 
 
 def test_runner_records_unsupported_without_starting_service(tmp_path: Path):
