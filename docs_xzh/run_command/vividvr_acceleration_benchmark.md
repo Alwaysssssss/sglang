@@ -60,4 +60,3 @@
 | `derived` | 相对 R0 累计加速、模块增量、GPU·秒、资源效率 |
 | `artifacts` | perf、视频、compare、服务日志路径 |
 | `reproducibility` | 命令、环境、请求、路径及 config fingerprint |
-
