@@ -5,18 +5,25 @@ import pytest
 
 from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     BenchmarkDataError,
+    BenchmarkCleanupError,
     BenchmarkConfig,
     BenchmarkConfigError,
+    BenchmarkRunner,
     GpuMemorySampler,
+    RunRole,
     SCHEMES,
     SchemeStatus,
     TmuxManager,
     VIVIDVR_STAGE_NAMES,
     atomic_write_json,
+    build_dry_run_report,
+    build_request_payload,
     build_unsupported_record,
     build_service_command,
     build_service_environment,
     compute_derived_metrics,
+    compute_config_fingerprint,
+    parse_args,
     run_preflight,
     summarize_perf,
     validate_effective_config,
@@ -484,3 +491,225 @@ def test_preflight_rejects_unknown_gpu_processes(tmp_path: Path):
                 2: [{"pid": 991, "process_name": "foreign.py"}]
             },
         )
+
+
+class FakeLifecycle:
+    def __init__(self, *, fail_stop_scheme: str | None = None):
+        self.events: list[tuple[str, str | None]] = []
+        self.fail_stop_scheme = fail_stop_scheme
+
+    def start_shared(self):
+        self.events.append(("start_shared", None))
+
+    def stop_shared(self):
+        self.events.append(("stop_shared", None))
+
+    def start_scheme(self, scheme):
+        self.events.append(("start_scheme", scheme.scheme_id))
+
+    def stop_scheme(self, scheme):
+        self.events.append(("stop_scheme", scheme.scheme_id))
+        if scheme.scheme_id == self.fail_stop_scheme:
+            raise RuntimeError("cannot stop owned service")
+
+
+class FakeRequestExecutor:
+    def __init__(self, failures: set[tuple[str, str]] | None = None):
+        self.order: list[tuple[str, str]] = []
+        self.failures = failures or set()
+
+    def __call__(self, scheme, role, *, batch_id, fingerprint):
+        key = (scheme.scheme_id, role.value)
+        self.order.append(key)
+        if key in self.failures:
+            return {
+                "status": "failed",
+                "failure": {"type": "FixtureFailure", "message": "failed"},
+            }
+        return {
+            "status": "succeeded",
+            "run_role": role.value,
+            "timings": {
+                "model_inference_runtime_seconds": float(
+                    100 - len(self.order)
+                )
+            },
+            "quality": {
+                "pass_compare": True if role is RunRole.FORMAL else None
+            },
+        }
+
+
+def make_runner(
+    tmp_path: Path,
+    *,
+    lifecycle: FakeLifecycle | None = None,
+    executor: FakeRequestExecutor | None = None,
+    resume: bool = False,
+) -> tuple[BenchmarkRunner, FakeLifecycle, FakeRequestExecutor]:
+    config = make_config(tmp_path)
+    actual_lifecycle = lifecycle or FakeLifecycle()
+    actual_executor = executor or FakeRequestExecutor()
+    runner = BenchmarkRunner(
+        config=config,
+        batch_id="batch",
+        lifecycle=actual_lifecycle,
+        request_executor=actual_executor,
+        resume=resume,
+    )
+    return runner, actual_lifecycle, actual_executor
+
+
+def test_runner_warms_only_compile_schemes_then_runs_formal(tmp_path: Path):
+    runner, lifecycle, executor = make_runner(tmp_path)
+
+    result = runner.run([SCHEMES["R0"], SCHEMES["R2"]])
+
+    assert executor.order == [
+        ("R0", "formal"),
+        ("R2", "warmup"),
+        ("R2", "formal"),
+    ]
+    assert lifecycle.events == [
+        ("start_shared", None),
+        ("start_scheme", "R0"),
+        ("stop_scheme", "R0"),
+        ("start_scheme", "R2"),
+        ("stop_scheme", "R2"),
+        ("stop_shared", None),
+    ]
+    assert result["status"] == "completed"
+
+
+def test_runner_skips_formal_after_warmup_failure_and_continues(tmp_path: Path):
+    executor = FakeRequestExecutor({("R2", "warmup")})
+    runner, _, _ = make_runner(tmp_path, executor=executor)
+
+    result = runner.run([SCHEMES["R2"], SCHEMES["R3"]])
+
+    assert executor.order == [
+        ("R2", "warmup"),
+        ("R3", "warmup"),
+        ("R3", "formal"),
+    ]
+    assert result["schemes"]["R2"]["status"] == "failed"
+    assert result["schemes"]["R3"]["status"] == "succeeded"
+
+
+def test_runner_records_unsupported_without_starting_service(tmp_path: Path):
+    runner, lifecycle, executor = make_runner(tmp_path)
+
+    result = runner.run([SCHEMES["R8"]])
+
+    assert executor.order == []
+    assert lifecycle.events == [
+        ("start_shared", None),
+        ("stop_shared", None),
+    ]
+    assert result["schemes"]["R8"]["status"] == "unsupported"
+    assert (tmp_path / "outputs/batch/records/R8_unsupported.json").exists()
+
+
+def test_runner_aborts_on_owned_service_cleanup_failure(tmp_path: Path):
+    lifecycle = FakeLifecycle(fail_stop_scheme="R2")
+    runner, _, _ = make_runner(tmp_path, lifecycle=lifecycle)
+
+    with pytest.raises(BenchmarkCleanupError, match="R2"):
+        runner.run([SCHEMES["R2"], SCHEMES["R3"]])
+
+    assert ("start_scheme", "R3") not in lifecycle.events
+    assert lifecycle.events[-1] == ("stop_shared", None)
+
+
+def test_resume_reruns_warmup_when_only_previous_warmup_succeeded(
+    tmp_path: Path,
+):
+    runner, _, first_executor = make_runner(tmp_path)
+    first_executor.failures.add(("R2", "formal"))
+    runner.run([SCHEMES["R2"]])
+
+    resumed, _, executor = make_runner(tmp_path, resume=True)
+    resumed.run([SCHEMES["R2"]])
+
+    assert executor.order == [("R2", "warmup"), ("R2", "formal")]
+
+
+def test_resume_skips_completed_formal_with_matching_fingerprint(tmp_path: Path):
+    runner, _, _ = make_runner(tmp_path)
+    runner.run([SCHEMES["R0"]])
+
+    resumed, lifecycle, executor = make_runner(tmp_path, resume=True)
+    result = resumed.run([SCHEMES["R0"]])
+
+    assert executor.order == []
+    assert ("start_scheme", "R0") not in lifecycle.events
+    assert result["schemes"]["R0"]["status"] == "resumed"
+
+
+def test_config_fingerprint_changes_with_scheme_or_input_metadata(tmp_path: Path):
+    config = make_existing_config(tmp_path)
+    first = compute_config_fingerprint(config, SCHEMES["R2"])
+    assert first != compute_config_fingerprint(config, SCHEMES["R3"])
+
+    config.input_video.write_bytes(b"changed")
+    assert first != compute_config_fingerprint(config, SCHEMES["R2"])
+
+
+def test_request_payload_uses_caption_bridge_and_fixed_workload(tmp_path: Path):
+    config = make_config(tmp_path)
+    payload = build_request_payload(
+        config,
+        task_id="batch-R2-formal",
+        callback_url="http://127.0.0.1:39090/tasks/batch-R2-formal/callback",
+        output_path=config.output_root / "result.mp4",
+        perf_path=config.output_root / "perf.json",
+    )
+
+    assert payload["video_input_path"] == str(config.input_video)
+    assert payload["num_inference_steps"] == 20
+    assert payload["num_temporal_process_frames"] == 121
+    assert payload["seed"] == 42
+    assert payload["guidance_scale"] == 6.0
+    assert payload["restoration_guidance_scale"] == -1.0
+    assert payload["upscale"] == 1.0
+    assert payload["outputObjectKey"] == "acceleration-benchmark/batch-R2-formal"
+    assert payload["minioConfig"]["endpoint"] == "127.0.0.1:4566"
+    assert "caption_file_path" not in payload
+    assert "prompt" not in payload
+
+
+def test_request_payload_rejects_path_outside_output_root(tmp_path: Path):
+    config = make_config(tmp_path)
+
+    with pytest.raises(BenchmarkConfigError, match="output_root"):
+        build_request_payload(
+            config,
+            task_id="task",
+            callback_url="http://127.0.0.1:39090/callback",
+            output_path=tmp_path.parent / "outside.mp4",
+            perf_path=tmp_path / "outputs/perf.json",
+        )
+
+
+def test_dry_run_reports_fixed_matrix_without_runtime_commands(tmp_path: Path):
+    config = make_existing_config(tmp_path)
+
+    report = build_dry_run_report(config, list(SCHEMES.values()))
+
+    assert report["scheme_count"] == 12
+    assert report["preflight"]["runtime_resources_checked"] is False
+    assert [item["scheme"]["scheme_id"] for item in report["schemes"]] == list(
+        SCHEMES
+    )
+    assert report["schemes"][0]["requests"] == ["formal"]
+    assert report["schemes"][2]["requests"] == ["warmup", "formal"]
+    assert report["schemes"][7]["requests"] == []
+
+
+def test_run_one_cli_requires_a_registered_scheme():
+    args = parse_args(["run-one", "--scheme", "R99"])
+    assert args.command == "run-one"
+    assert args.scheme == "R99"
+
+    with pytest.raises(SystemExit):
+        parse_args(["run-one", "--scheme", "unknown"])

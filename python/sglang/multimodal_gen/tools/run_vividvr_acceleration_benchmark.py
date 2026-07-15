@@ -8,6 +8,8 @@ execution, and result serialization.
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,9 +20,11 @@ import statistics
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -40,9 +44,18 @@ class BenchmarkDataError(BenchmarkError):
     """Raised when runtime evidence does not match the experiment contract."""
 
 
+class BenchmarkCleanupError(BenchmarkError):
+    """Raised when an owned process cannot be cleaned up safely."""
+
+
 class SchemeStatus(str, Enum):
     EXECUTABLE = "executable"
     UNSUPPORTED = "unsupported"
+
+
+class RunRole(str, Enum):
+    WARMUP = "warmup"
+    FORMAL = "formal"
 
 
 @dataclass(frozen=True)
@@ -102,6 +115,10 @@ class BenchmarkConfig:
     s3_port: int = 4566
     dist_timeout_seconds: int = 3600
     caption_timeout_seconds: int = 1800
+    service_start_timeout_seconds: int = 1800
+    request_timeout_seconds: int = 21600
+    poll_interval_seconds: float = 10.0
+    s3_bucket: str = "flowcut"
 
 
 def _scheme(
@@ -890,6 +907,12 @@ class TmuxManager:
             )
         self._owner_path(session).unlink(missing_ok=True)
 
+    def is_running(self, session: str) -> bool:
+        completed = self.command_runner(
+            ["tmux", "has-session", "-t", session], capture_output=True
+        )
+        return completed.returncode == 0
+
     def cleanup_owned(self) -> None:
         if not self.ownership_dir.exists():
             return
@@ -997,9 +1020,6 @@ def run_preflight(
         raise BenchmarkConfigError(
             f"missing required executables: {', '.join(missing_binaries)}"
         )
-    if len(config.gpu_ids) < max(scheme.gpu_count for scheme in SCHEMES.values()):
-        raise BenchmarkConfigError("the full benchmark matrix requires four GPU IDs")
-
     result: dict[str, Any] = {
         "ok": True,
         "required_paths": {name: str(path) for name, path in required_paths.items()},
@@ -1039,6 +1059,361 @@ def run_preflight(
     result["ports"] = list(ports)
     result["gpu_processes"] = {}
     return result
+
+
+def _path_fingerprint(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if path.exists():
+        stat = path.stat()
+        result.update(
+            {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "is_dir": path.is_dir(),
+            }
+        )
+    return result
+
+
+def compute_config_fingerprint(config: BenchmarkConfig, scheme: Scheme) -> str:
+    config_payload = asdict(config)
+    normalized_config = {
+        key: (
+            str(value)
+            if isinstance(value, Path)
+            else list(value)
+            if isinstance(value, tuple)
+            else value
+        )
+        for key, value in config_payload.items()
+    }
+    payload = {
+        "schema_version": 1,
+        "scheme": _scheme_payload(scheme),
+        "config": normalized_config,
+        "input_metadata": {
+            "input_video": _path_fingerprint(config.input_video),
+            "caption_file": _path_fingerprint(config.caption_file),
+            "reference_video": _path_fingerprint(config.reference_video),
+            "model_path": _path_fingerprint(config.model_path),
+            "vividvr_path": _path_fingerprint(config.vividvr_path),
+        },
+    }
+    serialized = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _ensure_output_path(config: BenchmarkConfig, path: Path) -> None:
+    try:
+        path.resolve().relative_to(config.output_root.resolve())
+    except ValueError as error:
+        raise BenchmarkConfigError(
+            f"benchmark artifact must be below output_root={config.output_root}: {path}"
+        ) from error
+
+
+def build_request_payload(
+    config: BenchmarkConfig,
+    *,
+    task_id: str,
+    callback_url: str,
+    output_path: Path,
+    perf_path: Path,
+) -> dict[str, Any]:
+    """Build the fixed 130-frame/20-step FlowCut request.
+
+    The caption path is deliberately absent: the service must obtain it from the
+    fixed caption-sidecar mock, preserving the production caption-bridge contract.
+    """
+
+    _ensure_output_path(config, output_path)
+    _ensure_output_path(config, perf_path)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", task_id):
+        raise BenchmarkConfigError(f"unsafe task ID: {task_id!r}")
+    return {
+        "taskId": task_id,
+        "timeout": -1,
+        "callbackUrl": callback_url,
+        "video_input_path": str(config.input_video),
+        "num_inference_steps": 20,
+        "seed": 42,
+        "num_temporal_process_frames": 121,
+        "guidance_scale": 6.0,
+        "restoration_guidance_scale": -1.0,
+        "upscale": 1.0,
+        "output_path": str(output_path),
+        "outputObjectKey": f"acceleration-benchmark/{task_id}",
+        "perf_dump_path": str(perf_path),
+        "minioConfig": {
+            "endpoint": f"{config.host}:{config.s3_port}",
+            "bucket_name": config.s3_bucket,
+            "access_key": "test",
+            "secret_key": "test",
+            "secure": False,
+            "region": "us-east-1",
+        },
+    }
+
+
+class BenchmarkRunner:
+    """Coordinate sequential schemes while keeping I/O boundaries injectable."""
+
+    def __init__(
+        self,
+        *,
+        config: BenchmarkConfig,
+        batch_id: str,
+        lifecycle: Any,
+        request_executor: Callable[..., Mapping[str, Any]],
+        resume: bool = False,
+    ):
+        self.config = config
+        self.batch_id = batch_id
+        self.lifecycle = lifecycle
+        self.request_executor = request_executor
+        self.resume = resume
+        self.batch_dir = config.output_root / batch_id
+        self.records_dir = self.batch_dir / "records"
+        self.summary_path = self.batch_dir / "batch_summary.json"
+
+    def _record_path(self, scheme: Scheme, role: RunRole | None) -> Path:
+        suffix = role.value if role is not None else "unsupported"
+        return self.records_dir / f"{scheme.scheme_id}_{suffix}.json"
+
+    def _read_record(self, scheme: Scheme, role: RunRole) -> dict[str, Any] | None:
+        try:
+            value = json.loads(
+                self._record_path(scheme, role).read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _stamp_record(
+        self,
+        record: Mapping[str, Any],
+        scheme: Scheme,
+        role: RunRole,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        stamped = dict(record)
+        stamped.setdefault("schema_version", 1)
+        stamped["batch_id"] = self.batch_id
+        stamped["recorded_at"] = datetime.now(timezone.utc).isoformat()
+        stamped["run_role"] = role.value
+        stamped["scheme"] = _scheme_payload(scheme)
+        reproducibility = dict(stamped.get("reproducibility") or {})
+        reproducibility["config_fingerprint"] = fingerprint
+        stamped["reproducibility"] = reproducibility
+        return stamped
+
+    def _execute_request(
+        self, scheme: Scheme, role: RunRole, fingerprint: str
+    ) -> dict[str, Any]:
+        try:
+            raw_record = self.request_executor(
+                scheme,
+                role,
+                batch_id=self.batch_id,
+                fingerprint=fingerprint,
+            )
+            if not isinstance(raw_record, Mapping):
+                raise BenchmarkDataError("request executor did not return an object")
+            record = self._stamp_record(raw_record, scheme, role, fingerprint)
+        except Exception as error:
+            record = self._stamp_record(
+                {
+                    "status": "failed",
+                    "failure": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    },
+                },
+                scheme,
+                role,
+                fingerprint,
+            )
+        atomic_write_json(self._record_path(scheme, role), record)
+        return record
+
+    def _can_resume(self, scheme: Scheme, fingerprint: str) -> bool:
+        if not self.resume:
+            return False
+        formal = self._read_record(scheme, RunRole.FORMAL)
+        return bool(
+            formal
+            and formal.get("status") == "succeeded"
+            and formal.get("reproducibility", {}).get("config_fingerprint")
+            == fingerprint
+        )
+
+    def _write_summary(self, summary: Mapping[str, Any]) -> None:
+        atomic_write_json(self.summary_path, summary)
+
+    def run(self, schemes: Sequence[Scheme]) -> dict[str, Any]:
+        self.records_dir.mkdir(parents=True, exist_ok=True)
+        summary: dict[str, Any] = {
+            "schema_version": 1,
+            "batch_id": self.batch_id,
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "schemes": {},
+        }
+        self._write_summary(summary)
+        formal_records: dict[str, Mapping[str, Any]] = {}
+        cleanup_error: BenchmarkCleanupError | None = None
+        try:
+            self.lifecycle.start_shared()
+            for scheme in schemes:
+                fingerprint = compute_config_fingerprint(self.config, scheme)
+                if not scheme.executable:
+                    record = build_unsupported_record(
+                        scheme, self.config, batch_id=self.batch_id
+                    )
+                    record["reproducibility"]["config_fingerprint"] = fingerprint
+                    record_path = self._record_path(scheme, None)
+                    atomic_write_json(record_path, record)
+                    summary["schemes"][scheme.scheme_id] = {
+                        "status": "unsupported",
+                        "record": str(record_path),
+                    }
+                    self._write_summary(summary)
+                    continue
+
+                if self._can_resume(scheme, fingerprint):
+                    formal = self._read_record(scheme, RunRole.FORMAL) or {}
+                    formal_records[scheme.scheme_id] = formal
+                    summary["schemes"][scheme.scheme_id] = {
+                        "status": "resumed",
+                        "formal_record": str(
+                            self._record_path(scheme, RunRole.FORMAL)
+                        ),
+                    }
+                    self._write_summary(summary)
+                    continue
+
+                try:
+                    self.lifecycle.start_scheme(scheme)
+                except Exception as error:
+                    try:
+                        self.lifecycle.stop_scheme(scheme)
+                    except Exception as cleanup_failure:
+                        raise BenchmarkCleanupError(
+                            "failed to clean up partially started service for "
+                            f"{scheme.scheme_id}: {cleanup_failure}"
+                        ) from error
+                    failed = self._stamp_record(
+                        {
+                            "status": "failed",
+                            "failure": {
+                                "type": type(error).__name__,
+                                "message": str(error),
+                                "phase": "service_start",
+                            },
+                        },
+                        scheme,
+                        RunRole.FORMAL,
+                        fingerprint,
+                    )
+                    atomic_write_json(
+                        self._record_path(scheme, RunRole.FORMAL), failed
+                    )
+                    summary["schemes"][scheme.scheme_id] = {
+                        "status": "failed",
+                        "failure_phase": "service_start",
+                    }
+                    self._write_summary(summary)
+                    continue
+
+                skip_formal = False
+                try:
+                    if scheme.compile_enabled:
+                        warmup = self._execute_request(
+                            scheme, RunRole.WARMUP, fingerprint
+                        )
+                        if warmup.get("status") != "succeeded":
+                            summary["schemes"][scheme.scheme_id] = {
+                                "status": "failed",
+                                "failure_phase": "warmup",
+                                "warmup_record": str(
+                                    self._record_path(scheme, RunRole.WARMUP)
+                                ),
+                                "formal_status": "skipped_after_warmup_failure",
+                            }
+                            self._write_summary(summary)
+                            skip_formal = True
+                    if not skip_formal:
+                        formal = self._execute_request(
+                            scheme, RunRole.FORMAL, fingerprint
+                        )
+                        formal_records[scheme.scheme_id] = formal
+                        scheme_status = str(formal.get("status", "failed"))
+                        if scheme_status == "succeeded":
+                            derived = compute_derived_metrics(scheme, formal_records)
+                            formal["derived"] = derived
+                            atomic_write_json(
+                                self._record_path(scheme, RunRole.FORMAL), formal
+                            )
+                        summary["schemes"][scheme.scheme_id] = {
+                            "status": scheme_status,
+                            "warmup_record": (
+                                str(self._record_path(scheme, RunRole.WARMUP))
+                                if scheme.compile_enabled
+                                else None
+                            ),
+                            "formal_record": str(
+                                self._record_path(scheme, RunRole.FORMAL)
+                            ),
+                        }
+                        self._write_summary(summary)
+                finally:
+                    try:
+                        self.lifecycle.stop_scheme(scheme)
+                    except Exception as error:
+                        cleanup_error = BenchmarkCleanupError(
+                            f"failed to clean up service for {scheme.scheme_id}: {error}"
+                        )
+                if cleanup_error is not None:
+                    raise cleanup_error
+        except Exception as error:
+            if cleanup_error is None and isinstance(error, BenchmarkCleanupError):
+                cleanup_error = error
+            if cleanup_error is None:
+                summary["status"] = "aborted"
+                summary["failure"] = f"{type(error).__name__}: {error}"
+                summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+                self._write_summary(summary)
+            raise
+        finally:
+            try:
+                self.lifecycle.stop_shared()
+            except Exception as error:
+                shared_error = BenchmarkCleanupError(
+                    f"failed to clean up shared benchmark services: {error}"
+                )
+                if cleanup_error is None:
+                    cleanup_error = shared_error
+            if cleanup_error is not None:
+                summary["status"] = "cleanup_failed"
+                summary["failure"] = str(cleanup_error)
+                summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+                self._write_summary(summary)
+        if cleanup_error is not None:
+            raise cleanup_error
+        statuses = {value["status"] for value in summary["schemes"].values()}
+        successful_statuses = {"succeeded", "resumed", "unsupported"}
+        summary["status"] = (
+            "completed_with_failures"
+            if not statuses.issubset(successful_statuses)
+            else "completed"
+        )
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        self._write_summary(summary)
+        return summary
 
 
 def build_service_environment(
@@ -1137,3 +1512,859 @@ def build_service_command(scheme: Scheme, config: BenchmarkConfig) -> list[str]:
             ]
         )
     return command
+
+
+def _wait_for_http(
+    url: str,
+    *,
+    timeout_seconds: float,
+    process_alive: Callable[[], bool] | None = None,
+) -> None:
+    import httpx
+
+    deadline = time.monotonic() + timeout_seconds
+    last_error = "no response"
+    with httpx.Client(follow_redirects=True, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            if process_alive is not None and not process_alive():
+                raise BenchmarkError(f"service process exited while waiting for {url}")
+            try:
+                response = client.get(url, timeout=5.0)
+                if response.is_success:
+                    return
+                last_error = f"HTTP {response.status_code}"
+            except Exception as error:
+                last_error = f"{type(error).__name__}: {error}"
+            time.sleep(1.0)
+    raise BenchmarkError(
+        f"timed out after {timeout_seconds}s waiting for {url}: {last_error}"
+    )
+
+
+def _wait_for_port(host: str, port: int, *, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise BenchmarkError(f"timed out waiting for {host}:{port}")
+
+
+def _safe_batch_token(batch_id: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_-]", "_", batch_id)
+    if not token or len(token) > 80:
+        raise BenchmarkConfigError(f"invalid batch ID: {batch_id!r}")
+    return token
+
+
+class TmuxBenchmarkLifecycle:
+    """Own shared mock dependencies and one scheme service at a time."""
+
+    def __init__(self, config: BenchmarkConfig, batch_id: str):
+        self.config = config
+        self.batch_id = batch_id
+        self.batch_token = _safe_batch_token(batch_id)
+        self.batch_dir = config.output_root / batch_id
+        self.logs_dir = self.batch_dir / "logs"
+        self.manager = TmuxManager(
+            batch_id=batch_id,
+            ownership_dir=self.batch_dir / "tmux_ownership",
+        )
+        prefix = f"vividvr_accel_{self.batch_token}"
+        self.shared_sessions = {
+            "moto": f"{prefix}_moto",
+            "callback": f"{prefix}_callback",
+            "caption": f"{prefix}_caption",
+        }
+        self.scheme_session: str | None = None
+
+    @property
+    def script_path(self) -> Path:
+        return Path(__file__).resolve()
+
+    def _start_shared_session(
+        self, name: str, command: Sequence[str], log_name: str
+    ) -> None:
+        self.manager.start(
+            self.shared_sessions[name], command, self.logs_dir / log_name
+        )
+
+    def start_shared(self) -> None:
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
+        self._start_shared_session(
+            "moto",
+            [
+                str(self.config.python_executable.parent / "moto_server"),
+                "-H",
+                self.config.host,
+                "-p",
+                str(self.config.s3_port),
+            ],
+            "moto.log",
+        )
+        _wait_for_port(self.config.host, self.config.s3_port, timeout_seconds=60)
+        self._create_s3_bucket()
+
+        self._start_shared_session(
+            "callback",
+            [
+                str(self.config.python_executable),
+                str(self.script_path),
+                "_serve-callback",
+                "--host",
+                self.config.host,
+                "--port",
+                str(self.config.callback_port),
+                "--callback-log",
+                str(self.logs_dir / "callbacks.jsonl"),
+            ],
+            "callback.log",
+        )
+        _wait_for_http(
+            f"http://{self.config.host}:{self.config.callback_port}/health",
+            timeout_seconds=60,
+            process_alive=lambda: self.manager.is_running(
+                self.shared_sessions["callback"]
+            ),
+        )
+
+        self._start_shared_session(
+            "caption",
+            [
+                str(self.config.python_executable),
+                str(self.script_path),
+                "_serve-caption",
+                "--host",
+                self.config.host,
+                "--port",
+                str(self.config.caption_port),
+                "--caption-file",
+                str(self.config.caption_file),
+            ],
+            "caption.log",
+        )
+        _wait_for_http(
+            f"http://{self.config.host}:{self.config.caption_port}/health",
+            timeout_seconds=60,
+            process_alive=lambda: self.manager.is_running(
+                self.shared_sessions["caption"]
+            ),
+        )
+
+    def _create_s3_bucket(self) -> None:
+        import boto3
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=f"http://{self.config.host}:{self.config.s3_port}",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            region_name="us-east-1",
+        )
+        client.create_bucket(Bucket=self.config.s3_bucket)
+
+    def start_scheme(self, scheme: Scheme) -> None:
+        if self.scheme_session is not None:
+            raise BenchmarkCleanupError(
+                f"previous scheme session is still owned: {self.scheme_session}"
+            )
+        session = f"vividvr_accel_{self.batch_token}_{scheme.scheme_id}_service"
+        log_path = self.logs_dir / f"{scheme.scheme_id}_service.log"
+        self.manager.start(
+            session,
+            build_service_command(scheme, self.config),
+            log_path,
+            environment=build_service_environment(scheme, self.config),
+        )
+        self.scheme_session = session
+        try:
+            _wait_for_http(
+                f"http://{self.config.host}:{self.config.service_port}/health",
+                timeout_seconds=self.config.service_start_timeout_seconds,
+                process_alive=lambda: self.manager.is_running(session),
+            )
+        except Exception:
+            try:
+                self.manager.stop(session)
+            finally:
+                self.scheme_session = None
+            raise
+
+    def stop_scheme(self, scheme: Scheme) -> None:
+        if self.scheme_session is None:
+            return
+        session = self.scheme_session
+        self.manager.stop(session)
+        self.scheme_session = None
+
+    def stop_shared(self) -> None:
+        errors: list[str] = []
+        if self.scheme_session is not None:
+            try:
+                self.manager.stop(self.scheme_session)
+                self.scheme_session = None
+            except Exception as error:
+                errors.append(str(error))
+        for name in ("caption", "callback", "moto"):
+            try:
+                self.manager.stop(self.shared_sessions[name])
+            except Exception as error:
+                errors.append(f"{name}: {error}")
+        if errors:
+            raise BenchmarkCleanupError("; ".join(errors))
+
+    def cleanup_owned(self) -> None:
+        """Remove only sessions carrying this batch's ownership marker."""
+
+        self.manager.cleanup_owned()
+
+
+def _load_json_object(path: Path, description: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BenchmarkDataError(f"cannot read {description} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise BenchmarkDataError(f"{description} must contain a JSON object: {path}")
+    return value
+
+
+def _download_result(url: str, destination: Path) -> None:
+    import httpx
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".partial")
+    try:
+        with httpx.stream(
+            "GET", url, follow_redirects=True, trust_env=False, timeout=600.0
+        ) as response:
+            response.raise_for_status()
+            with temporary.open("wb") as output:
+                for chunk in response.iter_bytes():
+                    output.write(chunk)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_compare(
+    config: BenchmarkConfig, candidate: Path, report_path: Path
+) -> dict[str, Any]:
+    command = [
+        str(config.python_executable),
+        str(
+            config.repo_root
+            / "python/sglang/multimodal_gen/runtime/videoedit/compare.py"
+        ),
+        "--reference",
+        str(config.reference_video),
+        "--candidate",
+        str(candidate),
+        "--report-json",
+        str(report_path),
+        "--min-ssim",
+        "0.98",
+        "--max-failed-frame-ratio",
+        "0",
+    ]
+    completed = _run_command(command, capture_output=True)
+    if completed.returncode not in (0, 1) or not report_path.exists():
+        raise BenchmarkDataError(
+            "video comparison failed without a valid report: "
+            f"exit={completed.returncode}, stderr={(completed.stderr or '').strip()}"
+        )
+    return _load_json_object(report_path, "compare report")
+
+
+class FlowCutRequestExecutor:
+    """Execute one benchmark request against the currently running service."""
+
+    def __init__(self, config: BenchmarkConfig):
+        self.config = config
+
+    def __call__(
+        self,
+        scheme: Scheme,
+        role: RunRole,
+        *,
+        batch_id: str,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        import httpx
+
+        from sglang.multimodal_gen.tools.run_flowcut_vividvr_service_acceptance import (
+            poll_accepted_task,
+            submit_flowcut_task_with_retry,
+        )
+
+        task_id = _safe_batch_token(f"{batch_id}-{scheme.scheme_id}-{role.value}")
+        request_dir = self.config.output_root / batch_id / "requests" / task_id
+        request_dir.mkdir(parents=True, exist_ok=True)
+        output_path = request_dir / "service-output.mp4"
+        downloaded_path = request_dir / "downloaded.mp4"
+        perf_path = request_dir / "perf.json"
+        compare_path = request_dir / "compare.json"
+        callback_url = (
+            f"http://{self.config.host}:{self.config.callback_port}/tasks/"
+            f"{task_id}/callback"
+        )
+        payload = build_request_payload(
+            self.config,
+            task_id=task_id,
+            callback_url=callback_url,
+            output_path=output_path,
+            perf_path=perf_path,
+        )
+        sampler = GpuMemorySampler(
+            self.config.gpu_ids[: scheme.gpu_count], interval_seconds=0.25
+        )
+        started = time.monotonic()
+        sampler.start()
+        try:
+            with httpx.Client(follow_redirects=True, trust_env=False) as client:
+                submit_flowcut_task_with_retry(
+                    client=client,
+                    base_url=f"http://{self.config.host}:{self.config.service_port}",
+                    payload=payload,
+                    submit_timeout_s=1800.0,
+                    retry_interval_seconds=30.0,
+                    max_submit_attempts=60,
+                )
+                max_polls = max(
+                    1,
+                    int(
+                        self.config.request_timeout_seconds
+                        / self.config.poll_interval_seconds
+                    ),
+                )
+                progress = poll_accepted_task(
+                    client=client,
+                    base_url=f"http://{self.config.host}:{self.config.service_port}",
+                    task_id=task_id,
+                    poll_interval_seconds=self.config.poll_interval_seconds,
+                    max_polls=max_polls,
+                )
+                total_runtime_seconds = time.monotonic() - started
+                if progress.get("status") != "completed":
+                    raise BenchmarkError(
+                        f"task {task_id} ended with status={progress.get('status')}: "
+                        f"{progress}"
+                    )
+                detail_response = client.get(
+                    f"http://{self.config.host}:{self.config.service_port}/v1/videos/"
+                    f"repairs/flowcut/{task_id}",
+                    timeout=60.0,
+                )
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+        finally:
+            gpu_memory = sampler.stop()
+
+        result_url = detail.get("url")
+        if not isinstance(result_url, str) or not result_url:
+            raise BenchmarkDataError(f"completed task has no result URL: {detail}")
+        _download_result(result_url, downloaded_path)
+        perf = _load_json_object(perf_path, "perf dump")
+        effective = validate_effective_config(scheme, perf)
+        perf_summary = summarize_perf(perf)
+
+        quality: dict[str, Any]
+        if role is RunRole.FORMAL:
+            compare = run_compare(self.config, downloaded_path, compare_path)
+            compare_summary = compare.get("summary")
+            if not isinstance(compare_summary, Mapping):
+                raise BenchmarkDataError("compare report is missing summary")
+            failed_frames = compare_summary.get("failed_frames")
+            compared_frames = compare_summary.get("compared_frames")
+            failed_ratio = (
+                len(failed_frames) / compared_frames
+                if isinstance(failed_frames, list)
+                and isinstance(compared_frames, int)
+                and compared_frames > 0
+                else None
+            )
+            quality = {
+                "pass_compare": compare_summary.get("pass_compare") is True,
+                "ssim_mean": compare_summary.get("ssim_mean"),
+                "ssim_min": compare_summary.get("ssim_min"),
+                "failed_frame_ratio": failed_ratio,
+                "reason": None,
+            }
+        else:
+            quality = {
+                "pass_compare": None,
+                "ssim_mean": None,
+                "ssim_min": None,
+                "failed_frame_ratio": None,
+                "reason": "warmup_quality_not_evaluated",
+            }
+
+        status = (
+            "quality_failed"
+            if role is RunRole.FORMAL and not quality["pass_compare"]
+            else "succeeded"
+        )
+        return {
+            "status": status,
+            "capability": {"status": "executable", "reason": None},
+            "inputs": {
+                "input_video": str(self.config.input_video),
+                "caption_file": str(self.config.caption_file),
+                "prompt_source": "caption_sidecar_file_only",
+                "reference_video": str(self.config.reference_video),
+                "num_frames": 130,
+                "temporal_process_frames": 121,
+                "inference_steps": 20,
+                "seed": 42,
+                "guidance_scale": 6.0,
+                "restoration_guidance_scale": -1.0,
+                "upscale": 1.0,
+                "dtype": "bfloat16",
+            },
+            "runtime": {
+                **effective,
+                "parallel_topology": scheme.parallel_mode,
+                "fusion": (
+                    "cogvideox_modulation_transformer_controlnet"
+                    if scheme.modulation_fusion
+                    else "disabled"
+                ),
+                "cache": "disabled",
+                "quantization": "disabled",
+            },
+            "timings": {
+                "total_runtime_seconds": total_runtime_seconds,
+                "model_inference_runtime_seconds": (
+                    perf_summary.model_inference_runtime_seconds
+                ),
+                "denoising_runtime_seconds": perf_summary.denoising_runtime_seconds,
+                "denoise_fraction": perf_summary.denoise_fraction,
+                "stage_seconds": perf_summary.stage_seconds,
+                "unclassified_seconds": perf_summary.unclassified_seconds,
+                "temporal_clip_count": perf_summary.temporal_clip_count,
+                "inference_step_count": perf_summary.inference_step_count,
+                "mean_step_seconds": perf_summary.mean_step_seconds,
+                "steady_step_median_seconds": (
+                    perf_summary.steady_step_median_seconds
+                ),
+                "sp_communication_seconds": None,
+                "sp_communication_reason": "not_profiled",
+                "cfg_communication_seconds": None,
+                "cfg_communication_reason": "not_profiled",
+                "cache_executed_steps": None,
+                "cache_skipped_steps": None,
+                "cache_steps_reason": "cache_disabled_or_unsupported",
+            },
+            "gpu_memory": gpu_memory,
+            "quality": quality,
+            "derived": {},
+            "artifacts": {
+                "perf_json": str(perf_path),
+                "result_video": str(downloaded_path),
+                "compare_json": (
+                    str(compare_path) if role is RunRole.FORMAL else None
+                ),
+                "service_log": str(
+                    self.config.output_root
+                    / batch_id
+                    / "logs"
+                    / f"{scheme.scheme_id}_service.log"
+                ),
+            },
+            "reproducibility": {
+                "repo_root": str(self.config.repo_root),
+                "python_executable": str(self.config.python_executable),
+                "model_path": str(self.config.model_path),
+                "vividvr_path": str(self.config.vividvr_path),
+                "service_command": build_service_command(scheme, self.config),
+                "service_environment": build_service_environment(
+                    scheme, self.config
+                ),
+                "config_fingerprint": fingerprint,
+                "request_payload": payload,
+            },
+        }
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    log_path: Path
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/health":
+            self.send_error(404)
+            return
+        self._reply({"status": "ok"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_error(400)
+            return
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._reply({"code": 0})
+
+    def _reply(self, payload: Mapping[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+class _CaptionHandler(BaseHTTPRequestHandler):
+    caption_file: Path
+    captions: list[str]
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/health":
+            self.send_error(404)
+            return
+        self._reply({"status": "ok"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/v1/vividvr/captions":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            request = json.loads(self.rfile.read(length).decode("utf-8"))
+            expected = int(request["expected_caption_count"])
+            if expected != len(self.captions):
+                raise ValueError(
+                    f"expected_caption_count={expected}, captions={len(self.captions)}"
+                )
+            output_path = Path(request["output_caption_path"]).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.caption_file, output_path)
+        except Exception as error:
+            self._reply({"error": str(error)}, status=400)
+            return
+        self._reply(
+            {
+                "caption_file_path": str(output_path),
+                "caption_count": len(self.captions),
+                "manifest_path": request["manifest_path"],
+                "mode": "mock",
+                "worker_count": 0,
+                "fallback_used": False,
+                "request_id": None,
+                "total_clip_count": len(self.captions),
+                "assigned_clip_indices_by_worker": {},
+                "timing": {"mock": True},
+            }
+        )
+
+    def _reply(self, payload: Mapping[str, Any], *, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+def serve_callback(host: str, port: int, log_path: Path) -> None:
+    handler = type("VividVRBenchmarkCallbackHandler", (_CallbackHandler,), {})
+    handler.log_path = log_path
+    ThreadingHTTPServer((host, port), handler).serve_forever()
+
+
+def serve_caption(host: str, port: int, caption_file: Path) -> None:
+    captions = caption_file.read_text(encoding="utf-8").splitlines()
+    if not captions:
+        raise BenchmarkConfigError(f"caption file is empty: {caption_file}")
+    handler = type("VividVRBenchmarkCaptionHandler", (_CaptionHandler,), {})
+    handler.caption_file = caption_file
+    handler.captions = captions
+    ThreadingHTTPServer((host, port), handler).serve_forever()
+
+
+def build_dry_run_report(
+    config: BenchmarkConfig, schemes: Sequence[Scheme]
+) -> dict[str, Any]:
+    required_gpus = max(
+        (scheme.gpu_count for scheme in schemes if scheme.executable), default=0
+    )
+    if len(config.gpu_ids) < required_gpus:
+        raise BenchmarkConfigError(
+            f"selected schemes require {required_gpus} GPUs, got {config.gpu_ids}"
+        )
+    return {
+        "mode": "dry-run",
+        "preflight": run_preflight(config, check_runtime_resources=False),
+        "scheme_count": len(schemes),
+        "schemes": [
+            {
+                "scheme": _scheme_payload(scheme),
+                "service_command": (
+                    build_service_command(scheme, config)
+                    if scheme.executable
+                    else None
+                ),
+                "service_environment": (
+                    build_service_environment(scheme, config)
+                    if scheme.executable
+                    else None
+                ),
+                "unsupported_reason": scheme.unsupported_reason,
+                "requests": (
+                    [RunRole.WARMUP.value, RunRole.FORMAL.value]
+                    if scheme.executable and scheme.compile_enabled
+                    else [RunRole.FORMAL.value]
+                    if scheme.executable
+                    else []
+                ),
+            }
+            for scheme in schemes
+        ],
+    }
+
+
+def _new_batch_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--batch-id")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--model-path", type=Path, default=BenchmarkConfig.model_path)
+    parser.add_argument("--vividvr-path", type=Path, default=BenchmarkConfig.vividvr_path)
+    parser.add_argument("--input-video", type=Path, default=BenchmarkConfig.input_video)
+    parser.add_argument("--caption-file", type=Path, default=BenchmarkConfig.caption_file)
+    parser.add_argument(
+        "--reference-video", type=Path, default=BenchmarkConfig.reference_video
+    )
+    parser.add_argument("--output-root", type=Path, default=BenchmarkConfig.output_root)
+    parser.add_argument(
+        "--gpu-ids",
+        default=",".join(str(item) for item in BenchmarkConfig.gpu_ids),
+        help="Comma-separated physical GPU IDs, in allocation order.",
+    )
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the fixed VividVR acceleration benchmark matrix."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in ("dry-run", "run-all", "run-one"):
+        child = subparsers.add_parser(command)
+        _add_config_arguments(child)
+        if command == "run-one":
+            child.add_argument("--scheme", required=True, choices=list(SCHEMES))
+
+    internal = subparsers.add_parser("_run-batch", help=argparse.SUPPRESS)
+    _add_config_arguments(internal)
+    internal.add_argument("--scheme", choices=list(SCHEMES))
+
+    callback = subparsers.add_parser("_serve-callback", help=argparse.SUPPRESS)
+    callback.add_argument("--host", required=True)
+    callback.add_argument("--port", type=int, required=True)
+    callback.add_argument("--callback-log", type=Path, required=True)
+
+    caption = subparsers.add_parser("_serve-caption", help=argparse.SUPPRESS)
+    caption.add_argument("--host", required=True)
+    caption.add_argument("--port", type=int, required=True)
+    caption.add_argument("--caption-file", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
+def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
+    raw_gpu_ids = [item.strip() for item in args.gpu_ids.split(",")]
+    try:
+        gpu_ids = tuple(int(item) for item in raw_gpu_ids if item)
+    except ValueError as error:
+        raise BenchmarkConfigError("--gpu-ids must be comma-separated integers") from error
+    if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
+        raise BenchmarkConfigError("--gpu-ids must contain unique GPU IDs")
+    return BenchmarkConfig(
+        model_path=args.model_path.expanduser().resolve(),
+        vividvr_path=args.vividvr_path.expanduser().resolve(),
+        input_video=args.input_video.expanduser().resolve(),
+        caption_file=args.caption_file.expanduser().resolve(),
+        reference_video=args.reference_video.expanduser().resolve(),
+        output_root=args.output_root.expanduser().resolve(),
+        gpu_ids=gpu_ids,
+    )
+
+
+def _selected_schemes(args: argparse.Namespace) -> list[Scheme]:
+    scheme_id = getattr(args, "scheme", None)
+    return [SCHEMES[scheme_id]] if scheme_id else list(SCHEMES.values())
+
+
+def _config_cli_arguments(config: BenchmarkConfig) -> list[str]:
+    return [
+        "--model-path",
+        str(config.model_path),
+        "--vividvr-path",
+        str(config.vividvr_path),
+        "--input-video",
+        str(config.input_video),
+        "--caption-file",
+        str(config.caption_file),
+        "--reference-video",
+        str(config.reference_video),
+        "--output-root",
+        str(config.output_root),
+        "--gpu-ids",
+        ",".join(str(item) for item in config.gpu_ids),
+    ]
+
+
+def _launch_detached_batch(
+    config: BenchmarkConfig,
+    *,
+    batch_id: str,
+    scheme_id: str | None,
+    resume: bool,
+) -> dict[str, Any]:
+    token = _safe_batch_token(batch_id)
+    session = f"vividvr_accel_batch_{token}"
+    batch_dir = config.output_root / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(config.python_executable),
+        str(Path(__file__).resolve()),
+        "_run-batch",
+        "--batch-id",
+        batch_id,
+        *_config_cli_arguments(config),
+    ]
+    if scheme_id:
+        command.extend(["--scheme", scheme_id])
+    if resume:
+        command.append("--resume")
+    shell_command = (
+        f"cd {shlex.quote(str(config.repo_root))} && "
+        f"PYTHONPATH={shlex.quote(str(config.repo_root / 'python'))} "
+        f"{shlex.join(command)} 2>&1 | "
+        f"tee {shlex.quote(str(batch_dir / 'batch.log'))}"
+    )
+    completed = _run_command(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "bash",
+            "-lc",
+            shell_command,
+        ],
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise BenchmarkError(
+            f"failed to launch batch tmux session {session}: "
+            f"{(completed.stderr or '').strip()}"
+        )
+    return {
+        "batch_id": batch_id,
+        "session": session,
+        "attach_command": f"tmux attach -r -t {session}",
+        "batch_dir": str(batch_dir),
+    }
+
+
+def _run_batch(
+    config: BenchmarkConfig,
+    *,
+    batch_id: str,
+    schemes: Sequence[Scheme],
+    resume: bool,
+) -> dict[str, Any]:
+    required_gpus = max(
+        (scheme.gpu_count for scheme in schemes if scheme.executable), default=0
+    )
+    if len(config.gpu_ids) < required_gpus:
+        raise BenchmarkConfigError(
+            f"selected schemes require {required_gpus} GPUs, got {config.gpu_ids}"
+        )
+    lifecycle = TmuxBenchmarkLifecycle(config, batch_id)
+    if resume:
+        lifecycle.cleanup_owned()
+    run_preflight(config, check_runtime_resources=True)
+    runner = BenchmarkRunner(
+        config=config,
+        batch_id=batch_id,
+        lifecycle=lifecycle,
+        request_executor=FlowCutRequestExecutor(config),
+        resume=resume,
+    )
+    return runner.run(schemes)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.command == "_serve-callback":
+        serve_callback(args.host, args.port, args.callback_log)
+        return 0
+    if args.command == "_serve-caption":
+        serve_caption(args.host, args.port, args.caption_file)
+        return 0
+
+    try:
+        config = _config_from_args(args)
+        schemes = _selected_schemes(args)
+        if args.command == "dry-run":
+            print(
+                json.dumps(
+                    build_dry_run_report(config, schemes),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
+        if args.resume and not args.batch_id:
+            raise BenchmarkConfigError("--resume requires an explicit --batch-id")
+        batch_id = args.batch_id or _new_batch_id()
+        if args.command == "_run-batch":
+            result = _run_batch(
+                config,
+                batch_id=batch_id,
+                schemes=schemes,
+                resume=args.resume,
+            )
+        else:
+            required_gpus = max(
+                (scheme.gpu_count for scheme in schemes if scheme.executable),
+                default=0,
+            )
+            if len(config.gpu_ids) < required_gpus:
+                raise BenchmarkConfigError(
+                    f"selected schemes require {required_gpus} GPUs, got {config.gpu_ids}"
+                )
+            if args.resume:
+                TmuxBenchmarkLifecycle(config, batch_id).cleanup_owned()
+            run_preflight(config, check_runtime_resources=True)
+            result = _launch_detached_batch(
+                config,
+                batch_id=batch_id,
+                scheme_id=(schemes[0].scheme_id if len(schemes) == 1 else None),
+                resume=args.resume,
+            )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    except BenchmarkError as error:
+        print(f"error: {error}", file=os.sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
