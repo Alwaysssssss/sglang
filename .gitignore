@@ -290,3 +290,6 @@ sgl-kernel/csrc/**/*_musa/
 
 # mgtv
 wheel/output_tyx/
+
+# Local isolated development worktrees
+.worktrees/
