@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.models.vaes.cogvideox import (
     _unpack_gathered_tiles,
     _validate_spatial_decode_descriptor,
 )
+from sglang.multimodal_gen.tools.run_vividvr_vae_spatial_decode_validation import (
+    compare_serial_and_parallel_decode,
+)
 
 
 class RecordingDecoder:
@@ -464,3 +467,49 @@ def test_parallel_failure_is_not_retried_serially(monkeypatch):
     with pytest.raises(RuntimeError, match="NCCL failed"):
         vae.tiled_decode(make_latent(trigger_tiling=True))
     serial.assert_not_called()
+
+
+def test_compare_decode_deterministic_exact_passes():
+    serial = torch.tensor([1.0, 2.0])
+
+    result = compare_serial_and_parallel_decode(serial, serial.clone(), serial.clone())
+
+    assert result["serial_deterministic"] is True
+    assert result["parallel_exact"] is True
+    assert result["passed"] is True
+
+
+def test_compare_decode_deterministic_mismatch_fails():
+    serial = torch.tensor([1.0, 2.0])
+    parallel = torch.tensor([1.0, 2.001])
+
+    result = compare_serial_and_parallel_decode(serial, serial.clone(), parallel)
+
+    assert result["serial_deterministic"] is True
+    assert result["parallel_exact"] is False
+    assert result["passed"] is False
+
+
+def test_compare_decode_nondeterministic_envelope_passes():
+    serial_a = torch.tensor([1.0, 2.0])
+    serial_b = torch.tensor([1.2, 1.8])
+    parallel = torch.tensor([1.1, 1.9])
+
+    result = compare_serial_and_parallel_decode(serial_a, serial_b, parallel)
+
+    assert result["serial_deterministic"] is False
+    assert result["parallel_max_abs_error"] <= result["serial_repeat_max_abs_error"]
+    assert result["parallel_mean_abs_error"] <= result["serial_repeat_mean_abs_error"]
+    assert result["passed"] is True
+
+
+def test_compare_decode_nondeterministic_envelope_fails():
+    serial_a = torch.tensor([1.0, 2.0])
+    serial_b = torch.tensor([1.1, 1.9])
+    parallel = torch.tensor([1.3, 1.7])
+
+    result = compare_serial_and_parallel_decode(serial_a, serial_b, parallel)
+
+    assert result["serial_deterministic"] is False
+    assert result["parallel_max_abs_error"] > result["serial_repeat_max_abs_error"]
+    assert result["passed"] is False
