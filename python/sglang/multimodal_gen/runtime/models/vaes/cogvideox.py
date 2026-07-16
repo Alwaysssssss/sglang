@@ -1,9 +1,83 @@
 # SPDX-License-Identifier: Apache-2.0
+from dataclasses import dataclass
+
 from diffusers.models.autoencoders.autoencoder_kl_cogvideox import (
     AutoencoderKLCogVideoX as DiffusersAutoencoderKLCogVideoX,
 )
 
 from sglang.multimodal_gen.configs.models.vaes.cogvideox import CogVideoXVAEConfig
+
+
+@dataclass(frozen=True)
+class CogVideoXSpatialTile:
+    global_index: int
+    row_index: int
+    column_index: int
+    latent_top: int
+    latent_left: int
+
+
+@dataclass(frozen=True)
+class CogVideoXSpatialTilePlan:
+    tiles: tuple[CogVideoXSpatialTile, ...]
+    num_rows: int
+    num_columns: int
+    overlap_height: int
+    overlap_width: int
+    blend_extent_height: int
+    blend_extent_width: int
+    row_limit_height: int
+    row_limit_width: int
+
+
+def _build_spatial_tile_plan(
+    *,
+    latent_height: int,
+    latent_width: int,
+    tile_latent_min_height: int,
+    tile_latent_min_width: int,
+    tile_sample_min_height: int,
+    tile_sample_min_width: int,
+    tile_overlap_factor_height: float,
+    tile_overlap_factor_width: float,
+) -> CogVideoXSpatialTilePlan:
+    overlap_height = int(
+        tile_latent_min_height * (1 - tile_overlap_factor_height)
+    )
+    overlap_width = int(tile_latent_min_width * (1 - tile_overlap_factor_width))
+    if overlap_height <= 0 or overlap_width <= 0:
+        raise ValueError("CogVideoX VAE tile overlap stride must be positive")
+    blend_extent_height = int(tile_sample_min_height * tile_overlap_factor_height)
+    blend_extent_width = int(tile_sample_min_width * tile_overlap_factor_width)
+    coordinates = [
+        (row_index, column_index, top, left)
+        for row_index, top in enumerate(range(0, latent_height, overlap_height))
+        for column_index, left in enumerate(range(0, latent_width, overlap_width))
+    ]
+    num_rows = len(range(0, latent_height, overlap_height))
+    num_columns = len(range(0, latent_width, overlap_width))
+    return CogVideoXSpatialTilePlan(
+        tiles=tuple(
+            CogVideoXSpatialTile(index, row, column, top, left)
+            for index, (row, column, top, left) in enumerate(coordinates)
+        ),
+        num_rows=num_rows,
+        num_columns=num_columns,
+        overlap_height=overlap_height,
+        overlap_width=overlap_width,
+        blend_extent_height=blend_extent_height,
+        blend_extent_width=blend_extent_width,
+        row_limit_height=tile_sample_min_height - blend_extent_height,
+        row_limit_width=tile_sample_min_width - blend_extent_width,
+    )
+
+
+def _assign_spatial_tiles(
+    tiles: tuple[CogVideoXSpatialTile, ...], rank: int, world_size: int
+) -> tuple[CogVideoXSpatialTile, ...]:
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError(f"invalid SP rank/world size: {rank}/{world_size}")
+    return tuple(tile for tile in tiles if tile.global_index % world_size == rank)
 
 
 class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
