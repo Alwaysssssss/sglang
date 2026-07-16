@@ -244,6 +244,13 @@ def _validate_spatial_decode_descriptor(
         )
 
 
+def _canonicalize_spatial_decode_input(sp_group, z: torch.Tensor) -> torch.Tensor:
+    """Use one latent value source for every tile in the local SP subgroup."""
+    canonical = z.clone()
+    sp_group.broadcast(canonical, src=0)
+    return canonical
+
+
 def _pack_local_tiles(
     local_tiles: dict[int, torch.Tensor],
     slots_per_rank: int,
@@ -546,6 +553,7 @@ class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
         )
         _validate_spatial_decode_descriptor(sp_group, z, plan)
         tile_start.record()
+        z = _canonicalize_spatial_decode_input(sp_group, z)
         owned_tiles = _assign_spatial_tiles(
             plan.tiles, sp_group.rank_in_group, sp_group.world_size
         )

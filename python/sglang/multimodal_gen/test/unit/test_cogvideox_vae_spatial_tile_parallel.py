@@ -81,6 +81,22 @@ class FakeGroup:
         self.all_gather_calls += 1
         return self.gathered_descriptors
 
+    def broadcast(self, tensor, src=0):
+        assert src == 0
+        return tensor
+
+
+class BroadcastFakeGroup(FakeGroup):
+    def __init__(self, *, canonical, rank_in_group=1):
+        super().__init__(world_size=2, rank_in_group=rank_in_group)
+        self.canonical = canonical
+        self.broadcast_calls = []
+
+    def broadcast(self, tensor, src=0):
+        self.broadcast_calls.append(src)
+        tensor.copy_(self.canonical)
+        return tensor
+
 
 def simulate_fixed_tensor_gather(rank_tiles, *, total_tiles):
     slots_per_rank = (total_tiles + len(rank_tiles) - 1) // len(rank_tiles)
@@ -409,6 +425,19 @@ def test_requested_parallel_rejects_uninitialized_sp_group(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="SP group is not initialized"):
         vae.configure_spatial_tile_parallel(requested=True)
+
+
+def test_parallel_decode_canonicalizes_latent_from_sp_local_rank_zero():
+    local = torch.full((1, 1, 1, 2, 2), 9.0)
+    canonical = torch.arange(4.0).reshape_as(local)
+    group = BroadcastFakeGroup(canonical=canonical)
+
+    actual = cogvideox._canonicalize_spatial_decode_input(group, local)
+
+    assert group.broadcast_calls == [0]
+    assert torch.equal(actual, canonical)
+    assert torch.equal(local, torch.full_like(local, 9.0))
+    assert actual.data_ptr() != local.data_ptr()
 
 
 def test_parallel_tiled_decode_decodes_only_owned_tiles_and_merges_all(

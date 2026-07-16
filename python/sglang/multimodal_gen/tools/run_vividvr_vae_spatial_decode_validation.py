@@ -188,6 +188,12 @@ def validate_subgroup_results(
         latent_sums = {item["latent_sum"] for item in items}
         serial_sums = {item["serial_output_sum"] for item in items}
         parallel_sums = {item["parallel_output_sum"] for item in items}
+        divergent_latent_sums = {
+            item["rank_divergent_latent_sum"] for item in items
+        }
+        divergent_parallel_sums = {
+            item["rank_divergent_parallel_output_sum"] for item in items
+        }
         checks.append(
             {
                 "sp_subgroup_ranks": list(group_ranks),
@@ -195,11 +201,23 @@ def validate_subgroup_results(
                 "same_latent_within_subgroup": len(latent_sums) == 1,
                 "same_serial_output_within_subgroup": len(serial_sums) == 1,
                 "same_parallel_output_within_subgroup": len(parallel_sums) == 1,
+                "rank_divergent_inputs_detected": len(divergent_latent_sums)
+                == len(items),
+                "same_canonicalized_output_within_subgroup": len(
+                    divergent_parallel_sums
+                )
+                == 1,
                 "passed": (
                     len(seeds) == 1
                     and len(latent_sums) == 1
                     and len(serial_sums) == 1
                     and len(parallel_sums) == 1
+                    and len(divergent_latent_sums) == len(items)
+                    and len(divergent_parallel_sums) == 1
+                    and all(
+                        item["rank_divergent_input_comparison"]["passed"]
+                        for item in items
+                    )
                 ),
             }
         )
@@ -264,6 +282,10 @@ def main() -> int:
             serial_b, serial_b_start, serial_b_end = timed_decode(vae, latent)
             vae.configure_spatial_tile_parallel(requested=True)
             parallel, parallel_start, parallel_end = timed_decode(vae, latent)
+            rank_divergent_latent = latent + float(sp_group.rank_in_group)
+            rank_divergent_parallel, divergent_start, divergent_end = timed_decode(
+                vae, rank_divergent_latent
+            )
 
         torch.cuda.synchronize(device)
         model_seconds = sum(
@@ -272,10 +294,14 @@ def main() -> int:
                 (serial_a_start, serial_a_end),
                 (serial_b_start, serial_b_end),
                 (parallel_start, parallel_end),
+                (divergent_start, divergent_end),
             )
         ) / 1000.0
         comparison = compare_serial_and_parallel_decode(
             serial_a, serial_b, parallel
+        )
+        rank_divergent_comparison = compare_serial_and_parallel_decode(
+            serial_a, serial_b, rank_divergent_parallel
         )
         vae_stats = vae.get_last_spatial_decode_stats().to_debug_dict()
         rank_payload = {
@@ -287,6 +313,13 @@ def main() -> int:
             "latent_sum": float(latent.float().sum().item()),
             "serial_output_sum": float(serial_a.float().sum().item()),
             "parallel_output_sum": float(parallel.float().sum().item()),
+            "rank_divergent_latent_sum": float(
+                rank_divergent_latent.float().sum().item()
+            ),
+            "rank_divergent_parallel_output_sum": float(
+                rank_divergent_parallel.float().sum().item()
+            ),
+            "rank_divergent_input_comparison": rank_divergent_comparison,
             "model_inference_runtime_seconds": model_seconds,
             "total_runtime_seconds_before_gather": time.perf_counter()
             - process_start,
@@ -301,7 +334,9 @@ def main() -> int:
         rank_payloads = [item for item in gathered if item is not None]
         subgroup_checks = validate_subgroup_results(rank_payloads, cfg_degree)
         overall_pass = all(
-            item["passed"] for item in rank_payloads
+            item["passed"]
+            and item["rank_divergent_input_comparison"]["passed"]
+            for item in rank_payloads
         ) and all(item["passed"] for item in subgroup_checks)
 
         if rank == 0:
@@ -360,7 +395,7 @@ def main() -> int:
                         "atomic result write"
                     ),
                     "model_inference_runtime_seconds": (
-                        "maximum per-rank CUDA-event sum of the three "
+                        "maximum per-rank CUDA-event sum of the four "
                         "vae.decode calls"
                     ),
                 },
