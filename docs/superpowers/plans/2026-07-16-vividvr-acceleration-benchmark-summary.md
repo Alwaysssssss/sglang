@@ -94,3 +94,55 @@ git commit -m "docs(vividvr): summarize acceleration benchmark timings"
 ```
 
 预期：提交只包含实现计划和正式总结文档。
+
+### 任务 4：补充完整 Stage 横向总表
+
+**文件：**
+- 修改：`docs_xzh/docs_analysis/acceleration_benchmark_results_20260716.md`
+- 读取：`Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R{0,1,2,3,4,5,6,99,100}_formal.json`
+
+- [ ] **步骤 1：从正式 JSON 提取完整 Stage 耗时**
+
+使用仓库 `.venv` 中的 Python 读取每条正式记录的 `timings.stage_seconds`，固定检查以下 8 个键：
+
+```python
+stage_names = [
+    "VividVRInputValidationStage",
+    "VividVRPromptPreparationStage",
+    "VividVRTemporalWindowPlanningStage",
+    "VividVRLongClipPreparationStage",
+    "VividVRTimestepPreparationStage",
+    "VividVRMultiClipDenoisingStage",
+    "VividVRMultiClipDecodeTrimStage",
+    "VividVRTemporalStitchPostprocessStage",
+]
+```
+
+预期：R0–R6、R99、R100 均包含全部 8 个键，且值为非负数。
+
+- [ ] **步骤 2：写入 Stage 名称映射和横向总表**
+
+在“总体耗时”和“最快方案”之间新增“完整 Stage 耗时”章节。先用两列表格说明简化列名到完整类名的映射，再写入以下横向表头：
+
+```markdown
+| 方案 | Input Validation | Prompt Preparation | Window Planning | Long Clip Preparation | Timestep Preparation | Multi-Clip Denoising | Decode/Trim | Stitch/Postprocess |
+```
+
+九个正式方案各占一行，所有秒数使用三位小数。
+
+- [ ] **步骤 3：机械核对 Stage 表格**
+
+使用 Python 解析“完整 Stage 耗时”横向表，并逐项比较正式 JSON 中 `stage_seconds` 四舍五入到三位小数后的值。
+
+预期：9 个方案 × 8 个 Stage，共 72 个数值全部一致。
+
+- [ ] **步骤 4：检查格式并提交**
+
+```bash
+git diff --check
+git add docs_xzh/docs_analysis/acceleration_benchmark_results_20260716.md \
+  docs/superpowers/plans/2026-07-16-vividvr-acceleration-benchmark-summary.md
+git commit -m "docs(vividvr): add complete stage timing table"
+```
+
+预期：提交只包含实现计划和正式总结文档的 Stage 耗时增量。
