@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
 
+import torch
 from diffusers.models.autoencoders.autoencoder_kl_cogvideox import (
     AutoencoderKLCogVideoX as DiffusersAutoencoderKLCogVideoX,
 )
@@ -78,6 +79,65 @@ def _assign_spatial_tiles(
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError(f"invalid SP rank/world size: {rank}/{world_size}")
     return tuple(tile for tile in tiles if tile.global_index % world_size == rank)
+
+
+def _decode_one_spatial_tile(
+    vae, z, tile: CogVideoXSpatialTile
+):
+    frame_batch_size = vae.num_latent_frames_batch_size
+    num_frames = z.shape[2]
+    num_batches = max(num_frames // frame_batch_size, 1)
+    conv_cache = None
+    temporal_parts = []
+    for batch_index in range(num_batches):
+        remaining_frames = num_frames % frame_batch_size
+        start_frame = frame_batch_size * batch_index + (
+            0 if batch_index == 0 else remaining_frames
+        )
+        end_frame = frame_batch_size * (batch_index + 1) + remaining_frames
+        decoded = z[
+            :,
+            :,
+            start_frame:end_frame,
+            tile.latent_top : tile.latent_top + vae.tile_latent_min_height,
+            tile.latent_left : tile.latent_left + vae.tile_latent_min_width,
+        ]
+        if vae.post_quant_conv is not None:
+            decoded = vae.post_quant_conv(decoded)
+        decoded, conv_cache = vae.decoder(decoded, conv_cache=conv_cache)
+        temporal_parts.append(decoded)
+    return torch.cat(temporal_parts, dim=2)
+
+
+def _merge_spatial_tiles(vae, plan, decoded_tiles):
+    rows = [
+        [
+            decoded_tiles[row * plan.num_columns + column]
+            for column in range(plan.num_columns)
+        ]
+        for row in range(plan.num_rows)
+    ]
+    result_rows = []
+    for row_index, row in enumerate(rows):
+        result_row = []
+        for column_index, tile in enumerate(row):
+            if row_index > 0:
+                tile = vae.blend_v(
+                    rows[row_index - 1][column_index],
+                    tile,
+                    plan.blend_extent_height,
+                )
+            if column_index > 0:
+                tile = vae.blend_h(
+                    row[column_index - 1], tile, plan.blend_extent_width
+                )
+            result_row.append(
+                tile[
+                    :, :, :, : plan.row_limit_height, : plan.row_limit_width
+                ]
+            )
+        result_rows.append(torch.cat(result_row, dim=4))
+    return torch.cat(result_rows, dim=3)
 
 
 class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):

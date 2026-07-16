@@ -8,10 +8,44 @@ from sglang.multimodal_gen.runtime.models.vaes import cogvideox
 from sglang.multimodal_gen.runtime.models.vaes.cogvideox import (
     AutoencoderKLCogVideoX,
     CogVideoXSpatialTile,
+    CogVideoXSpatialTilePlan,
     DiffusersAutoencoderKLCogVideoX,
     _assign_spatial_tiles,
     _build_spatial_tile_plan,
+    _decode_one_spatial_tile,
+    _merge_spatial_tiles,
 )
+
+
+class RecordingDecoder:
+    def __init__(self):
+        self.received_cache = []
+
+    def __call__(self, tensor, *, conv_cache):
+        self.received_cache.append(conv_cache)
+        next_cache = f"cache-{len(self.received_cache)}"
+        return tensor + 10, next_cache
+
+
+def make_two_by_two_plan(
+    *, row_limit_height: int, row_limit_width: int
+) -> CogVideoXSpatialTilePlan:
+    return CogVideoXSpatialTilePlan(
+        tiles=tuple(
+            CogVideoXSpatialTile(index, row, column, row, column)
+            for index, (row, column) in enumerate(
+                ((0, 0), (0, 1), (1, 0), (1, 1))
+            )
+        ),
+        num_rows=2,
+        num_columns=2,
+        overlap_height=1,
+        overlap_width=1,
+        blend_extent_height=1,
+        blend_extent_width=1,
+        row_limit_height=row_limit_height,
+        row_limit_width=row_limit_width,
+    )
 
 
 def test_tile_plan_matches_diffusers_row_major_geometry():
@@ -65,3 +99,60 @@ def test_round_robin_assignment_is_complete_and_balanced(
     assert sorted(index for rank_tiles in actual for index in rank_tiles) == list(
         range(total_tiles)
     )
+
+
+def test_one_spatial_tile_keeps_cache_only_across_its_temporal_batches():
+    decoder = RecordingDecoder()
+    vae = SimpleNamespace(
+        num_latent_frames_batch_size=2,
+        tile_latent_min_height=3,
+        tile_latent_min_width=4,
+        post_quant_conv=None,
+        decoder=decoder,
+    )
+    z = torch.arange(1 * 1 * 5 * 5 * 6).reshape(1, 1, 5, 5, 6).float()
+    tile = CogVideoXSpatialTile(0, 0, 0, 1, 1)
+
+    first = _decode_one_spatial_tile(vae, z, tile)
+    second = _decode_one_spatial_tile(vae, z, tile)
+
+    assert first.shape == (1, 1, 5, 3, 4)
+    assert torch.equal(first, second)
+    assert decoder.received_cache[:2] == [None, "cache-1"]
+    assert decoder.received_cache[2:] == [None, "cache-3"]
+
+
+def test_merge_is_row_major_vertical_then_horizontal_then_crop():
+    calls = []
+
+    class BlendVAE:
+        @staticmethod
+        def blend_v(above, current, extent):
+            calls.append(
+                ("v", int(above.flatten()[0]), int(current.flatten()[0]), extent)
+            )
+            current.add_(100)
+            return current
+
+        @staticmethod
+        def blend_h(left, current, extent):
+            calls.append(
+                ("h", int(left.flatten()[0]), int(current.flatten()[0]), extent)
+            )
+            current.add_(1000)
+            return current
+
+    plan = make_two_by_two_plan(row_limit_height=1, row_limit_width=1)
+    tiles = {
+        index: torch.full((1, 1, 1, 2, 2), float(index + 1))
+        for index in range(4)
+    }
+    actual = _merge_spatial_tiles(BlendVAE(), plan, tiles)
+
+    assert calls == [
+        ("h", 1, 2, plan.blend_extent_width),
+        ("v", 1, 3, plan.blend_extent_height),
+        ("v", 1002, 4, plan.blend_extent_height),
+        ("h", 103, 104, plan.blend_extent_width),
+    ]
+    assert actual.shape == (1, 1, 1, 2, 2)
