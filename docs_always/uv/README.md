@@ -134,10 +134,11 @@ mkdir -p /home/$USER/uv-envs
 export UV_PROJECT_ENVIRONMENT=/home/$USER/uv-envs/sglang-llm-diffusion
 ```
 
-如果当前 shell 的 `$USER` 不符合预期，也可以写成固定路径，例如：
+如果当前 shell 的 `$USER` 不符合预期，先显式设置用户名或直接传 `--env-dir`：
 
 ```bash
-export UV_PROJECT_ENVIRONMENT=/home/zhouhao6/uv-envs/sglang-llm-diffusion
+export USER=$(id -un)
+export UV_PROJECT_ENVIRONMENT=/home/$USER/uv-envs/sglang-llm-diffusion
 ```
 
 等价的根目录脚本命令：
@@ -415,7 +416,47 @@ nvidia-smi
 
 如果 `nvidia-smi` 正常但 PyTorch CUDA 不可用，优先核对当前平台、Python 版本、lockfile 解析结果和 uv index 配置。
 
-### 9.3 `flash-attn`、`st_attn`、`vsa` 或 kernel wheel 安装失败
+### 9.3 下载 NVIDIA CUDA wheel 失败
+
+现象示例：
+
+```text
+Failed to download `nvidia-cuda-nvrtc-cu12==12.8.93`
+Failed to download distribution due to network timeout. Try increasing UV_HTTP_TIMEOUT (current value: 30s).
+
+Failed to download `nvidia-cufft-cu12==11.3.3.83`
+Failed to write to the distribution cache
+error decoding response body
+peer closed connection without sending TLS close_notify
+```
+
+根因：`nvidia-cuda-nvrtc-cu12`、`nvidia-cufft-cu12` 等是 `torch==2.9.1` 依赖的大型 CUDA wheel。默认 `UV_HTTP_TIMEOUT=30` 秒，在当前网络或 PyPI/CDN 抖动时，wheel 下载或解压阶段容易超过 30 秒，被 uv 主动中断；即使把超时调大，远端也可能在大文件传输中提前关闭 TLS 连接，导致 `peer closed connection without sending TLS close_notify` 或半截 wheel 写入 uv cache。这不是 `sglang` 代码错误，也不是 `/home/$USER/uv-envs/sglang-llm-diffusion` 路径错误。
+
+解决：使用安装脚本的较长超时和自动重试。脚本失败后会清理 NVIDIA CUDA wheel 的 uv 缓存条目，再重新执行 `uv sync`：
+
+```bash
+cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
+./install_uv_env.sh --http-timeout 3000 --sync-retries 5
+```
+
+等价手工命令：
+
+```bash
+cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang/python
+export UV_PROJECT_ENVIRONMENT=/home/$USER/uv-envs/sglang-llm-diffusion
+export UV_HTTP_TIMEOUT=3000
+uv cache clean nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cusparse-cu12 nvidia-nccl-cu12
+uv sync --locked --extra dev --extra diffusion
+```
+
+如果上一次失败留下了不完整环境，先安全重建：
+
+```bash
+cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
+CONFIRM_DELETE_ENV=1 ./install_uv_env.sh --recreate --http-timeout 3000 --sync-retries 5
+```
+
+### 9.4 `flash-attn`、`st_attn`、`vsa` 或 kernel wheel 安装失败
 
 这些包和 CUDA/PyTorch/平台强相关。排查顺序：
 
@@ -424,7 +465,7 @@ nvidia-smi
 3. 确认系统有编译工具、`ninja`、CUDA 编译/运行库。
 4. 在 ARM/aarch64 平台上注意 `pyproject.toml` 中部分 diffusion 包带有平台 marker，行为会和 x86_64 不同。
 
-### 9.4 Diffusion import 正常但运行模型失败
+### 9.5 Diffusion import 正常但运行模型失败
 
 常见原因不是环境安装本身，而是：
 
@@ -463,7 +504,8 @@ cd /mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang
 | --- | --- |
 | `./install_uv_env.sh` | 安装 Python 3.11、固定 `.python-version`、同步 `dev + diffusion`。 |
 | `./install_uv_env.sh --python 3.12` | 使用 Python 3.12 创建环境。 |
-| `./install_uv_env.sh --env-dir /home/$USER/uv-envs/sglang-dev` | 指定 `/home` 下的环境目录。 |
+| `./install_uv_env.sh --env-dir /home/$USER/uv-envs/sglang-llm-diffusion` | 显式指定默认环境目录。 |
+| `./install_uv_env.sh --http-timeout 3000 --sync-retries 5` | 大型 CUDA wheel 下载慢或 TLS 中断时，提高超时并自动重试。 |
 | `./install_uv_env.sh --with-tracing` | 额外安装 `tracing` extra。 |
 | `CONFIRM_DELETE_ENV=1 ./install_uv_env.sh --recreate` | 删除并重建目标环境。 |
 

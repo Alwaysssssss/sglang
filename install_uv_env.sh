@@ -3,9 +3,12 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_PROJECT_DIR="$ROOT_DIR/python"
+DEFAULT_UV_ENV_DIR="/home/${USER:-$(id -un)}/uv-envs/sglang-llm-diffusion"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
-UV_ENV_DIR="${UV_ENV_DIR:-/home/${USER:-$(id -un)}/uv-envs/sglang-llm-diffusion}"
+UV_ENV_DIR="${UV_ENV_DIR:-$DEFAULT_UV_ENV_DIR}"
 UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$UV_ENV_DIR}"
+UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-3000}"
+UV_SYNC_RETRIES="${UV_SYNC_RETRIES:-3}"
 WITH_TRACING="${WITH_TRACING:-0}"
 RECREATE_ENV="${RECREATE_ENV:-0}"
 CONFIRM_DELETE_ENV="${CONFIRM_DELETE_ENV:-0}"
@@ -21,6 +24,8 @@ By default, the virtual environment is created under:
 Options:
   --python VERSION       Python version to install and pin, default: 3.11
   --env-dir PATH         Virtual environment path, default: /home/$USER/uv-envs/sglang-llm-diffusion
+  --http-timeout SECONDS uv HTTP timeout, default: 3000
+  --sync-retries COUNT   Retry uv sync after transient network/cache failures, default: 3
   --with-tracing         Also install the tracing extra
   --recreate             Delete and recreate the target environment
   -h, --help             Show this help
@@ -28,7 +33,11 @@ Options:
 Environment variables:
   PYTHON_VERSION         Same as --python
   UV_ENV_DIR             Same as --env-dir
-  UV_PROJECT_ENVIRONMENT uv project environment path; defaults to UV_ENV_DIR
+  UV_PROJECT_ENVIRONMENT uv project environment path; defaults to UV_ENV_DIR,
+                         which defaults to /home/$USER/uv-envs/sglang-llm-diffusion
+  UV_HTTP_TIMEOUT        Same as --http-timeout; uv defaults to 30s, which can be too short
+                         for large CUDA wheels such as nvidia-cuda-nvrtc-cu12
+  UV_SYNC_RETRIES        Same as --sync-retries
   WITH_TRACING=1         Same as --with-tracing
   RECREATE_ENV=1         Same as --recreate
   CONFIRM_DELETE_ENV=1   Required together with --recreate for deletion safety
@@ -36,8 +45,50 @@ Environment variables:
 Examples:
   ./install_uv_env.sh
   ./install_uv_env.sh --python 3.11 --env-dir /home/$USER/uv-envs/sglang-llm-diffusion
+  ./install_uv_env.sh --http-timeout 3000 --sync-retries 5
   CONFIRM_DELETE_ENV=1 ./install_uv_env.sh --recreate
 EOF
+}
+
+run_uv_sync_with_retries() {
+  local attempt=1
+  local max_attempts="$UV_SYNC_RETRIES"
+  local delay_seconds=10
+  local cuda_cache_packages=(
+    nvidia-cublas-cu12
+    nvidia-cuda-cupti-cu12
+    nvidia-cuda-nvrtc-cu12
+    nvidia-cuda-runtime-cu12
+    nvidia-cudnn-cu12
+    nvidia-cufft-cu12
+    nvidia-cufile-cu12
+    nvidia-curand-cu12
+    nvidia-cusolver-cu12
+    nvidia-cusparse-cu12
+    nvidia-cusparselt-cu12
+    nvidia-nccl-cu12
+    nvidia-nvjitlink-cu12
+    nvidia-nvshmem-cu12
+    nvidia-nvtx-cu12
+  )
+
+  while true; do
+    echo "uv sync attempt $attempt/$max_attempts"
+    if uv sync "${sync_args[@]}"; then
+      return 0
+    fi
+
+    if (( attempt >= max_attempts )); then
+      echo "uv sync failed after $max_attempts attempts" >&2
+      return 1
+    fi
+
+    echo "uv sync failed; cleaning CUDA wheel cache entries before retry" >&2
+    uv cache clean "${cuda_cache_packages[@]}" >/dev/null || true
+    sleep "$delay_seconds"
+    attempt=$((attempt + 1))
+    delay_seconds=$((delay_seconds * 2))
+  done
 }
 
 while [[ $# -gt 0 ]]; do
@@ -49,6 +100,14 @@ while [[ $# -gt 0 ]]; do
     --env-dir)
       UV_ENV_DIR="${2:?missing value for --env-dir}"
       UV_PROJECT_ENVIRONMENT="$UV_ENV_DIR"
+      shift 2
+      ;;
+    --http-timeout)
+      UV_HTTP_TIMEOUT="${2:?missing value for --http-timeout}"
+      shift 2
+      ;;
+    --sync-retries)
+      UV_SYNC_RETRIES="${2:?missing value for --sync-retries}"
       shift 2
       ;;
     --with-tracing)
@@ -102,6 +161,7 @@ fi
 mkdir -p "$(dirname "$UV_PROJECT_ENVIRONMENT")"
 
 export UV_PROJECT_ENVIRONMENT
+export UV_HTTP_TIMEOUT
 
 cd "$PYTHON_PROJECT_DIR"
 
@@ -115,11 +175,13 @@ echo "Repository: $ROOT_DIR"
 echo "Python project: $PYTHON_PROJECT_DIR"
 echo "Python version: $PYTHON_VERSION"
 echo "UV_PROJECT_ENVIRONMENT: $UV_PROJECT_ENVIRONMENT"
+echo "UV_HTTP_TIMEOUT: $UV_HTTP_TIMEOUT"
+echo "UV_SYNC_RETRIES: $UV_SYNC_RETRIES"
 echo "Extras: dev diffusion$([[ "$WITH_TRACING" == "1" ]] && printf ' tracing')"
 
 uv python install "$PYTHON_VERSION"
 uv python pin "$PYTHON_VERSION"
-uv sync "${sync_args[@]}"
+run_uv_sync_with_retries
 
 "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
 import torch
