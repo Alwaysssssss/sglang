@@ -28,6 +28,7 @@ from urllib.parse import unquote, urlsplit
 
 
 REPO_ROOT = Path("/home/zhiheng/sglang")
+MODULATION_FUSION_IMPL = "sglang_modulation_fused_ops"
 
 
 class BenchmarkError(RuntimeError):
@@ -405,7 +406,12 @@ def validate_effective_config(
         debug.get("modulation_fusion_transformer"),
         debug.get("modulation_fusion_controlnet"),
     ]
-    if scheme.modulation_fusion and fusion_values != [True, True, True]:
+    expected_fusion_values = [
+        True,
+        MODULATION_FUSION_IMPL,
+        MODULATION_FUSION_IMPL,
+    ]
+    if scheme.modulation_fusion and fusion_values != expected_fusion_values:
         mismatches.append(
             "modulation fusion expected requested/applied on transformer and "
             f"controlnet, observed {fusion_values!r}"
@@ -650,7 +656,11 @@ def _deep_fill_defaults(
 
 
 def _complete_executable_record(
-    record: Mapping[str, Any], scheme: Scheme, config: BenchmarkConfig
+    record: Mapping[str, Any],
+    scheme: Scheme,
+    config: BenchmarkConfig,
+    *,
+    role: RunRole,
 ) -> dict[str, Any]:
     """Keep failure and fixture records schema-compatible with successful runs."""
 
@@ -663,7 +673,7 @@ def _complete_executable_record(
             "reference_video": str(config.reference_video),
             "num_frames": 130,
             "temporal_process_frames": 121,
-            "inference_steps": 20,
+            "inference_steps": 1 if role is RunRole.WARMUP else 20,
             "seed": 42,
             "guidance_scale": 6.0,
             "restoration_guidance_scale": -1.0,
@@ -1378,7 +1388,9 @@ class BenchmarkRunner:
         role: RunRole,
         fingerprint: str,
     ) -> dict[str, Any]:
-        stamped = _complete_executable_record(record, scheme, self.config)
+        stamped = _complete_executable_record(
+            record, scheme, self.config, role=role
+        )
         stamped.setdefault("schema_version", 1)
         stamped["batch_id"] = self.batch_id
         stamped["recorded_at"] = datetime.now(timezone.utc).isoformat()
@@ -1424,7 +1436,7 @@ class BenchmarkRunner:
         formal = self._read_record(scheme, RunRole.FORMAL)
         return bool(
             formal
-            and formal.get("status") == "succeeded"
+            and formal.get("status") in {"succeeded", "quality_failed"}
             and formal.get("reproducibility", {}).get("config_fingerprint")
             == fingerprint
         )
@@ -2189,7 +2201,7 @@ class FlowCutRequestExecutor:
                 "reference_video": str(self.config.reference_video),
                 "num_frames": 130,
                 "temporal_process_frames": 121,
-                "inference_steps": 20,
+                "inference_steps": payload["num_inference_steps"],
                 "seed": 42,
                 "guidance_scale": 6.0,
                 "restoration_guidance_scale": -1.0,

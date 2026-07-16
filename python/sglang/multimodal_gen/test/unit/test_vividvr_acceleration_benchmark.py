@@ -238,10 +238,10 @@ def make_perf_fixture(
                 "torch_compile_controlnet": compile_enabled,
                 "modulation_fusion_requested": modulation_fusion,
                 "modulation_fusion_transformer": (
-                    True if modulation_fusion else None
+                    "sglang_modulation_fused_ops" if modulation_fusion else None
                 ),
                 "modulation_fusion_controlnet": (
-                    True if modulation_fusion else None
+                    "sglang_modulation_fused_ops" if modulation_fusion else None
                 ),
             }
         },
@@ -743,6 +743,18 @@ def test_runner_warms_only_compile_schemes_then_runs_formal(tmp_path: Path):
         ("stop_shared", None),
     ]
     assert result["status"] == "completed"
+    warmup_record = json.loads(
+        (tmp_path / "outputs/batch/records/R2_warmup.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    formal_record = json.loads(
+        (tmp_path / "outputs/batch/records/R2_formal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert warmup_record["inputs"]["inference_steps"] == 1
+    assert formal_record["inputs"]["inference_steps"] == 20
 
 
 def test_runner_skips_formal_after_warmup_failure_and_continues(tmp_path: Path):
@@ -820,6 +832,32 @@ def test_resume_reruns_warmup_when_only_previous_warmup_succeeded(
 def test_resume_skips_completed_formal_with_matching_fingerprint(tmp_path: Path):
     runner, _, _ = make_runner(tmp_path)
     runner.run([SCHEMES["R0"]])
+
+    resumed, lifecycle, executor = make_runner(tmp_path, resume=True)
+    result = resumed.run([SCHEMES["R0"]])
+
+    assert executor.order == []
+    assert ("start_scheme", "R0") not in lifecycle.events
+    assert result["schemes"]["R0"]["status"] == "resumed"
+
+
+def test_resume_skips_completed_quality_failed_formal_with_matching_fingerprint(
+    tmp_path: Path,
+):
+    runner, _, _ = make_runner(tmp_path)
+    fingerprint = compute_config_fingerprint(runner.config, SCHEMES["R0"])
+    failed_quality = runner._stamp_record(
+        {
+            "status": "quality_failed",
+            "quality": {"pass_compare": False},
+        },
+        SCHEMES["R0"],
+        RunRole.FORMAL,
+        fingerprint,
+    )
+    atomic_write_json(
+        runner._record_path(SCHEMES["R0"], RunRole.FORMAL), failed_quality
+    )
 
     resumed, lifecycle, executor = make_runner(tmp_path, resume=True)
     result = resumed.run([SCHEMES["R0"]])
