@@ -1,7 +1,7 @@
 # VividVR CogVideoX VAE 空间 Tile 并行设计
 
 日期：2026-07-16
-状态：设计已确认，尚未实施
+状态：实现与验收已完成（实验开关，默认关闭）
 
 ## 1. 目标
 
@@ -264,3 +264,17 @@ R99 固定为双卡 `SP=2 + FA-SP + torch.compile + modulation/residual fusion`�
 - 更复杂的基于 tile 计算量的负载均衡。
 
 这些优化都不属于第一阶段实现，不应提前增加主路径复杂度。
+
+## 15. 实施与验收补记
+
+2026-07-16 已按本设计完成实现、真实 NCCL 正确性验证和两条正式 FlowCut 服务 benchmark。核心实现提交为 `1ca30dd7b`、`14a1610c3`、`cf8be47ae`、`2e4cff479`、`da687d21d`、`6e6438b90`、`22dc14157`、`8f3e2ff9b`、`8701b6197`。
+
+实施中确认 VividVR decode 边界上的 SP rank latent 可能不同，且实际 tensor 可能是非 contiguous view。因此按第 4.3 节既定防护，在并行 decode 前增加了 SP subgroup root latent broadcast，并显式生成 contiguous buffer 以满足 NCCL 要求。真实 non-contiguous 固定 latent 验证覆盖 SP2、SP4、CFG2×SP2，串行与并行输出均 bitwise equal。
+
+正式 R99/R100 treatment 的 Decode/Trim 分别从 `100.274310 s` 降至 `58.937737 s`、从 `101.785656 s` 降至 `60.178877 s`；端到端 speedup 分别为 `1.078657×`、`1.087615×`。质量 JSON 保留原始硬门禁状态，微小差异依据用户明确决定做人工豁免，最终验收通过。
+
+完整命令、指标、质量、服务证据与风险记录见：
+
+- `docs_xzh/distribute/vividvr_vae_spatial_tile_parallel_acceptance_20260716.md`
+
+`vae_sp` 继续保持默认关闭的实验性 opt-in；Phase E 正式默认配置、服务请求契约和 `AGENTS.md` 均未改变。

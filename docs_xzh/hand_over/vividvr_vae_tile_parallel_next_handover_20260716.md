@@ -3,10 +3,10 @@
 ## 1. 文档状态
 
 - 日期：2026-07-16
-- 当前状态：方案已确认，尚未实现
+- 当前状态：实现与验收已完成（实验开关，默认关闭）
 - 暂定方案：方案一——在 CogVideoX VAE 内实现等价的空间 tile 并行解码
 - 目标：复用现有 SP 进程组并行解码 VAE 空间 tiles，降低 `Decode/Trim` 阶段和端到端推理耗时
-- 当前代码基线：分支 `sglang_Vivid`，方案确认时 HEAD 为 `66c5c2dd7`
+- 当前代码基线：分支 `sglang_Vivid`；方案确认时 HEAD 为 `66c5c2dd7`，实现提交截至 `8701b6197`
 
 本阶段不是重做 Vivid-VR 解码链，而是在严格保持现有 CogVideoX VAE tiled decode 语义的前提下，仅改变空间 tiles 的执行位置。
 
@@ -267,7 +267,38 @@ tile 分配规则应当确定、可测试，并优先做到负载均衡。第一
 
 在上述验收完成前，`vae_sp` 保持实验开关，不能替换当前正式默认配置。
 
-## 12. 下一轮开始前的快速检查
+## 13. 本轮完成记录
+
+2026-07-16 已完成第 11 节定义的实现与验收：
+
+- CogVideoX VAE 空间 tile plan、round-robin 分配、单 tile temporal decode、SP subgroup tensor transport、原序 merge、fallback/fail-fast 与 CUDA 统计均已落地。
+- VividVR pipeline、单 clip/多 clip decode stage 已接入 `vae_sp` 请求值、实际生效值和逐 clip 聚合统计。
+- 固定 latent 的 SP2、SP4、CFG2×SP2 真实 NCCL 验证全部通过；特别覆盖 rank-divergent、non-contiguous latent，串行与并行结果 bitwise equal。
+- R99/R100 正式服务 benchmark 均完成完整 FlowCut 生命周期，Decode/Trim speedup 分别为 `1.701360×` 和 `1.691385×`，端到端 speedup 分别为 `1.078657×` 和 `1.087615×`。
+- R99 的轻微质量差异已由用户明确批准人工豁免；R100 沿用相同口径。原始 `quality_failed` 记录保持不变，验收文档同时保留机器门禁与人工结论。
+- 轻量回归结果为 `154 passed, 5 warnings, 1145 subtests passed`，未发现 Phase C/D/E debug contract 或服务合同回归。
+
+实现提交：
+
+```text
+1ca30dd7b  feat(vividvr): define CogVideoX VAE spatial tile plan
+14a1610c3  feat(vividvr): preserve CogVideoX tiled decode semantics
+cf8be47ae  feat(vividvr): gather CogVideoX VAE tiles inside SP groups
+2e4cff479  feat(vividvr): enable CogVideoX VAE tile parallel decode
+da687d21d  feat(vividvr): report VAE tile parallel decode metrics
+6e6438b90  feat(vividvr): add VAE SP benchmark treatments
+22dc14157  test(vividvr): validate VAE tile parallel subgroups
+8f3e2ff9b  fix(vividvr): canonicalize VAE SP decode latents
+8701b6197  fix(vividvr): broadcast contiguous VAE latents
+```
+
+完整验收记录：
+
+- `docs_xzh/distribute/vividvr_vae_spatial_tile_parallel_acceptance_20260716.md`
+
+后续若继续优化，应优先 profile leader merge/broadcast、分批 gather 或通信计算重叠，并继续以 opt-in 实验处理；未经新的正式验收，不修改 `single_gpu_fa_compile`、`dual_gpu_fa_eager_compile` 或服务默认值。
+
+## 14. 下一轮开始前的快速检查
 
 - 阅读本交接文档及 `docs_xzh/add_strategy/11_phase_e_acceleration_implementation.md`。
 - 检查最新 `git status`，保护用户未提交改动。
