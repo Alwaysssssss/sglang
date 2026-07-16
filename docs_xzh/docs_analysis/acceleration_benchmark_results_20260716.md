@@ -26,6 +26,33 @@
 | R99 | 双卡全部已实现加速 | 551.119 | 544.321 | 380.176 | 19.003 | 2.03× |
 | R100 | 四卡全部已实现加速 | 370.881 | 365.067 | 195.652 | 9.779 | 3.02× |
 
+## 完整 Stage 耗时
+
+Stage 横向总表的单位均为秒。列名与代码中的完整 Stage 类名对应如下：
+
+| 表格列名 | Stage 类名 |
+| --- | --- |
+| Input Validation | `VividVRInputValidationStage` |
+| Prompt Preparation | `VividVRPromptPreparationStage` |
+| Window Planning | `VividVRTemporalWindowPlanningStage` |
+| Long Clip Preparation | `VividVRLongClipPreparationStage` |
+| Timestep Preparation | `VividVRTimestepPreparationStage` |
+| Multi-Clip Denoising | `VividVRMultiClipDenoisingStage` |
+| Decode/Trim | `VividVRMultiClipDecodeTrimStage` |
+| Stitch/Postprocess | `VividVRTemporalStitchPostprocessStage` |
+
+| 方案 | Input Validation | Prompt Preparation | Window Planning | Long Clip Preparation | Timestep Preparation | Multi-Clip Denoising | Decode/Trim | Stitch/Postprocess |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| R0 | 0.000 | 0.000 | 0.000 | 60.293 | 0.000 | 928.872 | 111.985 | 0.184 |
+| R1 | 0.000 | 0.000 | 0.000 | 59.664 | 0.000 | 870.188 | 99.267 | 0.188 |
+| R2 | 0.000 | 0.001 | 0.000 | 61.335 | 0.001 | 772.493 | 100.704 | 0.172 |
+| R3 | 0.000 | 0.000 | 0.000 | 61.081 | 0.001 | 383.512 | 101.167 | 0.144 |
+| R4 | 0.001 | 0.002 | 0.000 | 63.102 | 0.001 | 201.709 | 107.193 | 0.245 |
+| R5 | 0.000 | 0.001 | 0.001 | 62.421 | 0.001 | 194.807 | 110.560 | 0.239 |
+| R6 | 0.000 | 0.000 | 0.000 | 60.596 | 0.001 | 775.704 | 98.781 | 0.231 |
+| R99 | 0.000 | 0.000 | 0.000 | 61.824 | 0.001 | 380.176 | 100.274 | 0.190 |
+| R100 | 0.000 | 0.000 | 0.000 | 65.857 | 0.001 | 195.652 | 101.786 | 0.132 |
+
 ## 最快方案
 
 | GPU 数量 | 最快方案 | 总耗时（s） | 模型推理耗时（s） | Denoise（s） | 相对 R0 模型加速比 |
