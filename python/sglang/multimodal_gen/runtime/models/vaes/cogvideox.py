@@ -5,8 +5,10 @@ import torch
 from diffusers.models.autoencoders.autoencoder_kl_cogvideox import (
     AutoencoderKLCogVideoX as DiffusersAutoencoderKLCogVideoX,
 )
+from diffusers.models.autoencoders.vae import DecoderOutput
 
 from sglang.multimodal_gen.configs.models.vaes.cogvideox import CogVideoXVAEConfig
+from sglang.multimodal_gen.runtime.distributed import get_sp_group
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,52 @@ class CogVideoXSpatialTilePlan:
     blend_extent_width: int
     row_limit_height: int
     row_limit_width: int
+
+
+@dataclass(frozen=True)
+class CogVideoXVaeSpatialDecodeStats:
+    requested: bool
+    effective: bool
+    fallback_reason: str
+    world_size: int
+    group_type: str
+    total_tiles: int
+    local_tiles_per_rank: tuple[int, ...]
+    tile_decode_seconds: float
+    tile_gather_seconds: float
+    tile_merge_seconds: float
+    decode_seconds: float
+
+    @classmethod
+    def serial_default(cls) -> "CogVideoXVaeSpatialDecodeStats":
+        return cls(
+            requested=False,
+            effective=False,
+            fallback_reason="not_requested",
+            world_size=1,
+            group_type="none",
+            total_tiles=0,
+            local_tiles_per_rank=(0,),
+            tile_decode_seconds=0.0,
+            tile_gather_seconds=0.0,
+            tile_merge_seconds=0.0,
+            decode_seconds=0.0,
+        )
+
+    def to_debug_dict(self) -> dict[str, object]:
+        return {
+            "vae_sp_requested": self.requested,
+            "vae_sp_effective": self.effective,
+            "vae_sp_fallback_reason": self.fallback_reason,
+            "vae_sp_world_size": self.world_size,
+            "vae_sp_group_type": self.group_type,
+            "vae_total_tiles": self.total_tiles,
+            "vae_local_tiles_per_rank": list(self.local_tiles_per_rank),
+            "vae_tile_decode_seconds": self.tile_decode_seconds,
+            "vae_tile_gather_seconds": self.tile_gather_seconds,
+            "vae_tile_merge_seconds": self.tile_merge_seconds,
+            "vae_decode_seconds": self.decode_seconds,
+        }
 
 
 def _build_spatial_tile_plan(
@@ -81,9 +129,7 @@ def _assign_spatial_tiles(
     return tuple(tile for tile in tiles if tile.global_index % world_size == rank)
 
 
-def _decode_one_spatial_tile(
-    vae, z, tile: CogVideoXSpatialTile
-):
+def _decode_one_spatial_tile(vae, z, tile: CogVideoXSpatialTile):
     frame_batch_size = vae.num_latent_frames_batch_size
     num_frames = z.shape[2]
     num_batches = max(num_frames // frame_batch_size, 1)
@@ -366,6 +412,181 @@ class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
             "load_decoder",
         ):
             setattr(self, name, getattr(config, name))
+        self._vae_sp_requested = False
+        self._vae_sp_group = None
+        self._last_spatial_decode_stats = (
+            CogVideoXVaeSpatialDecodeStats.serial_default()
+        )
+
+    def configure_spatial_tile_parallel(self, requested: bool) -> None:
+        requested = bool(requested)
+        if requested and not self.use_tiling:
+            raise ValueError("CogVideoX vae_sp requires VAE tiling to be enabled")
+        group = None
+        if requested:
+            try:
+                group = get_sp_group()
+            except AssertionError as error:
+                raise RuntimeError(
+                    "CogVideoX vae_sp requested but SP group is not initialized"
+                ) from error
+        self._vae_sp_requested = requested
+        self._vae_sp_group = group
+
+    def get_last_spatial_decode_stats(self) -> CogVideoXVaeSpatialDecodeStats:
+        return self._last_spatial_decode_stats
+
+    def _set_serial_decode_stats(
+        self, reason: str, *, world_size: int, decode_seconds: float
+    ) -> None:
+        self._last_spatial_decode_stats = CogVideoXVaeSpatialDecodeStats(
+            requested=self._vae_sp_requested,
+            effective=False,
+            fallback_reason=reason,
+            world_size=world_size,
+            group_type="none",
+            total_tiles=0,
+            local_tiles_per_rank=(0,) * world_size,
+            tile_decode_seconds=0.0,
+            tile_gather_seconds=0.0,
+            tile_merge_seconds=0.0,
+            decode_seconds=decode_seconds,
+        )
+
+    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+        tiled = self.use_tiling and (
+            z.shape[-1] > self.tile_latent_min_width
+            or z.shape[-2] > self.tile_latent_min_height
+        )
+        if tiled:
+            return super()._decode(z, return_dict=return_dict)
+
+        reason = (
+            "input_below_tiling_threshold"
+            if self._vae_sp_requested
+            else "not_requested"
+        )
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        decoded = super()._decode(z, return_dict=return_dict)
+        end.record()
+        end.synchronize()
+        self._set_serial_decode_stats(
+            reason,
+            world_size=(
+                self._vae_sp_group.world_size if self._vae_sp_group else 1
+            ),
+            decode_seconds=start.elapsed_time(end) / 1000.0,
+        )
+        return decoded
+
+    def _serial_tiled_decode_with_stats(
+        self,
+        z: torch.Tensor,
+        *,
+        reason: str,
+        world_size: int,
+        return_dict: bool,
+    ):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        decoded = super().tiled_decode(z, return_dict=return_dict)
+        end.record()
+        end.synchronize()
+        self._set_serial_decode_stats(
+            reason,
+            world_size=world_size,
+            decode_seconds=start.elapsed_time(end) / 1000.0,
+        )
+        return decoded
+
+    def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
+        if not self._vae_sp_requested:
+            return self._serial_tiled_decode_with_stats(
+                z,
+                reason="not_requested",
+                world_size=1,
+                return_dict=return_dict,
+            )
+        sp_group = self._vae_sp_group
+        if sp_group is None:
+            raise RuntimeError("CogVideoX VAE SP group is unavailable")
+        if sp_group.world_size == 1:
+            return self._serial_tiled_decode_with_stats(
+                z,
+                reason="sp_world_size_one",
+                world_size=1,
+                return_dict=return_dict,
+            )
+        return self._parallel_spatial_tiled_decode(
+            z, sp_group=sp_group, return_dict=return_dict
+        )
+
+    def _parallel_spatial_tiled_decode(
+        self, z: torch.Tensor, *, sp_group, return_dict: bool
+    ):
+        decode_start = torch.cuda.Event(enable_timing=True)
+        tile_start = torch.cuda.Event(enable_timing=True)
+        gather_start = torch.cuda.Event(enable_timing=True)
+        merge_start = torch.cuda.Event(enable_timing=True)
+        decode_end = torch.cuda.Event(enable_timing=True)
+        decode_start.record()
+
+        plan = _build_spatial_tile_plan(
+            latent_height=z.shape[-2],
+            latent_width=z.shape[-1],
+            tile_latent_min_height=self.tile_latent_min_height,
+            tile_latent_min_width=self.tile_latent_min_width,
+            tile_sample_min_height=self.tile_sample_min_height,
+            tile_sample_min_width=self.tile_sample_min_width,
+            tile_overlap_factor_height=self.tile_overlap_factor_height,
+            tile_overlap_factor_width=self.tile_overlap_factor_width,
+        )
+        _validate_spatial_decode_descriptor(sp_group, z, plan)
+        tile_start.record()
+        owned_tiles = _assign_spatial_tiles(
+            plan.tiles, sp_group.rank_in_group, sp_group.world_size
+        )
+        local_tiles = {
+            tile.global_index: _decode_one_spatial_tile(self, z, tile)
+            for tile in owned_tiles
+        }
+
+        gather_start.record()
+        decoded_tiles = _all_gather_decoded_tiles(
+            sp_group,
+            local_tiles,
+            len(plan.tiles),
+            payload_dtype=z.dtype,
+            payload_device=z.device,
+        )
+        merge_start.record()
+        decoded = _merge_spatial_tiles(self, plan, decoded_tiles)
+        decode_end.record()
+        decode_end.synchronize()
+
+        local_tiles_per_rank = tuple(
+            len(_assign_spatial_tiles(plan.tiles, rank, sp_group.world_size))
+            for rank in range(sp_group.world_size)
+        )
+        self._last_spatial_decode_stats = CogVideoXVaeSpatialDecodeStats(
+            requested=True,
+            effective=True,
+            fallback_reason="effective",
+            world_size=sp_group.world_size,
+            group_type="sp",
+            total_tiles=len(plan.tiles),
+            local_tiles_per_rank=local_tiles_per_rank,
+            tile_decode_seconds=tile_start.elapsed_time(gather_start) / 1000.0,
+            tile_gather_seconds=gather_start.elapsed_time(merge_start) / 1000.0,
+            tile_merge_seconds=merge_start.elapsed_time(decode_end) / 1000.0,
+            decode_seconds=decode_start.elapsed_time(decode_end) / 1000.0,
+        )
+        if not return_dict:
+            return (decoded,)
+        return DecoderOutput(sample=decoded)
 
 
 EntryClass = AutoencoderKLCogVideoX

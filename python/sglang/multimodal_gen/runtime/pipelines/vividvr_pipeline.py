@@ -341,6 +341,16 @@ def _maybe_torch_compile_module(
         return module
 
 
+def _configure_vividvr_vae_spatial_tile_parallel(
+    vae: object, requested: bool
+) -> None:
+    configure_vae_sp = getattr(vae, "configure_spatial_tile_parallel", None)
+    if configure_vae_sp is None and requested:
+        raise TypeError("VividVR vae_sp requires the native CogVideoX VAE runtime")
+    if configure_vae_sp is not None:
+        configure_vae_sp(requested=bool(requested))
+
+
 def _build_stage_without_global_server_args(stage_cls, *, server_args, **attrs):
     stage = object.__new__(stage_cls)
     stage.server_args = server_args
@@ -974,6 +984,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         self._apply_torch_compile(server_args)
 
         vae = self.get_module("vae")
+        _configure_vividvr_vae_spatial_tile_parallel(
+            vae, bool(server_args.pipeline_config.vae_sp)
+        )
         vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
         self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
 

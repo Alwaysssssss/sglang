@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import 
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import VividVRPipeline
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import (
+    _configure_vividvr_vae_spatial_tile_parallel,
     _maybe_torch_compile_module,
 )
 
@@ -132,6 +133,23 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         self.assertEqual(
             normalize_cogvideox_attention_backend("sage_attn"), "sage_attn"
         )
+
+    def test_vividvr_pipeline_forwards_vae_sp_request_to_native_vae(self):
+        for requested in (False, True):
+            with self.subTest(requested=requested):
+                vae = SimpleNamespace(
+                    configure_spatial_tile_parallel=unittest.mock.Mock()
+                )
+
+                _configure_vividvr_vae_spatial_tile_parallel(vae, requested)
+
+                vae.configure_spatial_tile_parallel.assert_called_once_with(
+                    requested=requested
+                )
+
+    def test_vividvr_pipeline_rejects_vae_sp_without_native_interface(self):
+        with self.assertRaisesRegex(TypeError, "native CogVideoX VAE runtime"):
+            _configure_vividvr_vae_spatial_tile_parallel(object(), True)
 
     def test_selector_accepts_sdpa_alias(self):
         self.assertEqual(backend_name_to_enum("sdpa"), AttentionBackendEnum.TORCH_SDPA)
