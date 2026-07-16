@@ -264,6 +264,23 @@ class _DummyDecodeVAE(torch.nn.Module):
     def decode(self, latents):
         return latents
 
+    def get_last_spatial_decode_stats(self):
+        return SimpleNamespace(
+            to_debug_dict=lambda: {
+                "vae_sp_requested": True,
+                "vae_sp_effective": True,
+                "vae_sp_fallback_reason": "effective",
+                "vae_sp_world_size": 2,
+                "vae_sp_group_type": "sp",
+                "vae_total_tiles": 9,
+                "vae_local_tiles_per_rank": [5, 4],
+                "vae_tile_decode_seconds": 1.2,
+                "vae_tile_gather_seconds": 0.2,
+                "vae_tile_merge_seconds": 0.1,
+                "vae_decode_seconds": 1.5,
+            }
+        )
+
 
 class TestStageEVividVRDecoding(unittest.TestCase):
     def test_decode_latents_keeps_e2_decode_path_without_explicit_tiling(self):
@@ -282,6 +299,21 @@ class TestStageEVividVRDecoding(unittest.TestCase):
 
         self.assertEqual(tuple(decoded.shape), (1, 16, 3, 4, 4))
         self.assertEqual(stage.vae.enable_tiling_calls, 0)
+
+    def test_decode_stage_exposes_last_vae_spatial_stats(self):
+        with patch(_GLOBAL_ARGS_PATCH, return_value=SimpleNamespace()):
+            stage = VividVRDecodingStage(vae=_DummyDecodeVAE())
+
+        stage.decode_latents(
+            torch.zeros(1, 3, 16, 4, 4),
+            0,
+            _dummy_server_args(),
+        )
+
+        self.assertTrue(stage.last_vae_decode_stats["vae_sp_effective"])
+        self.assertEqual(
+            stage.last_vae_decode_stats["vae_local_tiles_per_rank"], [5, 4]
+        )
 
 
 if __name__ == "__main__":

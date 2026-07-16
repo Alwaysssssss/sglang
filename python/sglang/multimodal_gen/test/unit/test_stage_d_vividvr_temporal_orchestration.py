@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.vividvr import VividVRPipeli
 from sglang.multimodal_gen.configs.sample.vividvr import VividVRSamplingParams
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import VividVRPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
+    VividVRMultiClipDecodeTrimStage,
     VividVRMultiClipDenoisingStage,
     VividVRTilingPreparationStage,
 )
@@ -484,6 +485,107 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         stitched = stitch_vividvr_temporal_output_clips(trimmed_clips)
         self.assertEqual(stitched.shape[0], 200)
 
+    def test_multi_clip_decode_aggregates_parallel_stats_without_changing_trim(self):
+        clip_stats = [
+            {
+                "vae_sp_requested": True,
+                "vae_sp_effective": True,
+                "vae_sp_fallback_reason": "effective",
+                "vae_sp_world_size": 2,
+                "vae_sp_group_type": "sp",
+                "vae_total_tiles": 9,
+                "vae_local_tiles_per_rank": [5, 4],
+                "vae_tile_decode_seconds": 1.2,
+                "vae_tile_gather_seconds": 0.2,
+                "vae_tile_merge_seconds": 0.1,
+                "vae_decode_seconds": 1.5,
+            },
+            {
+                "vae_sp_requested": True,
+                "vae_sp_effective": True,
+                "vae_sp_fallback_reason": "effective",
+                "vae_sp_world_size": 2,
+                "vae_sp_group_type": "sp",
+                "vae_total_tiles": 6,
+                "vae_local_tiles_per_rank": [3, 3],
+                "vae_tile_decode_seconds": 0.8,
+                "vae_tile_gather_seconds": 0.1,
+                "vae_tile_merge_seconds": 0.1,
+                "vae_decode_seconds": 1.0,
+            },
+        ]
+
+        class _DummyDecodingStage:
+            def __init__(self):
+                self.vae = SimpleNamespace(use_tiling=True)
+                self.last_vae_decode_stats = {}
+                self.decode_index = 0
+
+            def decode_latents(self, _latents, _padding, _server_args):
+                self.last_vae_decode_stats = dict(clip_stats[self.decode_index])
+                self.decode_index += 1
+                return torch.zeros(1, 3, 5, 2, 2)
+
+        decoding_stage = _DummyDecodingStage()
+        stage = object.__new__(VividVRMultiClipDecodeTrimStage)
+        stage.decoding_stage = decoding_stage
+        stage.video_processor = VideoProcessor(vae_scale_factor=8)
+        params = self._make_vividvr_params(
+            num_frames=10,
+            num_temporal_process_frames=9,
+        )
+        batch = SimpleNamespace(
+            sampling_params=params,
+            extra={
+                "vividvr_input_video_info": {
+                    "original_height": 2,
+                    "original_width": 2,
+                },
+                "vividvr_long_video_runtime": {
+                    "clip_states": [
+                        {
+                            "num_latent_padding_frames": 0,
+                            "clip_spec": SimpleNamespace(),
+                        },
+                        {
+                            "num_latent_padding_frames": 0,
+                            "clip_spec": SimpleNamespace(),
+                        },
+                    ],
+                    "denoising_states": [
+                        {"latents": torch.zeros(1)},
+                        {"latents": torch.zeros(1)},
+                    ],
+                },
+            },
+        )
+        module = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.vividvr"
+        )
+        with patch(
+            f"{module}.decoded_video_to_frame_tensor",
+            return_value=torch.zeros(5, 3, 2, 2),
+        ), patch(
+            f"{module}.trim_vividvr_temporal_output_clip",
+            side_effect=lambda video, _spec: video,
+        ):
+            stage.forward(batch, SimpleNamespace())
+
+        debug = batch.extra["vividvr_debug"]
+        self.assertTrue(debug["vae_sp_requested"])
+        self.assertTrue(debug["vae_sp_effective"])
+        self.assertEqual(debug["vae_total_tiles"], 15)
+        self.assertEqual(debug["vae_local_tiles_per_rank"], [8, 7])
+        self.assertAlmostEqual(debug["vae_decode_seconds"], 2.5)
+        self.assertEqual(len(debug["vae_sp_clips"]), 2)
+        self.assertEqual(
+            len(
+                batch.extra["vividvr_long_video_runtime"]["trimmed_clips"]
+            ),
+            2,
+        )
+
     def test_tiling_state_accepts_pre_tiled_prompt_embeds(self):
         latents = torch.zeros(1, 31, 2, 4, 8)
         tiling_infos = VividVRTilingPreparationStage.build_tiling_infos(
@@ -533,11 +635,15 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
 
     def test_caption_module_can_be_disabled_without_changing_prompt_file_path(self):
         params = self._make_vividvr_params(enable_optional_caption_module=False)
-        prompt_context = prepare_vividvr_prompt_context(
-            params,
-            pipeline_config=VividVRPipelineConfig(),
-            debug={},
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.vividvr.captioning.read_prompt_file",
+            return_value="prompt",
+        ):
+            prompt_context = prepare_vividvr_prompt_context(
+                params,
+                pipeline_config=VividVRPipelineConfig(),
+                debug={},
+            )
 
         self.assertEqual(prompt_context["caption_backend"], "prompt_file")
         self.assertEqual(

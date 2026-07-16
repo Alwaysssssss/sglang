@@ -76,6 +76,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VividVRTextEncodingStage,
     VividVRTilingPreparationStage,
     VividVRTimestepPreparationStage,
+    _aggregate_vae_spatial_decode_stats,
 )
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -1432,12 +1433,18 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         debug["latents_shape"] = tuple(denoising_states[0]["latents"].shape)
 
         trimmed_clips: list[torch.Tensor] = []
+        clip_vae_stats: list[dict[str, object]] = []
         for clip_state, denoising_state in zip(clip_states, denoising_states, strict=True):
             decoded_video = self.decoding_stage.decode_latents(
                 denoising_state["latents"],
                 int(clip_state["num_latent_padding_frames"]),
                 server_args,
             )
+            last_vae_decode_stats = getattr(
+                self.decoding_stage, "last_vae_decode_stats", {}
+            )
+            if last_vae_decode_stats:
+                clip_vae_stats.append(dict(last_vae_decode_stats))
             output_video = decoded_video_to_frame_tensor(
                 decoded_video,
                 video_processor=self.video_processor,
@@ -1456,6 +1463,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         debug["vae_tiling_enabled"] = bool(
             getattr(getattr(self.decoding_stage, "vae", None), "use_tiling", False)
         )
+        debug.update(_aggregate_vae_spatial_decode_stats(clip_vae_stats))
 
         final_output_video = stitch_vividvr_temporal_output_clips(trimmed_clips)
         final_output_video = apply_reference_color_fix(

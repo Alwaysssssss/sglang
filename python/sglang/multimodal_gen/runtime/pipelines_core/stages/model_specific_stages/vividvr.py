@@ -163,6 +163,61 @@ def _ensure_tensor_decode_output(decode_output: Any) -> torch.Tensor:
     return decode_output
 
 
+def _aggregate_vae_spatial_decode_stats(
+    clip_stats: list[dict[str, object]],
+) -> dict[str, object]:
+    if not clip_stats:
+        return {}
+    topologies = {
+        (
+            int(item["vae_sp_world_size"]),
+            str(item["vae_sp_group_type"]),
+            len(item["vae_local_tiles_per_rank"]),
+        )
+        for item in clip_stats
+    }
+    if len(topologies) != 1:
+        raise RuntimeError(f"VAE SP clip topology mismatch: {sorted(topologies)}")
+    reasons = {str(item["vae_sp_fallback_reason"]) for item in clip_stats}
+    local_width = max(
+        len(item["vae_local_tiles_per_rank"]) for item in clip_stats
+    )
+    local_totals = [0] * local_width
+    for item in clip_stats:
+        for rank, count in enumerate(item["vae_local_tiles_per_rank"]):
+            local_totals[rank] += int(count)
+    return {
+        "vae_sp_requested": all(
+            bool(item["vae_sp_requested"]) for item in clip_stats
+        ),
+        "vae_sp_effective": all(
+            bool(item["vae_sp_effective"]) for item in clip_stats
+        ),
+        "vae_sp_fallback_reason": (
+            next(iter(reasons)) if len(reasons) == 1 else "mixed"
+        ),
+        "vae_sp_world_size": int(clip_stats[0]["vae_sp_world_size"]),
+        "vae_sp_group_type": str(clip_stats[0]["vae_sp_group_type"]),
+        "vae_total_tiles": sum(
+            int(item["vae_total_tiles"]) for item in clip_stats
+        ),
+        "vae_local_tiles_per_rank": local_totals,
+        "vae_tile_decode_seconds": sum(
+            float(item["vae_tile_decode_seconds"]) for item in clip_stats
+        ),
+        "vae_tile_gather_seconds": sum(
+            float(item["vae_tile_gather_seconds"]) for item in clip_stats
+        ),
+        "vae_tile_merge_seconds": sum(
+            float(item["vae_tile_merge_seconds"]) for item in clip_stats
+        ),
+        "vae_decode_seconds": sum(
+            float(item["vae_decode_seconds"]) for item in clip_stats
+        ),
+        "vae_sp_clips": [dict(item) for item in clip_stats],
+    }
+
+
 def _prepare_extra_step_kwargs(
     scheduler: Any,
     generator: torch.Generator | list[torch.Generator] | None,
@@ -1375,6 +1430,7 @@ class VividVRDecodingStage(PipelineStage):
     def __init__(self, vae: torch.nn.Module):
         super().__init__()
         self.vae = vae
+        self.last_vae_decode_stats: dict[str, object] = {}
 
     @torch.no_grad()
     def decode_latents(
@@ -1398,6 +1454,12 @@ class VividVRDecodingStage(PipelineStage):
         decoded = _ensure_tensor_decode_output(
             self.vae.decode(decode_latents.to(dtype=vae_dtype))
         )
+        stats_getter = getattr(self.vae, "get_last_spatial_decode_stats", None)
+        self.last_vae_decode_stats = (
+            dict(stats_getter().to_debug_dict())
+            if stats_getter is not None
+            else {}
+        )
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
         return decoded
@@ -1416,6 +1478,12 @@ class VividVRDecodingStage(PipelineStage):
         params.runtime_decoded_video = decoded
         debug = batch.extra.setdefault("vividvr_debug", {})
         debug["vae_tiling_enabled"] = bool(getattr(self.vae, "use_tiling", False))
+        debug.update(self.last_vae_decode_stats)
+        debug["vae_sp_clips"] = (
+            [dict(self.last_vae_decode_stats)]
+            if self.last_vae_decode_stats
+            else []
+        )
         return batch
 
 
@@ -1797,12 +1865,18 @@ class VividVRMultiClipDecodeTrimStage(PipelineStage):
             raise ValueError("VividVR denoising states must be prepared before decode/trim")
 
         trimmed_clips: list[torch.Tensor] = []
+        clip_vae_stats: list[dict[str, object]] = []
         for clip_state, denoising_state in zip(clip_states, denoising_states, strict=True):
             decoded_video = self.decoding_stage.decode_latents(
                 denoising_state["latents"],
                 int(clip_state["num_latent_padding_frames"]),
                 server_args,
             )
+            last_vae_decode_stats = getattr(
+                self.decoding_stage, "last_vae_decode_stats", {}
+            )
+            if last_vae_decode_stats:
+                clip_vae_stats.append(dict(last_vae_decode_stats))
             output_video = decoded_video_to_frame_tensor(
                 decoded_video,
                 video_processor=self.video_processor,
@@ -1819,6 +1893,7 @@ class VividVRMultiClipDecodeTrimStage(PipelineStage):
         long_runtime["trimmed_clips"] = trimmed_clips
         long_runtime["denoising_states"] = None
         debug["vae_tiling_enabled"] = bool(getattr(self.decoding_stage.vae, "use_tiling", False))
+        debug.update(_aggregate_vae_spatial_decode_stats(clip_vae_stats))
         return batch
 
 
