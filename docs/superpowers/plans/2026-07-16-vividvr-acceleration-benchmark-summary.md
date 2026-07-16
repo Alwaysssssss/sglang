@@ -146,3 +146,72 @@ git commit -m "docs(vividvr): add complete stage timing table"
 ```
 
 预期：提交只包含实现计划和正式总结文档的 Stage 耗时增量。
+
+### 任务 5：补充实验环境和模块收益结论
+
+**文件：**
+- 修改：`docs_xzh/docs_analysis/acceleration_benchmark_results_20260716.md`
+- 读取：`docs_xzh/docs_analysis/analysis.md`
+- 读取：`Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R{0,1,2,3,4,5,6,99,100}_formal.json`
+- 读取：`Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/logs/R0_service.log`
+
+- [ ] **步骤 1：采集可验证的实验环境字段**
+
+运行 `hostnamectl`、`nvidia-smi` 和仓库 `.venv` Python，记录机器型号、GPU、Driver、PyTorch CUDA、PyTorch 和 FlashAttention 4 版本。模型路径、Python 路径、显存采样方式和批次目录从正式 JSON 读取。
+
+预期环境值固定为：
+
+```text
+机器型号：6U GPU Server
+GPU：8 × NVIDIA A100-SXM4-80GB；单方案最多使用 4 张
+Driver：550.90.07
+PyTorch CUDA：12.8；系统无 nvcc
+PyTorch：2.9.1+cu128
+FlashAttention 4：4.0.0b19
+Python：/home/zhiheng/sglang/.venv/bin/python
+模型：/home/zhiheng/ckpts/CogVideoX1.5-5B
+Vivid-VR：/home/zhiheng/ckpts/Vivid-VR
+显存统计：NVML sampling
+sglang commit：N/A（本批次 JSON 未记录）
+```
+
+- [ ] **步骤 2：计算 10 组正式模块收益**
+
+按 `analysis.md` 的 Treatment/Control 关系读取正式 JSON，并计算：
+
+```python
+latency_speedup = control_model_seconds / treatment_model_seconds
+gpu_seconds_delta = treatment_gpu_count * treatment_model_seconds - control_gpu_count * control_model_seconds
+gpu_seconds_percent = gpu_seconds_delta / (control_gpu_count * control_model_seconds) * 100
+memory_delta_gib = treatment_max_single_gpu_peak_gib - control_max_single_gpu_peak_gib
+ssim_mean_delta = treatment_ssim_mean - control_ssim_mean
+```
+
+正式比较固定为 R1/R0、R2/R1、R3/R2、R4/R3、R5/R3、R5/R4、R6/R2、R99/R3、R100/R5、R100/R99。R7/R2、R8/R2、R9/R2 不计算数值，统一标记 `N/A`。
+
+- [ ] **步骤 3：写入实验环境和模块收益表**
+
+在“完整 Stage 耗时”和“最快方案”之间新增“实验环境记录”和“模块收益结论”。模块收益表保留以下列：
+
+```markdown
+| 加速模块 | Treatment | Control | 延迟增量加速比 | GPU·秒变化 | 最大单卡峰值显存变化 | 质量变化 | 正式结论 |
+```
+
+已执行方案的质量变化写入相对 Control 的 `SSIM mean` 差值，并标记“用户验收通过”；表后注明人工验收与 JSON 严格 `pass_compare` 门槛的区别。多卡结论必须同时解释延迟降低和 GPU·秒变化，R6 明确写为未形成端到端加速。
+
+- [ ] **步骤 4：机械核对收益数据和文档范围**
+
+使用仓库 `.venv` Python 解析模块收益表，逐项对照正式 JSON 复算 10 组增量加速比、GPU·秒差值及百分比、峰值显存差值和 SSIM mean 差值。
+
+预期：10 组正式对比的全部数值一致；R7–R9 的四个收益字段均为 `N/A`；实验环境表不存在空单元格。
+
+- [ ] **步骤 5：检查并提交**
+
+```bash
+git diff --check
+git add docs_xzh/docs_analysis/acceleration_benchmark_results_20260716.md \
+  docs/superpowers/plans/2026-07-16-vividvr-acceleration-benchmark-summary.md
+git commit -m "docs(vividvr): add environment and module benefit results"
+```
+
+预期：提交只包含实现计划和正式总结文档的环境与模块收益增量。
