@@ -2,16 +2,15 @@
 
 ## 目标
 
-缩短 compile 实验的 warmup 时间：warmup 请求固定使用 1 个推理 step，formal 请求继续使用固定的 20 个推理 step。
+缩短加速组合完整测试的准备时间：所有启用 `torch.compile` 的方案仍执行一次 warmup，但 warmup 请求固定只运行 1 个推理 step。
 
-## 设计
+## 行为边界
 
-- 保持 `build_request_payload` 生成正式工作负载的现有行为，不修改其接口。
-- `FlowCutRequestExecutor` 已经收到当前请求的 `RunRole`。构造 payload 后，如果角色是 `RunRole.WARMUP`，直接把 `num_inference_steps` 覆盖为 `1`。
-- eager 方案仍不执行 warmup；compile 方案仍执行一次 warmup 后再执行 formal。
-- 记录到结果 JSON 中的 `request_payload` 保留实际发送的 step 数，因此 warmup 记录为 1，formal 记录为 20。
+- `RunRole.WARMUP` 请求的 `num_inference_steps` 固定为 `1`。
+- `RunRole.FORMAL` 请求继续使用固定正式口径 `20` step。
+- eager 方案继续只执行 formal 请求，不新增 warmup。
+- warmup 与 formal 的视频、性能 JSON、请求记录和失败处理路径保持不变。
 
-## 验证
+## 实现与测试
 
-- 单元测试分别执行 warmup 和 formal 请求，断言实际提交 payload 的 `num_inference_steps` 为 1 和 20。
-- 重跑 benchmark runner 完整单测文件并执行 `git diff --check`。
+`build_request_payload` 显式接收 `RunRole`，由请求角色决定 step，避免根据 task ID 猜测或在 payload 创建后隐式覆盖。单元测试分别覆盖 warmup=1 与 formal=20，并运行 benchmark runner 的完整单测文件回归。
