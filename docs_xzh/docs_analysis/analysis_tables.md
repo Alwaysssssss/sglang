@@ -10,7 +10,7 @@
 | 模型推理耗时 | perf 中 `total_duration_ms / 1000` |
 | Denoise 耗时 | `VividVRMultiClipDenoisingStage` |
 | Stage 耗时 | 八个 VividVR pipeline stage 的整次请求累计值 |
-| Warmup | 仅 compile 方案完整 warmup 一次；eager 方案不 warmup |
+| Warmup | 仅 compile 方案执行一次 1-step warmup；eager 方案不 warmup |
 | Formal | warmup 成功后下一次完整请求；eager 方案的第一次完整请求 |
 | 累计加速比 | R0 模型推理耗时 / 当前方案模型推理耗时 |
 | 模块增量加速比 | 指定质量通过的对照方案耗时 / 当前方案耗时 |

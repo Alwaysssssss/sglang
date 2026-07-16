@@ -64,7 +64,7 @@ GPU·秒 = GPU 数量 × 当前方案模型推理耗时
 | Prompt embedding 长度 | 226；不得回退到 512 |
 | VAE tiling | 保持当前正式配置，tile sample min height/width 为 240/360 |
 | 双卡及四卡 SP connector | `SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE=eager_global`，使用 full global control context |
-| Compile 正式口径 | 固定形状完整 warmup 后记录第二次完整请求；同时保存 compile mode 和实际生效状态 |
+| Compile 正式口径 | 固定形状 1-step warmup 后记录下一次完整请求；同时保存 compile mode 和实际生效状态 |
 | 质量最低要求 | `pass_compare=true`，并检查质量指标是否相对稳定基线发生明显漂移 |
 
 除被测加速模块外，所有方案必须保持上述输入、模型、dtype、seed、调度器、VAE、前后处理和服务请求语义一致。
@@ -264,4 +264,4 @@ R4 与 R5 还需在结论表中单独计算同为四卡时的耗时比和 GPU·�
 | 四卡综合最快方案 | R100 | R4/R5 最快者 |  |  |  |  |  |
 | 综合方案 2→4 卡扩展 | R100 | R99 |  |  |  |  |  |
 
-“正式结论”只能基于完整 warmup 后的正式请求、有效 runtime 配置记录和质量比较填写。局部 kernel 或 collective 指标改善但端到端耗时没有改善时，应明确写为“局部优化生效，但未形成端到端收益”，不能只报告局部加速数字。
+“正式结论”只能基于 compile 方案 1-step warmup 后的正式请求、有效 runtime 配置记录和质量比较填写。局部 kernel 或 collective 指标改善但端到端耗时没有改善时，应明确写为“局部优化生效，但未形成端到端收益”，不能只报告局部加速数字。

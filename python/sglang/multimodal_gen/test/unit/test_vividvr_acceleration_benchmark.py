@@ -6,12 +6,16 @@ from subprocess import CompletedProcess
 
 import pytest
 
+from sglang.multimodal_gen.tools import (
+    run_vividvr_acceleration_benchmark as benchmark_module,
+)
 from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     BenchmarkDataError,
     BenchmarkCleanupError,
     BenchmarkConfig,
     BenchmarkConfigError,
     BenchmarkRunner,
+    FlowCutRequestExecutor,
     GpuMemorySampler,
     RunRole,
     SCHEMES,
@@ -855,6 +859,51 @@ def test_request_payload_uses_caption_bridge_and_fixed_workload(tmp_path: Path):
     assert payload["minioConfig"]["endpoint"] == "127.0.0.1:4566"
     assert "caption_file_path" not in payload
     assert "prompt" not in payload
+
+
+def test_warmup_request_uses_one_step(monkeypatch, tmp_path: Path):
+    from sglang.multimodal_gen.tools import (
+        run_flowcut_vividvr_service_acceptance as acceptance_module,
+    )
+
+    captured_payload: dict[str, object] = {}
+
+    class StopAfterSubmit(Exception):
+        pass
+
+    class FakeGpuMemorySampler:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            return {}
+
+    def capture_submit(*, payload, **_kwargs):
+        captured_payload.update(payload)
+        raise StopAfterSubmit
+
+    monkeypatch.setattr(
+        benchmark_module, "GpuMemorySampler", FakeGpuMemorySampler
+    )
+    monkeypatch.setattr(
+        acceptance_module,
+        "submit_flowcut_task_with_retry",
+        capture_submit,
+    )
+    executor = FlowCutRequestExecutor(make_config(tmp_path))
+
+    with pytest.raises(StopAfterSubmit):
+        executor(
+            SCHEMES["R2"],
+            RunRole.WARMUP,
+            batch_id="batch",
+            fingerprint="fingerprint",
+        )
+
+    assert captured_payload["num_inference_steps"] == 1
 
 
 def test_request_payload_rejects_path_outside_output_root(tmp_path: Path):

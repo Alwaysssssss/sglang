@@ -6,7 +6,7 @@
 | --- | --- |
 | 实验顺序 | `R0`—`R9`、`R99`、`R100`，严格串行 |
 | 服务生命周期 | Moto S3、callback receiver、固定 caption mock 每批启动一次；主推理服务每个可执行方案重启一次 |
-| Warmup | 仅启用 `torch.compile` 的方案执行一次完整 warmup；eager 方案直接执行 formal |
+| Warmup | 仅启用 `torch.compile` 的方案执行一次 `1 step` warmup；eager 方案直接执行 formal |
 | Formal | 每个可执行方案执行一次完整正式请求，并立即原子写入 JSON |
 | 不支持方案 | `R7`、`R8`、`R9` 不启动服务，写入带明确原因的 `unsupported` JSON |
 | 运行环境 | `/home/zhiheng/sglang/.venv`，`PYTHONPATH=python` |

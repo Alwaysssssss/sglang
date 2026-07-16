@@ -73,7 +73,7 @@ tmux attach -r -t vividvr_accel_20260715T120000Z
 
 ## 4. 固定实验注册表
 
-所有可执行方案都运行一次完整 warmup 和一次完整 formal。warmup 也生成 JSON，但不参与速度和质量结论；formal 使用第二次请求的热态结果。
+仅启用 compile 的可执行方案运行一次 1-step warmup，再运行一次完整 formal；eager 方案直接运行 formal。warmup 也生成 JSON，但不参与速度和质量结论。
 
 | 方案 | GPU | Requested backend | 并行 | Compile | Fusion | 执行状态 | 增益对照 |
 | --- | ---: | --- | --- | --- | --- | --- | --- |
@@ -189,11 +189,11 @@ vividvr-accel-<batch-id>-<scheme-lower>-<warmup|formal>-a<attempt>
 - `denoising_runtime_seconds`：`VividVRMultiClipDenoisingStage.duration_ms / 1000`。
 - 下载、compare 和 JSON 合并耗时单独记录，不计入上述三个表格耗时。
 
-warmup 和 formal 使用相同 130f/20-step 请求。warmup 的作用：
+compile 方案的 warmup 使用 130f/1-step 请求，formal 使用固定的 130f/20-step 请求。warmup 的作用：
 
 - compile 方案完成图编译以及 CUDA/kernel/allocator 预热；
-- 非 compile 方案完成 CUDA/kernel/allocator 预热；
-- 所有模块增益都使用 formal 对 formal，禁止冷态 eager 对热态 compile。
+- eager 方案不额外 warmup；
+- 所有模块增益都使用 formal 对 formal。
 
 warmup 不执行 reference compare，但保留输出路径、服务 perf、callback、运行时快照和 GPU 指标。formal 下载 S3 结果并运行 `compare.py`。
 

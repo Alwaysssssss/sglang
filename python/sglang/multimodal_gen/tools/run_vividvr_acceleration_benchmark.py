@@ -2088,6 +2088,8 @@ class FlowCutRequestExecutor:
             output_path=output_path,
             perf_path=perf_path,
         )
+        if role is RunRole.WARMUP:
+            payload["num_inference_steps"] = 1
         sampler = GpuMemorySampler(
             self.config.gpu_ids[: scheme.gpu_count], interval_seconds=0.25
         )
