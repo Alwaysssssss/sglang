@@ -1294,6 +1294,7 @@ def _ensure_output_path(config: BenchmarkConfig, path: Path) -> None:
 def build_request_payload(
     config: BenchmarkConfig,
     *,
+    role: RunRole,
     task_id: str,
     callback_url: str,
     output_path: Path,
@@ -1314,7 +1315,7 @@ def build_request_payload(
         "timeout": -1,
         "callbackUrl": callback_url,
         "video_input_path": str(config.input_video),
-        "num_inference_steps": 20,
+        "num_inference_steps": 1 if role is RunRole.WARMUP else 20,
         "seed": 42,
         "num_temporal_process_frames": 121,
         "guidance_scale": 6.0,
@@ -2083,13 +2084,12 @@ class FlowCutRequestExecutor:
         )
         payload = build_request_payload(
             self.config,
+            role=role,
             task_id=task_id,
             callback_url=callback_url,
             output_path=output_path,
             perf_path=perf_path,
         )
-        if role is RunRole.WARMUP:
-            payload["num_inference_steps"] = 1
         sampler = GpuMemorySampler(
             self.config.gpu_ids[: scheme.gpu_count], interval_seconds=0.25
         )

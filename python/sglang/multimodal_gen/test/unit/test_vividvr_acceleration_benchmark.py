@@ -842,6 +842,7 @@ def test_request_payload_uses_caption_bridge_and_fixed_workload(tmp_path: Path):
     config = make_config(tmp_path)
     payload = build_request_payload(
         config,
+        role=RunRole.FORMAL,
         task_id="batch-R2-formal",
         callback_url="http://127.0.0.1:39090/tasks/batch-R2-formal/callback",
         output_path=config.output_root / "result.mp4",
@@ -859,6 +860,21 @@ def test_request_payload_uses_caption_bridge_and_fixed_workload(tmp_path: Path):
     assert payload["minioConfig"]["endpoint"] == "127.0.0.1:4566"
     assert "caption_file_path" not in payload
     assert "prompt" not in payload
+
+
+def test_warmup_request_payload_uses_one_step(tmp_path: Path):
+    config = make_config(tmp_path)
+
+    payload = build_request_payload(
+        config,
+        role=RunRole.WARMUP,
+        task_id="batch-R2-warmup",
+        callback_url="http://127.0.0.1:39090/tasks/batch-R2-warmup/callback",
+        output_path=config.output_root / "warmup.mp4",
+        perf_path=config.output_root / "warmup-perf.json",
+    )
+
+    assert payload["num_inference_steps"] == 1
 
 
 def test_warmup_request_uses_one_step(monkeypatch, tmp_path: Path):
@@ -912,6 +928,7 @@ def test_request_payload_rejects_path_outside_output_root(tmp_path: Path):
     with pytest.raises(BenchmarkConfigError, match="output_root"):
         build_request_payload(
             config,
+            role=RunRole.FORMAL,
             task_id="task",
             callback_url="http://127.0.0.1:39090/callback",
             output_path=tmp_path.parent / "outside.mp4",
