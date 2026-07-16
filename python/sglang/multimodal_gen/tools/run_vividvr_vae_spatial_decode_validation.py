@@ -263,18 +263,19 @@ def main() -> int:
         latent_seed = args.seed + cfg_group_index
         latent_channels = int(vae.config.latent_channels)
         generator = torch.Generator(device=device).manual_seed(latent_seed)
-        latent = torch.randn(
+        latent_storage = torch.randn(
             (
                 1,
                 latent_channels,
                 args.latent_frames,
-                args.latent_height,
                 args.latent_width,
+                args.latent_height,
             ),
             generator=generator,
             device=device,
             dtype=torch.bfloat16,
         )
+        latent = latent_storage.transpose(-1, -2)
 
         with torch.inference_mode():
             vae.configure_spatial_tile_parallel(requested=False)
@@ -310,6 +311,7 @@ def main() -> int:
             "cfg_group_index": cfg_group_index,
             "sp_subgroup_ranks": list(sp_group.ranks),
             "latent_seed": latent_seed,
+            "latent_input_contiguous": latent.is_contiguous(),
             "latent_sum": float(latent.float().sum().item()),
             "serial_output_sum": float(serial_a.float().sum().item()),
             "parallel_output_sum": float(parallel.float().sum().item()),
@@ -338,6 +340,10 @@ def main() -> int:
             and item["rank_divergent_input_comparison"]["passed"]
             for item in rank_payloads
         ) and all(item["passed"] for item in subgroup_checks)
+        noncontiguous_inputs_exercised = all(
+            not item["latent_input_contiguous"] for item in rank_payloads
+        )
+        overall_pass = overall_pass and noncontiguous_inputs_exercised
 
         if rank == 0:
             subgroup_seeds = {
@@ -361,6 +367,9 @@ def main() -> int:
                     args.latent_width,
                 ],
                 "latent_dtype": "torch.bfloat16",
+                "noncontiguous_inputs_exercised": (
+                    noncontiguous_inputs_exercised
+                ),
                 "seed": args.seed,
                 "cfg_subgroup_seeds": subgroup_seeds,
                 "serial_deterministic": all(

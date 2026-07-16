@@ -246,7 +246,7 @@ def _validate_spatial_decode_descriptor(
 
 def _canonicalize_spatial_decode_input(sp_group, z: torch.Tensor) -> torch.Tensor:
     """Use one latent value source for every tile in the local SP subgroup."""
-    canonical = z.clone()
+    canonical = z.clone(memory_format=torch.contiguous_format)
     sp_group.broadcast(canonical, src=0)
     return canonical
 

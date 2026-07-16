@@ -94,6 +94,7 @@ class BroadcastFakeGroup(FakeGroup):
 
     def broadcast(self, tensor, src=0):
         self.broadcast_calls.append(src)
+        assert tensor.is_contiguous()
         tensor.copy_(self.canonical)
         return tensor
 
@@ -428,15 +429,18 @@ def test_requested_parallel_rejects_uninitialized_sp_group(monkeypatch):
 
 
 def test_parallel_decode_canonicalizes_latent_from_sp_local_rank_zero():
-    local = torch.full((1, 1, 1, 2, 2), 9.0)
-    canonical = torch.arange(4.0).reshape_as(local)
+    local_storage = torch.full((1, 1, 1, 2, 3), 9.0)
+    local = local_storage.transpose(-1, -2)
+    canonical = torch.arange(6.0).reshape_as(local)
     group = BroadcastFakeGroup(canonical=canonical)
 
     actual = cogvideox._canonicalize_spatial_decode_input(group, local)
 
     assert group.broadcast_calls == [0]
     assert torch.equal(actual, canonical)
+    assert not local.is_contiguous()
     assert torch.equal(local, torch.full_like(local, 9.0))
+    assert actual.is_contiguous()
     assert actual.data_ptr() != local.data_ptr()
 
 
