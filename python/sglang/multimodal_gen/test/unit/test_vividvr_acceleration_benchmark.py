@@ -1,4 +1,6 @@
 import json
+import os
+import sysconfig
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -19,6 +21,7 @@ from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     VIVIDVR_STAGE_NAMES,
     _config_cli_arguments,
     _config_from_args,
+    _download_result,
     atomic_write_json,
     build_dry_run_report,
     build_request_payload,
@@ -149,6 +152,34 @@ def test_distributed_environment_uses_selected_gpus_and_global_context(tmp_path:
     )
     assert "SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE" not in (
         build_service_environment(SCHEMES["R2"], config)
+    )
+
+
+def test_compile_environment_injects_existing_python_dev_headers(
+    monkeypatch, tmp_path: Path
+):
+    include_dir = tmp_path / "python-dev" / "usr" / "include" / "python3.10"
+    include_dir.mkdir(parents=True)
+    (include_dir / "Python.h").write_text("/* test header */\n", encoding="utf-8")
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    assert multiarch
+    multiarch_dir = include_dir.parent / multiarch / include_dir.name
+    multiarch_dir.mkdir(parents=True)
+    (multiarch_dir / "pyconfig.h").write_text(
+        "/* test multiarch config */\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("SGLANG_PYTHON_DEV_INCLUDE", str(include_dir))
+    monkeypatch.setenv("CPATH", "/existing/cpath")
+    monkeypatch.setenv("C_INCLUDE_PATH", "/existing/c-include")
+
+    environment = build_service_environment(SCHEMES["R2"], make_config(tmp_path))
+
+    expected_prefix = os.pathsep.join((str(include_dir.parent), str(include_dir)))
+    assert environment["CPATH"] == os.pathsep.join(
+        (expected_prefix, "/existing/cpath")
+    )
+    assert environment["C_INCLUDE_PATH"] == os.pathsep.join(
+        (expected_prefix, "/existing/c-include")
     )
 
 
@@ -580,6 +611,46 @@ def test_s3_bucket_creation_explicitly_disables_proxy(monkeypatch, tmp_path: Pat
 
     assert captured["bucket"] == "flowcut"
     assert captured["client_kwargs"]["config"].proxies == {}
+
+
+def test_download_result_uses_authenticated_s3_without_proxy(
+    monkeypatch, tmp_path: Path
+):
+    import boto3
+
+    captured: dict[str, object] = {}
+
+    class FakeS3Client:
+        def download_file(self, bucket: str, key: str, filename: str):
+            captured["download"] = (bucket, key, Path(filename).name)
+            Path(filename).write_bytes(b"private-moto-object")
+
+    def fake_client(service_name: str, **kwargs):
+        captured["service_name"] = service_name
+        captured["client_kwargs"] = kwargs
+        return FakeS3Client()
+
+    monkeypatch.setattr(boto3, "client", fake_client)
+    destination = tmp_path / "result.mp4"
+
+    _download_result(
+        "http://127.0.0.1:4566/flowcut/acceleration-benchmark/run.mp4",
+        destination,
+    )
+
+    assert destination.read_bytes() == b"private-moto-object"
+    assert captured["service_name"] == "s3"
+    assert captured["download"] == (
+        "flowcut",
+        "acceleration-benchmark/run.mp4",
+        "result.mp4.partial",
+    )
+    client_kwargs = captured["client_kwargs"]
+    assert client_kwargs["endpoint_url"] == "http://127.0.0.1:4566"
+    assert client_kwargs["aws_access_key_id"] == "test"
+    assert client_kwargs["aws_secret_access_key"] == "test"
+    assert client_kwargs["region_name"] == "us-east-1"
+    assert client_kwargs["config"].proxies == {}
 
 
 class FakeLifecycle:

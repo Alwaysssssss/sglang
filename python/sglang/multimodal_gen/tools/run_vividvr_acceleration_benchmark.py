@@ -13,6 +13,8 @@ import shutil
 import socket
 import statistics
 import subprocess
+import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -22,6 +24,7 @@ from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
+from urllib.parse import unquote, urlsplit
 
 
 REPO_ROOT = Path("/home/zhiheng/sglang")
@@ -1590,6 +1593,67 @@ class BenchmarkRunner:
         return summary
 
 
+def _merge_environment_paths(
+    preferred: Sequence[Path], existing: str | None
+) -> str:
+    values = [str(path) for path in preferred]
+    if existing:
+        values.extend(value for value in existing.split(os.pathsep) if value)
+    return os.pathsep.join(dict.fromkeys(values))
+
+
+def _resolve_python_dev_include_paths() -> tuple[Path, ...]:
+    version_tag = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    compact_version = f"{sys.version_info.major}{sys.version_info.minor}"
+    major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    home = Path.home()
+    candidates: list[Path] = []
+
+    override = os.environ.get("SGLANG_PYTHON_DEV_INCLUDE")
+    if override:
+        candidates.append(Path(override).expanduser())
+    for value in (
+        sysconfig.get_config_var("INCLUDEPY"),
+        sysconfig.get_path("include"),
+        sysconfig.get_path("platinclude"),
+    ):
+        if value:
+            candidates.append(Path(value))
+    candidates.extend(
+        (
+            Path(sys.prefix) / "include" / version_tag,
+            Path(sys.base_prefix) / "include" / version_tag,
+            home
+            / f"tmp_py{compact_version}dev"
+            / "extracted"
+            / "usr"
+            / "include"
+            / version_tag,
+            home
+            / f"tmp_py{compact_version}_headers"
+            / "extracted"
+            / f"libpython{major_minor}-dev"
+            / "usr"
+            / "include"
+            / version_tag,
+        )
+    )
+
+    for candidate in dict.fromkeys(candidates):
+        if not (candidate / "Python.h").is_file():
+            continue
+        include_paths = [candidate]
+        multiarch = sysconfig.get_config_var("MULTIARCH")
+        if multiarch:
+            multiarch_config = (
+                candidate.parent / multiarch / candidate.name / "pyconfig.h"
+            )
+            if multiarch_config.is_file():
+                include_paths.insert(0, candidate.parent)
+        return tuple(include_paths)
+    return ()
+
+
 def build_service_environment(
     scheme: Scheme, config: BenchmarkConfig
 ) -> dict[str, str]:
@@ -1616,6 +1680,19 @@ def build_service_environment(
     }
     if scheme.sp_degree > 1:
         environment["SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE"] = "eager_global"
+    if scheme.compile_enabled:
+        python_include_paths = _resolve_python_dev_include_paths()
+        if not python_include_paths:
+            raise BenchmarkConfigError(
+                "torch.compile requires Python development headers; set "
+                "SGLANG_PYTHON_DEV_INCLUDE to a directory containing Python.h"
+            )
+        environment["CPATH"] = _merge_environment_paths(
+            python_include_paths, os.environ.get("CPATH")
+        )
+        environment["C_INCLUDE_PATH"] = _merge_environment_paths(
+            python_include_paths, os.environ.get("C_INCLUDE_PATH")
+        )
     return environment
 
 
@@ -1908,18 +1985,36 @@ def _load_json_object(path: Path, description: str) -> dict[str, Any]:
 
 
 def _download_result(url: str, destination: Path) -> None:
-    import httpx
+    import boto3
+    from botocore.config import Config
+
+    parsed = urlsplit(url)
+    object_path = unquote(parsed.path).lstrip("/")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise BenchmarkDataError(f"invalid S3 result URL: {url!r}")
+    if "/" not in object_path:
+        raise BenchmarkDataError(
+            f"S3 result URL must contain bucket and object key: {url!r}"
+        )
+    bucket, object_key = object_path.split("/", 1)
+    if not bucket or not object_key:
+        raise BenchmarkDataError(
+            f"S3 result URL must contain bucket and object key: {url!r}"
+        )
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=f"{parsed.scheme}://{parsed.netloc}",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+        config=Config(proxies={}, s3={"addressing_style": "path"}),
+    )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".partial")
     try:
-        with httpx.stream(
-            "GET", url, follow_redirects=True, trust_env=False, timeout=600.0
-        ) as response:
-            response.raise_for_status()
-            with temporary.open("wb") as output:
-                for chunk in response.iter_bytes():
-                    output.write(chunk)
+        client.download_file(bucket, object_key, str(temporary))
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
