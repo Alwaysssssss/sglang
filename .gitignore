@@ -278,3 +278,4 @@ sgl-kernel/csrc/**/*_musa/
 
 # mgtv
 wheel/output_tyx/
+.venv-cu129/

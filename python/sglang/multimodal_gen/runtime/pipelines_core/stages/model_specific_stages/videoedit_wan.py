@@ -703,13 +703,20 @@ class VideoEditDecodingStage(PipelineStage):
             self.vae.enable_tiling()
         latents = params.runtime_latents.to(device=device).to(dtype=vae_dtype)
         autocast_enabled = vae_dtype != torch.float32 and not server_args.disable_autocast
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=autocast_enabled,
-        ):
-            latents = _denormalize_vae_latents(latents, self.vae)
-            decoded = _decode_vae_for_videoedit(self.vae, latents)
+        previous_use_feature_cache = getattr(self.vae, "use_feature_cache", None)
+        if server_args.pipeline_config.vae_tiling and previous_use_feature_cache is not None:
+            self.vae.use_feature_cache = False
+        try:
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=autocast_enabled,
+            ):
+                latents = _denormalize_vae_latents(latents, self.vae)
+                decoded = _decode_vae_for_videoedit(self.vae, latents)
+        finally:
+            if previous_use_feature_cache is not None:
+                self.vae.use_feature_cache = previous_use_feature_cache
         decoded_frames = (decoded / 2 + 0.5).clamp(0, 1)[0].permute(1, 0, 2, 3)
         params.runtime_decoded_video_tensor = decoded_frames
 

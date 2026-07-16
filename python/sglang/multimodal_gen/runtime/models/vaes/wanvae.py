@@ -883,28 +883,79 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self._enc_conv_idx = 0
             self._enc_feat_map = [None] * self._enc_conv_num
 
+    def _encode_with_feature_cache(self, x: torch.Tensor) -> torch.Tensor:
+        self.clear_cache()
+        if self.config.patch_size is not None:
+            x = patchify(x, patch_size=self.config.patch_size)
+        with forward_context(
+            feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+        ):
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            for i in range(iter_):
+                feat_idx.set(0)
+                if i == 0:
+                    out = self.encoder(x[:, :, :1, :, :])
+                else:
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
+                    out = torch.cat([out, out_], 2)
+        enc = self.quant_conv(out)
+        mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
+        enc = torch.cat([mu, logvar], dim=1)
+        self.clear_cache()
+        return enc
+
+    def _spatial_tiled_encode_with_feature_cache(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, _, height, width = x.shape
+        tile_latent_min_height = (
+            self.tile_sample_min_height // self.spatial_compression_ratio
+        )
+        tile_latent_min_width = (
+            self.tile_sample_min_width // self.spatial_compression_ratio
+        )
+        tile_latent_stride_height = (
+            self.tile_sample_stride_height // self.spatial_compression_ratio
+        )
+        tile_latent_stride_width = (
+            self.tile_sample_stride_width // self.spatial_compression_ratio
+        )
+        blend_height = tile_latent_min_height - tile_latent_stride_height
+        blend_width = tile_latent_min_width - tile_latent_stride_width
+
+        rows = []
+        for i in range(0, height, self.tile_sample_stride_height):
+            row = []
+            for j in range(0, width, self.tile_sample_stride_width):
+                tile = x[
+                    :,
+                    :,
+                    :,
+                    i : i + self.tile_sample_min_height,
+                    j : j + self.tile_sample_min_width,
+                ]
+                row.append(self._encode_with_feature_cache(tile))
+            rows.append(row)
+        return self._merge_spatial_tiles(
+            rows,
+            blend_height,
+            blend_width,
+            tile_latent_stride_height,
+            tile_latent_stride_width,
+        )
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_feature_cache:
-            self.clear_cache()
-            if self.config.patch_size is not None:
-                x = patchify(x, patch_size=self.config.patch_size)
-            with forward_context(
-                feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+            _, _, num_frames, height, width = x.shape
+            latent_num_frames = (num_frames - 1) // self.temporal_compression_ratio + 1
+            if self.use_tiling and (
+                width > self.tile_sample_min_width or height > self.tile_sample_min_height
             ):
-                t = x.shape[2]
-                iter_ = 1 + (t - 1) // 4
-                for i in range(iter_):
-                    feat_idx.set(0)
-                    if i == 0:
-                        out = self.encoder(x[:, :, :1, :, :])
-                    else:
-                        out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
-                        out = torch.cat([out, out_], 2)
-            enc = self.quant_conv(out)
-            mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
-            enc = torch.cat([mu, logvar], dim=1)
+                enc = self._spatial_tiled_encode_with_feature_cache(x)[
+                    :, :, :latent_num_frames
+                ]
+            else:
+                enc = self._encode_with_feature_cache(x)[:, :, :latent_num_frames]
             enc = DiagonalGaussianDistribution(enc)
-            self.clear_cache()
         else:
             for block in self.encoder.down_blocks:
                 if isinstance(block, WanResample) and block.mode == "downsample3d":

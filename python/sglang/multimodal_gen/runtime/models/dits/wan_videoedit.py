@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+logger = init_logger(__name__)
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.wan_videoedit import (
@@ -72,6 +74,10 @@ class WanVideoEditTransformer3DModel(WanTransformer3DModel):
     lora_param_names_mapping = WanVideoEditConfig().lora_param_names_mapping
 
     def __init__(self, config: WanVideoEditConfig, hf_config, quant_config=None):
+        logger.warning(
+            "[WanVideoEditTransformer3DModel] __init__ called. "
+            "This means WanVideoEditTransformer3DModel is being used."
+        )
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
         for i, block in enumerate(self.blocks):
             block.attn2 = WanVideoEditCrossAttention(
@@ -85,6 +91,11 @@ class WanVideoEditTransformer3DModel(WanTransformer3DModel):
                 },
                 quant_config=quant_config,
             )
+        logger.warning(
+            "[WanVideoEditTransformer3DModel] replaced attn2 with "
+            "WanVideoEditCrossAttention for %d blocks.",
+            len(self.blocks),
+        )        
 
 
 EntryClass = WanVideoEditTransformer3DModel

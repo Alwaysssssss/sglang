@@ -137,6 +137,21 @@ class VAEConfig(ModelConfig):
             default=VAEConfig.use_parallel_tiling,
             help="Whether to use parallel tiling for VAE",
         )
+        parser.add_argument(
+            f"--{prefix}.use-feature-cache",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.use_feature_cache",
+            default=None,
+            help="Whether to use the VAE feature-cache path when supported by the selected VAE",
+        )
+        if prefix == "vae-config":
+            parser.add_argument(
+                "--no-vae-feature-cache",
+                action="store_false",
+                dest="vae_config.use_feature_cache",
+                default=None,
+                help="Disable the VAE feature-cache path so VAE tiling can use the tiled encode/decode implementation",
+            )
 
         return parser
 

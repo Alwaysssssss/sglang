@@ -71,6 +71,7 @@ from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     resolve_videoedit_num_frames,
 )
 from sglang.multimodal_gen.runtime.videoedit.progress import read_videoedit_progress
+from sglang.multimodal_gen.runtime.videoedit.request_audit import VideoEditRequestAudit
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -711,6 +712,7 @@ async def _dispatch_video_repair_job_async(
     output_object_key: str | None = None,
     output_bucket: str | None = None,
     timeout_deadline: float | None = None,
+    request_audit: VideoEditRequestAudit | None = None,
 ) -> None:
     progress_callback_task = None
     try:
@@ -766,22 +768,73 @@ async def _dispatch_video_repair_job_async(
         _VIDEOEDIT_SEMAPHORE.release()
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
+        if request_audit is not None:
+            try:
+                final_job = await VIDEO_STORE.get(job_id)
+                request_audit.update(
+                    status=(final_job or {}).get("status", "finished"),
+                    result={
+                        key: (final_job or {}).get(key)
+                        for key in (
+                            "progress",
+                            "url",
+                            "file_path",
+                            "output_object_key",
+                            "inference_time_s",
+                            "peak_memory_mb",
+                            "callback_status",
+                            "callback_error",
+                            "reason",
+                        )
+                    },
+                )
+            except Exception as error:
+                logger.warning("Failed to finalize VideoEdit request audit: %s", error)
 
 
 @router.post("/repairs")
 async def create_video_repair(request: Request):
-    if _VIDEOEDIT_SEMAPHORE.locked():
-        return _video_repair_submit_response(2, "A task is running.")
-
+    server_args = get_global_server_args()
     body = None
+    body_error = None
     try:
         body = await request.json()
+    except Exception as error:
+        body_error = error
+
+    task_id = _task_id_from_video_repair_body(body)
+    request_audit = VideoEditRequestAudit(
+        getattr(server_args, "videoedit_request_log_dir", None),
+        task_id=task_id,
+        include_sensitive_values=getattr(
+            server_args, "videoedit_request_log_sensitive_values", False
+        ),
+    )
+    client_host = request.client.host if request.client is not None else None
+    request_audit.update(
+        status="received",
+        http_request={
+            "method": request.method,
+            "path": request.url.path,
+            "client_host": client_host,
+        },
+        raw_request=body,
+        parse_error=_exception_message(body_error) if body_error else None,
+    )
+
+    if _VIDEOEDIT_SEMAPHORE.locked():
+        request_audit.update(status="rejected_busy")
+        return _video_repair_submit_response(2, "A task is running.")
+
+    try:
+        if body_error is not None:
+            raise body_error
         payload = _normalize_video_repair_payload(body)
         req = VideoRepairRequest(**payload)
         _validate_video_repair_request(req)
-    except Exception as e:
-        reason = f"Invalid request body: {_exception_message(e)}"
-        task_id = _task_id_from_video_repair_body(body)
+    except Exception as error:
+        reason = f"Invalid request body: {_exception_message(error)}"
+        request_audit.update(status="rejected_invalid", error=reason)
         if task_id is not None:
             await _store_failed_video_repair_submission(
                 task_id,
@@ -790,12 +843,17 @@ async def create_video_repair(request: Request):
             )
         return _video_repair_submit_response(1, reason)
 
+    request_audit.update(
+        status="validated",
+        task_id=req.task_id,
+        effective_request=req.model_dump(mode="json"),
+    )
+
     if _VIDEOEDIT_SEMAPHORE.locked():
+        request_audit.update(status="rejected_busy")
         return _video_repair_submit_response(2, "A task is running.")
 
     await _VIDEOEDIT_SEMAPHORE.acquire()
-
-    server_args = get_global_server_args()
     request_id = req.task_id or generate_request_id()
     timeout_deadline = request_timeout_deadline(req.timeout)
     temp_dirs: list[str] = []
@@ -955,6 +1013,31 @@ async def create_video_repair(request: Request):
                 req, output_object_key
             )
         req.output_object_key = output_object_key
+        target_bucket = req.output_bucket
+        if target_bucket is None:
+            target_bucket = (
+                request_storage.bucket_name
+                if request_storage is not None
+                else getattr(cloud_storage, "bucket_name", None)
+            )
+        request_audit.update(
+            status="queued",
+            task_id=request_id,
+            effective_request=req.model_dump(mode="json"),
+            resolved={
+                "request_id": request_id,
+                "num_frames": resolved_num_frames,
+                "drop_reference_frame": effective_drop_reference_frame,
+                "video_input_path": video_input_path,
+                "mask_input_path": mask_input_path,
+                "reference_image_path": reference_image_path,
+                "output_file_path": os.path.abspath(
+                    os.path.join(output_dir, output_file_name)
+                ),
+                "output_bucket": target_bucket,
+                "output_object_key": output_object_key,
+            },
+        )
         job = _video_repair_job_from_sampling(request_id, req, sampling_params)
         job["progress_path"] = progress_path
         await VIDEO_STORE.upsert(request_id, job)
@@ -972,6 +1055,7 @@ async def create_video_repair(request: Request):
                 output_object_key=output_object_key,
                 output_bucket=req.output_bucket,
                 timeout_deadline=timeout_deadline,
+                request_audit=request_audit,
             )
         )
         return _video_repair_submit_response(0, "ok")
@@ -980,6 +1064,11 @@ async def create_video_repair(request: Request):
         for td in temp_dirs:
             shutil.rmtree(td, ignore_errors=True)
         reason = _exception_message(e)
+        request_audit.update(
+            status="failed_submission",
+            error=reason,
+            effective_request=req.model_dump(mode="json"),
+        )
         await _store_failed_video_repair_submission(
             request_id,
             reason,

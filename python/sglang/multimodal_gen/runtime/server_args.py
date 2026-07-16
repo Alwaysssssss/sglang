@@ -207,6 +207,8 @@ class ServerArgs:
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    videoedit_request_log_dir: str | None = None
+    videoedit_request_log_sensitive_values: bool = False
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -277,6 +279,11 @@ class ServerArgs:
             self.output_path = None
         if self.input_save_path is not None and self.input_save_path.strip() == "":
             self.input_save_path = None
+        if (
+            self.videoedit_request_log_dir is not None
+            and self.videoedit_request_log_dir.strip() == ""
+        ):
+            self.videoedit_request_log_dir = None
 
     def _adjust_quant_config(self):
         """
@@ -831,6 +838,21 @@ class ServerArgs:
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
         )
+        parser.add_argument(
+            "--videoedit-request-log-dir",
+            type=str,
+            default=ServerArgs.videoedit_request_log_dir,
+            help="Directory for per-request VideoEdit JSON audit files. Disabled by default.",
+        )
+        parser.add_argument(
+            "--videoedit-request-log-sensitive-values",
+            action=StoreBoolean,
+            default=ServerArgs.videoedit_request_log_sensitive_values,
+            help=(
+                "Include unredacted storage credentials in VideoEdit request audit files. "
+                "Disabled by default."
+            ),
+        )
 
         # LoRA
         parser.add_argument(
@@ -1075,10 +1097,18 @@ class ServerArgs:
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
 
+        if hasattr(args, "_provided"):
+            provided_arg_names.update(args._provided)
+
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
             if k in provided_arg_names:
                 provided_args[k] = v
+
+        if "no_vae_feature_cache" in provided_arg_names:
+            attr = "vae_config.use_feature_cache"
+            if hasattr(args, attr):
+                provided_args[attr] = getattr(args, attr)
 
         return provided_args
 

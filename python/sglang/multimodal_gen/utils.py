@@ -212,15 +212,15 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         while i < len(args):
             arg = args[i]
             if arg.startswith("--"):
-                # Handle --key=value format
+                option = arg.split("=", 1)[0]
+                key = option[2:].replace("-", "_")
+                namespace._provided.add(key)
+                action = self._option_string_actions.get(option.replace("_", "-"))
+                if action is not None:
+                    namespace._provided.add(action.dest)
                 if "=" in arg:
-                    key = arg.split("=")[0][2:].replace("-", "_")
-                    namespace._provided.add(key)
                     i += 1
-                # Handle --key value format
                 else:
-                    key = arg[2:].replace("-", "_")
-                    namespace._provided.add(key)
                     # Skip the value if there is one
                     if i + 1 < len(args) and not args[i + 1].startswith("-"):
                         i += 2
