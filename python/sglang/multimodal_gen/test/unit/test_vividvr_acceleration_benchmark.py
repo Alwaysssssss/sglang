@@ -1,6 +1,7 @@
 import json
 import os
 import sysconfig
+from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -10,6 +11,7 @@ from sglang.multimodal_gen.tools import (
     run_vividvr_acceleration_benchmark as benchmark_module,
 )
 from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
+    ALL_SCHEMES,
     BenchmarkDataError,
     BenchmarkCleanupError,
     BenchmarkConfig,
@@ -22,6 +24,7 @@ from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     SchemeStatus,
     TmuxBenchmarkLifecycle,
     TmuxManager,
+    VAE_SP_TREATMENTS,
     VIVIDVR_STAGE_NAMES,
     _config_cli_arguments,
     _config_from_args,
@@ -34,7 +37,10 @@ from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     build_service_environment,
     compute_derived_metrics,
     compute_config_fingerprint,
+    compute_vae_sp_derived_metrics,
+    load_historical_controls,
     parse_args,
+    quality_not_worse_than_control,
     run_preflight,
     summarize_perf,
     validate_effective_config,
@@ -82,6 +88,63 @@ def test_scheme_registry_has_fixed_order_and_capabilities():
         for key in ("R7", "R8", "R9")
     )
     assert all(SCHEMES[key].unsupported_reason for key in ("R7", "R8", "R9"))
+
+
+def test_vae_sp_treatments_do_not_expand_default_run_all_matrix():
+    assert list(VAE_SP_TREATMENTS) == ["R99_VAE_SP", "R100_VAE_SP"]
+    assert list(SCHEMES)[-2:] == ["R99", "R100"]
+    assert "R99_VAE_SP" not in SCHEMES
+    assert ALL_SCHEMES["R99_VAE_SP"].controls == ("R99",)
+    assert ALL_SCHEMES["R100_VAE_SP"].controls == ("R100",)
+
+
+@pytest.mark.parametrize("scheme_id", ["R99_VAE_SP", "R100_VAE_SP"])
+def test_vae_sp_treatment_adds_only_vae_sp_to_control_command(
+    tmp_path: Path, scheme_id: str
+):
+    treatment = ALL_SCHEMES[scheme_id]
+    control = SCHEMES[treatment.controls[0]]
+    treatment_command = build_service_command(treatment, make_config(tmp_path))
+    control_command = build_service_command(control, make_config(tmp_path))
+    assert treatment_command == control_command + ["--vae-sp"]
+
+
+def test_vae_sp_formal_defaults_follow_mock_test_service_contract():
+    config = BenchmarkConfig()
+    assert config.model_path == Path("/home/zhiheng/ckpts/CogVideoX1.5-5B")
+    assert config.vividvr_path == Path("/home/zhiheng/ckpts/Vivid-VR")
+    assert config.service_port == 31221
+    assert config.caption_port == 31200
+    assert config.callback_port == 39090
+    assert config.s3_port == 4566
+    assert config.s3_bucket == "flowcut"
+
+    r99 = build_service_command(ALL_SCHEMES["R99_VAE_SP"], config)
+    assert r99[r99.index("--model-path") + 1] == str(config.model_path)
+    assert r99[r99.index("--component-paths.vividvr") + 1] == str(
+        config.vividvr_path
+    )
+    assert "--vividvr-caption-bridge" in r99
+    assert "--vae-sp" in r99
+
+
+def test_vae_sp_formal_request_keeps_flowcut_contract(tmp_path: Path):
+    config = replace(BenchmarkConfig(), output_root=tmp_path)
+    payload = build_request_payload(
+        config,
+        role=RunRole.FORMAL,
+        task_id="r99-vae-sp-formal",
+        callback_url="http://127.0.0.1:39090/tasks/r99/callback",
+        output_path=tmp_path / "service-output.mp4",
+        perf_path=tmp_path / "perf.json",
+    )
+    assert payload["num_inference_steps"] == 20
+    assert payload["seed"] == 42
+    assert payload["num_temporal_process_frames"] == 121
+    assert payload["callbackUrl"].startswith("http://127.0.0.1:39090/")
+    assert payload["minioConfig"]["endpoint"] == "127.0.0.1:4566"
+    assert "caption_file_path" not in payload
+    assert "prompt_file_path" not in payload
 
 
 @pytest.mark.parametrize(
@@ -201,6 +264,7 @@ def make_perf_fixture(
     cfg_enabled: bool = False,
     compile_enabled: bool = True,
     modulation_fusion: bool = False,
+    vae_sp: bool = False,
 ) -> dict:
     stage_ms = {
         "VividVRInputValidationStage": 100.0,
@@ -212,7 +276,7 @@ def make_perf_fixture(
         "VividVRMultiClipDecodeTrimStage": 100.0,
         "VividVRTemporalStitchPostprocessStage": 100.0,
     }
-    return {
+    perf = {
         "total_duration_ms": 10000.0,
         "steps": [
             {"name": name, "duration_ms": duration_ms}
@@ -246,6 +310,23 @@ def make_perf_fixture(
             }
         },
     }
+    if vae_sp:
+        perf["meta"]["vividvr_debug"].update(
+            {
+                "vae_sp_requested": True,
+                "vae_sp_effective": True,
+                "vae_sp_fallback_reason": "effective",
+                "vae_sp_world_size": sp_world_size,
+                "vae_sp_group_type": "sp",
+                "vae_total_tiles": 15,
+                "vae_local_tiles_per_rank": [8, 7],
+                "vae_tile_decode_seconds": 1.25,
+                "vae_tile_gather_seconds": 0.25,
+                "vae_tile_merge_seconds": 0.1,
+                "vae_decode_seconds": 1.6,
+            }
+        )
+    return perf
 
 
 def test_summarize_perf_computes_table_metrics():
@@ -294,6 +375,23 @@ def test_validate_effective_config_rejects_compile_not_applied():
         validate_effective_config(SCHEMES["R3"], perf)
 
 
+def test_validate_effective_config_requires_effective_vae_sp_for_treatment():
+    perf = make_perf_fixture(modulation_fusion=True, vae_sp=True)
+    validated = validate_effective_config(ALL_SCHEMES["R99_VAE_SP"], perf)
+    assert validated["vae_sp_effective"] is True
+    assert validated["vae_sp_world_size"] == 2
+
+
+def test_validate_effective_config_rejects_vae_sp_silent_fallback():
+    perf = make_perf_fixture(modulation_fusion=True, vae_sp=True)
+    perf["meta"]["vividvr_debug"]["vae_sp_effective"] = False
+    perf["meta"]["vividvr_debug"]["vae_sp_fallback_reason"] = (
+        "sp_world_size_one"
+    )
+    with pytest.raises(BenchmarkDataError, match="VAE SP expected effective"):
+        validate_effective_config(ALL_SCHEMES["R99_VAE_SP"], perf)
+
+
 def formal_record(seconds: float, *, quality_passed: bool = True) -> dict:
     return {
         "status": "succeeded",
@@ -329,6 +427,143 @@ def test_r100_derived_metrics_select_fastest_quality_passing_control():
     assert derived["control_scheme_id"] == "R4"
     assert derived["incremental_speedup"] == pytest.approx(5.0 / 3.0)
     assert derived["gpu_seconds"] == pytest.approx(12.0)
+
+
+def write_formal_record(
+    path: Path,
+    *,
+    scheme_id: str = "R99",
+    status: str = "succeeded",
+    total: float,
+    model: float,
+    decode_trim: float,
+    quality_passed: bool,
+    ssim_mean: float = 0.99,
+    ssim_min: float = 0.98,
+    failed_frame_ratio: float = 0.0,
+) -> dict:
+    record = {
+        "schema_version": 1,
+        "batch_id": "historical-batch",
+        "run_role": "formal",
+        "scheme": {
+            "scheme_id": scheme_id,
+            "gpu_count": 2 if scheme_id == "R99" else 4,
+        },
+        "status": status,
+        "timings": {
+            "total_runtime_seconds": total,
+            "model_inference_runtime_seconds": model,
+            "stage_seconds": {"VividVRMultiClipDecodeTrimStage": decode_trim},
+        },
+        "quality": {
+            "pass_compare": quality_passed,
+            "ssim_mean": ssim_mean,
+            "ssim_min": ssim_min,
+            "failed_frame_ratio": failed_frame_ratio,
+        },
+    }
+    atomic_write_json(path, record)
+    return record
+
+
+def formal_record_with_stage(
+    *, total: float, model: float, decode_trim: float
+) -> dict:
+    return {
+        "status": "succeeded",
+        "timings": {
+            "total_runtime_seconds": total,
+            "model_inference_runtime_seconds": model,
+            "stage_seconds": {"VividVRMultiClipDecodeTrimStage": decode_trim},
+        },
+        "quality": {
+            "pass_compare": True,
+            "ssim_mean": 0.995,
+            "ssim_min": 0.985,
+            "failed_frame_ratio": 0.0,
+        },
+    }
+
+
+def test_load_historical_control_and_compute_vae_sp_speedups(tmp_path: Path):
+    control_dir = tmp_path / "control"
+    write_formal_record(
+        control_dir / "records/R99_formal.json",
+        total=551.119,
+        model=544.321,
+        decode_trim=100.274,
+        quality_passed=True,
+    )
+    controls = load_historical_controls(
+        control_dir, ALL_SCHEMES["R99_VAE_SP"]
+    )
+    treatment = formal_record_with_stage(
+        total=500.0, model=493.0, decode_trim=50.0
+    )
+    derived = compute_vae_sp_derived_metrics(
+        ALL_SCHEMES["R99_VAE_SP"], treatment, controls["R99"]
+    )
+    assert derived["control_scheme_id"] == "R99"
+    assert derived["decode_trim_speedup"] == pytest.approx(100.274 / 50.0)
+    assert derived["model_inference_speedup"] == pytest.approx(544.321 / 493.0)
+    assert derived["total_runtime_speedup"] == pytest.approx(551.119 / 500.0)
+
+
+def test_load_historical_r100_accepts_recorded_quality_failed_control(
+    tmp_path: Path,
+):
+    control_dir = tmp_path / "control"
+    write_formal_record(
+        control_dir / "records/R100_formal.json",
+        scheme_id="R100",
+        status="quality_failed",
+        total=370.881,
+        model=365.067,
+        decode_trim=101.786,
+        quality_passed=False,
+        ssim_mean=0.9846193275671117,
+        ssim_min=0.978691848628344,
+        failed_frame_ratio=2 / 130,
+    )
+    controls = load_historical_controls(
+        control_dir, ALL_SCHEMES["R100_VAE_SP"]
+    )
+    assert controls["R100"]["status"] == "quality_failed"
+
+
+@pytest.mark.parametrize(
+    ("ssim_mean", "ssim_min", "failed_frame_ratio", "expected"),
+    [
+        (0.99, 0.98, 0.0, True),
+        (0.989, 0.98, 0.0, False),
+        (0.99, 0.979, 0.0, False),
+        (0.99, 0.98, 0.01, False),
+    ],
+)
+def test_quality_not_worse_than_control(
+    ssim_mean: float,
+    ssim_min: float,
+    failed_frame_ratio: float,
+    expected: bool,
+):
+    treatment = formal_record_with_stage(
+        total=1.0, model=1.0, decode_trim=1.0
+    )
+    treatment["quality"].update(
+        {
+            "ssim_mean": ssim_mean,
+            "ssim_min": ssim_min,
+            "failed_frame_ratio": failed_frame_ratio,
+        }
+    )
+    control = formal_record_with_stage(
+        total=1.0, model=1.0, decode_trim=1.0
+    )
+    control["quality"].update(
+        {"ssim_mean": 0.99, "ssim_min": 0.98, "failed_frame_ratio": 0.0}
+    )
+    assert quality_not_worse_than_control(treatment, control) is expected
 
 
 def test_unsupported_record_contains_every_table_section(tmp_path: Path):

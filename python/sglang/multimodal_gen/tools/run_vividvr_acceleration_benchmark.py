@@ -68,6 +68,7 @@ class Scheme:
     compile_enabled: bool
     modulation_fusion: bool
     controls: tuple[str, ...]
+    vae_sp: bool = False
     status: SchemeStatus = SchemeStatus.EXECUTABLE
     unsupported_reason: str | None = None
 
@@ -119,6 +120,7 @@ class BenchmarkConfig:
     poll_interval_seconds: float = 10.0
     s3_bucket: str = "flowcut"
     allow_idle_gpu_processes: bool = False
+    control_batch_dir: Path | None = None
 
 
 def _scheme(
@@ -131,6 +133,7 @@ def _scheme(
     sp_degree: int = 1,
     compile_enabled: bool = False,
     modulation_fusion: bool = False,
+    vae_sp: bool = False,
     controls: tuple[str, ...] = (),
 ) -> Scheme:
     return Scheme(
@@ -143,6 +146,7 @@ def _scheme(
         compile_enabled=compile_enabled,
         modulation_fusion=modulation_fusion,
         controls=controls,
+        vae_sp=vae_sp,
     )
 
 
@@ -249,6 +253,32 @@ SCHEMES: dict[str, Scheme] = {
         controls=("R4", "R5"),
     ),
 }
+
+VAE_SP_TREATMENTS: dict[str, Scheme] = {
+    "R99_VAE_SP": _scheme(
+        "R99_VAE_SP",
+        "R99 + CogVideoX VAE spatial tile parallel",
+        gpu_count=2,
+        parallel_mode="sp",
+        sp_degree=2,
+        compile_enabled=True,
+        modulation_fusion=True,
+        vae_sp=True,
+        controls=("R99",),
+    ),
+    "R100_VAE_SP": _scheme(
+        "R100_VAE_SP",
+        "R100 + CogVideoX VAE spatial tile parallel",
+        gpu_count=4,
+        parallel_mode="cfg_sp",
+        sp_degree=2,
+        compile_enabled=True,
+        modulation_fusion=True,
+        vae_sp=True,
+        controls=("R100",),
+    ),
+}
+ALL_SCHEMES: dict[str, Scheme] = {**SCHEMES, **VAE_SP_TREATMENTS}
 
 
 VIVIDVR_STAGE_NAMES = (
@@ -421,9 +451,77 @@ def validate_effective_config(
             "modulation fusion expected disabled, "
             f"observed requested={fusion_values[0]!r}"
         )
+    if scheme.vae_sp:
+        vae_requested = debug.get("vae_sp_requested")
+        vae_effective = debug.get("vae_sp_effective")
+        vae_fallback_reason = debug.get("vae_sp_fallback_reason")
+        vae_group_type = debug.get("vae_sp_group_type")
+        vae_world_size = debug.get("vae_sp_world_size")
+        vae_total_tiles = debug.get("vae_total_tiles")
+        vae_local_counts = debug.get("vae_local_tiles_per_rank")
+        if vae_requested is not True or vae_effective is not True:
+            mismatches.append(
+                "VAE SP expected effective requested=True/effective=True, "
+                f"observed requested={vae_requested!r}, "
+                f"effective={vae_effective!r}"
+            )
+        if vae_fallback_reason != "effective":
+            mismatches.append(
+                "VAE SP fallback reason expected 'effective', "
+                f"observed {vae_fallback_reason!r}"
+            )
+        if vae_group_type != "sp":
+            mismatches.append(
+                f"VAE SP group type expected 'sp', observed {vae_group_type!r}"
+            )
+        if vae_world_size != scheme.sp_degree:
+            mismatches.append(
+                f"VAE SP world size expected {scheme.sp_degree}, "
+                f"observed {vae_world_size!r}"
+            )
+        valid_counts = (
+            isinstance(vae_local_counts, list)
+            and len(vae_local_counts) == scheme.sp_degree
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                for value in vae_local_counts
+            )
+        )
+        valid_total = (
+            isinstance(vae_total_tiles, int)
+            and not isinstance(vae_total_tiles, bool)
+            and vae_total_tiles >= 0
+        )
+        if not valid_counts:
+            mismatches.append(
+                "VAE SP local tile counts must be a non-negative integer list "
+                f"of length {scheme.sp_degree}, observed {vae_local_counts!r}"
+            )
+        elif not valid_total or sum(vae_local_counts) != vae_total_tiles:
+            mismatches.append(
+                "VAE SP local tile counts must sum to total tiles, "
+                f"observed counts={vae_local_counts!r}, total={vae_total_tiles!r}"
+            )
+        for key in (
+            "vae_tile_decode_seconds",
+            "vae_tile_gather_seconds",
+            "vae_tile_merge_seconds",
+            "vae_decode_seconds",
+        ):
+            value = debug.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value < 0
+            ):
+                mismatches.append(
+                    f"VAE SP timing {key} must be non-negative, observed {value!r}"
+                )
     if mismatches:
         raise BenchmarkDataError("; ".join(mismatches))
-    return {
+    validated = {
         "requested_backend": requested,
         "effective_backend": scheme.expected_effective_backend,
         "parallel_mode": observed_mode,
@@ -432,6 +530,25 @@ def validate_effective_config(
         "torch_compile_applied": scheme.compile_enabled,
         "modulation_fusion_applied": scheme.modulation_fusion,
     }
+    if scheme.vae_sp:
+        validated.update(
+            {
+                "vae_sp_requested": True,
+                "vae_sp_effective": True,
+                "vae_sp_fallback_reason": "effective",
+                "vae_sp_world_size": debug["vae_sp_world_size"],
+                "vae_sp_group_type": debug["vae_sp_group_type"],
+                "vae_total_tiles": debug["vae_total_tiles"],
+                "vae_local_tiles_per_rank": list(
+                    debug["vae_local_tiles_per_rank"]
+                ),
+                "vae_tile_decode_seconds": debug["vae_tile_decode_seconds"],
+                "vae_tile_gather_seconds": debug["vae_tile_gather_seconds"],
+                "vae_tile_merge_seconds": debug["vae_tile_merge_seconds"],
+                "vae_decode_seconds": debug["vae_decode_seconds"],
+            }
+        )
+    return validated
 
 
 def _successful_seconds(record: Mapping[str, Any] | None) -> float | None:
@@ -506,6 +623,263 @@ def compute_derived_metrics(
             None
             if baseline_gpu_seconds is not None and gpu_seconds is not None
             else "missing_successful_r0_or_current_formal_record"
+        ),
+    }
+
+
+def _historical_number(
+    payload: Mapping[str, Any], key: str, *, context: str
+) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchmarkDataError(f"{context}.{key} must be numeric, got {value!r}")
+    return float(value)
+
+
+def load_historical_controls(
+    control_batch_dir: Path, scheme: Scheme
+) -> dict[str, dict[str, Any]]:
+    if not scheme.vae_sp:
+        raise BenchmarkConfigError(
+            f"{scheme.scheme_id} is not a VAE SP treatment"
+        )
+    if not control_batch_dir.is_dir():
+        raise BenchmarkConfigError(
+            f"control batch directory does not exist: {control_batch_dir}"
+        )
+
+    controls: dict[str, dict[str, Any]] = {}
+    for control_id in scheme.controls:
+        path = control_batch_dir / "records" / f"{control_id}_formal.json"
+        record = _load_json_object(path, f"historical control {control_id}")
+        if record.get("run_role") != RunRole.FORMAL.value:
+            raise BenchmarkDataError(
+                f"historical control {control_id} run_role must be 'formal'"
+            )
+        recorded_scheme = record.get("scheme")
+        if not isinstance(recorded_scheme, Mapping) or (
+            recorded_scheme.get("scheme_id") != control_id
+        ):
+            raise BenchmarkDataError(
+                f"historical control {control_id} has mismatched scheme"
+            )
+        if record.get("status") not in {"succeeded", "quality_failed"}:
+            raise BenchmarkDataError(
+                f"historical control {control_id} status must be succeeded or "
+                "quality_failed"
+            )
+        batch_id = record.get("batch_id")
+        if not isinstance(batch_id, str) or not batch_id:
+            raise BenchmarkDataError(
+                f"historical control {control_id} batch_id must be non-empty"
+            )
+        timings = record.get("timings")
+        if not isinstance(timings, Mapping):
+            raise BenchmarkDataError(
+                f"historical control {control_id}.timings must be an object"
+            )
+        _historical_number(
+            timings, "total_runtime_seconds", context=f"{control_id}.timings"
+        )
+        _historical_number(
+            timings,
+            "model_inference_runtime_seconds",
+            context=f"{control_id}.timings",
+        )
+        stage_seconds = timings.get("stage_seconds")
+        if not isinstance(stage_seconds, Mapping):
+            raise BenchmarkDataError(
+                f"historical control {control_id}.timings.stage_seconds must be "
+                "an object"
+            )
+        _historical_number(
+            stage_seconds,
+            "VividVRMultiClipDecodeTrimStage",
+            context=f"{control_id}.timings.stage_seconds",
+        )
+        quality = record.get("quality")
+        if not isinstance(quality, Mapping):
+            raise BenchmarkDataError(
+                f"historical control {control_id}.quality must be an object"
+            )
+        if not isinstance(quality.get("pass_compare"), bool):
+            raise BenchmarkDataError(
+                f"historical control {control_id}.quality.pass_compare must be bool"
+            )
+        for key in ("ssim_mean", "ssim_min", "failed_frame_ratio"):
+            _historical_number(quality, key, context=f"{control_id}.quality")
+
+        copied = dict(record)
+        copied["_control_record_path"] = str(path.resolve())
+        controls[control_id] = copied
+    return controls
+
+
+def _historical_controls_for_config(
+    config: BenchmarkConfig, scheme: Scheme
+) -> dict[str, dict[str, Any]]:
+    if not scheme.vae_sp:
+        return {}
+    if config.control_batch_dir is None:
+        raise BenchmarkConfigError(
+            f"{scheme.scheme_id} requires --control-batch-dir"
+        )
+    return load_historical_controls(config.control_batch_dir, scheme)
+
+
+def quality_not_worse_than_control(
+    treatment: Mapping[str, Any], control: Mapping[str, Any]
+) -> bool:
+    treatment_quality = treatment.get("quality")
+    control_quality = control.get("quality")
+    if not isinstance(treatment_quality, Mapping) or not isinstance(
+        control_quality, Mapping
+    ):
+        raise BenchmarkDataError("treatment and control quality must be objects")
+    tolerance = 1e-6
+    treatment_mean = _historical_number(
+        treatment_quality, "ssim_mean", context="treatment.quality"
+    )
+    control_mean = _historical_number(
+        control_quality, "ssim_mean", context="control.quality"
+    )
+    treatment_min = _historical_number(
+        treatment_quality, "ssim_min", context="treatment.quality"
+    )
+    control_min = _historical_number(
+        control_quality, "ssim_min", context="control.quality"
+    )
+    treatment_failed = _historical_number(
+        treatment_quality,
+        "failed_frame_ratio",
+        context="treatment.quality",
+    )
+    control_failed = _historical_number(
+        control_quality, "failed_frame_ratio", context="control.quality"
+    )
+    return (
+        treatment_mean + tolerance >= control_mean
+        and treatment_min + tolerance >= control_min
+        and treatment_failed <= control_failed
+    )
+
+
+def compute_vae_sp_derived_metrics(
+    scheme: Scheme,
+    treatment: Mapping[str, Any],
+    control: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not scheme.vae_sp or len(scheme.controls) != 1:
+        raise BenchmarkConfigError(
+            f"{scheme.scheme_id} must declare exactly one VAE SP control"
+        )
+    control_id = scheme.controls[0]
+    control_scheme = control.get("scheme")
+    if isinstance(control_scheme, Mapping) and (
+        control_scheme.get("scheme_id") != control_id
+    ):
+        raise BenchmarkDataError(
+            f"control scheme expected {control_id}, observed "
+            f"{control_scheme.get('scheme_id')!r}"
+        )
+
+    treatment_timings = treatment.get("timings")
+    control_timings = control.get("timings")
+    if not isinstance(treatment_timings, Mapping) or not isinstance(
+        control_timings, Mapping
+    ):
+        raise BenchmarkDataError("treatment and control timings must be objects")
+    treatment_stages = treatment_timings.get("stage_seconds")
+    control_stages = control_timings.get("stage_seconds")
+    if not isinstance(treatment_stages, Mapping) or not isinstance(
+        control_stages, Mapping
+    ):
+        raise BenchmarkDataError(
+            "treatment and control timings.stage_seconds must be objects"
+        )
+
+    treatment_total = _historical_number(
+        treatment_timings,
+        "total_runtime_seconds",
+        context="treatment.timings",
+    )
+    control_total = _historical_number(
+        control_timings, "total_runtime_seconds", context="control.timings"
+    )
+    treatment_model = _historical_number(
+        treatment_timings,
+        "model_inference_runtime_seconds",
+        context="treatment.timings",
+    )
+    control_model = _historical_number(
+        control_timings,
+        "model_inference_runtime_seconds",
+        context="control.timings",
+    )
+    stage_name = "VividVRMultiClipDecodeTrimStage"
+    treatment_decode = _historical_number(
+        treatment_stages, stage_name, context="treatment.timings.stage_seconds"
+    )
+    control_decode = _historical_number(
+        control_stages, stage_name, context="control.timings.stage_seconds"
+    )
+    if (
+        min(
+            treatment_total,
+            control_total,
+            treatment_model,
+            control_model,
+            treatment_decode,
+            control_decode,
+        )
+        <= 0
+    ):
+        raise BenchmarkDataError("VAE SP derived timing values must be positive")
+
+    treatment_quality = treatment.get("quality")
+    control_quality = control.get("quality")
+    if not isinstance(treatment_quality, Mapping) or not isinstance(
+        control_quality, Mapping
+    ):
+        raise BenchmarkDataError("treatment and control quality must be objects")
+    treatment_mean = _historical_number(
+        treatment_quality, "ssim_mean", context="treatment.quality"
+    )
+    control_mean = _historical_number(
+        control_quality, "ssim_mean", context="control.quality"
+    )
+    treatment_min = _historical_number(
+        treatment_quality, "ssim_min", context="treatment.quality"
+    )
+    control_min = _historical_number(
+        control_quality, "ssim_min", context="control.quality"
+    )
+    treatment_failed = _historical_number(
+        treatment_quality,
+        "failed_frame_ratio",
+        context="treatment.quality",
+    )
+    control_failed = _historical_number(
+        control_quality, "failed_frame_ratio", context="control.quality"
+    )
+    control_gpu_count = SCHEMES[control_id].gpu_count
+    return {
+        "control_scheme_id": control_id,
+        "decode_trim_speedup": control_decode / treatment_decode,
+        "model_inference_speedup": control_model / treatment_model,
+        "total_runtime_speedup": control_total / treatment_total,
+        "control_gpu_seconds": control_gpu_count * control_total,
+        "treatment_gpu_seconds": scheme.gpu_count * treatment_total,
+        "control_record_path": control.get("_control_record_path"),
+        "control_batch_id": control.get("batch_id"),
+        "control_quality_passed": (
+            control_quality.get("pass_compare") is True
+        ),
+        "ssim_mean_delta": treatment_mean - control_mean,
+        "ssim_min_delta": treatment_min - control_min,
+        "failed_frame_ratio_delta": treatment_failed - control_failed,
+        "quality_not_worse_than_control": quality_not_worse_than_control(
+            treatment, control
         ),
     }
 
@@ -1486,6 +1860,10 @@ class BenchmarkRunner:
                     self._write_summary(summary)
                     continue
 
+                historical_controls = _historical_controls_for_config(
+                    self.config, scheme
+                )
+
                 try:
                     self.lifecycle.start_scheme(scheme)
                 except Exception as error:
@@ -1542,7 +1920,21 @@ class BenchmarkRunner:
                         )
                         formal_records[scheme.scheme_id] = formal
                         scheme_status = str(formal.get("status", "failed"))
-                        if scheme_status == "succeeded":
+                        if scheme.vae_sp and scheme_status in {
+                            "succeeded",
+                            "quality_failed",
+                        }:
+                            control_id = scheme.controls[0]
+                            derived = compute_vae_sp_derived_metrics(
+                                scheme,
+                                formal,
+                                historical_controls[control_id],
+                            )
+                            formal["derived"] = derived
+                            atomic_write_json(
+                                self._record_path(scheme, RunRole.FORMAL), formal
+                            )
+                        elif scheme_status == "succeeded":
                             derived = compute_derived_metrics(scheme, formal_records)
                             formal["derived"] = derived
                             atomic_write_json(
@@ -1775,6 +2167,8 @@ def build_service_command(scheme: Scheme, config: BenchmarkConfig) -> list[str]:
                 "transformer,controlnet",
             ]
         )
+    if scheme.vae_sp:
+        command.append("--vae-sp")
     return command
 
 
@@ -2388,6 +2782,8 @@ def build_dry_run_report(
         raise BenchmarkConfigError(
             f"selected schemes require {required_gpus} GPUs, got {config.gpu_ids}"
         )
+    for scheme in schemes:
+        _historical_controls_for_config(config, scheme)
     return {
         "mode": "dry-run",
         "preflight": run_preflight(config, check_runtime_resources=False),
@@ -2434,6 +2830,7 @@ def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
         "--reference-video", type=Path, default=BenchmarkConfig.reference_video
     )
     parser.add_argument("--output-root", type=Path, default=BenchmarkConfig.output_root)
+    parser.add_argument("--control-batch-dir", type=Path)
     parser.add_argument(
         "--gpu-ids",
         default=",".join(str(item) for item in BenchmarkConfig.gpu_ids),
@@ -2458,11 +2855,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         child = subparsers.add_parser(command)
         _add_config_arguments(child)
         if command == "run-one":
-            child.add_argument("--scheme", required=True, choices=list(SCHEMES))
+            child.add_argument("--scheme", required=True, choices=list(ALL_SCHEMES))
+        elif command == "dry-run":
+            child.add_argument("--scheme", choices=list(ALL_SCHEMES))
 
     internal = subparsers.add_parser("_run-batch", help=argparse.SUPPRESS)
     _add_config_arguments(internal)
-    internal.add_argument("--scheme", choices=list(SCHEMES))
+    internal.add_argument("--scheme", choices=list(ALL_SCHEMES))
 
     callback = subparsers.add_parser("_serve-callback", help=argparse.SUPPRESS)
     callback.add_argument("--host", required=True)
@@ -2493,12 +2892,17 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         output_root=args.output_root.expanduser().resolve(),
         gpu_ids=gpu_ids,
         allow_idle_gpu_processes=args.allow_idle_gpu_processes,
+        control_batch_dir=(
+            args.control_batch_dir.expanduser().resolve()
+            if args.control_batch_dir is not None
+            else None
+        ),
     )
 
 
 def _selected_schemes(args: argparse.Namespace) -> list[Scheme]:
     scheme_id = getattr(args, "scheme", None)
-    return [SCHEMES[scheme_id]] if scheme_id else list(SCHEMES.values())
+    return [ALL_SCHEMES[scheme_id]] if scheme_id else list(SCHEMES.values())
 
 
 def _config_cli_arguments(config: BenchmarkConfig) -> list[str]:
@@ -2520,6 +2924,8 @@ def _config_cli_arguments(config: BenchmarkConfig) -> list[str]:
     ]
     if config.allow_idle_gpu_processes:
         arguments.append("--allow-idle-gpu-processes")
+    if config.control_batch_dir is not None:
+        arguments.extend(["--control-batch-dir", str(config.control_batch_dir)])
     return arguments
 
 
@@ -2592,6 +2998,8 @@ def _run_batch(
         raise BenchmarkConfigError(
             f"selected schemes require {required_gpus} GPUs, got {config.gpu_ids}"
         )
+    for scheme in schemes:
+        _historical_controls_for_config(config, scheme)
     lifecycle = TmuxBenchmarkLifecycle(config, batch_id)
     if resume:
         lifecycle.cleanup_owned()
