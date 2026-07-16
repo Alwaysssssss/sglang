@@ -14,6 +14,8 @@ from sglang.multimodal_gen.runtime.models.vaes.cogvideox import (
     _build_spatial_tile_plan,
     _decode_one_spatial_tile,
     _merge_spatial_tiles,
+    _unpack_gathered_tiles,
+    _validate_spatial_decode_descriptor,
 )
 
 
@@ -46,6 +48,73 @@ def make_two_by_two_plan(
         row_limit_height=row_limit_height,
         row_limit_width=row_limit_width,
     )
+
+
+def make_plan_3x3() -> CogVideoXSpatialTilePlan:
+    return _build_spatial_tile_plan(
+        latent_height=90,
+        latent_width=120,
+        tile_latent_min_height=30,
+        tile_latent_min_width=45,
+        tile_sample_min_height=240,
+        tile_sample_min_width=360,
+        tile_overlap_factor_height=0.0,
+        tile_overlap_factor_width=0.0,
+    )
+
+
+class FakeGroup:
+    def __init__(self, *, world_size, rank_in_group=0, gathered_descriptors):
+        self.world_size = world_size
+        self.rank_in_group = rank_in_group
+        self.gathered_descriptors = gathered_descriptors
+        self.all_gather_calls = 0
+
+    def all_gather(self, _tensor, dim=0):
+        assert dim == 0
+        self.all_gather_calls += 1
+        return self.gathered_descriptors
+
+
+def simulate_fixed_tensor_gather(rank_tiles, *, total_tiles):
+    slots_per_rank = (total_tiles + len(rank_tiles) - 1) // len(rank_tiles)
+    metadata_per_rank = []
+    payload_per_rank = []
+    for local_tiles in rank_tiles:
+        metadata = torch.zeros(slots_per_rank, 7, dtype=torch.int64)
+        metadata[:, 0] = -1
+        payload_parts = []
+        for slot, (global_index, tile) in enumerate(sorted(local_tiles.items())):
+            metadata[slot] = torch.tensor(
+                [global_index, *tile.shape, tile.numel()], dtype=torch.int64
+            )
+            payload_parts.append(tile.flatten())
+        metadata_per_rank.append(metadata)
+        payload_per_rank.append(
+            torch.cat(payload_parts) if payload_parts else torch.empty(0)
+        )
+    max_numel = max(payload.numel() for payload in payload_per_rank)
+    padded_payloads = []
+    for payload in payload_per_rank:
+        padded = torch.zeros(max_numel, dtype=torch.float32)
+        padded[: payload.numel()] = payload
+        padded_payloads.append(padded)
+    return torch.stack(metadata_per_rank), torch.stack(padded_payloads)
+
+
+def simulate_duplicate_index_gather():
+    metadata, payload = simulate_fixed_tensor_gather(
+        ({0: torch.ones(1, 1, 1, 1, 1)}, {0: torch.ones(1, 1, 1, 1, 1)}),
+        total_tiles=2,
+    )
+    return metadata, payload
+
+
+def simulate_missing_index_gather():
+    metadata, payload = simulate_fixed_tensor_gather(
+        ({0: torch.ones(1, 1, 1, 1, 1)}, {}), total_tiles=2
+    )
+    return metadata, payload
 
 
 def test_tile_plan_matches_diffusers_row_major_geometry():
@@ -156,3 +225,75 @@ def test_merge_is_row_major_vertical_then_horizontal_then_crop():
         ("h", 103, 104, plan.blend_extent_width),
     ]
     assert actual.shape == (1, 1, 1, 2, 2)
+
+
+def test_unpack_tiles_handles_boundary_shapes_and_empty_rank():
+    rank_tiles = (
+        {
+            0: torch.arange(8, dtype=torch.float32).reshape(1, 1, 1, 2, 4),
+            3: torch.arange(6, dtype=torch.float32).reshape(1, 1, 1, 2, 3),
+        },
+        {
+            1: torch.arange(4, dtype=torch.float32).reshape(1, 1, 1, 1, 4),
+            2: torch.arange(3, dtype=torch.float32).reshape(1, 1, 1, 1, 3),
+        },
+        {},
+    )
+    gathered_metadata, gathered_payload = simulate_fixed_tensor_gather(
+        rank_tiles, total_tiles=4
+    )
+    recovered = _unpack_gathered_tiles(
+        gathered_metadata, gathered_payload, total_tiles=4
+    )
+
+    assert tuple(recovered) == (0, 1, 2, 3)
+    assert recovered[3].shape == (1, 1, 1, 2, 3)
+
+
+@pytest.mark.parametrize(
+    ("metadata_payload", "match"),
+    [
+        (simulate_duplicate_index_gather(), "duplicate.*global tile index"),
+        (simulate_missing_index_gather(), "missing.*global tile index"),
+    ],
+)
+def test_unpack_tiles_rejects_duplicate_or_missing_global_index(
+    metadata_payload, match
+):
+    metadata, payload = metadata_payload
+    with pytest.raises(RuntimeError, match=match):
+        _unpack_gathered_tiles(metadata, payload, total_tiles=2)
+
+
+def test_descriptor_preflight_rejects_rank_mismatch_before_payload_gather():
+    plan = make_plan_3x3()
+    z = torch.zeros(1, 16, 5, 90, 120)
+    descriptor = torch.tensor(
+        [
+            1,
+            16,
+            5,
+            90,
+            120,
+            3,
+            plan.overlap_height,
+            plan.overlap_width,
+            plan.blend_extent_height,
+            plan.blend_extent_width,
+            plan.row_limit_height,
+            plan.row_limit_width,
+            len(plan.tiles),
+            2,
+        ],
+        dtype=torch.int64,
+    )
+    mismatched = descriptor.clone()
+    mismatched[4] = 121
+    group = FakeGroup(
+        world_size=2,
+        rank_in_group=0,
+        gathered_descriptors=torch.stack((descriptor, mismatched)),
+    )
+    with pytest.raises(RuntimeError, match="SP input descriptor mismatch"):
+        _validate_spatial_decode_descriptor(group, z, plan)
+    assert group.all_gather_calls == 1

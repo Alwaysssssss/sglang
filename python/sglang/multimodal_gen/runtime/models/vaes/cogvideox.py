@@ -140,6 +140,189 @@ def _merge_spatial_tiles(vae, plan, decoded_tiles):
     return torch.cat(result_rows, dim=3)
 
 
+_DTYPE_CODES = {
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.float32: 3,
+}
+
+
+def _build_spatial_decode_descriptor(
+    z: torch.Tensor,
+    plan: CogVideoXSpatialTilePlan,
+    world_size: int,
+) -> torch.Tensor:
+    if z.ndim != 5:
+        raise ValueError(
+            f"CogVideoX VAE SP expects a 5D latent tensor, got {z.shape}"
+        )
+    try:
+        dtype_code = _DTYPE_CODES[z.dtype]
+    except KeyError as error:
+        raise TypeError(
+            f"unsupported CogVideoX VAE SP latent dtype: {z.dtype}"
+        ) from error
+    return torch.tensor(
+        [
+            *z.shape,
+            dtype_code,
+            plan.overlap_height,
+            plan.overlap_width,
+            plan.blend_extent_height,
+            plan.blend_extent_width,
+            plan.row_limit_height,
+            plan.row_limit_width,
+            len(plan.tiles),
+            world_size,
+        ],
+        dtype=torch.int64,
+        device=z.device,
+    )
+
+
+def _validate_spatial_decode_descriptor(
+    sp_group, z: torch.Tensor, plan: CogVideoXSpatialTilePlan
+) -> None:
+    local = _build_spatial_decode_descriptor(z, plan, sp_group.world_size)
+    gathered = sp_group.all_gather(local.unsqueeze(0), dim=0)
+    reference = gathered[0]
+    mismatch_ranks = [
+        rank
+        for rank in range(sp_group.world_size)
+        if not torch.equal(gathered[rank], reference)
+    ]
+    if mismatch_ranks:
+        raise RuntimeError(
+            "CogVideoX VAE SP input descriptor mismatch on ranks "
+            f"{mismatch_ranks}"
+        )
+
+
+def _pack_local_tiles(
+    local_tiles: dict[int, torch.Tensor],
+    slots_per_rank: int,
+    *,
+    payload_dtype: torch.dtype,
+    payload_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(local_tiles) > slots_per_rank:
+        raise RuntimeError(
+            "CogVideoX VAE SP local tile count exceeds the fixed slot count"
+        )
+    metadata = torch.zeros(
+        (slots_per_rank, 7), dtype=torch.int64, device=payload_device
+    )
+    metadata[:, 0] = -1
+    payload_parts = []
+    for slot, (global_index, tile) in enumerate(sorted(local_tiles.items())):
+        if tile.ndim != 5:
+            raise RuntimeError(
+                f"CogVideoX VAE SP decoded tile {global_index} is not 5D"
+            )
+        packed_tile = tile.to(device=payload_device, dtype=payload_dtype)
+        metadata[slot] = torch.tensor(
+            [global_index, *packed_tile.shape, packed_tile.numel()],
+            dtype=torch.int64,
+            device=payload_device,
+        )
+        payload_parts.append(packed_tile.reshape(-1))
+    payload = (
+        torch.cat(payload_parts)
+        if payload_parts
+        else torch.empty(0, dtype=payload_dtype, device=payload_device)
+    )
+    return metadata, payload
+
+
+def _unpack_gathered_tiles(
+    gathered_metadata: torch.Tensor,
+    gathered_payload: torch.Tensor,
+    *,
+    total_tiles: int,
+) -> dict[int, torch.Tensor]:
+    if gathered_metadata.ndim != 3 or gathered_metadata.shape[-1] != 7:
+        raise RuntimeError("invalid CogVideoX VAE SP gathered tile metadata")
+    if gathered_payload.ndim != 2:
+        raise RuntimeError("invalid CogVideoX VAE SP gathered tile payload")
+    if gathered_metadata.shape[0] != gathered_payload.shape[0]:
+        raise RuntimeError("CogVideoX VAE SP metadata/payload rank mismatch")
+
+    recovered = {}
+    for source_rank in range(gathered_metadata.shape[0]):
+        payload_offset = 0
+        for slot in gathered_metadata[source_rank]:
+            global_index = int(slot[0].item())
+            if global_index == -1:
+                continue
+            if not 0 <= global_index < total_tiles:
+                raise RuntimeError(
+                    f"invalid global tile index {global_index} in VAE SP payload"
+                )
+            if global_index in recovered:
+                raise RuntimeError(
+                    f"duplicate global tile index {global_index} in VAE SP payload"
+                )
+            shape = tuple(int(value.item()) for value in slot[1:6])
+            numel = int(slot[6].item())
+            expected_numel = 1
+            for dimension in shape:
+                expected_numel *= dimension
+            if numel <= 0 or expected_numel != numel:
+                raise RuntimeError(
+                    f"invalid shape/numel for global tile index {global_index}"
+                )
+            if payload_offset + numel > gathered_payload.shape[1]:
+                raise RuntimeError(
+                    f"truncated payload for global tile index {global_index}"
+                )
+            recovered[global_index] = (
+                gathered_payload[source_rank]
+                .narrow(0, payload_offset, numel)
+                .view(shape)
+            )
+            payload_offset += numel
+
+    expected_indices = set(range(total_tiles))
+    missing_indices = sorted(expected_indices.difference(recovered))
+    if missing_indices:
+        raise RuntimeError(
+            f"missing global tile index values {missing_indices} in VAE SP payload"
+        )
+    return dict(sorted(recovered.items()))
+
+
+def _all_gather_decoded_tiles(
+    sp_group,
+    local_tiles: dict[int, torch.Tensor],
+    total_tiles: int,
+    *,
+    payload_dtype: torch.dtype,
+    payload_device: torch.device,
+) -> dict[int, torch.Tensor]:
+    slots_per_rank = (total_tiles + sp_group.world_size - 1) // sp_group.world_size
+    metadata, payload = _pack_local_tiles(
+        local_tiles,
+        slots_per_rank,
+        payload_dtype=payload_dtype,
+        payload_device=payload_device,
+    )
+    gathered_metadata = sp_group.all_gather(metadata, dim=0).reshape(
+        sp_group.world_size, slots_per_rank, 7
+    )
+    rank_numels = gathered_metadata[:, :, 6].clamp_min(0).sum(dim=1)
+    max_rank_numel = int(rank_numels.max().item())
+    padded_payload = torch.zeros(
+        max_rank_numel, dtype=payload.dtype, device=payload.device
+    )
+    padded_payload[: payload.numel()].copy_(payload)
+    gathered_payload = sp_group.all_gather(padded_payload, dim=0).reshape(
+        sp_group.world_size, max_rank_numel
+    )
+    return _unpack_gathered_tiles(
+        gathered_metadata, gathered_payload, total_tiles=total_tiles
+    )
+
+
 class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
     def __init__(self, config: CogVideoXVAEConfig) -> None:
         arch = config.arch_config
