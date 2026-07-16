@@ -53,6 +53,50 @@ Stage 横向总表的单位均为秒。列名与代码中的完整 Stage 类名�
 | R99 | 0.000 | 0.000 | 0.000 | 61.824 | 0.001 | 380.176 | 100.274 | 0.190 |
 | R100 | 0.000 | 0.000 | 0.000 | 65.857 | 0.001 | 195.652 | 101.786 | 0.132 |
 
+## 实验环境记录
+
+| 项目 | 值 |
+| --- | --- |
+| Batch | `vividvr_accel_full_warmup1_20260716` |
+| 机器型号 | `6U GPU Server` |
+| GPU 型号与可用数量 | 8 × NVIDIA A100-SXM4-80GB；本轮单个方案最多使用 4 张 |
+| CUDA 版本 | PyTorch CUDA `12.8`；系统无 `nvcc`，CUDA Toolkit 版本未单独确认 |
+| Driver 版本 | `550.90.07` |
+| PyTorch 版本 | `2.9.1+cu128` |
+| FlashAttention 版本 | FlashAttention 4 `4.0.0b19` |
+| sglang commit | N/A；本批次正式 JSON 未记录 commit，不根据文件时间戳推测 |
+| Python 路径 | `/home/zhiheng/sglang/.venv/bin/python`（Python 3.10.12） |
+| 模型/checkpoint 路径 | 模型：`/home/zhiheng/ckpts/CogVideoX1.5-5B`；Vivid-VR：`/home/zhiheng/ckpts/Vivid-VR` |
+| Dtype | `bfloat16` |
+| Compile mode | R0/R1：eager；R2–R6、R99、R100：`torch.compile`；R7–R9：未实现 |
+| 计时方式 | 总耗时使用 `total_runtime_seconds`；模型耗时使用 `model_inference_runtime_seconds`；Stage 使用同步 profiling 累计值 |
+| 显存统计方式 | NVML 采样；模块收益表使用 `max_single_gpu_peak_gib` |
+| Stage profiling 是否同步 | 是；GPU 同步后记录 Stage 耗时 |
+| Perf/report 目录 | `/home/zhiheng/sglang/Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716` |
+| 结果视频目录 | 上述批次目录下 `requests/*/downloaded.mp4` |
+
+## 模块收益结论
+
+延迟增量加速比使用 Control 与 Treatment 的模型推理耗时计算。GPU·秒变化、最大单卡峰值显存变化和质量变化均为 Treatment 相对 Control 的差值。
+
+| 加速模块 | Treatment | Control | 延迟增量加速比 | GPU·秒变化 | 最大单卡峰值显存变化 | 质量变化 | 正式结论 |
+| --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| Attention backend | R1 | R0 | 1.0701× | -72.238 s（-6.55%） | -0.215 GiB | 人工验收 PASS；ΔSSIM mean=-0.000047 | FA 相对 SDPA 具有明确端到端收益，延迟和 GPU·秒均下降。 |
+| `torch.compile` | R2 | R1 | 1.1009× | -94.488 s（-9.17%） | +0.328 GiB | 人工验收 PASS；ΔSSIM mean=+0.000633 | Compile 提供明确端到端收益，代价是最大单卡峰值显存小幅增加。 |
+| 双卡 SP | R3 | R2 | 1.7106× | +158.343 s（+16.92%） | +0.770 GiB | 人工验收 PASS；ΔSSIM mean=-0.000278 | 双卡 SP 显著降低延迟，但 GPU·秒和最大单卡峰值显存增加。 |
+| SP 2→4 卡扩展 | R4 | R3 | 1.4622× | +402.524 s（+36.78%） | +0.594 GiB | 人工验收 PASS；ΔSSIM mean=+0.000178 | SP 扩展到四卡继续降低延迟，但资源成本明显上升。 |
+| CFG parallel | R5 | R3 | 1.4800× | +384.560 s（+35.14%） | +0.588 GiB | 人工验收 PASS；ΔSSIM mean=-0.000087 | 四卡 CFG×SP 显著降低延迟，但 GPU·秒明显增加。 |
+| 四卡并行拓扑 | R5 | R4 | 1.0121× | -17.964 s（-1.20%） | -0.006 GiB | 人工验收 PASS；ΔSSIM mean=-0.000266 | 同为四卡时，CFG=2 × SP=2 略快于 SP=4，资源成本也略低。 |
+| 算子融合 | R6 | R2 | 0.9992× | +0.763 s（+0.08%） | -0.625 GiB | 人工验收 PASS；ΔSSIM mean=-0.000198 | Modulation fusion 本轮降低了峰值显存，但未形成端到端加速。 |
+| Cache-DiT | R7 | R2 | N/A | N/A | N/A | N/A | 当前未实现，无正式收益结论。 |
+| TeaCache | R8 | R2 | N/A | N/A | N/A | N/A | 当前未实现，无正式收益结论。 |
+| 通用量化 | R9 | R2 | N/A | N/A | N/A | N/A | 当前未实现，无正式收益结论。 |
+| 双卡综合最快方案 | R99 | R3 | 1.0053× | -5.803 s（-0.53%） | -0.373 GiB | 人工验收 PASS；ΔSSIM mean=-0.000129 | 叠加已实现模块后取得小幅正收益，并降低峰值显存。 |
+| 四卡综合最快方案 | R100 | R5 | 1.0128× | -18.737 s（-1.27%） | -0.275 GiB | 人工验收 PASS；ΔSSIM mean=-0.000090 | 四卡综合方案相对最快基础拓扑取得小幅正收益。 |
+| 综合方案 2→4 卡扩展 | R100 | R99 | 1.4910× | +371.627 s（+34.14%） | +0.686 GiB | 人工验收 PASS；ΔSSIM mean=-0.000048 | 综合方案扩展到四卡显著降低延迟，但 GPU·秒和峰值显存增加。 |
+
+质量栏采用本轮人工验收结论：所有已执行视频结果均视为通过。该结论与正式 JSON 中更严格的 `pass_compare` 阈值判定不是同一口径；SSIM 差值保留用于量化比较。
+
 ## 最快方案
 
 | GPU 数量 | 最快方案 | 总耗时（s） | 模型推理耗时（s） | Denoise（s） | 相对 R0 模型加速比 |
