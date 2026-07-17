@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.vaes.cogvideox import (
     _validate_spatial_encode_descriptor,
 )
 from sglang.multimodal_gen.tools.run_vividvr_vae_spatial_encode_validation import (
+    build_rank_divergent_validation_fields,
     compare_serial_and_parallel_encode,
 )
 
@@ -468,5 +469,14 @@ def test_encode_validation_requires_exact_moments_and_sampled_latents():
 
     assert result["moments_exact"] is False
     assert result["passed"] is False
+
+
+def test_encode_validation_uses_rank_divergent_input_contract_key():
+    comparison = {"passed": True, "moments_exact": True}
+
+    assert build_rank_divergent_validation_fields(comparison) == {
+        "rank_divergent_passed": True,
+        "rank_divergent_input_comparison": comparison,
+    }
     DiffusersAutoencoderKLCogVideoX,
     _canonicalize_spatial_encode_input,

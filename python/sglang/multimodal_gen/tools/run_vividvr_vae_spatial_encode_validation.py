@@ -73,6 +73,15 @@ def compare_serial_and_parallel_encode(
     }
 
 
+def build_rank_divergent_validation_fields(
+    comparison: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "rank_divergent_passed": comparison["passed"],
+        "rank_divergent_input_comparison": comparison,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate serial and SP CogVideoX tiled encode outputs."
@@ -307,8 +316,7 @@ def main() -> int:
             "rank_divergent_input_sum": float(
                 rank_divergent_sample.float().sum().item()
             ),
-            "rank_divergent_passed": divergent_comparison["passed"],
-            "rank_divergent_comparison": divergent_comparison,
+            **build_rank_divergent_validation_fields(divergent_comparison),
             "model_inference_runtime_seconds": model_seconds,
             "total_runtime_seconds_before_gather": time.perf_counter() - process_start,
             "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
