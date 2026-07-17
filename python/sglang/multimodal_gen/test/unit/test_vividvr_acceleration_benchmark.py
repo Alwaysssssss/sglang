@@ -12,32 +12,32 @@ from sglang.multimodal_gen.tools import (
 )
 from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     ALL_SCHEMES,
-    BenchmarkDataError,
+    SCHEMES,
+    VAE_ENCODE_SP_TREATMENTS,
+    VAE_SP_TREATMENTS,
+    VIVIDVR_STAGE_NAMES,
     BenchmarkCleanupError,
     BenchmarkConfig,
     BenchmarkConfigError,
+    BenchmarkDataError,
     BenchmarkRunner,
     FlowCutRequestExecutor,
     GpuMemorySampler,
     RunRole,
-    SCHEMES,
     SchemeStatus,
     TmuxBenchmarkLifecycle,
     TmuxManager,
-    VAE_ENCODE_SP_TREATMENTS,
-    VAE_SP_TREATMENTS,
-    VIVIDVR_STAGE_NAMES,
     _config_cli_arguments,
     _config_from_args,
     _download_result,
     atomic_write_json,
     build_dry_run_report,
     build_request_payload,
-    build_unsupported_record,
     build_service_command,
     build_service_environment,
-    compute_derived_metrics,
+    build_unsupported_record,
     compute_config_fingerprint,
+    compute_derived_metrics,
     compute_vae_encode_sp_derived_metrics,
     compute_vae_sp_derived_metrics,
     load_historical_controls,
@@ -83,12 +83,13 @@ def test_scheme_registry_has_fixed_order_and_capabilities():
         "R99",
         "R100",
     ]
-    assert {
-        key for key, value in SCHEMES.items() if not value.executable
-    } == {"R7", "R8", "R9"}
+    assert {key for key, value in SCHEMES.items() if not value.executable} == {
+        "R7",
+        "R8",
+        "R9",
+    }
     assert all(
-        SCHEMES[key].status is SchemeStatus.UNSUPPORTED
-        for key in ("R7", "R8", "R9")
+        SCHEMES[key].status is SchemeStatus.UNSUPPORTED for key in ("R7", "R8", "R9")
     )
     assert all(SCHEMES[key].unsupported_reason for key in ("R7", "R8", "R9"))
 
@@ -142,9 +143,7 @@ def test_vae_encode_sp_treatments_do_not_expand_default_run_all_matrix():
 def test_vae_encode_sp_treatment_adds_only_encode_flag(
     tmp_path: Path, treatment_id: str, control_id: str
 ):
-    treatment = build_service_command(
-        ALL_SCHEMES[treatment_id], make_config(tmp_path)
-    )
+    treatment = build_service_command(ALL_SCHEMES[treatment_id], make_config(tmp_path))
     control = build_service_command(ALL_SCHEMES[control_id], make_config(tmp_path))
     assert treatment == control + ["--vae-encode-sp"]
     assert "--vae-sp" in treatment
@@ -162,9 +161,7 @@ def test_vae_sp_treatment_adds_only_vae_sp_to_control_command(
 
 
 def test_r101_vae_sp4_command_keeps_fusion_and_disables_cfg(tmp_path: Path):
-    command = build_service_command(
-        ALL_SCHEMES["R101_VAE_SP4"], make_config(tmp_path)
-    )
+    command = build_service_command(ALL_SCHEMES["R101_VAE_SP4"], make_config(tmp_path))
 
     assert option_value(command, "--num-gpus") == "4"
     assert option_value(command, "--sp-degree") == "4"
@@ -188,9 +185,7 @@ def test_vae_sp_formal_defaults_follow_mock_test_service_contract():
 
     r99 = build_service_command(ALL_SCHEMES["R99_VAE_SP"], config)
     assert r99[r99.index("--model-path") + 1] == str(config.model_path)
-    assert r99[r99.index("--component-paths.vividvr") + 1] == str(
-        config.vividvr_path
-    )
+    assert r99[r99.index("--component-paths.vividvr") + 1] == str(config.vividvr_path)
     assert "--vividvr-caption-bridge" in r99
     assert "--vae-sp" in r99
 
@@ -281,9 +276,7 @@ def test_distributed_environment_uses_selected_gpus_and_global_context(tmp_path:
     environment = build_service_environment(SCHEMES["R3"], config)
 
     assert environment["CUDA_VISIBLE_DEVICES"] == "4,5"
-    assert environment["SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE"] == (
-        "eager_global"
-    )
+    assert environment["SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE"] == ("eager_global")
     assert "SGLANG_VIVIDVR_CONNECTOR_SP_CONTEXT_MODE" not in (
         build_service_environment(SCHEMES["R2"], config)
     )
@@ -309,9 +302,7 @@ def test_compile_environment_injects_existing_python_dev_headers(
     environment = build_service_environment(SCHEMES["R2"], make_config(tmp_path))
 
     expected_prefix = os.pathsep.join((str(include_dir.parent), str(include_dir)))
-    assert environment["CPATH"] == os.pathsep.join(
-        (expected_prefix, "/existing/cpath")
-    )
+    assert environment["CPATH"] == os.pathsep.join((expected_prefix, "/existing/cpath"))
     assert environment["C_INCLUDE_PATH"] == os.pathsep.join(
         (expected_prefix, "/existing/c-include")
     )
@@ -407,8 +398,7 @@ def make_perf_fixture(
         clip_total = 32 // clip_count
         clip_base, clip_remainder = divmod(clip_total, sp_world_size)
         clip_local_counts = [
-            clip_base + (rank < clip_remainder)
-            for rank in range(sp_world_size)
+            clip_base + (rank < clip_remainder) for rank in range(sp_world_size)
         ]
         clip_stats = {
             "vae_encode_sp_requested": True,
@@ -436,9 +426,7 @@ def make_perf_fixture(
                 "vae_encode_tile_gather_seconds": 0.4,
                 "vae_encode_tile_merge_seconds": 0.2,
                 "vae_encode_seconds": 2.6,
-                "vae_encode_sp_clips": [
-                    dict(clip_stats) for _ in range(clip_count)
-                ],
+                "vae_encode_sp_clips": [dict(clip_stats) for _ in range(clip_count)],
             }
         )
     return perf
@@ -471,9 +459,7 @@ def test_summarize_perf_rejects_missing_or_duplicate_stages():
 
 
 def test_validate_effective_config_accepts_distributed_compile_and_fusion():
-    validate_effective_config(
-        SCHEMES["R99"], make_perf_fixture(modulation_fusion=True)
-    )
+    validate_effective_config(SCHEMES["R99"], make_perf_fixture(modulation_fusion=True))
 
 
 def test_validate_effective_config_rejects_wrong_sp_backend():
@@ -503,9 +489,7 @@ def test_validate_effective_config_accepts_vae_sp4_treatment():
         modulation_fusion=True,
         vae_sp=True,
     )
-    validated = validate_effective_config(
-        ALL_SCHEMES["R101_VAE_SP4"], perf
-    )
+    validated = validate_effective_config(ALL_SCHEMES["R101_VAE_SP4"], perf)
     assert validated["parallel_mode"] == "sp"
     assert validated["cfg_parallel_enabled"] is False
     assert validated["vae_sp_world_size"] == 4
@@ -515,20 +499,14 @@ def test_validate_effective_config_accepts_vae_sp4_treatment():
 def test_validate_effective_config_rejects_vae_sp_silent_fallback():
     perf = make_perf_fixture(modulation_fusion=True, vae_sp=True)
     perf["meta"]["vividvr_debug"]["vae_sp_effective"] = False
-    perf["meta"]["vividvr_debug"]["vae_sp_fallback_reason"] = (
-        "sp_world_size_one"
-    )
+    perf["meta"]["vividvr_debug"]["vae_sp_fallback_reason"] = "sp_world_size_one"
     with pytest.raises(BenchmarkDataError, match="VAE SP expected effective"):
         validate_effective_config(ALL_SCHEMES["R99_VAE_SP"], perf)
 
 
 def test_validate_effective_config_requires_effective_vae_encode_sp():
-    perf = make_perf_fixture(
-        modulation_fusion=True, vae_sp=True, vae_encode_sp=True
-    )
-    validated = validate_effective_config(
-        ALL_SCHEMES["R99_VAE_ENCODE_SP"], perf
-    )
+    perf = make_perf_fixture(modulation_fusion=True, vae_sp=True, vae_encode_sp=True)
+    validated = validate_effective_config(ALL_SCHEMES["R99_VAE_ENCODE_SP"], perf)
     assert validated["vae_encode_sp_effective"] is True
     assert validated["vae_encode_sp_world_size"] == 2
     assert validated["vae_encode_local_tiles_per_rank"] == [16, 16]
@@ -536,13 +514,9 @@ def test_validate_effective_config_requires_effective_vae_encode_sp():
 
 
 def test_validate_effective_config_rejects_vae_encode_sp_silent_fallback():
-    perf = make_perf_fixture(
-        modulation_fusion=True, vae_sp=True, vae_encode_sp=True
-    )
+    perf = make_perf_fixture(modulation_fusion=True, vae_sp=True, vae_encode_sp=True)
     perf["meta"]["vividvr_debug"]["vae_encode_sp_effective"] = False
-    perf["meta"]["vividvr_debug"]["vae_encode_sp_fallback_reason"] = (
-        "sp_world_size_one"
-    )
+    perf["meta"]["vividvr_debug"]["vae_encode_sp_fallback_reason"] = "sp_world_size_one"
     with pytest.raises(BenchmarkDataError, match="VAE encode SP expected effective"):
         validate_effective_config(ALL_SCHEMES["R99_VAE_ENCODE_SP"], perf)
 
@@ -622,9 +596,7 @@ def write_formal_record(
     return record
 
 
-def formal_record_with_stage(
-    *, total: float, model: float, decode_trim: float
-) -> dict:
+def formal_record_with_stage(*, total: float, model: float, decode_trim: float) -> dict:
     return {
         "status": "succeeded",
         "timings": {
@@ -701,9 +673,7 @@ def write_complete_encode_control(
             "failed_frame_ratio": 0.0,
         },
     }
-    atomic_write_json(
-        control_dir / "records" / f"{control_id}_formal.json", record
-    )
+    atomic_write_json(control_dir / "records" / f"{control_id}_formal.json", record)
     return control_dir
 
 
@@ -736,16 +706,12 @@ def test_encode_historical_control_rejects_identity_drift(
         target[field_path[-1]] = bad_value
     atomic_write_json(path, record)
     with pytest.raises(BenchmarkDataError):
-        load_historical_controls(
-            control_dir, ALL_SCHEMES["R99_VAE_ENCODE_SP"]
-        )
+        load_historical_controls(control_dir, ALL_SCHEMES["R99_VAE_ENCODE_SP"])
 
 
 def test_historical_control_snapshot_detects_content_change(tmp_path: Path):
     control_dir = write_complete_encode_control(tmp_path)
-    controls = load_historical_controls(
-        control_dir, ALL_SCHEMES["R99_VAE_ENCODE_SP"]
-    )
+    controls = load_historical_controls(control_dir, ALL_SCHEMES["R99_VAE_ENCODE_SP"])
     path = control_dir / "records/R99_VAE_SP_formal.json"
     path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(BenchmarkDataError, match="historical control changed"):
@@ -754,9 +720,7 @@ def test_historical_control_snapshot_detects_content_change(tmp_path: Path):
 
 def test_historical_control_snapshot_detects_mtime_only_change(tmp_path: Path):
     control_dir = write_complete_encode_control(tmp_path)
-    controls = load_historical_controls(
-        control_dir, ALL_SCHEMES["R99_VAE_ENCODE_SP"]
-    )
+    controls = load_historical_controls(control_dir, ALL_SCHEMES["R99_VAE_ENCODE_SP"])
     path = control_dir / "records/R99_VAE_SP_formal.json"
     original = path.stat().st_mtime_ns
     os.utime(path, ns=(path.stat().st_atime_ns, original + 1_000_000))
@@ -772,9 +736,7 @@ def encode_perf_record(
     denoise: float,
     decode_trim: float,
 ) -> dict:
-    record = formal_record_with_stage(
-        total=total, model=model, decode_trim=decode_trim
-    )
+    record = formal_record_with_stage(total=total, model=model, decode_trim=decode_trim)
     record["timings"]["stage_seconds"].update(
         {
             "VividVRLongClipPreparationStage": preparation,
@@ -821,12 +783,8 @@ def test_compute_vae_encode_sp_performance_gates(
         denoise=60.0 * (1.0 + denoise_ratio),
         decode_trim=20.0 * (1.0 + decode_ratio),
     )
-    derived = compute_vae_encode_sp_derived_metrics(
-        scheme, treatment, control
-    )
-    assert derived["long_clip_preparation_speedup"] == pytest.approx(
-        prep_speedup
-    )
+    derived = compute_vae_encode_sp_derived_metrics(scheme, treatment, control)
+    assert derived["long_clip_preparation_speedup"] == pytest.approx(prep_speedup)
     assert derived["long_clip_preparation_gate"] is (
         prep_speedup >= (2.5 if scheme.sp_degree == 4 else 1.5)
     )
@@ -846,12 +804,8 @@ def test_load_historical_control_and_compute_vae_sp_speedups(tmp_path: Path):
         decode_trim=100.274,
         quality_passed=True,
     )
-    controls = load_historical_controls(
-        control_dir, ALL_SCHEMES["R99_VAE_SP"]
-    )
-    treatment = formal_record_with_stage(
-        total=500.0, model=493.0, decode_trim=50.0
-    )
+    controls = load_historical_controls(control_dir, ALL_SCHEMES["R99_VAE_SP"])
+    treatment = formal_record_with_stage(total=500.0, model=493.0, decode_trim=50.0)
     derived = compute_vae_sp_derived_metrics(
         ALL_SCHEMES["R99_VAE_SP"], treatment, controls["R99"]
     )
@@ -877,9 +831,7 @@ def test_load_historical_r100_accepts_recorded_quality_failed_control(
         ssim_min=0.978691848628344,
         failed_frame_ratio=2 / 130,
     )
-    controls = load_historical_controls(
-        control_dir, ALL_SCHEMES["R100_VAE_SP"]
-    )
+    controls = load_historical_controls(control_dir, ALL_SCHEMES["R100_VAE_SP"])
     assert controls["R100"]["status"] == "quality_failed"
 
 
@@ -898,9 +850,7 @@ def test_quality_not_worse_than_control(
     failed_frame_ratio: float,
     expected: bool,
 ):
-    treatment = formal_record_with_stage(
-        total=1.0, model=1.0, decode_trim=1.0
-    )
+    treatment = formal_record_with_stage(total=1.0, model=1.0, decode_trim=1.0)
     treatment["quality"].update(
         {
             "ssim_mean": ssim_mean,
@@ -908,9 +858,7 @@ def test_quality_not_worse_than_control(
             "failed_frame_ratio": failed_frame_ratio,
         }
     )
-    control = formal_record_with_stage(
-        total=1.0, model=1.0, decode_trim=1.0
-    )
+    control = formal_record_with_stage(total=1.0, model=1.0, decode_trim=1.0)
     control["quality"].update(
         {"ssim_mean": 0.99, "ssim_min": 0.98, "failed_frame_ratio": 0.0}
     )
@@ -990,9 +938,7 @@ class FakeCommandRunner:
 
 def test_tmux_manager_only_kills_owned_sessions(tmp_path: Path):
     fake = FakeCommandRunner()
-    manager = TmuxManager(
-        batch_id="batch", ownership_dir=tmp_path, command_runner=fake
-    )
+    manager = TmuxManager(batch_id="batch", ownership_dir=tmp_path, command_runner=fake)
 
     manager.stop("vividvr_accel_batch_R0_service")
     assert fake.calls == []
@@ -1009,9 +955,7 @@ def test_tmux_manager_only_kills_owned_sessions(tmp_path: Path):
 
 def test_tmux_manager_starts_and_stops_owned_session(tmp_path: Path):
     fake = FakeCommandRunner()
-    manager = TmuxManager(
-        batch_id="batch", ownership_dir=tmp_path, command_runner=fake
-    )
+    manager = TmuxManager(batch_id="batch", ownership_dir=tmp_path, command_runner=fake)
     log_path = tmp_path / "logs/service.log"
 
     manager.start(
@@ -1280,13 +1224,9 @@ class FakeRequestExecutor:
             "status": "succeeded",
             "run_role": role.value,
             "timings": {
-                "model_inference_runtime_seconds": float(
-                    100 - len(self.order)
-                )
+                "model_inference_runtime_seconds": float(100 - len(self.order))
             },
-            "quality": {
-                "pass_compare": True if role is RunRole.FORMAL else None
-            },
+            "quality": {"pass_compare": True if role is RunRole.FORMAL else None},
         }
 
 
@@ -1330,14 +1270,10 @@ def test_runner_warms_only_compile_schemes_then_runs_formal(tmp_path: Path):
     ]
     assert result["status"] == "completed"
     warmup_record = json.loads(
-        (tmp_path / "outputs/batch/records/R2_warmup.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "outputs/batch/records/R2_warmup.json").read_text(encoding="utf-8")
     )
     formal_record = json.loads(
-        (tmp_path / "outputs/batch/records/R2_formal.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "outputs/batch/records/R2_formal.json").read_text(encoding="utf-8")
     )
     assert warmup_record["inputs"]["inference_steps"] == 1
     assert formal_record["inputs"]["inference_steps"] == 20
@@ -1357,9 +1293,7 @@ def test_runner_skips_formal_after_warmup_failure_and_continues(tmp_path: Path):
     assert result["schemes"]["R2"]["status"] == "failed"
     assert result["schemes"]["R3"]["status"] == "succeeded"
     failed_record = json.loads(
-        (tmp_path / "outputs/batch/records/R2_warmup.json").read_text(
-            encoding="utf-8"
-        )
+        (tmp_path / "outputs/batch/records/R2_warmup.json").read_text(encoding="utf-8")
     )
     assert {
         "schema_version",
@@ -1525,9 +1459,7 @@ def test_warmup_request_uses_one_step(monkeypatch, tmp_path: Path):
         captured_payload.update(payload)
         raise StopAfterSubmit
 
-    monkeypatch.setattr(
-        benchmark_module, "GpuMemorySampler", FakeGpuMemorySampler
-    )
+    monkeypatch.setattr(benchmark_module, "GpuMemorySampler", FakeGpuMemorySampler)
     monkeypatch.setattr(
         acceptance_module,
         "submit_flowcut_task_with_retry",
@@ -1567,9 +1499,7 @@ def test_dry_run_reports_fixed_matrix_without_runtime_commands(tmp_path: Path):
 
     assert report["scheme_count"] == 12
     assert report["preflight"]["runtime_resources_checked"] is False
-    assert [item["scheme"]["scheme_id"] for item in report["schemes"]] == list(
-        SCHEMES
-    )
+    assert [item["scheme"]["scheme_id"] for item in report["schemes"]] == list(SCHEMES)
     assert report["schemes"][0]["requests"] == ["formal"]
     assert report["schemes"][2]["requests"] == ["warmup", "formal"]
     assert report["schemes"][7]["requests"] == []

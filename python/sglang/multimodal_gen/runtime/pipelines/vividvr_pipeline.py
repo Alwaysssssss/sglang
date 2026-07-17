@@ -26,9 +26,6 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
-from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
-    CogVideoXVividVRTransformer3DModel,
-)
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend import (
     configure_cogvideox_usp_collectives,
     enable_cogvideox_qk_norm_fusion,
@@ -45,6 +42,9 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import (
     enable_cogvideox_modulation_fusion,
     inspect_cogvideox_modulation_fusion,
+)
+from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr import (
+    CogVideoXVividVRTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_vividvr_controlnet import (
     CogVideoXVividVRControlNetModel,
@@ -76,12 +76,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VividVRTextEncodingStage,
     VividVRTilingPreparationStage,
     VividVRTimestepPreparationStage,
-    _aggregate_vae_spatial_encode_stats,
     _aggregate_vae_spatial_decode_stats,
+    _aggregate_vae_spatial_encode_stats,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
@@ -91,9 +91,9 @@ from sglang.multimodal_gen.runtime.vividvr import (
     apply_reference_color_fix,
     attach_generation_resolution,
     build_vividvr_caption_prompt_lists,
-    build_vividvr_tiled_prompt_lists,
     build_vividvr_temporal_latent_merge_plan,
     build_vividvr_temporal_window_plan,
+    build_vividvr_tiled_prompt_lists,
     decoded_video_to_frame_tensor,
     load_control_video,
     merge_vividvr_temporal_latent_states,
@@ -307,16 +307,11 @@ def _maybe_torch_compile_module(
         try:
             import torch._inductor.config as _inductor_cfg
 
-            if (
-                torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-            ):
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
         except ImportError:
             pass
-        mode = os.environ.get(
-            "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-        )
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
         # Keep VividVR on static-shape graphs per realized tile shape. This avoids
         # inductor autotune carrying symbolic tile extents into benchmark buffer
         # allocation on edge-tile inputs such as 90x128 latent views.
@@ -343,9 +338,7 @@ def _maybe_torch_compile_module(
         return module
 
 
-def _configure_vividvr_vae_spatial_tile_parallel(
-    vae: object, requested: bool
-) -> None:
+def _configure_vividvr_vae_spatial_tile_parallel(vae: object, requested: bool) -> None:
     configure_vae_sp = getattr(vae, "configure_spatial_tile_parallel", None)
     if configure_vae_sp is None and requested:
         raise TypeError("VividVR vae_sp requires the native CogVideoX VAE runtime")
@@ -409,7 +402,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
     def build_executor(self, server_args: ServerArgs):
         return SyncExecutor(server_args=server_args)
 
-    def _build_runtime_acceleration_debug(self, server_args: ServerArgs) -> dict[str, object]:
+    def _build_runtime_acceleration_debug(
+        self, server_args: ServerArgs
+    ) -> dict[str, object]:
         transformer = self.get_module("transformer")
         controlnet = self.get_module("controlnet")
         requested_backend = server_args.attention_backend
@@ -475,9 +470,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                     )
                 )
             ),
-            "qk_norm_fusion_transformer": _inspect_module_qk_norm_fusion(
-                transformer
-            ),
+            "qk_norm_fusion_transformer": _inspect_module_qk_norm_fusion(transformer),
             "qk_norm_fusion_controlnet": _inspect_module_qk_norm_fusion(controlnet),
             "qk_norm_rope_fusion_requested": bool(
                 getattr(server_args, "enable_cogvideox_qk_norm_rope_fusion", False)
@@ -632,7 +625,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                     requested_backend,
                     runtime_choice.semantics,
                     runtime_choice.kernel,
-                    effective_candidates[effective_candidates.index(candidate_backend) + 1],
+                    effective_candidates[
+                        effective_candidates.index(candidate_backend) + 1
+                    ],
                     exc,
                 )
 
@@ -670,9 +665,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             applied = configure_cogvideox_usp_collectives(
                 component,
                 use_packed_qkv_a2a=use_packed_qkv_a2a,
-                use_prefix_all_gather_into_tensor=(
-                    use_prefix_all_gather_into_tensor
-                ),
+                use_prefix_all_gather_into_tensor=(use_prefix_all_gather_into_tensor),
             )
             logger.info(
                 "Applied USP collective optimizations to %s processors=%d "
@@ -909,7 +902,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             "transformer",
         )
         controlnet_dir = Path(
-            server_args.component_paths.get("controlnet", str(vivid_root / "controlnet"))
+            server_args.component_paths.get(
+                "controlnet", str(vivid_root / "controlnet")
+            )
         )
         text_encoder_dtype = PRECISION_TO_TYPE[
             server_args.pipeline_config.text_encoder_precisions[0]
@@ -974,9 +969,10 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         transformer.eval()
 
         controlnet_config = get_diffusers_component_config(str(controlnet_dir))
-        controlnet_dtype = quant_spec.param_dtype or PRECISION_TO_TYPE[
-            server_args.pipeline_config.dit_precision
-        ]
+        controlnet_dtype = (
+            quant_spec.param_dtype
+            or PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        )
         with set_default_torch_dtype(controlnet_dtype), torch.device("meta"):
             controlnet = CogVideoXVividVRControlNetModel(**controlnet_config)
         controlnet_state_dict = load_file(
@@ -984,7 +980,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             device="cpu",
         )
         controlnet.load_state_dict(controlnet_state_dict, strict=True, assign=True)
-        controlnet = controlnet.to(device=get_local_torch_device(), dtype=controlnet_dtype)
+        controlnet = controlnet.to(
+            device=get_local_torch_device(), dtype=controlnet_dtype
+        )
         controlnet.eval()
 
         self.add_module("text_encoder", text_encoder)
@@ -1060,9 +1058,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             decoding_stage=self.decoding_stage,
             video_processor=self.video_processor,
         )
-        self.temporal_stitch_postprocess_stage = (
-            VividVRTemporalStitchPostprocessStage()
-        )
+        self.temporal_stitch_postprocess_stage = VividVRTemporalStitchPostprocessStage()
         self.vividvr_stages = [
             self.input_validation_stage,
             self.prompt_preparation_stage,
@@ -1093,7 +1089,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         clip_spec,
     ) -> dict[str, object]:
         reference_video = input_video_info["reference_video"]
-        clip_reference_video = reference_video[clip_spec.start_frame : clip_spec.end_frame]
+        clip_reference_video = reference_video[
+            clip_spec.start_frame : clip_spec.end_frame
+        ]
         clip_video = clip_reference_video
         if clip_spec.num_padding_frames > 0:
             padding = clip_reference_video[-1:].repeat(
@@ -1122,9 +1120,11 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             self.executor = self.build_executor(server_args)
 
         if getattr(self, "temporal_window_planning_stage", None) is None:
-            self.temporal_window_planning_stage = _build_stage_without_global_server_args(
-                VividVRTemporalWindowPlanningStage,
-                server_args=server_args,
+            self.temporal_window_planning_stage = (
+                _build_stage_without_global_server_args(
+                    VividVRTemporalWindowPlanningStage,
+                    server_args=server_args,
+                )
             )
         if getattr(self, "long_clip_preparation_stage", None) is None:
             self.long_clip_preparation_stage = _build_stage_without_global_server_args(
@@ -1152,9 +1152,11 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 video_processor=self.video_processor,
             )
         if getattr(self, "temporal_stitch_postprocess_stage", None) is None:
-            self.temporal_stitch_postprocess_stage = _build_stage_without_global_server_args(
-                VividVRTemporalStitchPostprocessStage,
-                server_args=server_args,
+            self.temporal_stitch_postprocess_stage = (
+                _build_stage_without_global_server_args(
+                    VividVRTemporalStitchPostprocessStage,
+                    server_args=server_args,
+                )
             )
 
         stages = getattr(self, "vividvr_long_video_stages", None)
@@ -1355,9 +1357,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                     f"consumed {caption_cursor}, available {len(params.runtime_caption_texts)}"
                 )
             debug["clip_caption_texts"] = clip_caption_records
-        debug.update(
-            _aggregate_vae_spatial_encode_stats(clip_vae_encode_stats)
-        )
+        debug.update(_aggregate_vae_spatial_encode_stats(clip_vae_encode_stats))
 
         long_runtime["clip_states"] = clip_states
         long_runtime["clip_caption_records"] = clip_caption_records
@@ -1365,9 +1365,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         long_runtime["clip_tile_counts"] = clip_tile_counts
 
         params.runtime_prompt_embeds = clip_states[0]["prompt_embeds"]
-        params.runtime_negative_prompt_embeds = clip_states[0][
-            "negative_prompt_embeds"
-        ]
+        params.runtime_negative_prompt_embeds = clip_states[0]["negative_prompt_embeds"]
         params.runtime_tiled_prompt_embeds = clip_states[0]["tiled_prompt_embeds"]
         params.runtime_tiled_negative_prompt_embeds = clip_states[0][
             "tiled_negative_prompt_embeds"
@@ -1421,7 +1419,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             denoising_states.append(denoising_state)
         long_runtime["denoising_states"] = denoising_states
 
-        with self.denoising_stage.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
+        with self.denoising_stage.progress_bar(
+            total=len(params.runtime_timesteps)
+        ) as progress_bar:
             for timestep_index, _ in enumerate(params.runtime_timesteps):
                 check_request_timeout(batch)
                 with StageProfiler(
@@ -1459,7 +1459,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
 
         trimmed_clips: list[torch.Tensor] = []
         clip_vae_stats: list[dict[str, object]] = []
-        for clip_state, denoising_state in zip(clip_states, denoising_states, strict=True):
+        for clip_state, denoising_state in zip(
+            clip_states, denoising_states, strict=True
+        ):
             decoded_video = self.decoding_stage.decode_latents(
                 denoising_state["latents"],
                 int(clip_state["num_latent_padding_frames"]),
@@ -1554,7 +1556,10 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
             tile_size=int(params.tile_size),
         )
 
-        if int(input_video_info["original_num_frames"]) <= params.num_temporal_process_frames:
+        if (
+            int(input_video_info["original_num_frames"])
+            <= params.num_temporal_process_frames
+        ):
             batch.extra["vividvr_input_video_info"] = input_video_info
             result = super().forward(batch, server_args)
             self._attach_runtime_acceleration_debug(result, server_args)
@@ -1567,10 +1572,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         if not batch.is_warmup and not batch.suppress_logs:
             logger.info(
                 "Running pipeline stages: %s",
-                [
-                    stage.__class__.__name__
-                    for stage in self.vividvr_long_video_stages
-                ],
+                [stage.__class__.__name__ for stage in self.vividvr_long_video_stages],
                 main_process_only=True,
             )
         result = self._forward_temporal_windowed(batch, server_args, input_video_info)

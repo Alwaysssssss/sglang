@@ -158,9 +158,7 @@ def _build_spatial_tile_plan(
     tile_overlap_factor_height: float,
     tile_overlap_factor_width: float,
 ) -> CogVideoXSpatialTilePlan:
-    overlap_height = int(
-        tile_latent_min_height * (1 - tile_overlap_factor_height)
-    )
+    overlap_height = int(tile_latent_min_height * (1 - tile_overlap_factor_height))
     overlap_width = int(tile_latent_min_width * (1 - tile_overlap_factor_width))
     if overlap_height <= 0 or overlap_width <= 0:
         raise ValueError("CogVideoX VAE tile overlap stride must be positive")
@@ -200,9 +198,7 @@ def _build_spatial_encode_tile_plan(
     tile_overlap_factor_height: float,
     tile_overlap_factor_width: float,
 ) -> CogVideoXSpatialEncodeTilePlan:
-    overlap_height = int(
-        tile_sample_min_height * (1 - tile_overlap_factor_height)
-    )
+    overlap_height = int(tile_sample_min_height * (1 - tile_overlap_factor_height))
     overlap_width = int(tile_sample_min_width * (1 - tile_overlap_factor_width))
     if overlap_height <= 0 or overlap_width <= 0:
         raise ValueError("CogVideoX VAE encode tile overlap stride must be positive")
@@ -312,13 +308,9 @@ def _merge_spatial_tiles(vae, plan, decoded_tiles):
                     plan.blend_extent_height,
                 )
             if column_index > 0:
-                tile = vae.blend_h(
-                    row[column_index - 1], tile, plan.blend_extent_width
-                )
+                tile = vae.blend_h(row[column_index - 1], tile, plan.blend_extent_width)
             result_row.append(
-                tile[
-                    :, :, :, : plan.row_limit_height, : plan.row_limit_width
-                ]
+                tile[:, :, :, : plan.row_limit_height, : plan.row_limit_width]
             )
         result_rows.append(torch.cat(result_row, dim=4))
     return torch.cat(result_rows, dim=3)
@@ -343,9 +335,7 @@ def _merge_spatial_encode_tiles(vae, plan, encoded_tiles):
                     plan.blend_extent_height,
                 )
             if column_index > 0:
-                tile = vae.blend_h(
-                    row[column_index - 1], tile, plan.blend_extent_width
-                )
+                tile = vae.blend_h(row[column_index - 1], tile, plan.blend_extent_width)
             result_row.append(
                 tile[:, :, :, : plan.row_limit_height, : plan.row_limit_width]
             )
@@ -366,9 +356,7 @@ def _build_spatial_decode_descriptor(
     world_size: int,
 ) -> torch.Tensor:
     if z.ndim != 5:
-        raise ValueError(
-            f"CogVideoX VAE SP expects a 5D latent tensor, got {z.shape}"
-        )
+        raise ValueError(f"CogVideoX VAE SP expects a 5D latent tensor, got {z.shape}")
     try:
         dtype_code = _DTYPE_CODES[z.dtype]
     except KeyError as error:
@@ -406,8 +394,7 @@ def _validate_spatial_decode_descriptor(
     ]
     if mismatch_ranks:
         raise RuntimeError(
-            "CogVideoX VAE SP input descriptor mismatch on ranks "
-            f"{mismatch_ranks}"
+            "CogVideoX VAE SP input descriptor mismatch on ranks " f"{mismatch_ranks}"
         )
 
 
@@ -471,9 +458,7 @@ def _canonicalize_spatial_decode_input(sp_group, z: torch.Tensor) -> torch.Tenso
     return canonical
 
 
-def _canonicalize_spatial_encode_input(
-    sp_group, x: torch.Tensor
-) -> torch.Tensor:
+def _canonicalize_spatial_encode_input(sp_group, x: torch.Tensor) -> torch.Tensor:
     """Use one sample value source for every tile in the local SP subgroup."""
     canonical = x.clone(memory_format=torch.contiguous_format)
     sp_group.broadcast(canonical, src=0)
@@ -779,9 +764,7 @@ class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
             x,
             reason=reason,
             world_size=(
-                self._vae_encode_sp_group.world_size
-                if self._vae_encode_sp_group
-                else 1
+                self._vae_encode_sp_group.world_size if self._vae_encode_sp_group else 1
             ),
         )
 
@@ -920,9 +903,7 @@ class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
         end.synchronize()
         self._set_serial_decode_stats(
             reason,
-            world_size=(
-                self._vae_sp_group.world_size if self._vae_sp_group else 1
-            ),
+            world_size=(self._vae_sp_group.world_size if self._vae_sp_group else 1),
             decode_seconds=start.elapsed_time(end) / 1000.0,
         )
         return decoded

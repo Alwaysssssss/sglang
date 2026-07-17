@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-
 TOPOLOGIES = {
     "sp2": (1, 2),
     "sp4": (1, 4),
@@ -57,12 +56,8 @@ def compare_serial_and_parallel_encode(
         serial_latents.shape == parallel_latents.shape
         and torch.equal(serial_latents, parallel_latents)
     )
-    moments_max, moments_mean = _error_metrics(
-        serial_moments, parallel_moments
-    )
-    latents_max, latents_mean = _error_metrics(
-        serial_latents, parallel_latents
-    )
+    moments_max, moments_mean = _error_metrics(serial_moments, parallel_moments)
+    latents_max, latents_mean = _error_metrics(serial_latents, parallel_latents)
     return {
         "moments_exact": bool(moments_exact),
         "sampled_latents_exact": bool(sampled_latents_exact),
@@ -96,9 +91,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def initialize_topology(
-    topology: str, rank: int, local_rank: int, world_size: int
-):
+def initialize_topology(topology: str, rank: int, local_rank: int, world_size: int):
     cfg_degree, sp_degree = TOPOLOGIES[topology]
     if world_size != cfg_degree * sp_degree:
         raise ValueError(
@@ -277,14 +270,17 @@ def main() -> int:
             )
 
         torch.cuda.synchronize(device)
-        model_seconds = sum(
-            start.elapsed_time(end)
-            for start, end in (
-                (serial_start, serial_end),
-                (parallel_start, parallel_end),
-                (divergent_start, divergent_end),
+        model_seconds = (
+            sum(
+                start.elapsed_time(end)
+                for start, end in (
+                    (serial_start, serial_end),
+                    (parallel_start, parallel_end),
+                    (divergent_start, divergent_end),
+                )
             )
-        ) / 1000.0
+            / 1000.0
+        )
         comparison = compare_serial_and_parallel_encode(
             serial_moments,
             parallel_moments,
@@ -314,11 +310,8 @@ def main() -> int:
             "rank_divergent_passed": divergent_comparison["passed"],
             "rank_divergent_comparison": divergent_comparison,
             "model_inference_runtime_seconds": model_seconds,
-            "total_runtime_seconds_before_gather": time.perf_counter()
-            - process_start,
-            "peak_memory_allocated_bytes": int(
-                torch.cuda.max_memory_allocated(device)
-            ),
+            "total_runtime_seconds_before_gather": time.perf_counter() - process_start,
+            "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
             **comparison,
             **vae_stats,
         }
@@ -354,8 +347,7 @@ def main() -> int:
                 "ranks": rank_payloads,
                 "subgroup_checks": subgroup_checks,
                 "rank_pass": {
-                    str(item["rank"]): item["passed"]
-                    for item in rank_payloads
+                    str(item["rank"]): item["passed"] for item in rank_payloads
                 },
                 "rank_divergent_pass": {
                     str(item["rank"]): item["rank_divergent_passed"]
@@ -364,8 +356,7 @@ def main() -> int:
                 "overall_pass": overall_pass,
                 "total_runtime_seconds": time.perf_counter() - process_start,
                 "model_inference_runtime_seconds": max(
-                    item["model_inference_runtime_seconds"]
-                    for item in rank_payloads
+                    item["model_inference_runtime_seconds"] for item in rank_payloads
                 ),
                 "timing_scope": {
                     "total_runtime_seconds": (

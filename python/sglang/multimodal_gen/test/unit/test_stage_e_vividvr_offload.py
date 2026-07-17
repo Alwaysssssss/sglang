@@ -13,10 +13,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
     VividVRConditionEncodingStage,
     VividVRDecodingStage,
-    _VividVRLatentMixin,
     VividVRDenoisingStage,
     VividVRLatentPreparationStage,
     VividVRTimestepPreparationStage,
+    _VividVRLatentMixin,
 )
 
 _GLOBAL_ARGS_PATCH = (
@@ -98,7 +98,9 @@ class TestStageEVividVROffload(unittest.TestCase):
 
         self.assertEqual(actual_latents.device.type, "cpu")
         self.assertEqual(num_padding_frames, 0)
-        self.assertEqual(tuple(actual_control_latents.shape), tuple(control_latents.shape))
+        self.assertEqual(
+            tuple(actual_control_latents.shape), tuple(control_latents.shape)
+        )
         torch.testing.assert_close(actual_latents, expected_latents)
 
     def test_scheduler_step_preserves_cuda_rng_when_sample_is_cpu(self):
@@ -164,7 +166,9 @@ class TestStageEVividVROffload(unittest.TestCase):
         self.assertEqual(latents.device.type, "cuda")
         self.assertEqual(prepared_control_latents.device.type, "cuda")
 
-    def test_prepare_denoising_state_uses_local_cuda_device_even_when_modules_are_cpu(self):
+    def test_prepare_denoising_state_uses_local_cuda_device_even_when_modules_are_cpu(
+        self,
+    ):
         transformer = _dummy_transformer_module()
         controlnet = torch.nn.Linear(1, 1, bias=False)
         scheduler = _DummyScheduler()
@@ -238,7 +242,9 @@ class TestStageEVividVROffload(unittest.TestCase):
             "FlashAttentionMetadataBuilder",
         )
 
-    def test_prepare_timesteps_uses_local_cuda_device_even_when_transformer_is_cpu(self):
+    def test_prepare_timesteps_uses_local_cuda_device_even_when_transformer_is_cpu(
+        self,
+    ):
         scheduler = CogVideoXDDIMScheduler()
         with patch(_GLOBAL_ARGS_PATCH, return_value=SimpleNamespace()):
             stage = VividVRTimestepPreparationStage(
@@ -365,16 +371,16 @@ class TestStageEVividVRConditionEncoding(unittest.TestCase):
             extra={},
         )
         server_args = SimpleNamespace(
-            pipeline_config=SimpleNamespace(
-                dit_precision="fp32", vae_precision="fp32"
-            ),
+            pipeline_config=SimpleNamespace(dit_precision="fp32", vae_precision="fp32"),
             vae_cpu_offload=True,
         )
         module = (
             "sglang.multimodal_gen.runtime.pipelines_core.stages."
             "model_specific_stages.vividvr"
         )
-        with patch(f"{module}.get_local_torch_device", return_value=torch.device("cpu")):
+        with patch(
+            f"{module}.get_local_torch_device", return_value=torch.device("cpu")
+        ):
             prepared = stage.prepare_condition_inputs(batch, server_args)
 
         self.assertTrue(prepared["vae_encode_stats"]["vae_encode_sp_effective"])

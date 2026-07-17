@@ -179,28 +179,20 @@ def _aggregate_vae_spatial_decode_stats(
     if len(topologies) != 1:
         raise RuntimeError(f"VAE SP clip topology mismatch: {sorted(topologies)}")
     reasons = {str(item["vae_sp_fallback_reason"]) for item in clip_stats}
-    local_width = max(
-        len(item["vae_local_tiles_per_rank"]) for item in clip_stats
-    )
+    local_width = max(len(item["vae_local_tiles_per_rank"]) for item in clip_stats)
     local_totals = [0] * local_width
     for item in clip_stats:
         for rank, count in enumerate(item["vae_local_tiles_per_rank"]):
             local_totals[rank] += int(count)
     return {
-        "vae_sp_requested": all(
-            bool(item["vae_sp_requested"]) for item in clip_stats
-        ),
-        "vae_sp_effective": all(
-            bool(item["vae_sp_effective"]) for item in clip_stats
-        ),
+        "vae_sp_requested": all(bool(item["vae_sp_requested"]) for item in clip_stats),
+        "vae_sp_effective": all(bool(item["vae_sp_effective"]) for item in clip_stats),
         "vae_sp_fallback_reason": (
             next(iter(reasons)) if len(reasons) == 1 else "mixed"
         ),
         "vae_sp_world_size": int(clip_stats[0]["vae_sp_world_size"]),
         "vae_sp_group_type": str(clip_stats[0]["vae_sp_group_type"]),
-        "vae_total_tiles": sum(
-            int(item["vae_total_tiles"]) for item in clip_stats
-        ),
+        "vae_total_tiles": sum(int(item["vae_total_tiles"]) for item in clip_stats),
         "vae_local_tiles_per_rank": local_totals,
         "vae_tile_decode_seconds": sum(
             float(item["vae_tile_decode_seconds"]) for item in clip_stats
@@ -235,9 +227,7 @@ def _aggregate_vae_spatial_encode_stats(
         raise RuntimeError(
             f"VAE encode SP clip topology mismatch: {sorted(topologies)}"
         )
-    reasons = {
-        str(item["vae_encode_sp_fallback_reason"]) for item in clip_stats
-    }
+    reasons = {str(item["vae_encode_sp_fallback_reason"]) for item in clip_stats}
     local_totals = [0] * len(clip_stats[0]["vae_encode_local_tiles_per_rank"])
     for item in clip_stats:
         for rank, count in enumerate(item["vae_encode_local_tiles_per_rank"]):
@@ -252,27 +242,20 @@ def _aggregate_vae_spatial_encode_stats(
         "vae_encode_sp_fallback_reason": (
             next(iter(reasons)) if len(reasons) == 1 else "mixed"
         ),
-        "vae_encode_sp_world_size": int(
-            clip_stats[0]["vae_encode_sp_world_size"]
-        ),
-        "vae_encode_sp_group_type": str(
-            clip_stats[0]["vae_encode_sp_group_type"]
-        ),
+        "vae_encode_sp_world_size": int(clip_stats[0]["vae_encode_sp_world_size"]),
+        "vae_encode_sp_group_type": str(clip_stats[0]["vae_encode_sp_group_type"]),
         "vae_encode_total_tiles": sum(
             int(item["vae_encode_total_tiles"]) for item in clip_stats
         ),
         "vae_encode_local_tiles_per_rank": local_totals,
         "vae_encode_tile_compute_seconds": sum(
-            float(item["vae_encode_tile_compute_seconds"])
-            for item in clip_stats
+            float(item["vae_encode_tile_compute_seconds"]) for item in clip_stats
         ),
         "vae_encode_tile_gather_seconds": sum(
-            float(item["vae_encode_tile_gather_seconds"])
-            for item in clip_stats
+            float(item["vae_encode_tile_gather_seconds"]) for item in clip_stats
         ),
         "vae_encode_tile_merge_seconds": sum(
-            float(item["vae_encode_tile_merge_seconds"])
-            for item in clip_stats
+            float(item["vae_encode_tile_merge_seconds"]) for item in clip_stats
         ),
         "vae_encode_seconds": sum(
             float(item["vae_encode_seconds"]) for item in clip_stats
@@ -311,7 +294,9 @@ def _clip_spec_record(clip_spec) -> dict[str, int]:
 def _require_vividvr_input_video_info(batch: Req) -> dict[str, Any]:
     input_video_info = batch.extra.get("vividvr_input_video_info")
     if input_video_info is None:
-        raise ValueError("VividVR input video info must be prepared before long-video stages")
+        raise ValueError(
+            "VividVR input video info must be prepared before long-video stages"
+        )
     return input_video_info
 
 
@@ -515,7 +500,11 @@ class VividVRTextEncodingStage(PipelineStage):
             else:
                 empty_negative_prompt = ""
             negative_prompt_embeds_list, _, _ = self.text_stage.encode_text(
-                negative_prompt if negative_prompt is not None else empty_negative_prompt,
+                (
+                    negative_prompt
+                    if negative_prompt is not None
+                    else empty_negative_prompt
+                ),
                 server_args,
                 encoder_index=[0],
                 return_attention_mask=True,
@@ -534,7 +523,9 @@ class VividVRTextEncodingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         params = _vividvr_params(batch)
         if params.runtime_model_prompt_text is None:
-            raise ValueError("VividVR prompt text must be prepared before text encoding")
+            raise ValueError(
+                "VividVR prompt text must be prepared before text encoding"
+            )
 
         params.runtime_do_cfg = float(params.guidance_scale) > 1.0
         encoded = self.encode_prompt_pair(
@@ -748,9 +739,13 @@ class VividVRLatentPreparationStage(_VividVRLatentMixin, PipelineStage):
         del server_args
         params = _vividvr_params(batch)
         if params.runtime_control_video is None:
-            raise ValueError("VividVR control video must be prepared before latent init")
+            raise ValueError(
+                "VividVR control video must be prepared before latent init"
+            )
         if params.runtime_control_latents is None:
-            raise ValueError("VividVR control latents must be prepared before latent init")
+            raise ValueError(
+                "VividVR control latents must be prepared before latent init"
+            )
         if params.runtime_generator is None:
             raise ValueError("VividVR generator must be prepared before latent init")
 
@@ -985,7 +980,9 @@ class VividVRDenoisingStage(PipelineStage):
                 f"VividVR CFG parallel only supports cfg_rank 0/1, got {cfg_rank}"
             )
         return (
-            torch.cat([negative_prompt_embeds[prompt_slice], tile_prompt_embeds], dim=0),
+            torch.cat(
+                [negative_prompt_embeds[prompt_slice], tile_prompt_embeds], dim=0
+            ),
             "serial",
         )
 
@@ -1203,9 +1200,7 @@ class VividVRDenoisingStage(PipelineStage):
                 "sp_rank": None if sp_group is None else int(sp_group.rank_in_group),
                 "enable_sequence_shard": sequence_shard_enabled,
                 "sp_sequence_shard_strategy": (
-                    "model_native_video_token_shard"
-                    if sequence_shard_enabled
-                    else None
+                    "model_native_video_token_shard" if sequence_shard_enabled else None
                 ),
                 "sp_sequence_tokens_global": total_video_tokens,
                 "sp_sequence_tokens_local": sequence_shard_local_tokens,
@@ -1432,7 +1427,9 @@ class VividVRDenoisingStage(PipelineStage):
                 restoration_ori_latent=tile_control_latents,
             )
             tile_latents = tile_latents.to(target_dtype)
-            tile_old_pred_original_sample = tile_old_pred_original_sample.to(target_dtype)
+            tile_old_pred_original_sample = tile_old_pred_original_sample.to(
+                target_dtype
+            )
 
             latents_meshgrid[tile_slice_tuple] += tile_latents * tile_weights
             old_pred_original_sample_meshgrid[tile_slice_tuple] += (
@@ -1451,9 +1448,13 @@ class VividVRDenoisingStage(PipelineStage):
         if params.runtime_latents is None:
             raise ValueError("VividVR latents must be prepared before denoising")
         if params.runtime_control_latents is None:
-            raise ValueError("VividVR control latents must be prepared before denoising")
+            raise ValueError(
+                "VividVR control latents must be prepared before denoising"
+            )
         if params.runtime_tiled_prompt_embeds is None:
-            raise ValueError("VividVR tiled prompt embeds must be prepared before denoising")
+            raise ValueError(
+                "VividVR tiled prompt embeds must be prepared before denoising"
+            )
         if params.runtime_timesteps is None:
             raise ValueError("VividVR timesteps must be prepared before denoising")
 
@@ -1477,9 +1478,7 @@ class VividVRDenoisingStage(PipelineStage):
                     denoising_state,
                     timestep_index,
                     guidance_scale=float(params.guidance_scale),
-                    restoration_guidance_scale=float(
-                        params.restoration_guidance_scale
-                    ),
+                    restoration_guidance_scale=float(params.restoration_guidance_scale),
                 )
                 DenoisingStage.step_profile(self)
                 params.runtime_progress = float(timestep_index + 1) / float(
@@ -1529,9 +1528,7 @@ class VividVRDecodingStage(PipelineStage):
         )
         stats_getter = getattr(self.vae, "get_last_spatial_decode_stats", None)
         self.last_vae_decode_stats = (
-            dict(stats_getter().to_debug_dict())
-            if stats_getter is not None
-            else {}
+            dict(stats_getter().to_debug_dict()) if stats_getter is not None else {}
         )
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
@@ -1541,7 +1538,9 @@ class VividVRDecodingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         params = _vividvr_params(batch)
         if params.runtime_latents is None:
-            raise ValueError("VividVR denoised latents must be prepared before decoding")
+            raise ValueError(
+                "VividVR denoised latents must be prepared before decoding"
+            )
 
         decoded = self.decode_latents(
             params.runtime_latents,
@@ -1553,9 +1552,7 @@ class VividVRDecodingStage(PipelineStage):
         debug["vae_tiling_enabled"] = bool(getattr(self.vae, "use_tiling", False))
         debug.update(self.last_vae_decode_stats)
         debug["vae_sp_clips"] = (
-            [dict(self.last_vae_decode_stats)]
-            if self.last_vae_decode_stats
-            else []
+            [dict(self.last_vae_decode_stats)] if self.last_vae_decode_stats else []
         )
         return batch
 
@@ -1572,9 +1569,16 @@ class VividVROutputPostprocessStage(PipelineStage):
         debug: dict[str, Any],
     ) -> torch.Tensor:
         if params.runtime_decoded_video is None:
-            raise ValueError("VividVR decoded video must be prepared before postprocess")
-        if params.runtime_original_height is None or params.runtime_original_width is None:
-            raise ValueError("VividVR original video size must be available for postprocess")
+            raise ValueError(
+                "VividVR decoded video must be prepared before postprocess"
+            )
+        if (
+            params.runtime_original_height is None
+            or params.runtime_original_width is None
+        ):
+            raise ValueError(
+                "VividVR original video size must be available for postprocess"
+            )
 
         output_video = decoded_video_to_frame_tensor(
             params.runtime_decoded_video,
@@ -1661,7 +1665,9 @@ class VividVRTemporalWindowPlanningStage(PipelineStage):
 
         debug["execution_mode"] = params.runtime_execution_mode
         debug["num_clips"] = int(window_plan.num_clips)
-        debug["clip_specs"] = [_clip_spec_record(clip_spec) for clip_spec in window_plan.clip_specs]
+        debug["clip_specs"] = [
+            _clip_spec_record(clip_spec) for clip_spec in window_plan.clip_specs
+        ]
         return batch
 
 
@@ -1688,7 +1694,9 @@ class VividVRLongClipPreparationStage(PipelineStage):
         long_runtime = _get_long_video_runtime(batch)
         window_plan = long_runtime.get("window_plan")
         if window_plan is None:
-            raise ValueError("VividVR temporal window plan must be prepared before clip setup")
+            raise ValueError(
+                "VividVR temporal window plan must be prepared before clip setup"
+            )
 
         generator = torch.Generator(device=get_local_torch_device().type).manual_seed(
             int(params.seed)
@@ -1703,7 +1711,9 @@ class VividVRLongClipPreparationStage(PipelineStage):
         clip_vae_encode_stats: list[dict[str, object]] = []
         caption_cursor = 0
         for clip_spec in window_plan.clip_specs:
-            clip_video_info = _build_temporal_clip_video_info(input_video_info, clip_spec)
+            clip_video_info = _build_temporal_clip_video_info(
+                input_video_info, clip_spec
+            )
             prepared_condition = self.condition_encoding_stage.prepare_condition_inputs(
                 batch,
                 server_args,
@@ -1799,9 +1809,7 @@ class VividVRLongClipPreparationStage(PipelineStage):
             debug["clip_caption_texts"] = clip_caption_records
 
         long_runtime["clip_states"] = clip_states
-        debug.update(
-            _aggregate_vae_spatial_encode_stats(clip_vae_encode_stats)
-        )
+        debug.update(_aggregate_vae_spatial_encode_stats(clip_vae_encode_stats))
         long_runtime["clip_caption_records"] = clip_caption_records
         long_runtime["clip_latent_lengths"] = clip_latent_lengths
         long_runtime["clip_tile_counts"] = clip_tile_counts
@@ -1850,7 +1858,9 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
 
         clip_latent_lengths = long_runtime.get("clip_latent_lengths")
         if clip_latent_lengths is None:
-            clip_latent_lengths = [int(clip_state["latents"].shape[1]) for clip_state in clip_states]
+            clip_latent_lengths = [
+                int(clip_state["latents"].shape[1]) for clip_state in clip_states
+            ]
             long_runtime["clip_latent_lengths"] = clip_latent_lengths
 
         merge_plan = None
@@ -1880,7 +1890,9 @@ class VividVRMultiClipDenoisingStage(PipelineStage):
             denoising_states.append(denoising_state)
         long_runtime["denoising_states"] = denoising_states
 
-        with self.denoising_stage.progress_bar(total=len(params.runtime_timesteps)) as progress_bar:
+        with self.denoising_stage.progress_bar(
+            total=len(params.runtime_timesteps)
+        ) as progress_bar:
             for timestep_index, _ in enumerate(params.runtime_timesteps):
                 check_request_timeout(batch)
                 with StageProfiler(
@@ -1943,11 +1955,15 @@ class VividVRMultiClipDecodeTrimStage(PipelineStage):
         clip_states = long_runtime.get("clip_states")
         denoising_states = long_runtime.get("denoising_states")
         if not clip_states or not denoising_states:
-            raise ValueError("VividVR denoising states must be prepared before decode/trim")
+            raise ValueError(
+                "VividVR denoising states must be prepared before decode/trim"
+            )
 
         trimmed_clips: list[torch.Tensor] = []
         clip_vae_stats: list[dict[str, object]] = []
-        for clip_state, denoising_state in zip(clip_states, denoising_states, strict=True):
+        for clip_state, denoising_state in zip(
+            clip_states, denoising_states, strict=True
+        ):
             decoded_video = self.decoding_stage.decode_latents(
                 denoising_state["latents"],
                 int(clip_state["num_latent_padding_frames"]),
@@ -1973,7 +1989,9 @@ class VividVRMultiClipDecodeTrimStage(PipelineStage):
 
         long_runtime["trimmed_clips"] = trimmed_clips
         long_runtime["denoising_states"] = None
-        debug["vae_tiling_enabled"] = bool(getattr(self.decoding_stage.vae, "use_tiling", False))
+        debug["vae_tiling_enabled"] = bool(
+            getattr(self.decoding_stage.vae, "use_tiling", False)
+        )
         debug.update(_aggregate_vae_spatial_decode_stats(clip_vae_stats))
         return batch
 
@@ -1987,7 +2005,9 @@ class VividVRTemporalStitchPostprocessStage(PipelineStage):
         long_runtime = _get_long_video_runtime(batch)
         trimmed_clips = long_runtime.get("trimmed_clips")
         if trimmed_clips is None:
-            raise ValueError("VividVR trimmed clips must be prepared before final stitch")
+            raise ValueError(
+                "VividVR trimmed clips must be prepared before final stitch"
+            )
 
         final_output_video = stitch_vividvr_temporal_output_clips(trimmed_clips)
         final_output_video = apply_reference_color_fix(

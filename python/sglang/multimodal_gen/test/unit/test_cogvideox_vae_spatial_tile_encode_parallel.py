@@ -43,25 +43,18 @@ def test_encode_plan_matches_formal_720x960_geometry():
 
     assert (plan.num_rows, plan.num_columns) == (4, 4)
     assert [
-        (tile.global_index, tile.sample_top, tile.sample_left)
-        for tile in plan.tiles
+        (tile.global_index, tile.sample_top, tile.sample_left) for tile in plan.tiles
     ] == [
         (index, top, left)
         for index, (top, left) in enumerate(
-            [
-                (top, left)
-                for top in (0, 200, 400, 600)
-                for left in (0, 288, 576, 864)
-            ]
+            [(top, left) for top in (0, 200, 400, 600) for left in (0, 288, 576, 864)]
         )
     ]
     assert (plan.blend_extent_height, plan.blend_extent_width) == (5, 9)
     assert (plan.row_limit_height, plan.row_limit_width) == (25, 36)
 
 
-@pytest.mark.parametrize(
-    ("world_size", "expected"), [(2, [8, 8]), (4, [4, 4, 4, 4])]
-)
+@pytest.mark.parametrize(("world_size", "expected"), [(2, [8, 8]), (4, [4, 4, 4, 4])])
 def test_encode_tiles_use_round_robin_ownership(world_size, expected):
     plan = make_formal_encode_plan()
 
@@ -87,9 +80,7 @@ def test_encode_plan_keeps_partial_edge_tiles_in_row_major_order():
 
     assert (plan.num_rows, plan.num_columns) == (3, 3)
     assert [(tile.sample_top, tile.sample_left) for tile in plan.tiles] == [
-        (top, left)
-        for top in (0, 200, 400)
-        for left in (0, 288, 576)
+        (top, left) for top in (0, 200, 400) for left in (0, 288, 576)
     ]
 
 
@@ -124,9 +115,7 @@ def test_encode_one_tile_preserves_temporal_cache_and_quant_conv():
         encoder=encoder,
         quant_conv=quant_conv,
     )
-    x = torch.arange(9, dtype=torch.float32).view(1, 1, 9, 1, 1).expand(
-        1, 3, 9, 6, 8
-    )
+    x = torch.arange(9, dtype=torch.float32).view(1, 1, 9, 1, 1).expand(1, 3, 9, 6, 8)
     tile = CogVideoXSpatialEncodeTile(0, 0, 0, 0, 0)
 
     encoded = _encode_one_spatial_tile(vae, x, tile)
@@ -141,9 +130,7 @@ def make_two_by_two_encode_plan() -> CogVideoXSpatialEncodeTilePlan:
     return CogVideoXSpatialEncodeTilePlan(
         tiles=tuple(
             CogVideoXSpatialEncodeTile(index, row, column, row, column)
-            for index, (row, column) in enumerate(
-                ((0, 0), (0, 1), (1, 0), (1, 1))
-            )
+            for index, (row, column) in enumerate(((0, 0), (0, 1), (1, 0), (1, 1)))
         ),
         num_rows=2,
         num_columns=2,
@@ -209,12 +196,8 @@ def test_shared_transport_preserves_decode_wrapper_bytes():
         "payload_device": torch.device("cpu"),
     }
 
-    shared = _all_gather_spatial_tiles(
-        LocalGatherGroup(), local_tiles, 2, **kwargs
-    )
-    decoded = _all_gather_decoded_tiles(
-        LocalGatherGroup(), local_tiles, 2, **kwargs
-    )
+    shared = _all_gather_spatial_tiles(LocalGatherGroup(), local_tiles, 2, **kwargs)
+    decoded = _all_gather_decoded_tiles(LocalGatherGroup(), local_tiles, 2, **kwargs)
 
     assert tuple(shared) == tuple(decoded) == (0, 1)
     for index in shared:
@@ -275,9 +258,7 @@ class BroadcastFakeGroup(FakeGroup):
 def test_encode_descriptor_rejects_rank_mismatch():
     plan = make_formal_encode_plan()
     x = torch.zeros(1, 3, 9, 720, 960)
-    local = cogvideox._build_spatial_encode_descriptor(
-        x, plan, FakeGroup(2)
-    )
+    local = cogvideox._build_spatial_encode_descriptor(x, plan, FakeGroup(2))
     mismatch = local.clone()
     mismatch[4] += 1
     group = FakeGroup(2, gathered=torch.stack((local, mismatch)))

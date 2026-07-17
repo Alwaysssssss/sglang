@@ -10,6 +10,7 @@ from diffusers.models.attention_processor import CogVideoXAttnProcessor2_0
 from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXBlock
 from torch import nn
 
+from sglang.multimodal_gen.runtime.distributed import cleanup_dist_env_and_memory
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     backend_name_to_enum,
 )
@@ -19,32 +20,30 @@ from sglang.multimodal_gen.runtime.models.dits.cogvideox_attention_backend impor
     CogVideoXSDPAAttnProcessor,
     CogVideoXSPAttnProcessor,
     _get_cogvideox_sp_usp_attention,
+    _prepare_cogvideox_qkv,
     configure_cogvideox_usp_collectives,
     enable_cogvideox_qk_norm_fusion,
     enable_cogvideox_qk_norm_rope_fusion,
-    _prepare_cogvideox_qkv,
-    inspect_cogvideox_qk_norm_fusion,
-    inspect_cogvideox_qk_norm_rope_fusion,
     enable_cogvideox_qkv_fusion,
     inspect_cogvideox_attention_backend,
+    inspect_cogvideox_qk_norm_fusion,
+    inspect_cogvideox_qk_norm_rope_fusion,
     inspect_cogvideox_qkv_fusion,
     inspect_cogvideox_usp_collectives,
     normalize_cogvideox_attention_backend,
     set_cogvideox_attention_backend,
 )
-from sglang.multimodal_gen.runtime.distributed import cleanup_dist_env_and_memory
 from sglang.multimodal_gen.runtime.models.dits.cogvideox_operator_fusion import (
     CogVideoXModulationFusedBlock,
-    enable_cogvideox_modulation_fusion,
     inspect_cogvideox_modulation_fusion,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import VividVRPipeline
 from sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline import (
+    VividVRPipeline,
     _configure_vividvr_vae_spatial_tile_encode_parallel,
     _configure_vividvr_vae_spatial_tile_parallel,
     _maybe_torch_compile_module,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class _DummyCogVideoXAttentionModule(nn.Module):
@@ -209,9 +208,7 @@ class TestVividVRAttentionBackend(unittest.TestCase):
         )
 
         self.assertTrue(usp_cls.call_args.kwargs["use_packed_qkv_a2a"])
-        self.assertFalse(
-            usp_cls.call_args.kwargs["use_prefix_all_gather_into_tensor"]
-        )
+        self.assertFalse(usp_cls.call_args.kwargs["use_prefix_all_gather_into_tensor"])
         _get_cogvideox_sp_usp_attention.cache_clear()
 
     def test_configure_usp_collectives_only_updates_sp_processors(self):
@@ -555,9 +552,7 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             "sglang_merged_column_linear",
         )
         self.assertIsNone(inspect_cogvideox_qkv_fusion(controlnet))
-        self.assertEqual(
-            debug["qkv_fusion_transformer"], "sglang_merged_column_linear"
-        )
+        self.assertEqual(debug["qkv_fusion_transformer"], "sglang_merged_column_linear")
         self.assertIsNone(debug["qkv_fusion_controlnet"])
         self.assertEqual(debug["qkv_fusion_targets"], ["transformer"])
 
@@ -637,17 +632,13 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             inspect_cogvideox_qkv_fusion(controlnet),
             "sglang_merged_column_linear",
         )
-        self.assertEqual(
-            debug["qkv_fusion_transformer"], "sglang_merged_column_linear"
-        )
-        self.assertEqual(
-            debug["qkv_fusion_controlnet"], "sglang_merged_column_linear"
-        )
-        self.assertEqual(
-            debug["qkv_fusion_targets"], ["transformer", "controlnet"]
-        )
+        self.assertEqual(debug["qkv_fusion_transformer"], "sglang_merged_column_linear")
+        self.assertEqual(debug["qkv_fusion_controlnet"], "sglang_merged_column_linear")
+        self.assertEqual(debug["qkv_fusion_targets"], ["transformer", "controlnet"])
 
-    def test_vividvr_pipeline_initializes_single_process_parallel_env_for_qkv_fusion(self):
+    def test_vividvr_pipeline_initializes_single_process_parallel_env_for_qkv_fusion(
+        self,
+    ):
         pipeline = object.__new__(VividVRPipeline)
         transformer = _PipelineHookModule()
         pipeline.modules = {
@@ -687,7 +678,9 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             dist_timeout=3600,
         )
 
-    def test_vividvr_pipeline_applies_qk_norm_rope_fusion_to_requested_runtime_modules(self):
+    def test_vividvr_pipeline_applies_qk_norm_rope_fusion_to_requested_runtime_modules(
+        self,
+    ):
         pipeline = object.__new__(VividVRPipeline)
         transformer = _PipelineHookModule()
         controlnet = _PipelineHookModule()
@@ -731,17 +724,23 @@ class TestVividVRAttentionBackend(unittest.TestCase):
     def test_modulation_fused_block_matches_reference(self):
         torch.manual_seed(0)
         device = torch.device("cpu")
-        reference_block = CogVideoXBlock(
-            dim=128,
-            num_attention_heads=2,
-            attention_head_dim=64,
-            time_embed_dim=64,
-            attention_bias=True,
-            norm_elementwise_affine=True,
-        ).to(device=device).eval()
-        fused_block = CogVideoXModulationFusedBlock(deepcopy(reference_block)).to(
-            device=device
-        ).eval()
+        reference_block = (
+            CogVideoXBlock(
+                dim=128,
+                num_attention_heads=2,
+                attention_head_dim=64,
+                time_embed_dim=64,
+                attention_bias=True,
+                norm_elementwise_affine=True,
+            )
+            .to(device=device)
+            .eval()
+        )
+        fused_block = (
+            CogVideoXModulationFusedBlock(deepcopy(reference_block))
+            .to(device=device)
+            .eval()
+        )
         fused_block.norm1_modulation._forward_method = (
             fused_block.norm1_modulation.forward_native
         )
@@ -770,7 +769,9 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             actual_encoder, expected_encoder, rtol=1e-4, atol=1e-5
         )
 
-    def test_vividvr_pipeline_applies_modulation_fusion_to_requested_runtime_modules(self):
+    def test_vividvr_pipeline_applies_modulation_fusion_to_requested_runtime_modules(
+        self,
+    ):
         pipeline = object.__new__(VividVRPipeline)
         transformer = _DummyCogVideoXBlockModule()
         controlnet = _DummyCogVideoXBlockModule()
@@ -824,9 +825,7 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             self.assertIs(compiled_module, module)
             self.assertTrue(getattr(module, "_sglang_torch_compile_enabled"))
             self.assertEqual(len(module.compile_invocations), 1)
-            self.assertEqual(
-                module.compile_invocations[0]["mode"], "reduce-overhead"
-            )
+            self.assertEqual(module.compile_invocations[0]["mode"], "reduce-overhead")
             self.assertIs(module.compile_invocations[0]["dynamic"], False)
 
             compiled_again = _maybe_torch_compile_module(
@@ -842,11 +841,15 @@ class TestVividVRAttentionBackend(unittest.TestCase):
             else:
                 environ["SGLANG_TORCH_COMPILE_MODE"] = original_mode
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required for flash attention parity")
+    @unittest.skipIf(
+        not torch.cuda.is_available(), "CUDA is required for flash attention parity"
+    )
     def test_flash_attention_processor_matches_native(self):
         device = torch.device("cuda:0")
         dtype = torch.bfloat16
-        attn = _DummyCogVideoXAttentionModule().attn.to(device=device, dtype=dtype).eval()
+        attn = (
+            _DummyCogVideoXAttentionModule().attn.to(device=device, dtype=dtype).eval()
+        )
 
         hidden_states = torch.randn(1, 8, 128, device=device, dtype=dtype)
         encoder_hidden_states = torch.randn(1, 4, 128, device=device, dtype=dtype)

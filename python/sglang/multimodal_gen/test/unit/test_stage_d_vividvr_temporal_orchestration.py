@@ -296,7 +296,9 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             }
 
         pipeline = object.__new__(VividVRPipeline)
-        pipeline.input_validation_stage = lambda current_batch, _server_args: current_batch
+        pipeline.input_validation_stage = (
+            lambda current_batch, _server_args: current_batch
+        )
         pipeline.prompt_preparation_stage = _prompt_stage
         pipeline._attach_runtime_acceleration_debug = lambda _batch, _server_args: None
         pipeline.condition_encoding_stage = SimpleNamespace(
@@ -381,32 +383,42 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             "fps": 24,
         }
 
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.get_local_torch_device",
-            return_value=torch.device("cpu"),
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_window_plan",
-            return_value=window_plan,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_latent_merge_plan",
-            return_value=SimpleNamespace(),
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.merge_vividvr_temporal_latent_states"
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.decoded_video_to_frame_tensor",
-            side_effect=lambda video, **_kwargs: video,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.trim_vividvr_temporal_output_clip",
-            side_effect=lambda video, _clip_spec: video,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.stitch_vividvr_temporal_output_clips",
-            side_effect=lambda clips: clips[0],
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.apply_reference_color_fix",
-            side_effect=lambda video, _reference: video,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.run_optional_postprocess_modules",
-            side_effect=lambda video, **_kwargs: video,
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_window_plan",
+                return_value=window_plan,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_latent_merge_plan",
+                return_value=SimpleNamespace(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.merge_vividvr_temporal_latent_states"
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.decoded_video_to_frame_tensor",
+                side_effect=lambda video, **_kwargs: video,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.trim_vividvr_temporal_output_clip",
+                side_effect=lambda video, _clip_spec: video,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.stitch_vividvr_temporal_output_clips",
+                side_effect=lambda clips: clips[0],
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.apply_reference_color_fix",
+                side_effect=lambda video, _reference: video,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.run_optional_postprocess_modules",
+                side_effect=lambda video, **_kwargs: video,
+            ),
         ):
             result = pipeline._forward_temporal_windowed(
                 batch,
@@ -416,8 +428,12 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
 
         self.assertIs(result, batch)
         self.assertEqual(len(encoded_prompt_calls), 2)
-        self.assertTrue(all(prompt.startswith("clip 0 ") for prompt in encoded_prompt_calls[0]))
-        self.assertTrue(all(prompt.startswith("clip 1 ") for prompt in encoded_prompt_calls[1]))
+        self.assertTrue(
+            all(prompt.startswith("clip 0 ") for prompt in encoded_prompt_calls[0])
+        )
+        self.assertTrue(
+            all(prompt.startswith("clip 1 ") for prompt in encoded_prompt_calls[1])
+        )
         self.assertEqual([len(prompts) for prompts in encoded_prompt_calls], [2, 2])
         self.assertEqual(
             batch.extra["vividvr_debug"]["clip_caption_texts"],
@@ -600,12 +616,15 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             "sglang.multimodal_gen.runtime.pipelines_core.stages."
             "model_specific_stages.vividvr"
         )
-        with patch(
-            f"{module}.decoded_video_to_frame_tensor",
-            return_value=torch.zeros(5, 3, 2, 2),
-        ), patch(
-            f"{module}.trim_vividvr_temporal_output_clip",
-            side_effect=lambda video, _spec: video,
+        with (
+            patch(
+                f"{module}.decoded_video_to_frame_tensor",
+                return_value=torch.zeros(5, 3, 2, 2),
+            ),
+            patch(
+                f"{module}.trim_vividvr_temporal_output_clip",
+                side_effect=lambda video, _spec: video,
+            ),
         ):
             stage.forward(batch, SimpleNamespace())
 
@@ -617,9 +636,7 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         self.assertAlmostEqual(debug["vae_decode_seconds"], 2.5)
         self.assertEqual(len(debug["vae_sp_clips"]), 2)
         self.assertEqual(
-            len(
-                batch.extra["vividvr_long_video_runtime"]["trimmed_clips"]
-            ),
+            len(batch.extra["vividvr_long_video_runtime"]["trimmed_clips"]),
             2,
         )
 
@@ -760,7 +777,9 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             enabled=True,
             allow_fallback=True,
             debug=debug,
-            processor=lambda *_args: (_ for _ in ()).throw(RuntimeError("postprocess boom")),
+            processor=lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("postprocess boom")
+            ),
         )
 
         self.assertTrue(torch.equal(result, output_video))
@@ -780,7 +799,9 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
                 enabled=True,
                 allow_fallback=False,
                 debug={},
-                processor=lambda *_args: (_ for _ in ()).throw(RuntimeError("postprocess boom")),
+                processor=lambda *_args: (_ for _ in ()).throw(
+                    RuntimeError("postprocess boom")
+                ),
             )
 
     def test_decoded_video_to_frame_tensor_matches_reference_processor_path(self):
@@ -820,13 +841,16 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
         pipeline = object.__new__(VividVRPipeline)
         fake_video_info = {"original_num_frames": 121}
 
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.os.stat",
-            return_value=SimpleNamespace(st_mtime_ns=123, st_size=456),
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.load_control_video",
-            return_value=fake_video_info,
-        ) as mock_load_control_video:
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.os.stat",
+                return_value=SimpleNamespace(st_mtime_ns=123, st_size=456),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.load_control_video",
+                return_value=fake_video_info,
+            ) as mock_load_control_video,
+        ):
             first = pipeline._resolve_input_video_info("/tmp/control.mp4", upscale=1.0)
             second = pipeline._resolve_input_video_info("/tmp/control.mp4", upscale=1.0)
 
@@ -909,7 +933,9 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
 
         dummy_denoising_stage = _DummyDenoisingStage()
         pipeline = object.__new__(VividVRPipeline)
-        pipeline.input_validation_stage = lambda current_batch, _server_args: current_batch
+        pipeline.input_validation_stage = (
+            lambda current_batch, _server_args: current_batch
+        )
         pipeline.prompt_preparation_stage = _prompt_stage
         pipeline._attach_runtime_acceleration_debug = lambda _batch, _server_args: None
         pipeline.condition_encoding_stage = SimpleNamespace(
@@ -981,32 +1007,42 @@ class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
             "fps": 24,
         }
 
-        with patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.get_local_torch_device",
-            return_value=torch.device("cpu"),
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_window_plan",
-            return_value=window_plan,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_latent_merge_plan",
-            return_value=SimpleNamespace(),
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.merge_vividvr_temporal_latent_states"
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.decoded_video_to_frame_tensor",
-            side_effect=lambda video, **_kwargs: video,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.trim_vividvr_temporal_output_clip",
-            side_effect=lambda video, _clip_spec: video,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.stitch_vividvr_temporal_output_clips",
-            side_effect=lambda clips: clips[0],
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.apply_reference_color_fix",
-            side_effect=lambda video, _reference: video,
-        ), patch(
-            "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.run_optional_postprocess_modules",
-            side_effect=lambda video, **_kwargs: video,
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_window_plan",
+                return_value=window_plan,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.build_vividvr_temporal_latent_merge_plan",
+                return_value=SimpleNamespace(),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.merge_vividvr_temporal_latent_states"
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.decoded_video_to_frame_tensor",
+                side_effect=lambda video, **_kwargs: video,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.trim_vividvr_temporal_output_clip",
+                side_effect=lambda video, _clip_spec: video,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.stitch_vividvr_temporal_output_clips",
+                side_effect=lambda clips: clips[0],
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.apply_reference_color_fix",
+                side_effect=lambda video, _reference: video,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines.vividvr_pipeline.run_optional_postprocess_modules",
+                side_effect=lambda video, **_kwargs: video,
+            ),
         ):
             result = pipeline._forward_temporal_windowed(
                 batch,

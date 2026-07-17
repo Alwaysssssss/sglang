@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
-
 REPO_ROOT = Path("/home/zhiheng/sglang")
 MODULATION_FUSION_IMPL = "sglang_modulation_fused_ops"
 
@@ -92,9 +91,7 @@ class BenchmarkConfig:
     python_executable: Path = REPO_ROOT / ".venv/bin/python"
     model_path: Path = Path("/home/zhiheng/ckpts/CogVideoX1.5-5B")
     vividvr_path: Path = Path("/home/zhiheng/ckpts/Vivid-VR")
-    input_video: Path = Path(
-        "/home/zhiheng/input/test_video_long_960x720_130f.mp4"
-    )
+    input_video: Path = Path("/home/zhiheng/input/test_video_long_960x720_130f.mp4")
     caption_file: Path = Path(
         "/home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/"
         "quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt"
@@ -176,14 +173,14 @@ def _unsupported(
 
 
 SCHEMES: dict[str, Scheme] = {
-    "R0": _scheme("R0", "单卡 SDPA eager", backend="sdpa"),
-    "R1": _scheme("R1", "单卡 FA eager", controls=("R0",)),
+    "R0": _scheme("R0", "Single-GPU SDPA eager", backend="sdpa"),
+    "R1": _scheme("R1", "Single-GPU FA eager", controls=("R0",)),
     "R2": _scheme(
-        "R2", "单卡 FA + torch.compile", compile_enabled=True, controls=("R1",)
+        "R2", "Single-GPU FA + torch.compile", compile_enabled=True, controls=("R1",)
     ),
     "R3": _scheme(
         "R3",
-        "双卡 SP2 + FA-SP + torch.compile",
+        "Dual-GPU SP2 + FA-SP + torch.compile",
         gpu_count=2,
         parallel_mode="sp",
         sp_degree=2,
@@ -192,7 +189,7 @@ SCHEMES: dict[str, Scheme] = {
     ),
     "R4": _scheme(
         "R4",
-        "四卡 SP4 + FA-SP + torch.compile",
+        "Four-GPU SP4 + FA-SP + torch.compile",
         gpu_count=4,
         parallel_mode="sp",
         sp_degree=4,
@@ -201,7 +198,7 @@ SCHEMES: dict[str, Scheme] = {
     ),
     "R5": _scheme(
         "R5",
-        "四卡 CFG2×SP2 + FA-SP + torch.compile",
+        "Four-GPU CFG2xSP2 + FA-SP + torch.compile",
         gpu_count=4,
         parallel_mode="cfg_sp",
         sp_degree=2,
@@ -210,7 +207,7 @@ SCHEMES: dict[str, Scheme] = {
     ),
     "R6": _scheme(
         "R6",
-        "单卡 FA + torch.compile + modulation fusion",
+        "Single-GPU FA + torch.compile + modulation fusion",
         compile_enabled=True,
         modulation_fusion=True,
         controls=("R2",),
@@ -230,14 +227,14 @@ SCHEMES: dict[str, Scheme] = {
     ),
     "R9": _unsupported(
         "R9",
-        "通用量化",
+        "Generic quantization",
         "Quantization loader plumbing exists, but no verified VividVR weight or "
         "CogVideoX linear quantization path is available.",
         controls=("R2",),
     ),
     "R99": _scheme(
         "R99",
-        "双卡全量已实现加速",
+        "Dual-GPU all implemented accelerations",
         gpu_count=2,
         parallel_mode="sp",
         sp_degree=2,
@@ -247,7 +244,7 @@ SCHEMES: dict[str, Scheme] = {
     ),
     "R100": _scheme(
         "R100",
-        "四卡全量已实现加速",
+        "Four-GPU all implemented accelerations",
         gpu_count=4,
         parallel_mode="cfg_sp",
         sp_degree=2,
@@ -282,7 +279,7 @@ VAE_SP_TREATMENTS: dict[str, Scheme] = {
     ),
     "R101_VAE_SP4": _scheme(
         "R101_VAE_SP4",
-        "四卡 SP4 + fusion + CogVideoX VAE spatial tile parallel",
+        "Four-GPU SP4 + fusion + CogVideoX VAE spatial tile parallel",
         gpu_count=4,
         parallel_mode="sp",
         sp_degree=4,
@@ -439,7 +436,9 @@ def validate_effective_config(
     scheme: Scheme, perf: Mapping[str, Any]
 ) -> dict[str, Any]:
     if not scheme.executable:
-        raise BenchmarkDataError(f"cannot validate unsupported scheme {scheme.scheme_id}")
+        raise BenchmarkDataError(
+            f"cannot validate unsupported scheme {scheme.scheme_id}"
+        )
     debug = perf.get("meta", {}).get("vividvr_debug", {})
     if not isinstance(debug, Mapping):
         raise BenchmarkDataError("meta.vividvr_debug must be an object")
@@ -539,9 +538,7 @@ def validate_effective_config(
             isinstance(vae_local_counts, list)
             and len(vae_local_counts) == scheme.sp_degree
             and all(
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value >= 0
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
                 for value in vae_local_counts
             )
         )
@@ -609,9 +606,7 @@ def validate_effective_config(
             isinstance(encode_local_counts, list)
             and len(encode_local_counts) == scheme.sp_degree
             and all(
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value >= 0
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
                 for value in encode_local_counts
             )
         )
@@ -625,10 +620,7 @@ def validate_effective_config(
                 "VAE encode SP local tile counts must be a non-negative integer "
                 f"list of length {scheme.sp_degree}, observed {encode_local_counts!r}"
             )
-        elif (
-            not valid_encode_total
-            or sum(encode_local_counts) != encode_total_tiles
-        ):
+        elif not valid_encode_total or sum(encode_local_counts) != encode_total_tiles:
             mismatches.append(
                 "VAE encode SP local tile counts must sum to total tiles, "
                 f"observed counts={encode_local_counts!r}, "
@@ -689,9 +681,7 @@ def validate_effective_config(
                 "vae_sp_world_size": debug["vae_sp_world_size"],
                 "vae_sp_group_type": debug["vae_sp_group_type"],
                 "vae_total_tiles": debug["vae_total_tiles"],
-                "vae_local_tiles_per_rank": list(
-                    debug["vae_local_tiles_per_rank"]
-                ),
+                "vae_local_tiles_per_rank": list(debug["vae_local_tiles_per_rank"]),
                 "vae_tile_decode_seconds": debug["vae_tile_decode_seconds"],
                 "vae_tile_gather_seconds": debug["vae_tile_gather_seconds"],
                 "vae_tile_merge_seconds": debug["vae_tile_merge_seconds"],
@@ -703,9 +693,7 @@ def validate_effective_config(
             {
                 "vae_encode_sp_requested": debug["vae_encode_sp_requested"],
                 "vae_encode_sp_effective": debug["vae_encode_sp_effective"],
-                "vae_encode_sp_fallback_reason": debug[
-                    "vae_encode_sp_fallback_reason"
-                ],
+                "vae_encode_sp_fallback_reason": debug["vae_encode_sp_fallback_reason"],
                 "vae_encode_sp_world_size": debug["vae_encode_sp_world_size"],
                 "vae_encode_sp_group_type": debug["vae_encode_sp_group_type"],
                 "vae_encode_total_tiles": debug["vae_encode_total_tiles"],
@@ -718,9 +706,7 @@ def validate_effective_config(
                 "vae_encode_tile_gather_seconds": debug[
                     "vae_encode_tile_gather_seconds"
                 ],
-                "vae_encode_tile_merge_seconds": debug[
-                    "vae_encode_tile_merge_seconds"
-                ],
+                "vae_encode_tile_merge_seconds": debug["vae_encode_tile_merge_seconds"],
                 "vae_encode_seconds": debug["vae_encode_seconds"],
                 "vae_encode_sp_clips": [
                     dict(clip) for clip in debug["vae_encode_sp_clips"]
@@ -806,9 +792,7 @@ def compute_derived_metrics(
     }
 
 
-def _historical_number(
-    payload: Mapping[str, Any], key: str, *, context: str
-) -> float:
+def _historical_number(payload: Mapping[str, Any], key: str, *, context: str) -> float:
     value = payload.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise BenchmarkDataError(f"{context}.{key} must be numeric, got {value!r}")
@@ -958,9 +942,7 @@ def load_historical_controls(
     config: BenchmarkConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not scheme.vae_sp:
-        raise BenchmarkConfigError(
-            f"{scheme.scheme_id} is not a VAE SP treatment"
-        )
+        raise BenchmarkConfigError(f"{scheme.scheme_id} is not a VAE SP treatment")
     if not control_batch_dir.is_dir():
         raise BenchmarkConfigError(
             f"control batch directory does not exist: {control_batch_dir}"
@@ -1067,9 +1049,8 @@ def verify_historical_controls_unchanged(
             raise BenchmarkDataError(
                 f"historical control changed: {control_id} is unavailable: {error}"
             ) from error
-        if (
-            current_sha256 != snapshot.get("sha256")
-            or current_mtime_ns != snapshot.get("mtime_ns")
+        if current_sha256 != snapshot.get("sha256") or current_mtime_ns != snapshot.get(
+            "mtime_ns"
         ):
             raise BenchmarkDataError(
                 f"historical control changed: {control_id} at {path}"
@@ -1082,9 +1063,7 @@ def _historical_controls_for_config(
     if not scheme.vae_sp:
         return {}
     if config.control_batch_dir is None:
-        raise BenchmarkConfigError(
-            f"{scheme.scheme_id} requires --control-batch-dir"
-        )
+        raise BenchmarkConfigError(f"{scheme.scheme_id} requires --control-batch-dir")
     return load_historical_controls(config.control_batch_dir, scheme, config)
 
 
@@ -1233,9 +1212,7 @@ def compute_vae_sp_derived_metrics(
         "treatment_gpu_seconds": scheme.gpu_count * treatment_total,
         "control_record_path": control.get("_control_record_path"),
         "control_batch_id": control.get("batch_id"),
-        "control_quality_passed": (
-            control_quality.get("pass_compare") is True
-        ),
+        "control_quality_passed": (control_quality.get("pass_compare") is True),
         "ssim_mean_delta": treatment_mean - control_mean,
         "ssim_min_delta": treatment_min - control_min,
         "failed_frame_ratio_delta": treatment_failed - control_failed,
@@ -1313,15 +1290,9 @@ def compute_vae_encode_sp_derived_metrics(
         )
         return treatment_value, control_value
 
-    treatment_prep, control_prep = stage_pair(
-        "VividVRLongClipPreparationStage"
-    )
-    treatment_denoise, control_denoise = stage_pair(
-        "VividVRMultiClipDenoisingStage"
-    )
-    treatment_decode, control_decode = stage_pair(
-        "VividVRMultiClipDecodeTrimStage"
-    )
+    treatment_prep, control_prep = stage_pair("VividVRLongClipPreparationStage")
+    treatment_denoise, control_denoise = stage_pair("VividVRMultiClipDenoisingStage")
+    treatment_decode, control_decode = stage_pair("VividVRMultiClipDecodeTrimStage")
     required_prep_speedup = 2.5 if scheme.sp_degree == 4 else 1.5
     preparation_speedup = control_prep / treatment_prep
     denoise_regression_ratio = treatment_denoise / control_denoise - 1.0
@@ -1678,8 +1649,7 @@ def _sample_gpu_memory_with_nvidia_smi(
     )
     if completed.returncode != 0:
         raise BenchmarkDataError(
-            "nvidia-smi memory sampling failed: "
-            f"{(completed.stderr or '').strip()}"
+            "nvidia-smi memory sampling failed: " f"{(completed.stderr or '').strip()}"
         )
     selected = set(gpu_ids)
     result: dict[int, float] = {}
@@ -1952,7 +1922,9 @@ def _gpu_processes(
             uuid_to_index[fields[1]] = int(fields[0])
     missing = set(gpu_ids) - set(uuid_to_index.values())
     if missing:
-        raise BenchmarkConfigError(f"configured GPU IDs do not exist: {sorted(missing)}")
+        raise BenchmarkConfigError(
+            f"configured GPU IDs do not exist: {sorted(missing)}"
+        )
 
     process_query = command_runner(
         [
@@ -2025,14 +1997,12 @@ def run_preflight(
     command_runner: CommandRunner = _run_command,
     which: Callable[[str], str | None] = shutil.which,
     port_checker: Callable[[str, int], bool] = _port_is_available,
-    gpu_process_checker: Callable[
-        [Sequence[int]], Mapping[int, Sequence[Mapping[str, Any]]]
-    ]
-    | None = None,
-    gpu_utilization_checker: Callable[
-        [Sequence[int]], Mapping[int, float]
-    ]
-    | None = None,
+    gpu_process_checker: (
+        Callable[[Sequence[int]], Mapping[int, Sequence[Mapping[str, Any]]]] | None
+    ) = None,
+    gpu_utilization_checker: (
+        Callable[[Sequence[int]], Mapping[int, float]] | None
+    ) = None,
 ) -> dict[str, Any]:
     required_paths = {
         "python_executable": config.python_executable,
@@ -2102,7 +2072,9 @@ def run_preflight(
             if processes
         )
         if details:
-            raise BenchmarkConfigError(f"selected GPUs have active processes: {details}")
+            raise BenchmarkConfigError(
+                f"selected GPUs have active processes: {details}"
+            )
     if gpu_processes:
         utilization_checker = gpu_utilization_checker or (
             lambda gpu_ids: _gpu_utilization(gpu_ids, command_runner)
@@ -2152,9 +2124,7 @@ def compute_config_fingerprint(config: BenchmarkConfig, scheme: Scheme) -> str:
         key: (
             str(value)
             if isinstance(value, Path)
-            else list(value)
-            if isinstance(value, tuple)
-            else value
+            else list(value) if isinstance(value, tuple) else value
         )
         for key, value in config_payload.items()
     }
@@ -2272,9 +2242,7 @@ class BenchmarkRunner:
         role: RunRole,
         fingerprint: str,
     ) -> dict[str, Any]:
-        stamped = _complete_executable_record(
-            record, scheme, self.config, role=role
-        )
+        stamped = _complete_executable_record(record, scheme, self.config, role=role)
         stamped.setdefault("schema_version", 1)
         stamped["batch_id"] = self.batch_id
         stamped["recorded_at"] = datetime.now(timezone.utc).isoformat()
@@ -2363,9 +2331,7 @@ class BenchmarkRunner:
                     formal_records[scheme.scheme_id] = formal
                     summary["schemes"][scheme.scheme_id] = {
                         "status": "resumed",
-                        "formal_record": str(
-                            self._record_path(scheme, RunRole.FORMAL)
-                        ),
+                        "formal_record": str(self._record_path(scheme, RunRole.FORMAL)),
                     }
                     self._write_summary(summary)
                     continue
@@ -2399,9 +2365,7 @@ class BenchmarkRunner:
                         RunRole.FORMAL,
                         fingerprint,
                     )
-                    atomic_write_json(
-                        self._record_path(scheme, RunRole.FORMAL), failed
-                    )
+                    atomic_write_json(self._record_path(scheme, RunRole.FORMAL), failed)
                     summary["schemes"][scheme.scheme_id] = {
                         "status": "failed",
                         "failure_phase": "service_start",
@@ -2531,9 +2495,7 @@ class BenchmarkRunner:
         return summary
 
 
-def _merge_environment_paths(
-    preferred: Sequence[Path], existing: str | None
-) -> str:
+def _merge_environment_paths(preferred: Sequence[Path], existing: str | None) -> str:
     values = [str(path) for path in preferred]
     if existing:
         values.extend(value for value in existing.split(os.pathsep) if value)
@@ -2920,7 +2882,9 @@ def _load_json_object(path: Path, description: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise BenchmarkDataError(f"cannot read {description} {path}: {error}") from error
+        raise BenchmarkDataError(
+            f"cannot read {description} {path}: {error}"
+        ) from error
     if not isinstance(value, dict):
         raise BenchmarkDataError(f"{description} must contain a JSON object: {path}")
     return value
@@ -3160,9 +3124,7 @@ class FlowCutRequestExecutor:
                 "temporal_clip_count": perf_summary.temporal_clip_count,
                 "inference_step_count": perf_summary.inference_step_count,
                 "mean_step_seconds": perf_summary.mean_step_seconds,
-                "steady_step_median_seconds": (
-                    perf_summary.steady_step_median_seconds
-                ),
+                "steady_step_median_seconds": (perf_summary.steady_step_median_seconds),
                 "sp_communication_seconds": None,
                 "sp_communication_reason": "not_profiled",
                 "cfg_communication_seconds": None,
@@ -3177,9 +3139,7 @@ class FlowCutRequestExecutor:
             "artifacts": {
                 "perf_json": str(perf_path),
                 "result_video": str(downloaded_path),
-                "compare_json": (
-                    str(compare_path) if role is RunRole.FORMAL else None
-                ),
+                "compare_json": (str(compare_path) if role is RunRole.FORMAL else None),
                 "service_log": str(
                     self.config.output_root
                     / batch_id
@@ -3193,9 +3153,7 @@ class FlowCutRequestExecutor:
                 "model_path": str(self.config.model_path),
                 "vividvr_path": str(self.config.vividvr_path),
                 "service_command": build_service_command(scheme, self.config),
-                "service_environment": build_service_environment(
-                    scheme, self.config
-                ),
+                "service_environment": build_service_environment(scheme, self.config),
                 "config_fingerprint": fingerprint,
                 "request_payload": payload,
             },
@@ -3327,9 +3285,7 @@ def build_dry_run_report(
             {
                 "scheme": _scheme_payload(scheme),
                 "service_command": (
-                    build_service_command(scheme, config)
-                    if scheme.executable
-                    else None
+                    build_service_command(scheme, config) if scheme.executable else None
                 ),
                 "service_environment": (
                     build_service_environment(scheme, config)
@@ -3340,9 +3296,7 @@ def build_dry_run_report(
                 "requests": (
                     [RunRole.WARMUP.value, RunRole.FORMAL.value]
                     if scheme.executable and scheme.compile_enabled
-                    else [RunRole.FORMAL.value]
-                    if scheme.executable
-                    else []
+                    else [RunRole.FORMAL.value] if scheme.executable else []
                 ),
             }
             for scheme in schemes
@@ -3358,9 +3312,13 @@ def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-id")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--model-path", type=Path, default=BenchmarkConfig.model_path)
-    parser.add_argument("--vividvr-path", type=Path, default=BenchmarkConfig.vividvr_path)
+    parser.add_argument(
+        "--vividvr-path", type=Path, default=BenchmarkConfig.vividvr_path
+    )
     parser.add_argument("--input-video", type=Path, default=BenchmarkConfig.input_video)
-    parser.add_argument("--caption-file", type=Path, default=BenchmarkConfig.caption_file)
+    parser.add_argument(
+        "--caption-file", type=Path, default=BenchmarkConfig.caption_file
+    )
     parser.add_argument(
         "--reference-video", type=Path, default=BenchmarkConfig.reference_video
     )
@@ -3415,7 +3373,9 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
     try:
         gpu_ids = tuple(int(item) for item in raw_gpu_ids if item)
     except ValueError as error:
-        raise BenchmarkConfigError("--gpu-ids must be comma-separated integers") from error
+        raise BenchmarkConfigError(
+            "--gpu-ids must be comma-separated integers"
+        ) from error
     if not gpu_ids or len(set(gpu_ids)) != len(gpu_ids):
         raise BenchmarkConfigError("--gpu-ids must contain unique GPU IDs")
     return BenchmarkConfig(
