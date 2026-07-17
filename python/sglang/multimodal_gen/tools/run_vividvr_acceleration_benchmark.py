@@ -327,10 +327,35 @@ VAE_ENCODE_SP_TREATMENTS: dict[str, Scheme] = {
         controls=("R101_VAE_SP4",),
     ),
 }
+R0_VAE_SP_TREATMENTS: dict[str, Scheme] = {
+    "R0_VAE_SP2": _scheme(
+        "R0_VAE_SP2",
+        "SP2 SDPA eager with VAE decode+encode spatial tile parallel",
+        gpu_count=2,
+        backend="sdpa",
+        parallel_mode="sp",
+        sp_degree=2,
+        vae_sp=True,
+        vae_encode_sp=True,
+        controls=("R0",),
+    ),
+    "R0_VAE_SP4": _scheme(
+        "R0_VAE_SP4",
+        "SP4 SDPA eager with VAE decode+encode spatial tile parallel",
+        gpu_count=4,
+        backend="sdpa",
+        parallel_mode="sp",
+        sp_degree=4,
+        vae_sp=True,
+        vae_encode_sp=True,
+        controls=("R0",),
+    ),
+}
 ALL_SCHEMES: dict[str, Scheme] = {
     **SCHEMES,
     **VAE_SP_TREATMENTS,
     **VAE_ENCODE_SP_TREATMENTS,
+    **R0_VAE_SP_TREATMENTS,
 }
 
 

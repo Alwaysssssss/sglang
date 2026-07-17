@@ -132,6 +132,36 @@ def test_vae_encode_sp_treatments_do_not_expand_default_run_all_matrix():
     assert r101.vae_encode_sp is True
 
 
+def test_r0_vae_sp_clean_treatments_are_isolated_and_have_no_extra_acceleration(
+    tmp_path: Path,
+):
+    treatments = benchmark_module.R0_VAE_SP_TREATMENTS
+    assert list(treatments) == ["R0_VAE_SP2", "R0_VAE_SP4"]
+    assert all(scheme_id not in SCHEMES for scheme_id in treatments)
+
+    for scheme_id, gpu_count in (("R0_VAE_SP2", 2), ("R0_VAE_SP4", 4)):
+        scheme = ALL_SCHEMES[scheme_id]
+        assert scheme.gpu_count == gpu_count
+        assert scheme.backend == "sdpa"
+        assert scheme.parallel_mode == "sp"
+        assert scheme.sp_degree == gpu_count
+        assert scheme.compile_enabled is False
+        assert scheme.modulation_fusion is False
+        assert scheme.cfg_parallel is False
+        assert scheme.vae_sp is True
+        assert scheme.vae_encode_sp is True
+        assert scheme.controls == ("R0",)
+        assert scheme.expected_effective_backend == "sdpa_sp"
+
+        command = build_service_command(scheme, make_config(tmp_path))
+        assert option_value(command, "--attention-backend") == "sdpa"
+        assert "--vae-sp" in command
+        assert "--vae-encode-sp" in command
+        assert "--enable-torch-compile" not in command
+        assert "--enable-cogvideox-modulation-fusion" not in command
+        assert "--enable-cfg-parallel" not in command
+
+
 @pytest.mark.parametrize(
     ("treatment_id", "control_id"),
     [
