@@ -815,8 +815,147 @@ def _historical_number(
     return float(value)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_positive_historical_number(
+    payload: Mapping[str, Any], key: str, *, context: str
+) -> float:
+    value = _historical_number(payload, key, context=context)
+    if value <= 0:
+        raise BenchmarkDataError(f"{context}.{key} must be positive, got {value!r}")
+    return value
+
+
+def _validate_encode_historical_control(
+    record: Mapping[str, Any],
+    *,
+    control_id: str,
+    config: BenchmarkConfig,
+) -> None:
+    expected = ALL_SCHEMES[control_id]
+    recorded_scheme = record.get("scheme")
+    if not isinstance(recorded_scheme, Mapping):
+        raise BenchmarkDataError(
+            f"historical control {control_id}.scheme must be an object"
+        )
+    expected_scheme = {
+        "scheme_id": control_id,
+        "gpu_count": expected.gpu_count,
+        "backend": expected.backend,
+        "parallel_mode": expected.parallel_mode,
+        "sp_degree": expected.sp_degree,
+        "compile_enabled": expected.compile_enabled,
+        "modulation_fusion": expected.modulation_fusion,
+        "vae_sp": True,
+    }
+    for key, value in expected_scheme.items():
+        if recorded_scheme.get(key) != value:
+            raise BenchmarkDataError(
+                f"historical control {control_id}.scheme.{key} expected "
+                f"{value!r}, got {recorded_scheme.get(key)!r}"
+            )
+    if bool(recorded_scheme.get("vae_encode_sp", False)):
+        raise BenchmarkDataError(
+            f"historical control {control_id} must not enable vae_encode_sp"
+        )
+
+    inputs = record.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise BenchmarkDataError(
+            f"historical control {control_id}.inputs must be an object"
+        )
+    expected_inputs: dict[str, Any] = {
+        "input_video": str(config.input_video.resolve()),
+        "caption_file": str(config.caption_file.resolve()),
+        "reference_video": str(config.reference_video.resolve()),
+        "num_frames": 130,
+        "temporal_process_frames": 121,
+        "inference_steps": 20,
+        "seed": 42,
+        "guidance_scale": 6.0,
+        "restoration_guidance_scale": -1.0,
+        "upscale": 1.0,
+        "dtype": "bfloat16",
+    }
+    for key, value in expected_inputs.items():
+        if inputs.get(key) != value:
+            raise BenchmarkDataError(
+                f"historical control {control_id}.inputs.{key} expected "
+                f"{value!r}, got {inputs.get(key)!r}"
+            )
+
+    runtime = record.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise BenchmarkDataError(
+            f"historical control {control_id}.runtime must be an object"
+        )
+    expected_runtime: dict[str, Any] = {
+        "requested_backend": expected.backend,
+        "effective_backend": expected.expected_effective_backend,
+        "parallel_mode": expected.parallel_mode,
+        "sp_world_size": expected.sp_degree,
+        "cfg_parallel_enabled": expected.cfg_parallel,
+        "torch_compile_applied": expected.compile_enabled,
+        "modulation_fusion_applied": expected.modulation_fusion,
+        "vae_sp_requested": True,
+        "vae_sp_effective": True,
+        "vae_sp_fallback_reason": "effective",
+        "vae_sp_world_size": expected.sp_degree,
+        "vae_sp_group_type": "sp",
+    }
+    for key, value in expected_runtime.items():
+        if runtime.get(key) != value:
+            raise BenchmarkDataError(
+                f"historical control {control_id}.runtime.{key} expected "
+                f"{value!r}, got {runtime.get(key)!r}"
+            )
+    if bool(runtime.get("vae_encode_sp_requested", False)) or bool(
+        runtime.get("vae_encode_sp_effective", False)
+    ):
+        raise BenchmarkDataError(
+            f"historical control {control_id} runtime must not enable VAE encode SP"
+        )
+
+    timings = record.get("timings")
+    if not isinstance(timings, Mapping):
+        raise BenchmarkDataError(
+            f"historical control {control_id}.timings must be an object"
+        )
+    _require_positive_historical_number(
+        timings, "total_runtime_seconds", context=f"{control_id}.timings"
+    )
+    _require_positive_historical_number(
+        timings,
+        "model_inference_runtime_seconds",
+        context=f"{control_id}.timings",
+    )
+    stages = timings.get("stage_seconds")
+    if not isinstance(stages, Mapping):
+        raise BenchmarkDataError(
+            f"historical control {control_id}.timings.stage_seconds must be an object"
+        )
+    for stage_name in (
+        "VividVRLongClipPreparationStage",
+        "VividVRMultiClipDenoisingStage",
+        "VividVRMultiClipDecodeTrimStage",
+    ):
+        _require_positive_historical_number(
+            stages,
+            stage_name,
+            context=f"{control_id}.timings.stage_seconds",
+        )
+
+
 def load_historical_controls(
-    control_batch_dir: Path, scheme: Scheme
+    control_batch_dir: Path,
+    scheme: Scheme,
+    config: BenchmarkConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not scheme.vae_sp:
         raise BenchmarkConfigError(
@@ -888,10 +1027,53 @@ def load_historical_controls(
         for key in ("ssim_mean", "ssim_min", "failed_frame_ratio"):
             _historical_number(quality, key, context=f"{control_id}.quality")
 
+        if scheme.vae_encode_sp:
+            _validate_encode_historical_control(
+                record,
+                control_id=control_id,
+                config=config or BenchmarkConfig(),
+            )
+
         copied = dict(record)
         copied["_control_record_path"] = str(path.resolve())
+        copied["_control_record_snapshot"] = {
+            "path": str(path.resolve()),
+            "sha256": _file_sha256(path),
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
         controls[control_id] = copied
     return controls
+
+
+def verify_historical_controls_unchanged(
+    controls: Mapping[str, Mapping[str, Any]],
+) -> None:
+    for control_id, control in controls.items():
+        snapshot = control.get("_control_record_snapshot")
+        if not isinstance(snapshot, Mapping):
+            raise BenchmarkDataError(
+                f"historical control {control_id} has no immutable snapshot"
+            )
+        path_value = snapshot.get("path")
+        if not isinstance(path_value, str) or not path_value:
+            raise BenchmarkDataError(
+                f"historical control {control_id} snapshot path is invalid"
+            )
+        path = Path(path_value)
+        try:
+            current_sha256 = _file_sha256(path)
+            current_mtime_ns = path.stat().st_mtime_ns
+        except OSError as error:
+            raise BenchmarkDataError(
+                f"historical control changed: {control_id} is unavailable: {error}"
+            ) from error
+        if (
+            current_sha256 != snapshot.get("sha256")
+            or current_mtime_ns != snapshot.get("mtime_ns")
+        ):
+            raise BenchmarkDataError(
+                f"historical control changed: {control_id} at {path}"
+            )
 
 
 def _historical_controls_for_config(
@@ -903,7 +1085,7 @@ def _historical_controls_for_config(
         raise BenchmarkConfigError(
             f"{scheme.scheme_id} requires --control-batch-dir"
         )
-    return load_historical_controls(config.control_batch_dir, scheme)
+    return load_historical_controls(config.control_batch_dir, scheme, config)
 
 
 def quality_not_worse_than_control(
@@ -1054,6 +1236,155 @@ def compute_vae_sp_derived_metrics(
         "control_quality_passed": (
             control_quality.get("pass_compare") is True
         ),
+        "ssim_mean_delta": treatment_mean - control_mean,
+        "ssim_min_delta": treatment_min - control_min,
+        "failed_frame_ratio_delta": treatment_failed - control_failed,
+        "quality_not_worse_than_control": quality_not_worse_than_control(
+            treatment, control
+        ),
+    }
+
+
+def compute_vae_encode_sp_derived_metrics(
+    scheme: Scheme,
+    treatment: Mapping[str, Any],
+    control: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not scheme.vae_encode_sp or len(scheme.controls) != 1:
+        raise BenchmarkConfigError(
+            f"{scheme.scheme_id} must declare exactly one VAE encode SP control"
+        )
+    control_id = scheme.controls[0]
+    expected_control = ALL_SCHEMES[control_id]
+    control_scheme = control.get("scheme")
+    if not isinstance(control_scheme, Mapping) or (
+        control_scheme.get("scheme_id") != control_id
+    ):
+        raise BenchmarkDataError(
+            f"control scheme expected {control_id}, observed {control_scheme!r}"
+        )
+
+    treatment_timings = treatment.get("timings")
+    control_timings = control.get("timings")
+    if not isinstance(treatment_timings, Mapping) or not isinstance(
+        control_timings, Mapping
+    ):
+        raise BenchmarkDataError("treatment and control timings must be objects")
+    treatment_stages = treatment_timings.get("stage_seconds")
+    control_stages = control_timings.get("stage_seconds")
+    if not isinstance(treatment_stages, Mapping) or not isinstance(
+        control_stages, Mapping
+    ):
+        raise BenchmarkDataError(
+            "treatment and control timings.stage_seconds must be objects"
+        )
+
+    treatment_total = _require_positive_historical_number(
+        treatment_timings,
+        "total_runtime_seconds",
+        context="treatment.timings",
+    )
+    control_total = _require_positive_historical_number(
+        control_timings,
+        "total_runtime_seconds",
+        context="control.timings",
+    )
+    treatment_model = _require_positive_historical_number(
+        treatment_timings,
+        "model_inference_runtime_seconds",
+        context="treatment.timings",
+    )
+    control_model = _require_positive_historical_number(
+        control_timings,
+        "model_inference_runtime_seconds",
+        context="control.timings",
+    )
+
+    def stage_pair(stage_name: str) -> tuple[float, float]:
+        treatment_value = _require_positive_historical_number(
+            treatment_stages,
+            stage_name,
+            context="treatment.timings.stage_seconds",
+        )
+        control_value = _require_positive_historical_number(
+            control_stages,
+            stage_name,
+            context="control.timings.stage_seconds",
+        )
+        return treatment_value, control_value
+
+    treatment_prep, control_prep = stage_pair(
+        "VividVRLongClipPreparationStage"
+    )
+    treatment_denoise, control_denoise = stage_pair(
+        "VividVRMultiClipDenoisingStage"
+    )
+    treatment_decode, control_decode = stage_pair(
+        "VividVRMultiClipDecodeTrimStage"
+    )
+    required_prep_speedup = 2.5 if scheme.sp_degree == 4 else 1.5
+    preparation_speedup = control_prep / treatment_prep
+    denoise_regression_ratio = treatment_denoise / control_denoise - 1.0
+    decode_regression_ratio = treatment_decode / control_decode - 1.0
+    preparation_gate = preparation_speedup >= required_prep_speedup
+    model_gate = treatment_model < control_model
+    tolerance = 1e-12
+    denoise_gate = denoise_regression_ratio <= 0.03 + tolerance
+    decode_gate = decode_regression_ratio <= 0.03 + tolerance
+    snapshot = control.get("_control_record_snapshot")
+    if not isinstance(snapshot, Mapping):
+        snapshot = {}
+
+    treatment_quality = treatment.get("quality")
+    control_quality = control.get("quality")
+    if not isinstance(treatment_quality, Mapping) or not isinstance(
+        control_quality, Mapping
+    ):
+        raise BenchmarkDataError("treatment and control quality must be objects")
+    treatment_mean = _historical_number(
+        treatment_quality, "ssim_mean", context="treatment.quality"
+    )
+    control_mean = _historical_number(
+        control_quality, "ssim_mean", context="control.quality"
+    )
+    treatment_min = _historical_number(
+        treatment_quality, "ssim_min", context="treatment.quality"
+    )
+    control_min = _historical_number(
+        control_quality, "ssim_min", context="control.quality"
+    )
+    treatment_failed = _historical_number(
+        treatment_quality,
+        "failed_frame_ratio",
+        context="treatment.quality",
+    )
+    control_failed = _historical_number(
+        control_quality,
+        "failed_frame_ratio",
+        context="control.quality",
+    )
+    return {
+        "control_scheme_id": control_id,
+        "long_clip_preparation_speedup": preparation_speedup,
+        "required_long_clip_preparation_speedup": required_prep_speedup,
+        "long_clip_preparation_gate": preparation_gate,
+        "model_inference_speedup": control_model / treatment_model,
+        "model_inference_improved": model_gate,
+        "total_runtime_speedup": control_total / treatment_total,
+        "denoise_regression_ratio": denoise_regression_ratio,
+        "denoise_regression_gate": denoise_gate,
+        "decode_trim_regression_ratio": decode_regression_ratio,
+        "decode_trim_regression_gate": decode_gate,
+        "performance_gates_passed": all(
+            (preparation_gate, model_gate, denoise_gate, decode_gate)
+        ),
+        "control_gpu_seconds": expected_control.gpu_count * control_total,
+        "treatment_gpu_seconds": scheme.gpu_count * treatment_total,
+        "control_record_path": snapshot.get("path"),
+        "control_record_sha256": snapshot.get("sha256"),
+        "control_record_mtime_ns": snapshot.get("mtime_ns"),
+        "control_batch_id": control.get("batch_id"),
+        "control_quality_passed": control_quality.get("pass_compare") is True,
         "ssim_mean_delta": treatment_mean - control_mean,
         "ssim_min_delta": treatment_min - control_min,
         "failed_frame_ratio_delta": treatment_failed - control_failed,
@@ -2048,9 +2379,11 @@ class BenchmarkRunner:
                 except Exception as error:
                     try:
                         self.lifecycle.stop_scheme(scheme)
+                        verify_historical_controls_unchanged(historical_controls)
                     except Exception as cleanup_failure:
                         raise BenchmarkCleanupError(
-                            "failed to clean up partially started service for "
+                            "failed to clean up or verify controls for partially "
+                            "started service for "
                             f"{scheme.scheme_id}: {cleanup_failure}"
                         ) from error
                     failed = self._stamp_record(
@@ -2077,6 +2410,7 @@ class BenchmarkRunner:
                     continue
 
                 skip_formal = False
+                control_verification_error: Exception | None = None
                 try:
                     if scheme.compile_enabled:
                         warmup = self._execute_request(
@@ -2099,7 +2433,21 @@ class BenchmarkRunner:
                         )
                         formal_records[scheme.scheme_id] = formal
                         scheme_status = str(formal.get("status", "failed"))
-                        if scheme.vae_sp and scheme_status in {
+                        if scheme.vae_encode_sp and scheme_status in {
+                            "succeeded",
+                            "quality_failed",
+                        }:
+                            control_id = scheme.controls[0]
+                            derived = compute_vae_encode_sp_derived_metrics(
+                                scheme,
+                                formal,
+                                historical_controls[control_id],
+                            )
+                            formal["derived"] = derived
+                            atomic_write_json(
+                                self._record_path(scheme, RunRole.FORMAL), formal
+                            )
+                        elif scheme.vae_sp and scheme_status in {
                             "succeeded",
                             "quality_failed",
                         }:
@@ -2138,8 +2486,14 @@ class BenchmarkRunner:
                         cleanup_error = BenchmarkCleanupError(
                             f"failed to clean up service for {scheme.scheme_id}: {error}"
                         )
+                    try:
+                        verify_historical_controls_unchanged(historical_controls)
+                    except Exception as error:
+                        control_verification_error = error
                 if cleanup_error is not None:
                     raise cleanup_error
+                if control_verification_error is not None:
+                    raise control_verification_error
         except Exception as error:
             if cleanup_error is None and isinstance(error, BenchmarkCleanupError):
                 cleanup_error = error
