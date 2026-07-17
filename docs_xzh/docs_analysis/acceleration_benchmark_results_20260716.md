@@ -97,6 +97,20 @@ Stage 横向总表的单位均为秒。列名与代码中的完整 Stage 类名�
 
 质量栏采用本轮人工验收结论：所有已执行视频结果均视为通过。该结论与正式 JSON 中更严格的 `pass_compare` 阈值判定不是同一口径；SSIM 差值保留用于量化比较。
 
+## VAE tiled encode SP Treatment（2026-07-17）
+
+以下三条是额外的 Treatment-only 实验，不改写上面的历史总体排行。每条 Control 都是对应拓扑的历史 **decode-only** 正式 record：R99_ENCODE_SP 对 R99_VAE_SP，R100_ENCODE_SP 对 R100_VAE_SP，R101_ENCODE_SP4 对 R101_VAE_SP4。Control 未重跑，前后 SHA-256 与 `mtime_ns` 一致。
+
+Model/Total 列写作 “treatment 秒数 / 相对 Control speedup”，Denoise 与 Decode/Trim 写作 “treatment 秒数 / 相对 Control 回归”。Bitwise gate 要求完整 moments 和等价 generator sampled latents 均为 `torch.equal`。
+
+| Treatment | GPU / topology | Long Clip Preparation（s） | Stage speedup | Model（s / speedup） | Total（s / speedup） | Denoise（s / 回归） | Decode/Trim（s / 回归） | GPU·秒 | SSIM mean / min / failed ratio | Bitwise gate | Performance gate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| R99_ENCODE_SP | 2 / SP2 | 42.176 | 1.4441× | 486.321 / 1.0334× | 491.181 / 1.0402× | 380.798 / -0.10% | 61.428 / +4.23% | 982.362 | 0.984562 / 0.976291 / 1.5385% | PASS | **FAIL** |
+| R100_ENCODE_SP | 4 / CFG2×SP2 | 47.257 | 1.5464× | 309.705 / 1.0797× | 310.903 / 1.0968× | 195.837 / -1.47% | 64.287 / +6.83% | 1243.610 | 0.984504 / 0.978161 / 1.5385% | PASS | **FAIL** |
+| R101_ENCODE_SP4 | 4 / SP4 | 28.748 | 2.2414× | 265.806 / 1.1248× | 270.743 / 1.1479× | 203.575 / +0.30% | 30.963 / +3.22% | 1082.971 | 0.984169 / 0.977092 / 1.5385% | PASS | **FAIL** |
+
+正式性能门槛由四项组成：Long Clip Preparation speedup（SP2/CFG2×SP2 至少 1.5×，SP4 至少 2.5×）、模型推理耗时改善、Denoise 回归不超过 3%、Decode/Trim 回归不超过 3%。R99 的 Long Clip 与 Decode/Trim 失败，R100 的 Decode/Trim 失败，R101 的 Long Clip 与 Decode/Trim 失败，所以本轮 encode SP 正式性能验收未通过，能力继续保持实验性和默认关闭。
+
 ## 最快方案
 
 | GPU 数量 | 最快方案 | 总耗时（s） | 模型推理耗时（s） | Denoise（s） | 相对 R0 模型加速比 |

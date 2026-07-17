@@ -725,3 +725,50 @@ export BASE_URL=http://192.168.1.20:31191
 - 其他机器不能把自己的本地路径直接传给服务
 - `callbackUrl` 必须是服务机器可访问的地址，远程调用时不要写 `127.0.0.1`
 - 如果结果只写到 `output_path`，文件会落在服务机器本地；远程侧可以再调用 `/v1/videos/${TASK_ID}/content` 下载
+
+## 5. 实验性 VAE tiled encode 并行
+
+该能力尚未通过 2026-07-17 的正式性能验收，因此保持默认关闭，不加入本文前面的任何默认直接运行或 `serve` 命令。两个开关相互独立：
+
+```text
+--vae-sp         仅控制 tiled decode
+--vae-encode-sp  仅控制 tiled encode，要求 VAE tiling 和已初始化 SP subgroup
+```
+
+以下片段用于显式实验，同时打开 encode 和 decode 并行；其余模型、caption、compile、backend 和服务参数继续沿用对应正式命令。
+
+SP2：
+
+```bash
+--num-gpus 2 \
+--sp-degree 2 \
+--ulysses-degree 2 \
+--vividvr-parallel-mode sp \
+--vae-sp \
+--vae-encode-sp
+```
+
+CFG2×SP2：
+
+```bash
+--num-gpus 4 \
+--sp-degree 2 \
+--ulysses-degree 2 \
+--vividvr-parallel-mode cfg_sp \
+--enable-cfg-parallel \
+--vae-sp \
+--vae-encode-sp
+```
+
+SP4：
+
+```bash
+--num-gpus 4 \
+--sp-degree 4 \
+--ulysses-degree 4 \
+--vividvr-parallel-mode sp \
+--vae-sp \
+--vae-encode-sp
+```
+
+如果关闭 VAE tiling，`--vae-encode-sp` 会在配置校验阶段拒绝启动；如果运行时没有有效 SP subgroup，也不会进入 encode tile collective。只测试 encode 时可去掉 `--vae-sp`，只测试既有 decode 并行时可去掉 `--vae-encode-sp`。
