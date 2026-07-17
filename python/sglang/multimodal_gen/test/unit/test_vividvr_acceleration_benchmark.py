@@ -91,11 +91,26 @@ def test_scheme_registry_has_fixed_order_and_capabilities():
 
 
 def test_vae_sp_treatments_do_not_expand_default_run_all_matrix():
-    assert list(VAE_SP_TREATMENTS) == ["R99_VAE_SP", "R100_VAE_SP"]
+    assert list(VAE_SP_TREATMENTS) == [
+        "R99_VAE_SP",
+        "R100_VAE_SP",
+        "R101_VAE_SP4",
+    ]
     assert list(SCHEMES)[-2:] == ["R99", "R100"]
     assert "R99_VAE_SP" not in SCHEMES
+    assert "R101_VAE_SP4" not in SCHEMES
     assert ALL_SCHEMES["R99_VAE_SP"].controls == ("R99",)
     assert ALL_SCHEMES["R100_VAE_SP"].controls == ("R100",)
+    r101 = ALL_SCHEMES["R101_VAE_SP4"]
+    assert r101.controls == ("R4",)
+    assert r101.gpu_count == 4
+    assert r101.parallel_mode == "sp"
+    assert r101.sp_degree == 4
+    assert r101.compile_enabled is True
+    assert r101.modulation_fusion is True
+    assert r101.vae_sp is True
+    assert r101.cfg_parallel is False
+    assert r101.expected_effective_backend == "fa_sp"
 
 
 @pytest.mark.parametrize("scheme_id", ["R99_VAE_SP", "R100_VAE_SP"])
@@ -107,6 +122,21 @@ def test_vae_sp_treatment_adds_only_vae_sp_to_control_command(
     treatment_command = build_service_command(treatment, make_config(tmp_path))
     control_command = build_service_command(control, make_config(tmp_path))
     assert treatment_command == control_command + ["--vae-sp"]
+
+
+def test_r101_vae_sp4_command_keeps_fusion_and_disables_cfg(tmp_path: Path):
+    command = build_service_command(
+        ALL_SCHEMES["R101_VAE_SP4"], make_config(tmp_path)
+    )
+
+    assert option_value(command, "--num-gpus") == "4"
+    assert option_value(command, "--sp-degree") == "4"
+    assert option_value(command, "--ulysses-degree") == "4"
+    assert option_value(command, "--vividvr-parallel-mode") == "sp"
+    assert "--enable-torch-compile" in command
+    assert "--enable-cogvideox-modulation-fusion" in command
+    assert "--vae-sp" in command
+    assert "--enable-cfg-parallel" not in command
 
 
 def test_vae_sp_formal_defaults_follow_mock_test_service_contract():
@@ -311,6 +341,10 @@ def make_perf_fixture(
         },
     }
     if vae_sp:
+        base_count, remainder = divmod(15, sp_world_size)
+        local_tile_counts = [
+            base_count + (rank < remainder) for rank in range(sp_world_size)
+        ]
         perf["meta"]["vividvr_debug"].update(
             {
                 "vae_sp_requested": True,
@@ -319,7 +353,7 @@ def make_perf_fixture(
                 "vae_sp_world_size": sp_world_size,
                 "vae_sp_group_type": "sp",
                 "vae_total_tiles": 15,
-                "vae_local_tiles_per_rank": [8, 7],
+                "vae_local_tiles_per_rank": local_tile_counts,
                 "vae_tile_decode_seconds": 1.25,
                 "vae_tile_gather_seconds": 0.25,
                 "vae_tile_merge_seconds": 0.1,
@@ -380,6 +414,21 @@ def test_validate_effective_config_requires_effective_vae_sp_for_treatment():
     validated = validate_effective_config(ALL_SCHEMES["R99_VAE_SP"], perf)
     assert validated["vae_sp_effective"] is True
     assert validated["vae_sp_world_size"] == 2
+
+
+def test_validate_effective_config_accepts_vae_sp4_treatment():
+    perf = make_perf_fixture(
+        sp_world_size=4,
+        modulation_fusion=True,
+        vae_sp=True,
+    )
+    validated = validate_effective_config(
+        ALL_SCHEMES["R101_VAE_SP4"], perf
+    )
+    assert validated["parallel_mode"] == "sp"
+    assert validated["cfg_parallel_enabled"] is False
+    assert validated["vae_sp_world_size"] == 4
+    assert validated["vae_local_tiles_per_rank"] == [4, 4, 4, 3]
 
 
 def test_validate_effective_config_rejects_vae_sp_silent_fallback():

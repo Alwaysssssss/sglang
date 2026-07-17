@@ -277,6 +277,17 @@ VAE_SP_TREATMENTS: dict[str, Scheme] = {
         vae_sp=True,
         controls=("R100",),
     ),
+    "R101_VAE_SP4": _scheme(
+        "R101_VAE_SP4",
+        "四卡 SP4 + fusion + CogVideoX VAE spatial tile parallel",
+        gpu_count=4,
+        parallel_mode="sp",
+        sp_degree=4,
+        compile_enabled=True,
+        modulation_fusion=True,
+        vae_sp=True,
+        controls=("R4",),
+    ),
 }
 ALL_SCHEMES: dict[str, Scheme] = {**SCHEMES, **VAE_SP_TREATMENTS}
 
