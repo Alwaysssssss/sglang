@@ -318,6 +318,8 @@ def calc_current_cfg(
     min_cfg: float = 1.0,
     dynamic_cfg: bool = True,
 ) -> tuple[float, bool]:
+    if max_cfg <= min_cfg or max_step <= 0:
+        return max_cfg, max_cfg > 1.0
     if dynamic_cfg:
         if current_step < max_step:
             add_cfg = max(

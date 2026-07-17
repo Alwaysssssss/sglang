@@ -371,10 +371,13 @@ def poll_until_done(
     task_id: str,
     *,
     poll_interval_s: float,
+    progress_log_interval_s: float,
     monitor: GpuMonitor,
     progress_path: Path,
 ) -> dict[str, Any]:
-    last = None
+    started = time.monotonic()
+    last_log = 0.0
+    printed_running = False
     while True:
         status = client.json_request(
             "GET", f"/v1/videos/{quote(task_id, safe='')}/progress"
@@ -385,12 +388,31 @@ def poll_until_done(
         stage = str(status.get("stage") or progress_payload.get("stage") or "unknown")
         progress = progress_payload.get("progress", progress)
         monitor.set_progress(stage, progress)
-        current = (state, progress, stage)
-        if current != last:
-            print(f"[poll] {task_id}: status={state} progress={progress} stage={stage}")
-            last = current
+        now = time.monotonic()
         if state in TERMINAL_STATUSES:
+            elapsed_s = now - started
+            print(
+                f"[poll] {task_id}: status={state or 'unknown'} "
+                f"elapsed={elapsed_s:.1f}s"
+            )
             return status
+        if not printed_running:
+            print(
+                f"[running] {task_id}: polling every {poll_interval_s:.1f}s; "
+                "progress details are suppressed"
+            )
+            printed_running = True
+            last_log = now
+        elif (
+            progress_log_interval_s > 0
+            and now - last_log >= progress_log_interval_s
+        ):
+            elapsed_s = now - started
+            print(
+                f"[running] {task_id}: elapsed={elapsed_s:.1f}s "
+                f"status={state or 'unknown'} stage={stage}"
+            )
+            last_log = now
         time.sleep(poll_interval_s)
 
 
@@ -437,6 +459,7 @@ def run_variant(
             client,
             task_id,
             poll_interval_s=args.poll_interval_s,
+            progress_log_interval_s=args.progress_log_interval_s,
             monitor=monitor,
             progress_path=progress_path,
         )
@@ -480,6 +503,91 @@ def run_variant(
             f"peak_run={run_peak.get('total_memory_used_mb')} MB "
             f"peak_dit={dit_peak.get('total_memory_used_mb')} MB"
         )
+    return record
+
+
+def run_warmup_request(
+    args: argparse.Namespace,
+    client: HttpClient,
+    *,
+    enable_teacache: bool,
+) -> dict[str, Any] | None:
+    if not args.warmup_request:
+        return None
+
+    if args.warmup_request_teacache is not None:
+        enable_teacache = bool(args.warmup_request_teacache)
+
+    task_id = f"{args.task_prefix}{args.run_id}_{args.warmup_variant_name}"
+    warmup_dir = args.output_dir / "warmups"
+    output_path = warmup_dir / f"{task_id}.mp4"
+    progress_path = output_path.parent / f"{task_id}.progress.json"
+    perf_path = warmup_dir / "perf" / f"{task_id}.json"
+    payload_path = warmup_dir / "payloads" / f"{task_id}.json"
+    record_path = warmup_dir / "records" / f"{task_id}.json"
+
+    payload = build_payload(
+        args,
+        task_id=task_id,
+        output_path=output_path,
+        perf_path=perf_path,
+        enable_teacache=enable_teacache,
+    )
+    payload.update(
+        {
+            "task_id": task_id,
+            "output_path": str(output_path),
+            "perf_dump_path": str(perf_path),
+            "num_inference_steps": args.warmup_request_steps,
+            "enable_teacache": enable_teacache,
+        }
+    )
+    write_json(payload_path, payload)
+
+    print(
+        f"[warmup] task_id={task_id} steps={args.warmup_request_steps} "
+        f"enable_teacache={enable_teacache}"
+    )
+    monitor = GpuMonitor(args.gpus, args.sample_interval_s)
+    monitor.set_progress("warmup_submitting", 0)
+    started = time.monotonic()
+    final_status: dict[str, Any] | None = None
+    error: str | None = None
+    try:
+        submit_when_available(client, payload, busy_sleep_s=args.busy_sleep_s)
+        final_status = poll_until_done(
+            client,
+            task_id,
+            poll_interval_s=args.poll_interval_s,
+            progress_log_interval_s=args.progress_log_interval_s,
+            monitor=monitor,
+            progress_path=progress_path,
+        )
+        if final_status.get("status") != "completed":
+            error = str(final_status.get("reason") or final_status.get("error") or "failed")
+    except Exception as exc:
+        error = str(exc)
+    elapsed_s = time.monotonic() - started
+
+    record = {
+        "variant": args.warmup_variant_name,
+        "task_id": task_id,
+        "status": "failed" if error else "completed",
+        "error": error,
+        "enable_teacache": enable_teacache,
+        "elapsed_s": round(elapsed_s, 3),
+        "output_path": str(output_path),
+        "progress_path": str(progress_path),
+        "perf_path": str(perf_path),
+        "payload_path": str(payload_path),
+        "final_status": final_status,
+        "perf_summary": extract_perf_summary(perf_path),
+    }
+    write_json(record_path, record)
+    if error:
+        print(f"[warmup failed] {error}")
+        raise RuntimeError(f"warmup request failed: {error}")
+    print(f"[warmup done] elapsed={elapsed_s:.3f}s")
     return record
 
 
@@ -589,9 +697,16 @@ def wait_for_server(client: HttpClient, timeout_s: float) -> None:
     raise RuntimeError(f"server is not healthy after {timeout_s}s: {last_error}")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    *,
+    default_task_prefix: str = "videoedit_bench_",
+    default_native_variant_name: str = "dual_gpu",
+    default_teacache_variant_name: str = "dual_gpu_teacache",
+    description: str | None = None,
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
+        description=description
+        or (
             "Run one VideoEdit sample twice against an existing dual-GPU service: "
             "no TeaCache and TeaCache, with wall-time and nvidia-smi memory sampling."
         )
@@ -603,10 +718,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--case-name", default="videoedit")
     parser.add_argument("--run-id")
-    parser.add_argument("--task-prefix", default="videoedit_bench_")
+    parser.add_argument("--task-prefix", default=default_task_prefix)
+    parser.add_argument(
+        "--run-mode",
+        choices=("native", "teacache", "both"),
+        default="both",
+        help="Select which request variants to run. Default keeps the old native+TeaCache behavior.",
+    )
+    parser.add_argument("--native-variant-name", default=default_native_variant_name)
+    parser.add_argument(
+        "--teacache-variant-name", default=default_teacache_variant_name
+    )
+    parser.add_argument(
+        "--warmup-request",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run one unmeasured request before benchmark records are collected.",
+    )
+    parser.add_argument("--warmup-request-steps", type=int, default=1)
+    parser.add_argument(
+        "--warmup-request-teacache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override TeaCache for the warmup request. Defaults to the first measured variant.",
+    )
+    parser.add_argument("--warmup-variant-name", default="warmup")
     parser.add_argument("--gpus", default="0,1")
     parser.add_argument("--sample-interval-s", type=float, default=0.5)
-    parser.add_argument("--poll-interval-s", type=float, default=1.0)
+    parser.add_argument("--poll-interval-s", type=float, default=5.0)
+    parser.add_argument(
+        "--progress-log-interval-s",
+        type=float,
+        default=60.0,
+        help="Print a lightweight running heartbeat at this interval. Use 0 to disable heartbeat logs.",
+    )
     parser.add_argument("--busy-sleep-s", type=float, default=10.0)
     parser.add_argument("--cooldown-s", type=float, default=5.0)
     parser.add_argument("--http-timeout-s", type=float, default=120.0)
@@ -653,19 +798,26 @@ def main() -> int:
     client = HttpClient(args.base_url, timeout=args.http_timeout_s)
     wait_for_server(client, args.wait_server_timeout_s)
 
+    variants = []
+    if args.run_mode in ("native", "both"):
+        variants.append((args.native_variant_name, False))
+    if args.run_mode in ("teacache", "both"):
+        variants.append((args.teacache_variant_name, True))
+
+    run_warmup_request(
+        args,
+        client,
+        enable_teacache=variants[0][1] if variants else False,
+    )
+
     records = [
         run_variant(
             args,
             client,
-            variant_name="dual_gpu",
-            enable_teacache=False,
-        ),
-        run_variant(
-            args,
-            client,
-            variant_name="dual_gpu_teacache",
-            enable_teacache=True,
-        ),
+            variant_name=variant_name,
+            enable_teacache=enable_teacache,
+        )
+        for variant_name, enable_teacache in variants
     ]
     write_json(args.output_dir / "summary.json", records)
     write_summary_csv(args.output_dir / "summary.csv", records)
