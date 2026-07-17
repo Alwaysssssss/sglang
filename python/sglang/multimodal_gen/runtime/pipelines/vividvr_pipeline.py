@@ -76,6 +76,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VividVRTextEncodingStage,
     VividVRTilingPreparationStage,
     VividVRTimestepPreparationStage,
+    _aggregate_vae_spatial_encode_stats,
     _aggregate_vae_spatial_decode_stats,
 )
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
@@ -1255,6 +1256,7 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         clip_caption_records: list[dict[str, object]] = []
         clip_latent_lengths: list[int] = []
         clip_tile_counts: list[int] = []
+        clip_vae_encode_stats: list[dict[str, object]] = []
         caption_cursor = 0
         for clip_spec in window_plan.clip_specs:
             clip_video_info = self._build_temporal_clip_video_info(
@@ -1267,6 +1269,10 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                 control_video_info=clip_video_info,
                 generator=generator,
             )
+            if prepared_condition.get("vae_encode_stats"):
+                clip_vae_encode_stats.append(
+                    dict(prepared_condition["vae_encode_stats"])
+                )
             latents, control_latents, num_latent_padding_frames = (
                 self.latent_preparation_stage.prepare_latents(
                     control_video=prepared_condition["control_video"],
@@ -1349,6 +1355,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
                     f"consumed {caption_cursor}, available {len(params.runtime_caption_texts)}"
                 )
             debug["clip_caption_texts"] = clip_caption_records
+        debug.update(
+            _aggregate_vae_spatial_encode_stats(clip_vae_encode_stats)
+        )
 
         long_runtime["clip_states"] = clip_states
         long_runtime["clip_caption_records"] = clip_caption_records

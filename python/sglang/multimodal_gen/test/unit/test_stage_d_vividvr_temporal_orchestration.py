@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VividVRMultiClipDecodeTrimStage,
     VividVRMultiClipDenoisingStage,
     VividVRTilingPreparationStage,
+    _aggregate_vae_spatial_encode_stats,
 )
 from sglang.multimodal_gen.runtime.vividvr.captioning import (
     build_vividvr_caption_prompt_lists,
@@ -35,6 +36,42 @@ from sglang.multimodal_gen.runtime.vividvr.windowing import (
 
 
 class TestStageDVividVRTemporalOrchestration(unittest.TestCase):
+    @staticmethod
+    def _encode_stats(*, world_size=2):
+        return {
+            "vae_encode_sp_requested": True,
+            "vae_encode_sp_effective": True,
+            "vae_encode_sp_fallback_reason": "effective",
+            "vae_encode_sp_world_size": world_size,
+            "vae_encode_sp_group_type": "sp",
+            "vae_encode_total_tiles": 16,
+            "vae_encode_local_tiles_per_rank": [8] * world_size,
+            "vae_encode_tile_compute_seconds": 4.0,
+            "vae_encode_tile_gather_seconds": 1.0,
+            "vae_encode_tile_merge_seconds": 0.5,
+            "vae_encode_seconds": 6.0,
+        }
+
+    def test_two_clip_encode_stats_are_aggregated(self):
+        debug = _aggregate_vae_spatial_encode_stats(
+            [self._encode_stats(), self._encode_stats()]
+        )
+
+        self.assertEqual(debug["vae_encode_total_tiles"], 32)
+        self.assertEqual(debug["vae_encode_local_tiles_per_rank"], [16, 16])
+        self.assertEqual(len(debug["vae_encode_sp_clips"]), 2)
+        self.assertAlmostEqual(debug["vae_encode_seconds"], 12.0)
+        self.assertTrue(debug["vae_encode_sp_requested"])
+        self.assertTrue(debug["vae_encode_sp_effective"])
+
+    def test_encode_clip_topology_mismatch_is_fatal(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "VAE encode SP clip topology mismatch"
+        ):
+            _aggregate_vae_spatial_encode_stats(
+                [self._encode_stats(world_size=2), self._encode_stats(world_size=4)]
+            )
+
     def _make_vividvr_params(self, **kwargs) -> VividVRSamplingParams:
         return VividVRSamplingParams(
             prompt=" ",

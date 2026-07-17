@@ -218,6 +218,69 @@ def _aggregate_vae_spatial_decode_stats(
     }
 
 
+def _aggregate_vae_spatial_encode_stats(
+    clip_stats: list[dict[str, object]],
+) -> dict[str, object]:
+    if not clip_stats:
+        return {}
+    topologies = {
+        (
+            int(item["vae_encode_sp_world_size"]),
+            str(item["vae_encode_sp_group_type"]),
+            len(item["vae_encode_local_tiles_per_rank"]),
+        )
+        for item in clip_stats
+    }
+    if len(topologies) != 1:
+        raise RuntimeError(
+            f"VAE encode SP clip topology mismatch: {sorted(topologies)}"
+        )
+    reasons = {
+        str(item["vae_encode_sp_fallback_reason"]) for item in clip_stats
+    }
+    local_totals = [0] * len(clip_stats[0]["vae_encode_local_tiles_per_rank"])
+    for item in clip_stats:
+        for rank, count in enumerate(item["vae_encode_local_tiles_per_rank"]):
+            local_totals[rank] += int(count)
+    return {
+        "vae_encode_sp_requested": all(
+            bool(item["vae_encode_sp_requested"]) for item in clip_stats
+        ),
+        "vae_encode_sp_effective": all(
+            bool(item["vae_encode_sp_effective"]) for item in clip_stats
+        ),
+        "vae_encode_sp_fallback_reason": (
+            next(iter(reasons)) if len(reasons) == 1 else "mixed"
+        ),
+        "vae_encode_sp_world_size": int(
+            clip_stats[0]["vae_encode_sp_world_size"]
+        ),
+        "vae_encode_sp_group_type": str(
+            clip_stats[0]["vae_encode_sp_group_type"]
+        ),
+        "vae_encode_total_tiles": sum(
+            int(item["vae_encode_total_tiles"]) for item in clip_stats
+        ),
+        "vae_encode_local_tiles_per_rank": local_totals,
+        "vae_encode_tile_compute_seconds": sum(
+            float(item["vae_encode_tile_compute_seconds"])
+            for item in clip_stats
+        ),
+        "vae_encode_tile_gather_seconds": sum(
+            float(item["vae_encode_tile_gather_seconds"])
+            for item in clip_stats
+        ),
+        "vae_encode_tile_merge_seconds": sum(
+            float(item["vae_encode_tile_merge_seconds"])
+            for item in clip_stats
+        ),
+        "vae_encode_seconds": sum(
+            float(item["vae_encode_seconds"]) for item in clip_stats
+        ),
+        "vae_encode_sp_clips": [dict(item) for item in clip_stats],
+    }
+
+
 def _prepare_extra_step_kwargs(
     scheduler: Any,
     generator: torch.Generator | list[torch.Generator] | None,
@@ -300,15 +363,22 @@ class _VividVRLatentMixin:
         control_video: torch.Tensor,
         dtype: torch.dtype,
         generator: torch.Generator,
-    ) -> torch.Tensor:
-        control_latents = [
-            retrieve_latents(self.vae.encode(video.unsqueeze(0)), generator)
-            for video in control_video
-        ]
+    ) -> tuple[torch.Tensor, list[dict[str, object]]]:
+        control_latents = []
+        slice_stats: list[dict[str, object]] = []
+        stats_getter = getattr(self.vae, "get_last_spatial_encode_stats", None)
+        for video in control_video:
+            control_latents.append(
+                retrieve_latents(self.vae.encode(video.unsqueeze(0)), generator)
+            )
+            if stats_getter is not None:
+                stats = stats_getter()
+                if stats is not None:
+                    slice_stats.append(dict(stats.to_debug_dict()))
         control_latents = (
             torch.cat(control_latents, dim=0).to(dtype=dtype).permute(0, 2, 1, 3, 4)
         )
-        return self.vae.config.scaling_factor * control_latents
+        return self.vae.config.scaling_factor * control_latents, slice_stats
 
     @torch.no_grad()
     def _prepare_latent_noise(
@@ -576,11 +646,12 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             height=params.height,
             width=params.width,
         ).to(device=device, dtype=target_dtype)
-        control_latents = self._encode_control_latents(
+        control_latents, slice_stats = self._encode_control_latents(
             control_video=control_video,
             dtype=target_dtype,
             generator=generator,
         )
+        vae_encode_stats = _aggregate_vae_spatial_encode_stats(slice_stats)
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
 
@@ -589,6 +660,7 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
             "control_video": control_video,
             "reference_video": control_video_info["reference_video"],
             "control_latents": control_latents,
+            "vae_encode_stats": vae_encode_stats,
             "original_height": int(control_video_info["original_height"]),
             "original_width": int(control_video_info["original_width"]),
             "gen_height": int(control_video_info["gen_height"]),
@@ -619,6 +691,7 @@ class VividVRConditionEncodingStage(_VividVRLatentMixin, PipelineStage):
         debug["padded_input_frames"] = params.runtime_padded_input_frames
         debug["gen_height"] = int(prepared["gen_height"])
         debug["gen_width"] = int(prepared["gen_width"])
+        debug.update(prepared["vae_encode_stats"])
 
         batch.height = int(params.height)
         batch.width = int(params.width)
@@ -1627,6 +1700,7 @@ class VividVRLongClipPreparationStage(PipelineStage):
         clip_caption_records: list[dict[str, Any]] = []
         clip_latent_lengths: list[int] = []
         clip_tile_counts: list[int] = []
+        clip_vae_encode_stats: list[dict[str, object]] = []
         caption_cursor = 0
         for clip_spec in window_plan.clip_specs:
             clip_video_info = _build_temporal_clip_video_info(input_video_info, clip_spec)
@@ -1636,6 +1710,10 @@ class VividVRLongClipPreparationStage(PipelineStage):
                 control_video_info=clip_video_info,
                 generator=generator,
             )
+            if prepared_condition.get("vae_encode_stats"):
+                clip_vae_encode_stats.append(
+                    dict(prepared_condition["vae_encode_stats"])
+                )
             latents, control_latents, num_latent_padding_frames = (
                 self.latent_preparation_stage.prepare_latents(
                     control_video=prepared_condition["control_video"],
@@ -1721,6 +1799,9 @@ class VividVRLongClipPreparationStage(PipelineStage):
             debug["clip_caption_texts"] = clip_caption_records
 
         long_runtime["clip_states"] = clip_states
+        debug.update(
+            _aggregate_vae_spatial_encode_stats(clip_vae_encode_stats)
+        )
         long_runtime["clip_caption_records"] = clip_caption_records
         long_runtime["clip_latent_lengths"] = clip_latent_lengths
         long_runtime["clip_tile_counts"] = clip_tile_counts

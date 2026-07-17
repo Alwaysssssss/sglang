@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.cogvideox_dpm_vividvr impor
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vividvr import (
+    VividVRConditionEncodingStage,
     VividVRDecodingStage,
     _VividVRLatentMixin,
     VividVRDenoisingStage,
@@ -280,6 +281,105 @@ class _DummyDecodeVAE(torch.nn.Module):
                 "vae_decode_seconds": 1.5,
             }
         )
+
+
+class _DummyEncodeVAE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.config = SimpleNamespace(
+            scaling_factor=1.0,
+            block_out_channels=(1, 1, 1, 1),
+            temporal_compression_ratio=4,
+        )
+        self.events = []
+
+    def to(self, *args, **kwargs):
+        destination = args[0] if args else kwargs.get("device")
+        self.events.append(f"to:{destination}")
+        return self
+
+    def encode(self, video):
+        self.events.append("encode")
+        return SimpleNamespace(
+            latent_dist=SimpleNamespace(sample=lambda generator: video)
+        )
+
+    def get_last_spatial_encode_stats(self):
+        self.events.append("stats")
+        return SimpleNamespace(
+            to_debug_dict=lambda: {
+                "vae_encode_sp_requested": True,
+                "vae_encode_sp_effective": True,
+                "vae_encode_sp_fallback_reason": "effective",
+                "vae_encode_sp_world_size": 2,
+                "vae_encode_sp_group_type": "sp",
+                "vae_encode_total_tiles": 16,
+                "vae_encode_local_tiles_per_rank": [8, 8],
+                "vae_encode_tile_compute_seconds": 4.0,
+                "vae_encode_tile_gather_seconds": 1.0,
+                "vae_encode_tile_merge_seconds": 0.5,
+                "vae_encode_seconds": 6.0,
+            }
+        )
+
+
+class _DummyVideoProcessor:
+    @staticmethod
+    def preprocess_video(_video, *, height, width):
+        return torch.zeros(1, 3, 1, height, width)
+
+
+class TestStageEVividVRConditionEncoding(unittest.TestCase):
+    def test_condition_stage_exposes_encode_stats_before_cpu_offload(self):
+        vae = _DummyEncodeVAE()
+        stage = object.__new__(VividVRConditionEncodingStage)
+        stage.vae = vae
+        stage.transformer = _dummy_transformer_module()
+        stage.video_processor = _DummyVideoProcessor()
+        stage._resolve_generator = lambda *_args, **_kwargs: torch.Generator()
+        stage._resolve_control_video_info = lambda *_args, **_kwargs: {
+            "video": object(),
+            "reference_video": torch.zeros(1),
+            "original_height": 1,
+            "original_width": 1,
+            "gen_height": 1,
+            "gen_width": 1,
+            "original_num_frames": 1,
+            "num_padding_frames": 0,
+            "fps": 8,
+        }
+        stage._sync_runtime_resolution = lambda params, _info: (
+            setattr(params, "height", 1),
+            setattr(params, "width", 1),
+        )
+        batch = SimpleNamespace(
+            sampling_params=VividVRSamplingParams(
+                prompt=" ",
+                video_input_path="unused.mp4",
+                seed=42,
+                height=1,
+                width=1,
+            ),
+            generator=None,
+            extra={},
+        )
+        server_args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                dit_precision="fp32", vae_precision="fp32"
+            ),
+            vae_cpu_offload=True,
+        )
+        module = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.vividvr"
+        )
+        with patch(f"{module}.get_local_torch_device", return_value=torch.device("cpu")):
+            prepared = stage.prepare_condition_inputs(batch, server_args)
+
+        self.assertTrue(prepared["vae_encode_stats"]["vae_encode_sp_effective"])
+        self.assertLess(vae.events.index("stats"), len(vae.events) - 1)
+        self.assertEqual(vae.events[-1], "to:cpu")
 
 
 class TestStageEVividVRDecoding(unittest.TestCase):
