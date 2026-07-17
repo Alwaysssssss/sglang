@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.models.vaes.cogvideox import (
     _unpack_gathered_tiles,
     _validate_spatial_encode_descriptor,
 )
+from sglang.multimodal_gen.tools.run_vividvr_vae_spatial_encode_validation import (
+    compare_serial_and_parallel_encode,
+)
 
 
 def make_formal_encode_plan() -> CogVideoXSpatialEncodeTilePlan:
@@ -467,5 +470,22 @@ def test_encode_parallel_does_not_retry_serial_after_collective_failure(
     with pytest.raises(RuntimeError, match="collective failed"):
         vae.tiled_encode(make_tiled_input())
     serial.assert_not_called()
+
+
+def test_encode_validation_requires_exact_moments_and_sampled_latents():
+    moments = torch.arange(8, dtype=torch.bfloat16)
+    latents = torch.arange(4, dtype=torch.bfloat16)
+    assert compare_serial_and_parallel_encode(
+        moments, moments.clone(), latents, latents.clone()
+    )["passed"]
+
+    changed = moments.clone()
+    changed[0] += 1
+    result = compare_serial_and_parallel_encode(
+        moments, changed, latents, latents.clone()
+    )
+
+    assert result["moments_exact"] is False
+    assert result["passed"] is False
     DiffusersAutoencoderKLCogVideoX,
     _canonicalize_spatial_encode_input,
