@@ -55,6 +55,7 @@ class VividVRPipelineConfig(PipelineConfig):
     vae_precision: str = "bf16"
     vae_tiling: bool = True
     vae_sp: bool = False
+    vae_encode_sp: bool = False
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (T5Config(arch_config=T5ArchConfig(text_len=226)),)

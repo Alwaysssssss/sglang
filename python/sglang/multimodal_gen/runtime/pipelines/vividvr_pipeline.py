@@ -352,6 +352,19 @@ def _configure_vividvr_vae_spatial_tile_parallel(
         configure_vae_sp(requested=bool(requested))
 
 
+def _configure_vividvr_vae_spatial_tile_encode_parallel(
+    vae: object, requested: bool
+) -> None:
+    configure = getattr(vae, "configure_spatial_tile_encode_parallel", None)
+    if configure is None:
+        if requested:
+            raise TypeError(
+                "VividVR vae_encode_sp requires the native CogVideoX VAE runtime"
+            )
+        return
+    configure(requested=bool(requested))
+
+
 def _build_stage_without_global_server_args(stage_cls, *, server_args, **attrs):
     stage = object.__new__(stage_cls)
     stage.server_args = server_args
@@ -987,6 +1000,9 @@ class VividVRPipeline(LoRAPipeline, ComposedPipelineBase):
         vae = self.get_module("vae")
         _configure_vividvr_vae_spatial_tile_parallel(
             vae, bool(server_args.pipeline_config.vae_sp)
+        )
+        _configure_vividvr_vae_spatial_tile_encode_parallel(
+            vae, bool(server_args.pipeline_config.vae_encode_sp)
         )
         vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
         self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)

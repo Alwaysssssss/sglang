@@ -16,6 +16,18 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
+def test_vividvr_vae_encode_sp_cli_is_independent():
+    parser = FlexibleArgumentParser()
+    VividVRPipelineConfig.add_cli_args(parser)
+
+    defaults = parser.parse_args([])
+    encode_only = parser.parse_args(["--vae-encode-sp"])
+
+    assert defaults.vae_encode_sp is False
+    assert encode_only.vae_encode_sp is True
+    assert encode_only.vae_sp is False
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         with patch.object(

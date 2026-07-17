@@ -184,6 +184,7 @@ class PipelineConfig:
     vae_tiling: bool = True
     vae_slicing: bool = False
     vae_sp: bool = True
+    vae_encode_sp: bool = False
 
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
@@ -510,6 +511,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_sp",
             help="Enable VAE spatial parallelism",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-encode-sp",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_encode_sp",
+            default=PipelineConfig.vae_encode_sp,
+            help="Parallelize CogVideoX VAE tiled encode across the SP subgroup.",
+        )
 
         # Text encoder configuration
         parser.add_argument(
@@ -704,6 +712,11 @@ class PipelineConfig:
         if self.vae_sp and not self.vae_tiling:
             raise ValueError(
                 "Currently enabling vae_sp requires enabling vae_tiling, please set --vae-tiling to True."
+            )
+        if self.vae_encode_sp and not self.vae_tiling:
+            raise ValueError(
+                "Currently enabling vae_encode_sp requires enabling vae_tiling, "
+                "please set --vae-tiling to True."
             )
 
         if len(self.text_encoder_configs) != len(self.text_encoder_precisions):
