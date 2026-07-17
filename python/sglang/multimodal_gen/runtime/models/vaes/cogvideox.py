@@ -101,6 +101,52 @@ class CogVideoXVaeSpatialDecodeStats:
         }
 
 
+@dataclass(frozen=True)
+class CogVideoXVaeSpatialEncodeStats:
+    requested: bool
+    effective: bool
+    fallback_reason: str
+    world_size: int
+    group_type: str
+    total_tiles: int
+    local_tiles_per_rank: tuple[int, ...]
+    tile_compute_seconds: float
+    tile_gather_seconds: float
+    tile_merge_seconds: float
+    encode_seconds: float
+
+    @classmethod
+    def serial_default(cls) -> "CogVideoXVaeSpatialEncodeStats":
+        return cls(
+            requested=False,
+            effective=False,
+            fallback_reason="not_requested",
+            world_size=1,
+            group_type="none",
+            total_tiles=0,
+            local_tiles_per_rank=(0,),
+            tile_compute_seconds=0.0,
+            tile_gather_seconds=0.0,
+            tile_merge_seconds=0.0,
+            encode_seconds=0.0,
+        )
+
+    def to_debug_dict(self) -> dict[str, object]:
+        return {
+            "vae_encode_sp_requested": self.requested,
+            "vae_encode_sp_effective": self.effective,
+            "vae_encode_sp_fallback_reason": self.fallback_reason,
+            "vae_encode_sp_world_size": self.world_size,
+            "vae_encode_sp_group_type": self.group_type,
+            "vae_encode_total_tiles": self.total_tiles,
+            "vae_encode_local_tiles_per_rank": list(self.local_tiles_per_rank),
+            "vae_encode_tile_compute_seconds": self.tile_compute_seconds,
+            "vae_encode_tile_gather_seconds": self.tile_gather_seconds,
+            "vae_encode_tile_merge_seconds": self.tile_merge_seconds,
+            "vae_encode_seconds": self.encode_seconds,
+        }
+
+
 def _build_spatial_tile_plan(
     *,
     latent_height: int,
@@ -365,9 +411,71 @@ def _validate_spatial_decode_descriptor(
         )
 
 
+def _build_spatial_encode_descriptor(
+    x: torch.Tensor,
+    plan: CogVideoXSpatialEncodeTilePlan,
+    sp_group,
+) -> torch.Tensor:
+    if x.ndim != 5:
+        raise ValueError(
+            f"CogVideoX VAE encode SP expects a 5D input tensor, got {x.shape}"
+        )
+    try:
+        dtype_code = _DTYPE_CODES[x.dtype]
+    except KeyError as error:
+        raise TypeError(
+            f"unsupported CogVideoX VAE encode SP input dtype: {x.dtype}"
+        ) from error
+    ranks = tuple(int(rank) for rank in sp_group.ranks)
+    return torch.tensor(
+        [
+            *x.shape,
+            dtype_code,
+            plan.overlap_height,
+            plan.overlap_width,
+            plan.blend_extent_height,
+            plan.blend_extent_width,
+            plan.row_limit_height,
+            plan.row_limit_width,
+            len(plan.tiles),
+            sp_group.world_size,
+            *ranks,
+        ],
+        dtype=torch.int64,
+        device=x.device,
+    )
+
+
+def _validate_spatial_encode_descriptor(
+    sp_group, x: torch.Tensor, plan: CogVideoXSpatialEncodeTilePlan
+) -> None:
+    local = _build_spatial_encode_descriptor(x, plan, sp_group)
+    gathered = sp_group.all_gather(local.unsqueeze(0), dim=0)
+    reference = gathered[0]
+    mismatch_ranks = [
+        rank
+        for rank in range(sp_group.world_size)
+        if not torch.equal(gathered[rank], reference)
+    ]
+    if mismatch_ranks:
+        raise RuntimeError(
+            "CogVideoX VAE encode input descriptor mismatch on ranks "
+            f"{mismatch_ranks}"
+        )
+
+
 def _canonicalize_spatial_decode_input(sp_group, z: torch.Tensor) -> torch.Tensor:
     """Use one latent value source for every tile in the local SP subgroup."""
     canonical = z.clone(memory_format=torch.contiguous_format)
+    sp_group.broadcast(canonical, src=0)
+    return canonical
+
+
+def _canonicalize_spatial_encode_input(
+    sp_group, x: torch.Tensor
+) -> torch.Tensor:
+    """Use one sample value source for every tile in the local SP subgroup."""
+    canonical = x.clone(memory_format=torch.contiguous_format)
     sp_group.broadcast(canonical, src=0)
     return canonical
 
@@ -562,6 +670,11 @@ class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
         self._last_spatial_decode_stats = (
             CogVideoXVaeSpatialDecodeStats.serial_default()
         )
+        self._vae_encode_sp_requested = False
+        self._vae_encode_sp_group = None
+        self._last_spatial_encode_stats = (
+            CogVideoXVaeSpatialEncodeStats.serial_default()
+        )
 
     def configure_spatial_tile_parallel(self, requested: bool) -> None:
         requested = bool(requested)
@@ -580,6 +693,194 @@ class AutoencoderKLCogVideoX(DiffusersAutoencoderKLCogVideoX):
 
     def get_last_spatial_decode_stats(self) -> CogVideoXVaeSpatialDecodeStats:
         return self._last_spatial_decode_stats
+
+    def configure_spatial_tile_encode_parallel(self, requested: bool) -> None:
+        requested = bool(requested)
+        if requested and not self.use_tiling:
+            raise ValueError(
+                "CogVideoX vae_encode_sp requires VAE tiling to be enabled"
+            )
+        group = None
+        if requested:
+            try:
+                group = get_sp_group()
+            except AssertionError as error:
+                raise RuntimeError(
+                    "CogVideoX vae_encode_sp requested but SP group is not initialized"
+                ) from error
+        self._vae_encode_sp_requested = requested
+        self._vae_encode_sp_group = group
+
+    def get_last_spatial_encode_stats(self) -> CogVideoXVaeSpatialEncodeStats:
+        return self._last_spatial_encode_stats
+
+    def _set_serial_encode_stats(
+        self, reason: str, *, world_size: int, encode_seconds: float
+    ) -> None:
+        self._last_spatial_encode_stats = CogVideoXVaeSpatialEncodeStats(
+            requested=self._vae_encode_sp_requested,
+            effective=False,
+            fallback_reason=reason,
+            world_size=world_size,
+            group_type="none",
+            total_tiles=0,
+            local_tiles_per_rank=(0,) * world_size,
+            tile_compute_seconds=0.0,
+            tile_gather_seconds=0.0,
+            tile_merge_seconds=0.0,
+            encode_seconds=encode_seconds,
+        )
+
+    def _serial_encode_with_stats(
+        self, x: torch.Tensor, *, reason: str, world_size: int
+    ) -> torch.Tensor:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        encoded = super()._encode(x)
+        end.record()
+        end.synchronize()
+        self._set_serial_encode_stats(
+            reason,
+            world_size=world_size,
+            encode_seconds=start.elapsed_time(end) / 1000.0,
+        )
+        return encoded
+
+    def _serial_tiled_encode_with_stats(
+        self, x: torch.Tensor, *, reason: str, world_size: int
+    ) -> torch.Tensor:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        encoded = super().tiled_encode(x)
+        end.record()
+        end.synchronize()
+        self._set_serial_encode_stats(
+            reason,
+            world_size=world_size,
+            encode_seconds=start.elapsed_time(end) / 1000.0,
+        )
+        return encoded
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        tiled = self.use_tiling and (
+            x.shape[-1] > self.tile_sample_min_width
+            or x.shape[-2] > self.tile_sample_min_height
+        )
+        if tiled:
+            return self.tiled_encode(x)
+        reason = (
+            "input_below_tiling_threshold"
+            if self._vae_encode_sp_requested
+            else "not_requested"
+        )
+        return self._serial_encode_with_stats(
+            x,
+            reason=reason,
+            world_size=(
+                self._vae_encode_sp_group.world_size
+                if self._vae_encode_sp_group
+                else 1
+            ),
+        )
+
+    def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._vae_encode_sp_requested:
+            return self._serial_tiled_encode_with_stats(
+                x, reason="not_requested", world_size=1
+            )
+        sp_group = self._vae_encode_sp_group
+        if sp_group is None:
+            raise RuntimeError("CogVideoX VAE encode SP group is unavailable")
+        if sp_group.world_size == 1:
+            return self._serial_tiled_encode_with_stats(
+                x, reason="sp_world_size_one", world_size=1
+            )
+        return self._parallel_spatial_tiled_encode(x, sp_group=sp_group)
+
+    def _parallel_spatial_tiled_encode(
+        self, x: torch.Tensor, *, sp_group
+    ) -> torch.Tensor:
+        encode_start = torch.cuda.Event(enable_timing=True)
+        tile_start = torch.cuda.Event(enable_timing=True)
+        gather_start = torch.cuda.Event(enable_timing=True)
+        merge_start = torch.cuda.Event(enable_timing=True)
+        encode_end = torch.cuda.Event(enable_timing=True)
+        encode_start.record()
+
+        plan = _build_spatial_encode_tile_plan(
+            sample_height=x.shape[-2],
+            sample_width=x.shape[-1],
+            tile_sample_min_height=self.tile_sample_min_height,
+            tile_sample_min_width=self.tile_sample_min_width,
+            tile_latent_min_height=self.tile_latent_min_height,
+            tile_latent_min_width=self.tile_latent_min_width,
+            tile_overlap_factor_height=self.tile_overlap_factor_height,
+            tile_overlap_factor_width=self.tile_overlap_factor_width,
+        )
+        _validate_spatial_encode_descriptor(sp_group, x, plan)
+        x = _canonicalize_spatial_encode_input(sp_group, x)
+        tile_start.record()
+        owned_tiles = _assign_spatial_tiles(
+            plan.tiles, sp_group.rank_in_group, sp_group.world_size
+        )
+        local_tiles = {
+            tile.global_index: _encode_one_spatial_tile(self, x, tile)
+            for tile in owned_tiles
+        }
+
+        gather_start.record()
+        encoded_tiles = _all_gather_spatial_tiles(
+            sp_group,
+            local_tiles,
+            len(plan.tiles),
+            payload_dtype=x.dtype,
+            payload_device=x.device,
+        )
+        if tuple(encoded_tiles) != tuple(range(len(plan.tiles))):
+            raise RuntimeError("CogVideoX VAE encode SP gathered tiles are incomplete")
+        merge_start.record()
+        encoded = _merge_spatial_encode_tiles(self, plan, encoded_tiles)
+        first_tile = encoded_tiles[0]
+        expected_height = sum(
+            min(
+                plan.row_limit_height,
+                encoded_tiles[row * plan.num_columns].shape[-2],
+            )
+            for row in range(plan.num_rows)
+        )
+        expected_width = sum(
+            min(plan.row_limit_width, encoded_tiles[column].shape[-1])
+            for column in range(plan.num_columns)
+        )
+        expected_shape = (*first_tile.shape[:-2], expected_height, expected_width)
+        if tuple(encoded.shape) != expected_shape:
+            raise RuntimeError(
+                "CogVideoX VAE encode SP merged moments shape mismatch: "
+                f"expected {expected_shape}, got {tuple(encoded.shape)}"
+            )
+        encode_end.record()
+        encode_end.synchronize()
+
+        local_tiles_per_rank = tuple(
+            len(_assign_spatial_tiles(plan.tiles, rank, sp_group.world_size))
+            for rank in range(sp_group.world_size)
+        )
+        self._last_spatial_encode_stats = CogVideoXVaeSpatialEncodeStats(
+            requested=True,
+            effective=True,
+            fallback_reason="effective",
+            world_size=sp_group.world_size,
+            group_type="sp",
+            total_tiles=len(plan.tiles),
+            local_tiles_per_rank=local_tiles_per_rank,
+            tile_compute_seconds=tile_start.elapsed_time(gather_start) / 1000.0,
+            tile_gather_seconds=gather_start.elapsed_time(merge_start) / 1000.0,
+            tile_merge_seconds=merge_start.elapsed_time(encode_end) / 1000.0,
+            encode_seconds=encode_start.elapsed_time(encode_end) / 1000.0,
+        )
+        return encoded
 
     def _set_serial_decode_stats(
         self, reason: str, *, world_size: int, decode_seconds: float
