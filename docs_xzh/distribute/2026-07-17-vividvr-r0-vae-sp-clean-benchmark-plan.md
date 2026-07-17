@@ -92,27 +92,27 @@ PYTHONPATH=python .venv/bin/python -m pytest -q \
 
 ### 任务 3：串行正式服务测试与验收
 
-- [ ] **步骤 1：记录历史 R0 指纹**
+- [x] **步骤 1：记录历史 R0 指纹**
 
 对 `Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R0_formal.json` 记录 SHA-256 与 mtime_ns。
 
-- [ ] **步骤 2：在 tmux 启动 SP2**
+- [x] **步骤 2：在 tmux 启动 SP2**
 
 使用 `run-one --scheme R0_VAE_SP2 --control-batch-dir ... --gpu-ids 0,1 --allow-idle-gpu-processes`；eager 方案只能执行一次 formal，不 warmup。
 
-- [ ] **步骤 3：检查 SP2 record**
+- [x] **步骤 3：检查 SP2 record**
 
 状态必须为 `succeeded` 或 `quality_failed`；runtime 必须显示 `requested_backend=sdpa`、`effective_backend=sdpa_sp`、compile/fusion/CFG 均 false、VAE encode/decode SP effective 均 true。
 
-- [ ] **步骤 4：SP2 完全退出后在 tmux 启动 SP4**
+- [x] **步骤 4：SP2 完全退出后在 tmux 启动 SP4**
 
 替换 scheme 为 `R0_VAE_SP4`、GPU 为 `0,1,2,3`，其余口径相同。
 
-- [ ] **步骤 5：检查 SP4 record 并验证 R0 未改**
+- [x] **步骤 5：检查 SP4 record 并验证 R0 未改**
 
 重复 SP2 runtime 检查；重新计算 R0 SHA-256/mtime_ns，与运行前逐字节一致。
 
-- [ ] **步骤 6：独立复算并记录结论**
+- [x] **步骤 6：独立复算并记录结论**
 
 从三份 formal JSON 独立计算：
 
@@ -123,6 +123,6 @@ gpu_seconds = treatment_gpu_count * treatment_total_seconds
 
 记录 encode、decode、denoise、model、total、质量指标、callback/MinIO/video/perf 路径和 GPU 环境风险。
 
-- [ ] **步骤 7：最终验证**
+- [x] **步骤 7：最终验证**
 
 运行 benchmark 单测、两份 record schema/runtime 断言、派生值 `1e-9` 一致性检查，以及 `git diff --check`。只有取得新鲜输出后才报告完成。
