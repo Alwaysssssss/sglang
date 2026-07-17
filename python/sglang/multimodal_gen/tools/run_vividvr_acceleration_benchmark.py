@@ -69,6 +69,7 @@ class Scheme:
     modulation_fusion: bool
     controls: tuple[str, ...]
     vae_sp: bool = False
+    vae_encode_sp: bool = False
     status: SchemeStatus = SchemeStatus.EXECUTABLE
     unsupported_reason: str | None = None
 
@@ -134,6 +135,7 @@ def _scheme(
     compile_enabled: bool = False,
     modulation_fusion: bool = False,
     vae_sp: bool = False,
+    vae_encode_sp: bool = False,
     controls: tuple[str, ...] = (),
 ) -> Scheme:
     return Scheme(
@@ -147,6 +149,7 @@ def _scheme(
         modulation_fusion=modulation_fusion,
         controls=controls,
         vae_sp=vae_sp,
+        vae_encode_sp=vae_encode_sp,
     )
 
 
@@ -289,7 +292,49 @@ VAE_SP_TREATMENTS: dict[str, Scheme] = {
         controls=("R4",),
     ),
 }
-ALL_SCHEMES: dict[str, Scheme] = {**SCHEMES, **VAE_SP_TREATMENTS}
+VAE_ENCODE_SP_TREATMENTS: dict[str, Scheme] = {
+    "R99_VAE_ENCODE_SP": _scheme(
+        "R99_VAE_ENCODE_SP",
+        "R99 VAE decode+encode spatial tile parallel",
+        gpu_count=2,
+        parallel_mode="sp",
+        sp_degree=2,
+        compile_enabled=True,
+        modulation_fusion=True,
+        vae_sp=True,
+        vae_encode_sp=True,
+        controls=("R99_VAE_SP",),
+    ),
+    "R100_VAE_ENCODE_SP": _scheme(
+        "R100_VAE_ENCODE_SP",
+        "R100 VAE decode+encode spatial tile parallel",
+        gpu_count=4,
+        parallel_mode="cfg_sp",
+        sp_degree=2,
+        compile_enabled=True,
+        modulation_fusion=True,
+        vae_sp=True,
+        vae_encode_sp=True,
+        controls=("R100_VAE_SP",),
+    ),
+    "R101_VAE_ENCODE_SP4": _scheme(
+        "R101_VAE_ENCODE_SP4",
+        "SP4 VAE decode+encode spatial tile parallel",
+        gpu_count=4,
+        parallel_mode="sp",
+        sp_degree=4,
+        compile_enabled=True,
+        modulation_fusion=True,
+        vae_sp=True,
+        vae_encode_sp=True,
+        controls=("R101_VAE_SP4",),
+    ),
+}
+ALL_SCHEMES: dict[str, Scheme] = {
+    **SCHEMES,
+    **VAE_SP_TREATMENTS,
+    **VAE_ENCODE_SP_TREATMENTS,
+}
 
 
 VIVIDVR_STAGE_NAMES = (
@@ -530,6 +575,100 @@ def validate_effective_config(
                 mismatches.append(
                     f"VAE SP timing {key} must be non-negative, observed {value!r}"
                 )
+    if scheme.vae_encode_sp:
+        encode_requested = debug.get("vae_encode_sp_requested")
+        encode_effective = debug.get("vae_encode_sp_effective")
+        encode_fallback_reason = debug.get("vae_encode_sp_fallback_reason")
+        encode_group_type = debug.get("vae_encode_sp_group_type")
+        encode_world_size = debug.get("vae_encode_sp_world_size")
+        encode_total_tiles = debug.get("vae_encode_total_tiles")
+        encode_local_counts = debug.get("vae_encode_local_tiles_per_rank")
+        encode_clips = debug.get("vae_encode_sp_clips")
+        if encode_requested is not True or encode_effective is not True:
+            mismatches.append(
+                "VAE encode SP expected effective requested=True/effective=True, "
+                f"observed requested={encode_requested!r}, "
+                f"effective={encode_effective!r}"
+            )
+        if encode_fallback_reason != "effective":
+            mismatches.append(
+                "VAE encode SP fallback reason expected 'effective', "
+                f"observed {encode_fallback_reason!r}"
+            )
+        if encode_group_type != "sp":
+            mismatches.append(
+                "VAE encode SP group type expected 'sp', "
+                f"observed {encode_group_type!r}"
+            )
+        if encode_world_size != scheme.sp_degree:
+            mismatches.append(
+                f"VAE encode SP world size expected {scheme.sp_degree}, "
+                f"observed {encode_world_size!r}"
+            )
+        valid_encode_counts = (
+            isinstance(encode_local_counts, list)
+            and len(encode_local_counts) == scheme.sp_degree
+            and all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                for value in encode_local_counts
+            )
+        )
+        valid_encode_total = (
+            isinstance(encode_total_tiles, int)
+            and not isinstance(encode_total_tiles, bool)
+            and encode_total_tiles >= 0
+        )
+        if not valid_encode_counts:
+            mismatches.append(
+                "VAE encode SP local tile counts must be a non-negative integer "
+                f"list of length {scheme.sp_degree}, observed {encode_local_counts!r}"
+            )
+        elif (
+            not valid_encode_total
+            or sum(encode_local_counts) != encode_total_tiles
+        ):
+            mismatches.append(
+                "VAE encode SP local tile counts must sum to total tiles, "
+                f"observed counts={encode_local_counts!r}, "
+                f"total={encode_total_tiles!r}"
+            )
+        for key in (
+            "vae_encode_tile_compute_seconds",
+            "vae_encode_tile_gather_seconds",
+            "vae_encode_tile_merge_seconds",
+            "vae_encode_seconds",
+        ):
+            value = debug.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value < 0
+            ):
+                mismatches.append(
+                    "VAE encode SP timing "
+                    f"{key} must be non-negative, observed {value!r}"
+                )
+        num_clips = debug.get("num_clips")
+        valid_encode_clips = (
+            isinstance(encode_clips, list)
+            and bool(encode_clips)
+            and isinstance(num_clips, int)
+            and not isinstance(num_clips, bool)
+            and len(encode_clips) == num_clips
+        )
+        if not valid_encode_clips:
+            mismatches.append(
+                "VAE encode SP clips must be a non-empty list matching num_clips, "
+                f"observed clips={encode_clips!r}, num_clips={num_clips!r}"
+            )
+        elif any(
+            not isinstance(clip, Mapping)
+            or clip.get("vae_encode_sp_effective") is not True
+            for clip in encode_clips
+        ):
+            mismatches.append("VAE encode SP requires every clip to be effective")
     if mismatches:
         raise BenchmarkDataError("; ".join(mismatches))
     validated = {
@@ -557,6 +696,35 @@ def validate_effective_config(
                 "vae_tile_gather_seconds": debug["vae_tile_gather_seconds"],
                 "vae_tile_merge_seconds": debug["vae_tile_merge_seconds"],
                 "vae_decode_seconds": debug["vae_decode_seconds"],
+            }
+        )
+    if scheme.vae_encode_sp:
+        validated.update(
+            {
+                "vae_encode_sp_requested": debug["vae_encode_sp_requested"],
+                "vae_encode_sp_effective": debug["vae_encode_sp_effective"],
+                "vae_encode_sp_fallback_reason": debug[
+                    "vae_encode_sp_fallback_reason"
+                ],
+                "vae_encode_sp_world_size": debug["vae_encode_sp_world_size"],
+                "vae_encode_sp_group_type": debug["vae_encode_sp_group_type"],
+                "vae_encode_total_tiles": debug["vae_encode_total_tiles"],
+                "vae_encode_local_tiles_per_rank": list(
+                    debug["vae_encode_local_tiles_per_rank"]
+                ),
+                "vae_encode_tile_compute_seconds": debug[
+                    "vae_encode_tile_compute_seconds"
+                ],
+                "vae_encode_tile_gather_seconds": debug[
+                    "vae_encode_tile_gather_seconds"
+                ],
+                "vae_encode_tile_merge_seconds": debug[
+                    "vae_encode_tile_merge_seconds"
+                ],
+                "vae_encode_seconds": debug["vae_encode_seconds"],
+                "vae_encode_sp_clips": [
+                    dict(clip) for clip in debug["vae_encode_sp_clips"]
+                ],
             }
         )
     return validated
@@ -2180,6 +2348,8 @@ def build_service_command(scheme: Scheme, config: BenchmarkConfig) -> list[str]:
         )
     if scheme.vae_sp:
         command.append("--vae-sp")
+    if scheme.vae_encode_sp:
+        command.append("--vae-encode-sp")
     return command
 
 

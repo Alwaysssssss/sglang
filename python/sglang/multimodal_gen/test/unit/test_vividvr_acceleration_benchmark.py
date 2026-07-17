@@ -24,6 +24,7 @@ from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     SchemeStatus,
     TmuxBenchmarkLifecycle,
     TmuxManager,
+    VAE_ENCODE_SP_TREATMENTS,
     VAE_SP_TREATMENTS,
     VIVIDVR_STAGE_NAMES,
     _config_cli_arguments,
@@ -111,6 +112,40 @@ def test_vae_sp_treatments_do_not_expand_default_run_all_matrix():
     assert r101.vae_sp is True
     assert r101.cfg_parallel is False
     assert r101.expected_effective_backend == "fa_sp"
+
+
+def test_vae_encode_sp_treatments_do_not_expand_default_run_all_matrix():
+    assert list(VAE_ENCODE_SP_TREATMENTS) == [
+        "R99_VAE_ENCODE_SP",
+        "R100_VAE_ENCODE_SP",
+        "R101_VAE_ENCODE_SP4",
+    ]
+    assert all(scheme_id not in SCHEMES for scheme_id in VAE_ENCODE_SP_TREATMENTS)
+    assert ALL_SCHEMES["R99_VAE_ENCODE_SP"].controls == ("R99_VAE_SP",)
+    assert ALL_SCHEMES["R100_VAE_ENCODE_SP"].controls == ("R100_VAE_SP",)
+    r101 = ALL_SCHEMES["R101_VAE_ENCODE_SP4"]
+    assert r101.controls == ("R101_VAE_SP4",)
+    assert r101.vae_sp is True
+    assert r101.vae_encode_sp is True
+
+
+@pytest.mark.parametrize(
+    ("treatment_id", "control_id"),
+    [
+        ("R99_VAE_ENCODE_SP", "R99_VAE_SP"),
+        ("R100_VAE_ENCODE_SP", "R100_VAE_SP"),
+        ("R101_VAE_ENCODE_SP4", "R101_VAE_SP4"),
+    ],
+)
+def test_vae_encode_sp_treatment_adds_only_encode_flag(
+    tmp_path: Path, treatment_id: str, control_id: str
+):
+    treatment = build_service_command(
+        ALL_SCHEMES[treatment_id], make_config(tmp_path)
+    )
+    control = build_service_command(ALL_SCHEMES[control_id], make_config(tmp_path))
+    assert treatment == control + ["--vae-encode-sp"]
+    assert "--vae-sp" in treatment
 
 
 @pytest.mark.parametrize("scheme_id", ["R99_VAE_SP", "R100_VAE_SP"])
@@ -295,6 +330,7 @@ def make_perf_fixture(
     compile_enabled: bool = True,
     modulation_fusion: bool = False,
     vae_sp: bool = False,
+    vae_encode_sp: bool = False,
 ) -> dict:
     stage_ms = {
         "VividVRInputValidationStage": 100.0,
@@ -358,6 +394,49 @@ def make_perf_fixture(
                 "vae_tile_gather_seconds": 0.25,
                 "vae_tile_merge_seconds": 0.1,
                 "vae_decode_seconds": 1.6,
+            }
+        )
+    if vae_encode_sp:
+        base_count, remainder = divmod(32, sp_world_size)
+        local_tile_counts = [
+            base_count + (rank < remainder) for rank in range(sp_world_size)
+        ]
+        clip_count = perf["meta"]["vividvr_debug"]["num_clips"]
+        clip_total = 32 // clip_count
+        clip_base, clip_remainder = divmod(clip_total, sp_world_size)
+        clip_local_counts = [
+            clip_base + (rank < clip_remainder)
+            for rank in range(sp_world_size)
+        ]
+        clip_stats = {
+            "vae_encode_sp_requested": True,
+            "vae_encode_sp_effective": True,
+            "vae_encode_sp_fallback_reason": "effective",
+            "vae_encode_sp_world_size": sp_world_size,
+            "vae_encode_sp_group_type": "sp",
+            "vae_encode_total_tiles": clip_total,
+            "vae_encode_local_tiles_per_rank": clip_local_counts,
+            "vae_encode_tile_compute_seconds": 1.0,
+            "vae_encode_tile_gather_seconds": 0.2,
+            "vae_encode_tile_merge_seconds": 0.1,
+            "vae_encode_seconds": 1.3,
+        }
+        perf["meta"]["vividvr_debug"].update(
+            {
+                "vae_encode_sp_requested": True,
+                "vae_encode_sp_effective": True,
+                "vae_encode_sp_fallback_reason": "effective",
+                "vae_encode_sp_world_size": sp_world_size,
+                "vae_encode_sp_group_type": "sp",
+                "vae_encode_total_tiles": 32,
+                "vae_encode_local_tiles_per_rank": local_tile_counts,
+                "vae_encode_tile_compute_seconds": 2.0,
+                "vae_encode_tile_gather_seconds": 0.4,
+                "vae_encode_tile_merge_seconds": 0.2,
+                "vae_encode_seconds": 2.6,
+                "vae_encode_sp_clips": [
+                    dict(clip_stats) for _ in range(clip_count)
+                ],
             }
         )
     return perf
@@ -439,6 +518,31 @@ def test_validate_effective_config_rejects_vae_sp_silent_fallback():
     )
     with pytest.raises(BenchmarkDataError, match="VAE SP expected effective"):
         validate_effective_config(ALL_SCHEMES["R99_VAE_SP"], perf)
+
+
+def test_validate_effective_config_requires_effective_vae_encode_sp():
+    perf = make_perf_fixture(
+        modulation_fusion=True, vae_sp=True, vae_encode_sp=True
+    )
+    validated = validate_effective_config(
+        ALL_SCHEMES["R99_VAE_ENCODE_SP"], perf
+    )
+    assert validated["vae_encode_sp_effective"] is True
+    assert validated["vae_encode_sp_world_size"] == 2
+    assert validated["vae_encode_local_tiles_per_rank"] == [16, 16]
+    assert len(validated["vae_encode_sp_clips"]) == 2
+
+
+def test_validate_effective_config_rejects_vae_encode_sp_silent_fallback():
+    perf = make_perf_fixture(
+        modulation_fusion=True, vae_sp=True, vae_encode_sp=True
+    )
+    perf["meta"]["vividvr_debug"]["vae_encode_sp_effective"] = False
+    perf["meta"]["vividvr_debug"]["vae_encode_sp_fallback_reason"] = (
+        "sp_world_size_one"
+    )
+    with pytest.raises(BenchmarkDataError, match="VAE encode SP expected effective"):
+        validate_effective_config(ALL_SCHEMES["R99_VAE_ENCODE_SP"], perf)
 
 
 def formal_record(seconds: float, *, quality_passed: bool = True) -> dict:
