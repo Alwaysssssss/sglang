@@ -57,7 +57,7 @@ PYTHONPATH=python .venv/bin/python -m pytest -q \
 
 ### 任务 2：支持历史 R0 与纯加速比派生
 
-- [ ] **步骤 1：编写失败的历史 R0/派生指标测试**
+- [x] **步骤 1：编写失败的历史 R0/派生指标测试**
 
 构造 R0 formal fixture，断言 `load_historical_controls` 接受单卡、无 VAE SP 的 R0；断言纯净 treatment 的派生结果包含：
 
@@ -69,15 +69,15 @@ assert derived["denoise_speedup"] == pytest.approx(r0_denoise / treatment_denois
 assert derived["decode_trim_speedup"] == pytest.approx(r0_decode / treatment_decode)
 ```
 
-- [ ] **步骤 2：运行测试验证红灯**
+- [x] **步骤 2：运行测试验证红灯**
 
 运行对应 `-k 'historical_r0 or r0_vae_sp_derived'`，预期因旧 validator 强制 control 开启 `vae_sp` 或缺少纯 R0 派生字段而 FAIL。
 
-- [ ] **步骤 3：实现最小 R0 分支**
+- [x] **步骤 3：实现最小 R0 分支**
 
 历史 control validator 根据 control scheme 校验 `vae_sp`；R0 必须明确不启用 encode/decode VAE SP。`compute_vae_encode_sp_derived_metrics` 在 control 为 R0 时返回阶段、模型、总耗时、GPU·秒和质量差值，不生成旧同拓扑性能 gate。
 
-- [ ] **步骤 4：运行单测及 runner 全文件回归**
+- [x] **步骤 4：运行单测及 runner 全文件回归**
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m pytest -q \
@@ -86,7 +86,7 @@ PYTHONPATH=python .venv/bin/python -m pytest -q \
 
 预期：全部 PASS。
 
-- [ ] **步骤 5：dry-run 两条正式命令**
+- [x] **步骤 5：dry-run 两条正式命令**
 
 两条命令均指定历史 R0 batch、GPU 0–1 或 0–3；检查 eager 只请求 formal、backend 为 SDPA、无其他加速开关。
 

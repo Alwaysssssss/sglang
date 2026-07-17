@@ -707,6 +707,107 @@ def write_complete_encode_control(
     return control_dir
 
 
+def write_complete_r0_control(tmp_path: Path) -> Path:
+    config = BenchmarkConfig()
+    control = SCHEMES["R0"]
+    control_dir = tmp_path / "r0-control"
+    record = {
+        "schema_version": 1,
+        "batch_id": "historical-r0-control",
+        "run_role": "formal",
+        "scheme": benchmark_module._scheme_payload(control),
+        "status": "quality_failed",
+        "inputs": {
+            "input_video": str(config.input_video.resolve()),
+            "caption_file": str(config.caption_file.resolve()),
+            "reference_video": str(config.reference_video.resolve()),
+            "num_frames": 130,
+            "temporal_process_frames": 121,
+            "inference_steps": 20,
+            "seed": 42,
+            "guidance_scale": 6.0,
+            "restoration_guidance_scale": -1.0,
+            "upscale": 1.0,
+            "dtype": "bfloat16",
+        },
+        "runtime": {
+            "requested_backend": "sdpa",
+            "effective_backend": "sdpa",
+            "parallel_mode": "single",
+            "sp_world_size": 1,
+            "cfg_parallel_enabled": False,
+            "torch_compile_applied": False,
+            "modulation_fusion_applied": False,
+        },
+        "timings": {
+            "total_runtime_seconds": 1100.0,
+            "model_inference_runtime_seconds": 1090.0,
+            "stage_seconds": {
+                "VividVRLongClipPreparationStage": 60.0,
+                "VividVRMultiClipDenoisingStage": 920.0,
+                "VividVRMultiClipDecodeTrimStage": 110.0,
+            },
+        },
+        "quality": {
+            "pass_compare": False,
+            "ssim_mean": 0.984,
+            "ssim_min": 0.978,
+            "failed_frame_ratio": 2 / 130,
+        },
+    }
+    record["scheme"].pop("vae_sp")
+    record["scheme"].pop("vae_encode_sp")
+    atomic_write_json(control_dir / "records/R0_formal.json", record)
+    return control_dir
+
+
+def test_load_historical_r0_for_clean_vae_sp_treatment(tmp_path: Path):
+    control_dir = write_complete_r0_control(tmp_path)
+
+    controls = load_historical_controls(
+        control_dir, ALL_SCHEMES["R0_VAE_SP2"]
+    )
+
+    assert controls["R0"]["scheme"].get("vae_sp", False) is False
+    assert controls["R0"]["runtime"].get("vae_sp_effective", False) is False
+    assert controls["R0"]["_control_record_snapshot"]["sha256"]
+
+
+def test_compute_r0_vae_sp_derived_speedups_without_old_encode_gates():
+    scheme = ALL_SCHEMES["R0_VAE_SP2"]
+    control = encode_perf_record(
+        total=1100.0,
+        model=1090.0,
+        preparation=60.0,
+        denoise=920.0,
+        decode_trim=110.0,
+    )
+    control["scheme"] = {"scheme_id": "R0"}
+    control["batch_id"] = "historical-r0-control"
+    control["_control_record_snapshot"] = {
+        "path": "/tmp/R0_formal.json",
+        "sha256": "r0-sha256",
+        "mtime_ns": 123,
+    }
+    treatment = encode_perf_record(
+        total=600.0,
+        model=590.0,
+        preparation=35.0,
+        denoise=500.0,
+        decode_trim=50.0,
+    )
+
+    derived = compute_vae_encode_sp_derived_metrics(scheme, treatment, control)
+
+    assert derived["model_inference_speedup"] == pytest.approx(1090.0 / 590.0)
+    assert derived["total_runtime_speedup"] == pytest.approx(1100.0 / 600.0)
+    assert derived["long_clip_preparation_speedup"] == pytest.approx(60.0 / 35.0)
+    assert derived["denoise_speedup"] == pytest.approx(920.0 / 500.0)
+    assert derived["decode_trim_speedup"] == pytest.approx(110.0 / 50.0)
+    assert "performance_gates_passed" not in derived
+    assert derived["control_record_sha256"] == "r0-sha256"
+
+
 @pytest.mark.parametrize(
     ("field_path", "bad_value"),
     [

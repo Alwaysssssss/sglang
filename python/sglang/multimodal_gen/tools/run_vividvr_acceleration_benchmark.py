@@ -861,7 +861,6 @@ def _validate_encode_historical_control(
         "sp_degree": expected.sp_degree,
         "compile_enabled": expected.compile_enabled,
         "modulation_fusion": expected.modulation_fusion,
-        "vae_sp": True,
     }
     for key, value in expected_scheme.items():
         if recorded_scheme.get(key) != value:
@@ -869,6 +868,12 @@ def _validate_encode_historical_control(
                 f"historical control {control_id}.scheme.{key} expected "
                 f"{value!r}, got {recorded_scheme.get(key)!r}"
             )
+    recorded_vae_sp = bool(recorded_scheme.get("vae_sp", False))
+    if recorded_vae_sp is not expected.vae_sp:
+        raise BenchmarkDataError(
+            f"historical control {control_id}.scheme.vae_sp expected "
+            f"{expected.vae_sp!r}, got {recorded_vae_sp!r}"
+        )
     if bool(recorded_scheme.get("vae_encode_sp", False)):
         raise BenchmarkDataError(
             f"historical control {control_id} must not enable vae_encode_sp"
@@ -912,18 +917,30 @@ def _validate_encode_historical_control(
         "cfg_parallel_enabled": expected.cfg_parallel,
         "torch_compile_applied": expected.compile_enabled,
         "modulation_fusion_applied": expected.modulation_fusion,
-        "vae_sp_requested": True,
-        "vae_sp_effective": True,
-        "vae_sp_fallback_reason": "effective",
-        "vae_sp_world_size": expected.sp_degree,
-        "vae_sp_group_type": "sp",
     }
+    if expected.vae_sp:
+        expected_runtime.update(
+            {
+                "vae_sp_requested": True,
+                "vae_sp_effective": True,
+                "vae_sp_fallback_reason": "effective",
+                "vae_sp_world_size": expected.sp_degree,
+                "vae_sp_group_type": "sp",
+            }
+        )
     for key, value in expected_runtime.items():
         if runtime.get(key) != value:
             raise BenchmarkDataError(
                 f"historical control {control_id}.runtime.{key} expected "
                 f"{value!r}, got {runtime.get(key)!r}"
             )
+    if not expected.vae_sp and (
+        bool(runtime.get("vae_sp_requested", False))
+        or bool(runtime.get("vae_sp_effective", False))
+    ):
+        raise BenchmarkDataError(
+            f"historical control {control_id} runtime must not enable VAE decode SP"
+        )
     if bool(runtime.get("vae_encode_sp_requested", False)) or bool(
         runtime.get("vae_encode_sp_effective", False)
     ):
@@ -1359,6 +1376,33 @@ def compute_vae_encode_sp_derived_metrics(
         "failed_frame_ratio",
         context="control.quality",
     )
+    if control_id == "R0":
+        control_gpu_seconds = expected_control.gpu_count * control_total
+        treatment_gpu_seconds = scheme.gpu_count * treatment_total
+        return {
+            "control_scheme_id": control_id,
+            "long_clip_preparation_speedup": control_prep / treatment_prep,
+            "denoise_speedup": control_denoise / treatment_denoise,
+            "decode_trim_speedup": control_decode / treatment_decode,
+            "model_inference_speedup": control_model / treatment_model,
+            "total_runtime_speedup": control_total / treatment_total,
+            "control_gpu_seconds": control_gpu_seconds,
+            "treatment_gpu_seconds": treatment_gpu_seconds,
+            "resource_efficiency_vs_r0": (
+                control_gpu_seconds / treatment_gpu_seconds
+            ),
+            "control_record_path": snapshot.get("path"),
+            "control_record_sha256": snapshot.get("sha256"),
+            "control_record_mtime_ns": snapshot.get("mtime_ns"),
+            "control_batch_id": control.get("batch_id"),
+            "control_quality_passed": control_quality.get("pass_compare") is True,
+            "ssim_mean_delta": treatment_mean - control_mean,
+            "ssim_min_delta": treatment_min - control_min,
+            "failed_frame_ratio_delta": treatment_failed - control_failed,
+            "quality_not_worse_than_control": quality_not_worse_than_control(
+                treatment, control
+            ),
+        }
     return {
         "control_scheme_id": control_id,
         "long_clip_preparation_speedup": preparation_speedup,
