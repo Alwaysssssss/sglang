@@ -34,6 +34,28 @@ class CogVideoXSpatialTilePlan:
 
 
 @dataclass(frozen=True)
+class CogVideoXSpatialEncodeTile:
+    global_index: int
+    row_index: int
+    column_index: int
+    sample_top: int
+    sample_left: int
+
+
+@dataclass(frozen=True)
+class CogVideoXSpatialEncodeTilePlan:
+    tiles: tuple[CogVideoXSpatialEncodeTile, ...]
+    num_rows: int
+    num_columns: int
+    overlap_height: int
+    overlap_width: int
+    blend_extent_height: int
+    blend_extent_width: int
+    row_limit_height: int
+    row_limit_width: int
+
+
+@dataclass(frozen=True)
 class CogVideoXVaeSpatialDecodeStats:
     requested: bool
     effective: bool
@@ -121,9 +143,51 @@ def _build_spatial_tile_plan(
     )
 
 
+def _build_spatial_encode_tile_plan(
+    *,
+    sample_height: int,
+    sample_width: int,
+    tile_sample_min_height: int,
+    tile_sample_min_width: int,
+    tile_latent_min_height: int,
+    tile_latent_min_width: int,
+    tile_overlap_factor_height: float,
+    tile_overlap_factor_width: float,
+) -> CogVideoXSpatialEncodeTilePlan:
+    overlap_height = int(
+        tile_sample_min_height * (1 - tile_overlap_factor_height)
+    )
+    overlap_width = int(tile_sample_min_width * (1 - tile_overlap_factor_width))
+    if overlap_height <= 0 or overlap_width <= 0:
+        raise ValueError("CogVideoX VAE encode tile overlap stride must be positive")
+    blend_extent_height = int(tile_latent_min_height * tile_overlap_factor_height)
+    blend_extent_width = int(tile_latent_min_width * tile_overlap_factor_width)
+    coordinates = [
+        (row_index, column_index, top, left)
+        for row_index, top in enumerate(range(0, sample_height, overlap_height))
+        for column_index, left in enumerate(range(0, sample_width, overlap_width))
+    ]
+    return CogVideoXSpatialEncodeTilePlan(
+        tiles=tuple(
+            CogVideoXSpatialEncodeTile(index, row, column, top, left)
+            for index, (row, column, top, left) in enumerate(coordinates)
+        ),
+        num_rows=len(range(0, sample_height, overlap_height)),
+        num_columns=len(range(0, sample_width, overlap_width)),
+        overlap_height=overlap_height,
+        overlap_width=overlap_width,
+        blend_extent_height=blend_extent_height,
+        blend_extent_width=blend_extent_width,
+        row_limit_height=tile_latent_min_height - blend_extent_height,
+        row_limit_width=tile_latent_min_width - blend_extent_width,
+    )
+
+
 def _assign_spatial_tiles(
-    tiles: tuple[CogVideoXSpatialTile, ...], rank: int, world_size: int
-) -> tuple[CogVideoXSpatialTile, ...]:
+    tiles: tuple[CogVideoXSpatialTile | CogVideoXSpatialEncodeTile, ...],
+    rank: int,
+    world_size: int,
+) -> tuple[CogVideoXSpatialTile | CogVideoXSpatialEncodeTile, ...]:
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError(f"invalid SP rank/world size: {rank}/{world_size}")
     return tuple(tile for tile in tiles if tile.global_index % world_size == rank)
@@ -155,6 +219,34 @@ def _decode_one_spatial_tile(vae, z, tile: CogVideoXSpatialTile):
     return torch.cat(temporal_parts, dim=2)
 
 
+def _encode_one_spatial_tile(
+    vae, x: torch.Tensor, tile: CogVideoXSpatialEncodeTile
+) -> torch.Tensor:
+    frame_batch_size = vae.num_sample_frames_batch_size
+    num_frames = x.shape[2]
+    num_batches = max(num_frames // frame_batch_size, 1)
+    conv_cache = None
+    temporal_parts = []
+    for batch_index in range(num_batches):
+        remaining_frames = num_frames % frame_batch_size
+        start_frame = frame_batch_size * batch_index + (
+            0 if batch_index == 0 else remaining_frames
+        )
+        end_frame = frame_batch_size * (batch_index + 1) + remaining_frames
+        encoded = x[
+            :,
+            :,
+            start_frame:end_frame,
+            tile.sample_top : tile.sample_top + vae.tile_sample_min_height,
+            tile.sample_left : tile.sample_left + vae.tile_sample_min_width,
+        ]
+        encoded, conv_cache = vae.encoder(encoded, conv_cache=conv_cache)
+        if vae.quant_conv is not None:
+            encoded = vae.quant_conv(encoded)
+        temporal_parts.append(encoded)
+    return torch.cat(temporal_parts, dim=2)
+
+
 def _merge_spatial_tiles(vae, plan, decoded_tiles):
     rows = [
         [
@@ -181,6 +273,35 @@ def _merge_spatial_tiles(vae, plan, decoded_tiles):
                 tile[
                     :, :, :, : plan.row_limit_height, : plan.row_limit_width
                 ]
+            )
+        result_rows.append(torch.cat(result_row, dim=4))
+    return torch.cat(result_rows, dim=3)
+
+
+def _merge_spatial_encode_tiles(vae, plan, encoded_tiles):
+    rows = [
+        [
+            encoded_tiles[row * plan.num_columns + column]
+            for column in range(plan.num_columns)
+        ]
+        for row in range(plan.num_rows)
+    ]
+    result_rows = []
+    for row_index, row in enumerate(rows):
+        result_row = []
+        for column_index, tile in enumerate(row):
+            if row_index > 0:
+                tile = vae.blend_v(
+                    rows[row_index - 1][column_index],
+                    tile,
+                    plan.blend_extent_height,
+                )
+            if column_index > 0:
+                tile = vae.blend_h(
+                    row[column_index - 1], tile, plan.blend_extent_width
+                )
+            result_row.append(
+                tile[:, :, :, : plan.row_limit_height, : plan.row_limit_width]
             )
         result_rows.append(torch.cat(result_row, dim=4))
     return torch.cat(result_rows, dim=3)
@@ -344,7 +465,7 @@ def _unpack_gathered_tiles(
     return dict(sorted(recovered.items()))
 
 
-def _all_gather_decoded_tiles(
+def _all_gather_spatial_tiles(
     sp_group,
     local_tiles: dict[int, torch.Tensor],
     total_tiles: int,
@@ -373,6 +494,23 @@ def _all_gather_decoded_tiles(
     )
     return _unpack_gathered_tiles(
         gathered_metadata, gathered_payload, total_tiles=total_tiles
+    )
+
+
+def _all_gather_decoded_tiles(
+    sp_group,
+    local_tiles: dict[int, torch.Tensor],
+    total_tiles: int,
+    *,
+    payload_dtype: torch.dtype,
+    payload_device: torch.device,
+) -> dict[int, torch.Tensor]:
+    return _all_gather_spatial_tiles(
+        sp_group,
+        local_tiles,
+        total_tiles,
+        payload_dtype=payload_dtype,
+        payload_device=payload_device,
     )
 
 
