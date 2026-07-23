@@ -250,6 +250,10 @@ class Req:
         self.is_warmup = True
         self.save_output = False
         self.suppress_logs = True
+        # Request-based warmup is an internal copy and must not overwrite the
+        # user-visible progress of the real request queued behind it.
+        if hasattr(self, "progress_path"):
+            self.progress_path = None
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = warmup_steps
 

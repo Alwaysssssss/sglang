@@ -8,7 +8,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import Backend, ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
@@ -133,6 +133,33 @@ class TestOffloadValidation(unittest.TestCase):
         with patch.dict(os.environ, {"SGLANG_CACHE_DIT_ENABLED": "true"}):
             with self.assertRaisesRegex(ValueError, "cache-dit"):
                 args._validate_offload()
+
+
+class TestVideoEditAttentionBackend(unittest.TestCase):
+    @staticmethod
+    def _args(self_backend, cross_backend=None):
+        args = object.__new__(ServerArgs)
+        args.attention_backend = None
+        args.attention_backend_config = None
+        args.videoedit_self_attention_backend = self_backend
+        args.videoedit_cross_attention_backend = cross_backend
+        args.ring_degree = 1
+        args.backend = Backend.DIFFUSERS
+        return args
+
+    def test_sage_self_attention_defaults_cross_attention_to_flash(self):
+        args = self._args("SAGE_ATTN")
+
+        args._adjust_attention_backend()
+
+        self.assertEqual(args.videoedit_self_attention_backend, "sage_attn")
+        self.assertEqual(args.videoedit_cross_attention_backend, "fa")
+
+    def test_rejects_unknown_videoedit_attention_backend(self):
+        args = self._args("unknown")
+
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            args._adjust_attention_backend()
 
 
 if __name__ == "__main__":

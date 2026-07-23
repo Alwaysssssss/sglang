@@ -270,6 +270,7 @@ def _resolve_quant_config(
     """
     quant_config = get_quant_config(hf_config, component_model_path)
     runtime_quantization = getattr(server_args, "transformer_quantization", None)
+    fp8_gemm_backend = getattr(server_args, "transformer_fp8_gemm_backend", "auto")
     if runtime_quantization:
         if quant_config is not None:
             raise ValueError(
@@ -277,10 +278,15 @@ def _resolve_quant_config(
                 "contains quantization metadata. Use one quantization source."
             )
         if runtime_quantization == "fp8_dynamic":
-            logger.info("Using runtime transformer quantization: fp8_dynamic")
+            logger.info(
+                "Using runtime transformer quantization: fp8_dynamic "
+                "(gemm_backend=%s)",
+                fp8_gemm_backend,
+            )
             return Fp8Config(
                 is_checkpoint_fp8_serialized=False,
                 activation_scheme="dynamic",
+                gemm_backend=fp8_gemm_backend,
             )
         raise ValueError(
             f"Unsupported transformer_quantization: {runtime_quantization}"
@@ -290,16 +296,24 @@ def _resolve_quant_config(
         for safetensors_file in safetensors_list:
             quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
             if quant_config is not None:
-                return quant_config
+                break
 
-        param_names_mapping_dict = (
-            server_args.pipeline_config.dit_config.arch_config.param_names_mapping
-        )
-        quant_config = build_nvfp4_config_from_safetensors_list(
-            safetensors_list, param_names_mapping_dict
-        )
-        if quant_config is not None:
-            return quant_config
+        if quant_config is None:
+            param_names_mapping_dict = (
+                server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+            )
+            quant_config = build_nvfp4_config_from_safetensors_list(
+                safetensors_list, param_names_mapping_dict
+            )
+
+    if fp8_gemm_backend != "auto":
+        if not isinstance(quant_config, Fp8Config):
+            raise ValueError(
+                "--transformer-fp8-gemm-backend requires an FP8 transformer. "
+                "Set --transformer-quantization fp8_dynamic or load an FP8 checkpoint."
+            )
+        logger.info("Overriding checkpoint FP8 GEMM backend: %s", fp8_gemm_backend)
+        quant_config.gemm_backend = fp8_gemm_backend
 
     return quant_config
 

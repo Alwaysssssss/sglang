@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -61,6 +62,74 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+
+def use_fp8_fused_projections(
+    quant_config: QuantizationConfig | None,
+) -> bool:
+    """Return whether Wan should fuse projections for dynamic FP8 inference."""
+    if quant_config is None or quant_config.get_name() != "fp8":
+        return False
+    server_args = get_global_server_args()
+    return bool(
+        getattr(server_args, "transformer_fp8_fused_projections", False)
+        and not getattr(server_args, "lora_path", None)
+    )
+
+
+def sage_kernel_for_backend(
+    backend: AttentionBackendEnum | None,
+) -> str:
+    if backend == AttentionBackendEnum.SAGE_ATTN:
+        return "qk_int8_pv_fp8_cuda"
+    return "auto"
+
+
+def build_wan_fused_projection_mapping(
+    mapping: dict[str, str | tuple[str, int, int]],
+) -> dict[str, str | tuple[str, int, int]]:
+    """Map separate checkpoint projections into packed Wan parameters."""
+    fused_mapping = dict(mapping)
+    fused_mapping.update(
+        {
+            r"^blocks\.(\d+)\.attn1\.to_q\.(.*)$": (
+                r"blocks.\1.to_qkv.\2",
+                0,
+                3,
+            ),
+            r"^blocks\.(\d+)\.attn1\.to_k\.(.*)$": (
+                r"blocks.\1.to_qkv.\2",
+                1,
+                3,
+            ),
+            r"^blocks\.(\d+)\.attn1\.to_v\.(.*)$": (
+                r"blocks.\1.to_qkv.\2",
+                2,
+                3,
+            ),
+            r"^blocks\.(\d+)\.attn2\.to_k\.(.*)$": (
+                r"blocks.\1.attn2.to_kv.\2",
+                0,
+                2,
+            ),
+            r"^blocks\.(\d+)\.attn2\.to_v\.(.*)$": (
+                r"blocks.\1.attn2.to_kv.\2",
+                1,
+                2,
+            ),
+            r"^blocks\.(\d+)\.attn2\.add_k_proj\.(.*)$": (
+                r"blocks.\1.attn2.to_added_kv.\2",
+                0,
+                2,
+            ),
+            r"^blocks\.(\d+)\.attn2\.add_v_proj\.(.*)$": (
+                r"blocks.\1.attn2.to_added_kv.\2",
+                1,
+                2,
+            ),
+        }
+    )
+    return fused_mapping
 
 
 def _normalize_encoder_hidden_states_image(
@@ -183,6 +252,7 @@ class WanSelfAttention(nn.Module):
         prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         is_cross_attention: bool = False,
+        attention_backend_override: AttentionBackendEnum | None = None,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         assert dim % num_heads == 0
@@ -204,20 +274,30 @@ class WanSelfAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("to_q", prefix),
         )
-        self.to_k = ColumnParallelLinear(
-            dim,
-            dim,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_k", prefix),
-        )
-        self.to_v = ColumnParallelLinear(
-            dim,
-            dim,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("to_v", prefix),
-        )
+        self.use_fused_kv = use_fp8_fused_projections(quant_config)
+        if self.use_fused_kv:
+            self.to_kv = MergedColumnParallelLinear(
+                dim,
+                [dim, dim],
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_kv", prefix),
+            )
+        else:
+            self.to_k = ColumnParallelLinear(
+                dim,
+                dim,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_k", prefix),
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                dim,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_v", prefix),
+            )
         self.to_out = RowParallelLinear(
             dim,
             dim,
@@ -239,6 +319,10 @@ class WanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=is_cross_attention,
+            prefix=prefix,
+            profile_kind="text_cross" if is_cross_attention else None,
+            backend_override=attention_backend_override,
+            sage_attention_kernel=sage_kernel_for_backend(attention_backend_override),
             quant_config=quant_config,
         )
 
@@ -268,18 +352,21 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
+        if self.use_fused_kv:
+            kv, _ = self.to_kv(context)
+            k, v = tuple(part.contiguous() for part in kv.chunk(2, dim=-1))
+        else:
+            k, _ = self.to_k(context)
+            v, _ = self.to_v(context)
         if self.tp_rmsnorm:
             k = tensor_parallel_rms_norm(k, self.norm_k)
         else:
             k = self.norm_k(k)
         k = k.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        v, _ = self.to_v(context)
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         # compute attention
-        x = self.attn(q, k, v)
+        x = self.attn(q, k, v, profile_kind="text_cross")
 
         # output
         x = x.flatten(2)
@@ -298,6 +385,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         eps=1e-6,
         prefix: str = "",
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        attention_backend_override: AttentionBackendEnum | None = None,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(
@@ -306,25 +394,37 @@ class WanI2VCrossAttention(WanSelfAttention):
             window_size,
             qk_norm,
             eps,
+            prefix=prefix,
             supported_attention_backends=supported_attention_backends,
             is_cross_attention=True,
+            attention_backend_override=attention_backend_override,
             quant_config=quant_config,
         )
 
-        self.add_k_proj = ColumnParallelLinear(
-            dim,
-            dim,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("add_k_proj", prefix),
-        )
-        self.add_v_proj = ColumnParallelLinear(
-            dim,
-            dim,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("add_v_proj", prefix),
-        )
+        self.use_fused_added_kv = use_fp8_fused_projections(quant_config)
+        if self.use_fused_added_kv:
+            self.to_added_kv = MergedColumnParallelLinear(
+                dim,
+                [dim, dim],
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("to_added_kv", prefix),
+            )
+        else:
+            self.add_k_proj = ColumnParallelLinear(
+                dim,
+                dim,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("add_k_proj", prefix),
+            )
+            self.add_v_proj = ColumnParallelLinear(
+                dim,
+                dim,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("add_v_proj", prefix),
+            )
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_lens):
@@ -344,28 +444,36 @@ class WanI2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
+        if self.use_fused_kv:
+            kv, _ = self.to_kv(context)
+            k, v = tuple(part.contiguous() for part in kv.chunk(2, dim=-1))
+        else:
+            k, _ = self.to_k(context)
+            v, _ = self.to_v(context)
         if self.tp_rmsnorm:
             k = tensor_parallel_rms_norm(k, self.norm_k)
         else:
             k = self.norm_k(k)
         k = k.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        v, _ = self.to_v(context)
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k_img, _ = self.add_k_proj(context_img)
+        if self.use_fused_added_kv:
+            added_kv, _ = self.to_added_kv(context_img)
+            k_img, v_img = tuple(
+                part.contiguous() for part in added_kv.chunk(2, dim=-1)
+            )
+        else:
+            k_img, _ = self.add_k_proj(context_img)
+            v_img, _ = self.add_v_proj(context_img)
         if self.tp_rmsnorm:
             k_img = tensor_parallel_rms_norm(k_img, self.norm_added_k)
         else:
             k_img = self.norm_added_k(k_img)
         k_img = k_img.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        v_img, _ = self.add_v_proj(context_img)
         v_img = v_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        img_x = self.attn(q, k_img, v_img)
-        x = self.attn(q, k, v)
+        img_x = self.attn(q, k_img, v_img, profile_kind="image_cross")
+        x = self.attn(q, k, v, profile_kind="text_cross")
 
         # output
         x = x.flatten(2)
@@ -387,6 +495,8 @@ class WanTransformerBlock(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        self_attention_backend: AttentionBackendEnum | None = None,
+        cross_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         attention_type: str = "original",
         sla_topk: float = 0.1,
@@ -401,30 +511,41 @@ class WanTransformerBlock(nn.Module):
             elementwise_affine=False,
             dtype=torch.float32,
         )
-        self.to_q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("attn1.to_q", prefix),
-        )
-        self.to_k = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("attn1.to_k", prefix),
-        )
-        self.to_v = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=add_prefix("attn1.to_v", prefix),
-        )
+        self.use_fused_qkv = use_fp8_fused_projections(quant_config)
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [dim, dim, dim],
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_qkv", prefix),
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_q", prefix),
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_k", prefix),
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_v", prefix),
+            )
 
         self.to_out = RowParallelLinear(
             dim,
@@ -457,6 +578,9 @@ class WanTransformerBlock(nn.Module):
                 causal=False,
                 supported_attention_backends=self_attn_backends,
                 prefix=add_prefix("attn1", prefix),
+                profile_kind="self",
+                backend_override=self_attention_backend,
+                sage_attention_kernel=sage_kernel_for_backend(self_attention_backend),
                 quant_config=quant_config,
                 is_cross_attention=False,
             )
@@ -497,6 +621,7 @@ class WanTransformerBlock(nn.Module):
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
+                attention_backend_override=cross_attention_backend,
                 quant_config=quant_config,
             )
         else:
@@ -508,6 +633,7 @@ class WanTransformerBlock(nn.Module):
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
+                attention_backend_override=cross_attention_backend,
                 quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
@@ -563,9 +689,15 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
+        if self.use_fused_qkv:
+            qkv, _ = self.to_qkv(norm_hidden_states)
+            query, key, value = tuple(
+                part.contiguous() for part in qkv.chunk(3, dim=-1)
+            )
+        else:
+            query, _ = self.to_q(norm_hidden_states)
+            key, _ = self.to_k(norm_hidden_states)
+            value, _ = self.to_v(norm_hidden_states)
 
         if self.norm_q is not None:
             if self.tp_rmsnorm:
@@ -644,10 +776,16 @@ class WanTransformerBlock_VSA(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        self_attention_backend: AttentionBackendEnum | None = None,
+        cross_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
+        if self_attention_backend is not None or cross_attention_backend is not None:
+            raise ValueError(
+                "Per-role Attention overrides are not supported by Wan VSA blocks"
+            )
 
         # 1. Self-attention
         self.norm1 = LayerNormScaleShift(
@@ -656,30 +794,41 @@ class WanTransformerBlock_VSA(nn.Module):
             elementwise_affine=False,
             dtype=torch.float32,
         )
-        self.to_q = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=add_prefix("attn1.to_q", prefix),
-        )
-        self.to_k = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=add_prefix("attn1.to_k", prefix),
-        )
-        self.to_v = ColumnParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            gather_output=True,
-            quant_config=quant_config,
-            prefix=add_prefix("attn1.to_v", prefix),
-        )
+        self.use_fused_qkv = use_fp8_fused_projections(quant_config)
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [dim, dim, dim],
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_qkv", prefix),
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_q", prefix),
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_k", prefix),
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=True,
+                gather_output=True,
+                quant_config=quant_config,
+                prefix=add_prefix("attn1.to_v", prefix),
+            )
         self.to_gate_compress = ColumnParallelLinear(
             dim,
             dim,
@@ -739,6 +888,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
+                attention_backend_override=cross_attention_backend,
                 quant_config=quant_config,
             )
         else:
@@ -750,6 +900,7 @@ class WanTransformerBlock_VSA(nn.Module):
                 eps=eps,
                 prefix=add_prefix("attn2", prefix),
                 supported_attention_backends=cross_attn_backends,
+                attention_backend_override=cross_attention_backend,
                 quant_config=quant_config,
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
@@ -791,9 +942,15 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
+        if self.use_fused_qkv:
+            qkv, _ = self.to_qkv(norm_hidden_states)
+            query, key, value = tuple(
+                part.contiguous() for part in qkv.chunk(3, dim=-1)
+            )
+        else:
+            query, _ = self.to_q(norm_hidden_states)
+            key, _ = self.to_k(norm_hidden_states)
+            value, _ = self.to_v(norm_hidden_states)
         gate_compress, _ = self.to_gate_compress(norm_hidden_states)
 
         if self.norm_q is not None:
@@ -866,6 +1023,11 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
 
+    def _get_attention_backend_overrides(
+        self,
+    ) -> tuple[AttentionBackendEnum | None, AttentionBackendEnum | None]:
+        return None, None
+
     def __init__(
         self,
         config: WanVideoConfig,
@@ -873,6 +1035,31 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
+
+        (
+            self.self_attention_backend_override,
+            self.cross_attention_backend_override,
+        ) = self._get_attention_backend_overrides()
+        if self.self_attention_backend_override is not None:
+            logger.info(
+                "Wan Attention backend overrides: self=%s, cross=%s",
+                self.self_attention_backend_override.name.lower(),
+                (
+                    self.cross_attention_backend_override.name.lower()
+                    if self.cross_attention_backend_override is not None
+                    else "global"
+                ),
+            )
+
+        self.use_fp8_fused_projections = use_fp8_fused_projections(quant_config)
+        self.param_names_mapping = dict(self.param_names_mapping)
+        if self.use_fp8_fused_projections:
+            self.param_names_mapping = build_wan_fused_projection_mapping(
+                self.param_names_mapping
+            )
+            logger.info(
+                "Enabled Wan FP8 fused projections: self QKV, cross KV, added KV"
+            )
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.hidden_size = config.hidden_size
@@ -920,6 +1107,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     config.added_kv_proj_dim,
                     self._supported_attention_backends
                     | {AttentionBackendEnum.VIDEO_SPARSE_ATTN},
+                    self_attention_backend=self.self_attention_backend_override,
+                    cross_attention_backend=self.cross_attention_backend_override,
                     prefix=f"blocks.{i}",
                     attention_type=config.attention_type,
                     sla_topk=config.sla_topk,

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
+    maybe_log_linear_runtime_shape,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -20,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
@@ -38,6 +40,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    FP8_GEMM_BACKENDS,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -45,6 +48,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    resolve_fp8_linear_gemm_backend,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
@@ -73,6 +77,7 @@ if _use_aiter or _use_hip_int4:
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+WEIGHT_SCALE_GRANULARITIES = ["tensor", "channel"]
 FAKE_W8A8_DEQUANT_ENV = "SGLANG_DIFFUSION_FAKE_FP8_W8A8_DEQUANT"
 
 logger = logging.getLogger(__name__)
@@ -104,6 +109,8 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        gemm_backend: str = "auto",
+        weight_scale_granularity: str | None = None,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -111,6 +118,27 @@ class Fp8Config(QuantizationConfig):
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
+        if gemm_backend not in FP8_GEMM_BACKENDS:
+            raise ValueError(
+                f"Unsupported FP8 GEMM backend {gemm_backend!r}; "
+                f"expected one of {FP8_GEMM_BACKENDS}."
+            )
+        self.gemm_backend = gemm_backend
+        if weight_scale_granularity is None:
+            weight_scale_granularity = (
+                "tensor" if is_checkpoint_fp8_serialized else "channel"
+            )
+        if weight_scale_granularity not in WEIGHT_SCALE_GRANULARITIES:
+            raise ValueError(
+                "Unsupported FP8 weight scale granularity "
+                f"{weight_scale_granularity!r}; expected one of "
+                f"{WEIGHT_SCALE_GRANULARITIES}."
+            )
+        if weight_block_size is not None and weight_scale_granularity != "tensor":
+            raise ValueError(
+                "weight_scale_granularity applies only to non-block FP8 weights"
+            )
+        self.weight_scale_granularity = weight_scale_granularity
         self.ignored_layers = ignored_layers or []
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
@@ -155,11 +183,17 @@ class Fp8Config(QuantizationConfig):
             # hacking ministral
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        gemm_backend = cls.get_from_keys_or(config, ["gemm_backend"], "auto")
+        weight_scale_granularity = cls.get_from_keys_or(
+            config, ["weight_scale_granularity"], None
+        )
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            gemm_backend=gemm_backend,
+            weight_scale_granularity=weight_scale_granularity,
         )
 
     def get_quant_method(
@@ -197,6 +231,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
+        self.gemm_backend = getattr(quant_config, "gemm_backend", "auto")
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
@@ -302,6 +337,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale.format_ue8m0 = False
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
+            elif self.quant_config.weight_scale_granularity == "channel":
+                scale = ChannelQuantScaleParameter(
+                    data=torch.empty(
+                        output_size_per_partition,
+                        dtype=torch.float32,
+                    ),
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", scale)
             else:
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -424,8 +470,26 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.data, requires_grad=False
                     )
 
+                if self.quant_config.weight_scale_granularity == "channel":
+                    weight = layer.weight
+                    weight_scale = layer.weight_scale
+                    expected_scales = weight.shape[0]
+                    if weight_scale.numel() != expected_scales:
+                        raise ValueError(
+                            "Serialized per-channel FP8 scale count does not match "
+                            f"the output dimension: {weight_scale.numel()} != "
+                            f"{expected_scales}"
+                        )
+                    if not torch.isfinite(weight_scale).all() or not torch.all(
+                        weight_scale > 0
+                    ):
+                        raise ValueError(
+                            "Serialized per-channel FP8 scales must be finite and "
+                            "strictly positive"
+                        )
+                    weight_scale = weight_scale.reshape(1, -1).contiguous()
                 # cutlass sgl-kernel and marlin only support per-channel scale
-                if self.cutlass_fp8_supported or self.use_marlin:
+                elif self.cutlass_fp8_supported or self.use_marlin:
                     weight = layer.weight
                     weight_scale = convert_to_channelwise(
                         layer.weight_scale, layer.logical_widths
@@ -475,12 +539,59 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def runtime_kernel_name(
+        self, layer: torch.nn.Module, x: Optional[torch.Tensor] = None
+    ) -> str:
+        if self.use_dequant_fallback and not self.block_quant:
+            return "bf16_matmul_dequant_fallback"
+        if self.use_marlin:
+            return "fp8_marlin_weight_only"
+        if self.block_quant:
+            backend = getattr(
+                self.w8a8_block_fp8_linear,
+                "__name__",
+                type(self.w8a8_block_fp8_linear).__name__,
+            )
+            return f"dynamic_block_fp8+{backend}"
+
+        activation = (
+            "dynamic_per_token_fp8"
+            if getattr(layer, "input_scale", None) is None
+            else "static_fp8"
+        )
+        weight = layer.weight
+        input_num_tokens = None
+        if isinstance(x, torch.Tensor):
+            input_num_tokens = x.numel() // x.shape[-1]
+        backend = resolve_fp8_linear_gemm_backend(
+            requested_backend=self.gemm_backend,
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            weight_shape=tuple(weight.shape),
+            weight_scale_numel=layer.weight_scale.numel(),
+            input_num_tokens=input_num_tokens,
+        )
+        gemm = {
+            "sgl_cutlass": "sgl_kernel.fp8_scaled_mm",
+            "triton": "triton_scaled_mm",
+            "non_cutlass": "apply_fp8_linear.non_cutlass",
+            "hybrid_shape_dependent": (
+                "hybrid(sgl_kernel.fp8_scaled_mm|triton_scaled_mm)"
+            ),
+        }[backend]
+        return f"{activation}+{gemm}"
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        maybe_log_linear_runtime_shape(
+            layer,
+            x,
+            method=type(self).__name__,
+            kernel=self.runtime_kernel_name(layer, x),
+        )
         if self.use_dequant_fallback and not self.block_quant:
             if get_bool_env_var(FAKE_W8A8_DEQUANT_ENV):
                 x = _fake_quant_dequant_fp8_per_token(x)
@@ -540,4 +651,5 @@ class Fp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
+            gemm_backend=self.gemm_backend,
         )

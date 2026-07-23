@@ -1,5 +1,7 @@
 import gzip
+import json
 import os
+from contextlib import nullcontext
 
 import torch
 
@@ -16,6 +18,17 @@ if current_platform.is_npu():
     torch_npu._apply_patches(patches)
 
 logger = init_logger(__name__)
+
+_PROFILE_RANGES_ENABLED = os.getenv(
+    "SGLANG_DIT_PROFILE_RANGES", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def diffusion_profile_range(name: str):
+    """Create a torch profiler range only for explicit DiT profiling runs."""
+    if not _PROFILE_RANGES_ENABLED:
+        return nullcontext()
+    return torch.profiler.record_function(name)
 
 
 class SGLDiffusionProfiler:
@@ -62,10 +75,14 @@ class SGLDiffusionProfiler:
         if current_platform.is_npu():
             activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
+        with_stack = os.getenv(
+            "SGLANG_TORCH_PROFILER_WITH_STACK", "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
-            with_stack=True,
+            with_stack=with_stack,
+            acc_events=True,
             on_trace_ready=(
                 None
                 if not current_platform.is_npu()
@@ -78,22 +95,27 @@ class SGLDiffusionProfiler:
             self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
-            warmup = 1
+            warmup = 0 if num_steps == -1 else 1
             num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
-            self.num_active_steps = num_actual_steps + warmup
+            if num_actual_steps is None or num_actual_steps <= 0:
+                raise ValueError("num_steps must be positive or -1")
+            self.num_remaining_step_calls = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
                 **common_torch_profiler_args,
                 schedule=torch.profiler.schedule(
                     skip_first=0,
                     wait=0,
                     warmup=warmup,
-                    active=self.num_active_steps,
+                    active=num_actual_steps,
                     repeat=1,
                 ),
             )
             self.profile_mode_id = f"{num_actual_steps} steps"
 
-        logger.info(f"Profiling request: {request_id} for {self.profile_mode_id}...")
+        logger.info(
+            f"Profiling request: {request_id} for {self.profile_mode_id} "
+            f"(rank={self.rank}, pid={os.getpid()})..."
+        )
 
         self.has_stopped = False
 
@@ -101,7 +123,9 @@ class SGLDiffusionProfiler:
         self.start()
 
     def start(self):
-        logger.info("Starting Profiler...")
+        logger.info(
+            f"Starting Profiler (rank={self.rank}, pid={os.getpid()})..."
+        )
         self.profiler.start()
 
     def _step(self):
@@ -113,9 +137,9 @@ class SGLDiffusionProfiler:
 
     def step_denoising_step(self):
         if not self.full_profile:
-            if self.num_active_steps >= 0:
+            if self.num_remaining_step_calls > 0:
                 self._step()
-                self.num_active_steps -= 1
+                self.num_remaining_step_calls -= 1
             else:
                 # early exit when enough steps are captured, to reduce the trace file size
                 self.stop(dump_rank=0)
@@ -158,13 +182,57 @@ class SGLDiffusionProfiler:
                 )
             )
             self.profiler.export_chrome_trace(trace_path)
+            summary_path = self._export_operator_summary(trace_path)
 
             if self._check_trace_integrity(trace_path):
                 logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
+                logger.info(
+                    f"Saved profiler operator summary to: {CYAN}{summary_path}{RESET}"
+                )
             else:
                 logger.warning(f"Trace file may be corrupted: {trace_path}")
         except Exception as e:
             logger.error(f"Failed to save trace: {e}")
+
+    def _export_operator_summary(self, trace_path: str) -> str:
+        suffix = ".trace.json.gz"
+        base_path = (
+            trace_path[: -len(suffix)] if trace_path.endswith(suffix) else trace_path
+        )
+        summary_path = f"{base_path}.profile.json"
+        events = []
+        for event in self.profiler.key_averages():
+            events.append(
+                {
+                    "name": str(event.key),
+                    "count": int(event.count),
+                    "device_type": str(event.device_type).rsplit(".", 1)[-1].lower(),
+                    "cpu_time_total_us": float(event.cpu_time_total),
+                    "self_cpu_time_total_us": float(event.self_cpu_time_total),
+                    "device_time_total_us": float(event.device_time_total),
+                    "self_device_time_total_us": float(event.self_device_time_total),
+                }
+            )
+        events.sort(
+            key=lambda event: (
+                event["self_device_time_total_us"],
+                event["device_time_total_us"],
+            ),
+            reverse=True,
+        )
+        payload = {
+            "request_id": self.request_id,
+            "rank": self.rank,
+            "profile_mode": self.profile_mode_id,
+            "time_unit": "microseconds",
+            "trace_path": trace_path,
+            "events": events,
+        }
+        tmp_path = f"{summary_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=True, indent=2)
+        os.replace(tmp_path, summary_path)
+        return summary_path
 
     def _check_trace_integrity(self, trace_path: str) -> bool:
         try:

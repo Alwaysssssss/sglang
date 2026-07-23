@@ -678,6 +678,8 @@ class VideoEditDenoisingStage(DenoisingStage):
                     )
                     if progress_bar is not None:
                         progress_bar.update()
+                    if not batch.is_warmup:
+                        self.step_profile()
 
         return batch
 

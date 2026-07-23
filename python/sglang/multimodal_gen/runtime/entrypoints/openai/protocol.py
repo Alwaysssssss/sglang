@@ -201,6 +201,9 @@ class VideoRepairRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     perf_dump_path: Optional[str] = None
+    profile: bool = False
+    num_profiled_timesteps: int = 5
+    profile_all_stages: bool = False
 
 
 class VideoListResponse(BaseModel):

@@ -6,10 +6,10 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List
 
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -45,6 +45,11 @@ class PipelineExecutor(ABC):
 
     def __init__(self, server_args):
         self.server_args = server_args
+        # GPUWorker sets RANK before constructing the pipeline. Cache that
+        # process-local value so only one worker owns the process-global Kineto
+        # profiler, even if distributed group rank lookup is not ready/stable.
+        self.rank = int(os.environ.get("RANK", "0"))
+        self._active_profiler = None
 
     def execute_with_profiling(
         self,
@@ -90,7 +95,19 @@ class PipelineExecutor(ABC):
             return
 
         request_id = batch.request_id
-        rank = get_world_rank()
+        rank = self.rank
+        if rank != dump_rank:
+            # Kineto is process-global in the diffusion worker topology. Starting
+            # one profiler per distributed rank can race and corrupt its state.
+            yield
+            return
+
+        # Some pipelines profile the whole request while reusing executor
+        # helpers that also enter this context for individual windows. Kineto
+        # does not support nested sessions in one process.
+        if self._active_profiler is not None:
+            yield
+            return
 
         profiler = SGLDiffusionProfiler(
             request_id=request_id,
@@ -99,7 +116,11 @@ class PipelineExecutor(ABC):
             num_steps=batch.num_profiled_timesteps,
             num_inference_steps=batch.num_inference_steps,
         )
+        self._active_profiler = profiler
         try:
             yield
         finally:
-            profiler.stop(dump_rank=dump_rank)
+            try:
+                profiler.stop(dump_rank=dump_rank)
+            finally:
+                self._active_profiler = None

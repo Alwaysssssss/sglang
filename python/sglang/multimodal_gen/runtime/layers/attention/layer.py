@@ -1,6 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import json
+import os
 from typing import Type
 
 import torch
@@ -22,7 +24,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    global_force_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
@@ -33,7 +38,16 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import diffusion_profile_range
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+logger = init_logger(__name__)
+_ATTENTION_AUDIT_ENABLED = os.getenv(
+    "SGLANG_DIT_ATTENTION_AUDIT", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+_ATTENTION_AUDIT_KEYS: set[tuple] = set()
+_ATTENTION_PROFILE_KINDS = {"self", "text_cross", "image_cross"}
 
 
 class UlyssesAttention(nn.Module):
@@ -338,6 +352,8 @@ class USPAttention(nn.Module):
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
+        profile_kind: str | None = None,
+        backend_override: AttentionBackendEnum | None = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -358,9 +374,25 @@ class USPAttention(nn.Module):
             num_kv_heads = num_heads
 
         dtype = get_compute_dtype()
-        attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
-        )
+        if backend_override is None:
+            attn_backend = get_attn_backend(
+                head_size,
+                dtype,
+                supported_attention_backends=supported_attention_backends,
+            )
+        else:
+            with global_force_attn_backend_context_manager(backend_override):
+                attn_backend = get_attn_backend(
+                    head_size,
+                    dtype,
+                    supported_attention_backends={backend_override},
+                )
+            if attn_backend.get_enum() != backend_override:
+                raise RuntimeError(
+                    "Explicit Attention backend request was not honored: "
+                    f"requested={backend_override.name.lower()}, "
+                    f"resolved={attn_backend.get_enum().name.lower()}"
+                )
         if get_ring_parallel_world_size() > 1:
             backend_enum = attn_backend.get_enum()
             if backend_enum not in (
@@ -387,11 +419,94 @@ class USPAttention(nn.Module):
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self.requested_backend = backend_override
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.profile_kind = profile_kind
+
+    def _resolve_profile_kind(self, profile_kind: str | None) -> str | None:
+        resolved = profile_kind or self.profile_kind
+        if resolved is not None and resolved not in _ATTENTION_PROFILE_KINDS:
+            raise ValueError(
+                f"Unsupported attention profile kind {resolved!r}; expected one of "
+                f"{sorted(_ATTENTION_PROFILE_KINDS)}"
+            )
+        return resolved
+
+    @staticmethod
+    def _compute_profile_name(profile_kind: str | None) -> str:
+        if profile_kind is None:
+            return "sglang.dit.attention.compute"
+        return f"sglang.dit.attention.{profile_kind}.compute"
+
+    def _audit_runtime(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        profile_kind: str | None,
+    ) -> None:
+        if not _ATTENTION_AUDIT_ENABLED:
+            return
+
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else 0
+        )
+        key = (
+            rank,
+            profile_kind,
+            self.backend.name,
+            str(q.dtype),
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+        )
+        if key in _ATTENTION_AUDIT_KEYS:
+            return
+        _ATTENTION_AUDIT_KEYS.add(key)
+        payload = {
+            "rank": rank,
+            "profile_kind": profile_kind or "unclassified",
+            "profile_event": self._compute_profile_name(profile_kind),
+            "backend": self.backend.name.lower(),
+            "requested_backend": (
+                self.requested_backend.name.lower()
+                if self.requested_backend is not None
+                else None
+            ),
+            "backend_impl": self.attn_impl.__class__.__name__,
+            "kernel": getattr(self.attn_impl, "kernel_name", None),
+            "qk_quant_gran": getattr(self.attn_impl, "qk_quant_gran", None),
+            "pv_accum_dtype": getattr(self.attn_impl, "pv_accum_dtype", None),
+            "smooth_k": getattr(self.attn_impl, "smooth_k", None),
+            "dtype": str(q.dtype).removeprefix("torch."),
+            "q_shape": list(q.shape),
+            "k_shape": list(k.shape),
+            "v_shape": list(v.shape),
+            "causal": self.causal,
+            "softmax_scale": self.softmax_scale,
+            "sequence_parallel_world_size": get_sequence_parallel_world_size(),
+            "ulysses_parallel_world_size": get_ulysses_parallel_world_size(),
+            "ring_parallel_world_size": get_ring_parallel_world_size(),
+        }
+        logger.info("ATTENTION_RUNTIME_AUDIT %s", json.dumps(payload, sort_keys=True))
+
+    def _run_backend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+        profile_kind: str | None,
+    ) -> torch.Tensor:
+        self._audit_runtime(q, k, v, profile_kind)
+        with diffusion_profile_range(self._compute_profile_name(profile_kind)):
+            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
     def forward(
         self,
@@ -400,6 +515,7 @@ class USPAttention(nn.Module):
         v: torch.Tensor,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        profile_kind: str | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -421,10 +537,10 @@ class USPAttention(nn.Module):
         """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        profile_kind = self._resolve_profile_kind(profile_kind)
         if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
-            return out
+            return self._run_backend(q, k, v, ctx_attn_metadata, profile_kind)
 
         sp_size = get_ulysses_parallel_world_size()
         if num_replicated_prefix > 0 and num_replicated_suffix > 0:
@@ -433,38 +549,42 @@ class USPAttention(nn.Module):
             )
         if sp_size > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
-                q, k, v, ctx_attn_metadata, num_replicated_prefix
+                q, k, v, ctx_attn_metadata, num_replicated_prefix, profile_kind
             )
         if sp_size > 1 and num_replicated_suffix > 0:
             return self._forward_with_replicated_suffix(
-                q, k, v, ctx_attn_metadata, num_replicated_suffix
+                q, k, v, ctx_attn_metadata, num_replicated_suffix, profile_kind
             )
 
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            with diffusion_profile_range("sglang.dit.attention.sp_communication"):
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            out = ring_attn(
-                q,
-                k,
-                v,
-                attn_impl=self.attn_impl,
-                is_causal=self.causal,
-                dropout_p=self.dropout_p,
-            )
+            self._audit_runtime(q, k, v, profile_kind)
+            with diffusion_profile_range(self._compute_profile_name(profile_kind)):
+                out = ring_attn(
+                    q,
+                    k,
+                    v,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
         else:
             # -> [B, S, H_local, D]
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self._run_backend(q, k, v, ctx_attn_metadata, profile_kind)
 
         # Ulysses-style All-to-All to restore original sharding
         if sp_size > 1:
             # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            with diffusion_profile_range("sglang.dit.attention.sp_communication"):
+                out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
 
@@ -475,6 +595,7 @@ class USPAttention(nn.Module):
         v: torch.Tensor,
         ctx_attn_metadata,
         num_rep: int,
+        profile_kind: str | None,
     ) -> torch.Tensor:
         """Ulysses attention where the first *num_rep* tokens are replicated
         across SP ranks (e.g. text tokens) and should NOT be duplicated by the
@@ -509,7 +630,7 @@ class USPAttention(nn.Module):
         k = torch.cat([k_rep, k_shard], dim=1)
         v = torch.cat([v_rep, v_shard], dim=1)
 
-        out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        out = self._run_backend(q, k, v, ctx_attn_metadata, profile_kind)
 
         out_rep = out[:, :num_rep]
         out_shard = out[:, num_rep:]
@@ -533,6 +654,7 @@ class USPAttention(nn.Module):
         v: torch.Tensor,
         ctx_attn_metadata,
         num_rep: int,
+        profile_kind: str | None,
     ) -> torch.Tensor:
         """Ulysses attention where the last num_rep tokens are replicated
         across SP ranks and should not be duplicated by the all-to-all."""
@@ -553,6 +675,7 @@ class USPAttention(nn.Module):
             torch.cat([v_rep, v_shard], dim=1),
             ctx_attn_metadata,
             num_rep,
+            profile_kind,
         )
         out_rep, out_shard = out[:, :num_rep], out[:, num_rep:]
         return torch.cat([out_shard, out_rep], dim=1)

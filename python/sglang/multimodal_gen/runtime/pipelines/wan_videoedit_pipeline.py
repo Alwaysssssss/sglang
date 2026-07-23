@@ -623,7 +623,9 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                     )
                     self._materialize_window_inputs(params, window_spec)
                     check_request_timeout(batch)
-                    self.executor.execute_with_profiling(self.stages, batch, server_args)
+                    # The full VideoEdit request is already inside
+                    # profile_execution above; nesting Kineto here is invalid.
+                    self.executor.execute(self.stages, batch, server_args)
                     check_request_timeout(batch)
                     self._commit_window_output(params, window_spec)
                     check_request_timeout(batch)

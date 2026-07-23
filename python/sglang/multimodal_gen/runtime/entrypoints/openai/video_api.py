@@ -402,6 +402,8 @@ def _validate_video_repair_request(req: VideoRepairRequest) -> None:
         raise ValueError("videoUrl or video_input_path is required")
     if not (req.mask_input_path or req.mask_url):
         raise ValueError("maskUrl or mask_input_path is required")
+    if req.num_profiled_timesteps == 0 or req.num_profiled_timesteps < -1:
+        raise ValueError("num_profiled_timesteps must be positive or -1")
     if req.minio_config is None and (
         req.output_storage == "s3" or req.output_object_key is not None
     ):
@@ -1042,6 +1044,9 @@ async def create_video_repair(request: Request):
             output_quality=req.output_quality,
             output_compression=req.output_compression,
             perf_dump_path=req.perf_dump_path,
+            profile=req.profile,
+            num_profiled_timesteps=req.num_profiled_timesteps,
+            profile_all_stages=req.profile_all_stages,
             progress_path=progress_path,
         )
         output_object_key = None

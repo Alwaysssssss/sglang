@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
@@ -113,6 +114,95 @@ if _is_cuda:
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
+FP8_GEMM_BACKENDS = ("auto", "sgl_cutlass", "triton", "hybrid")
+FP8_HYBRID_TRITON_MIN_TOKENS = 513
+_fp8_nvtx_enabled = get_bool_env_var("SGLANG_FP8_NVTX")
+_dit_profile_ranges_enabled = get_bool_env_var("SGLANG_DIT_PROFILE_RANGES")
+
+
+def resolve_fp8_linear_gemm_backend(
+    *,
+    requested_backend: str,
+    cutlass_fp8_supported: bool,
+    weight_shape: tuple[int, ...],
+    weight_scale_numel: int,
+    input_num_tokens: Optional[int] = None,
+    is_cuda_platform: bool = _is_cuda,
+) -> str:
+    """Resolve the row-wise FP8 GEMM backend without launching a kernel."""
+    if requested_backend not in FP8_GEMM_BACKENDS:
+        raise ValueError(
+            f"Unsupported FP8 GEMM backend {requested_backend!r}; "
+            f"expected one of {FP8_GEMM_BACKENDS}."
+        )
+    if len(weight_shape) != 2:
+        raise ValueError(f"FP8 Linear weight must be 2D, got shape {weight_shape}.")
+
+    k, n = weight_shape
+    per_channel_scale = weight_scale_numel == n
+    cutlass_compatible = k % 16 == 0 and n % 16 == 0
+
+    if requested_backend == "auto":
+        if cutlass_fp8_supported and per_channel_scale:
+            if not cutlass_compatible or use_triton_w8a8_fp8_kernel:
+                return "triton"
+            return "sgl_cutlass"
+        return "non_cutlass"
+
+    if not is_cuda_platform:
+        raise ValueError(
+            f"FP8 GEMM backend {requested_backend!r} requires a CUDA device."
+        )
+    if not per_channel_scale:
+        raise ValueError(
+            f"FP8 GEMM backend {requested_backend!r} requires one scale per "
+            f"output channel, got {weight_scale_numel} scales for N={n}."
+        )
+
+    if requested_backend == "triton":
+        return "triton"
+    if requested_backend == "sgl_cutlass":
+        if not cutlass_fp8_supported or not cutlass_compatible:
+            raise ValueError(
+                "sgl_cutlass FP8 GEMM requires CUTLASS FP8 support and K/N "
+                f"multiples of 16, got K={k}, N={n}."
+            )
+        return "sgl_cutlass"
+
+    if input_num_tokens is None:
+        return "hybrid_shape_dependent"
+    if input_num_tokens >= FP8_HYBRID_TRITON_MIN_TOKENS:
+        return "triton"
+    if cutlass_fp8_supported and cutlass_compatible:
+        return "sgl_cutlass"
+    return "triton"
+
+
+def normalize_fp8_weight_scale_for_triton(
+    weight_scale: torch.Tensor, output_size: int
+) -> torch.Tensor:
+    """Return the per-output-channel scale layout required by Triton: [N, 1]."""
+    if weight_scale.numel() != output_size:
+        raise ValueError(
+            f"Triton FP8 GEMM requires {output_size} weight scales, "
+            f"got {weight_scale.numel()}."
+        )
+    if weight_scale.shape == (output_size, 1) and weight_scale.is_contiguous():
+        return weight_scale
+    return weight_scale.reshape(output_size, 1).contiguous()
+
+
+def _fp8_nvtx_range(name: str, tensor: torch.Tensor):
+    if _fp8_nvtx_enabled and tensor.is_cuda:
+        return torch.cuda.nvtx.range(name)
+    return nullcontext()
+
+
+def _fp8_profile_range(name: str):
+    if _dit_profile_ranges_enabled:
+        return torch.profiler.record_function(name)
+    return nullcontext()
+
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -1434,6 +1524,7 @@ def apply_fp8_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
+    gemm_backend: str = "auto",
 ) -> torch.Tensor:
     # Note: we pad the input because torch._scaled_mm is more performant
     # for matrices with batch dimension > 16.
@@ -1449,62 +1540,91 @@ def apply_fp8_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
+    selected_gemm_backend = resolve_fp8_linear_gemm_backend(
+        requested_backend=gemm_backend,
+        cutlass_fp8_supported=cutlass_fp8_supported,
+        weight_shape=tuple(weight.shape),
+        weight_scale_numel=weight_scale.numel(),
+        input_num_tokens=input_2d.shape[0],
+    )
+
+    quant_nvtx_pushed = _fp8_nvtx_enabled and input.is_cuda
+    if quant_nvtx_pushed:
+        torch.cuda.nvtx.range_push("sglang.fp8.activation_quant")
 
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        qinput, x_scale = scaled_fp8_quant(
-            input_2d,
-            input_scale,
-            num_token_padding=num_token_padding,
-            use_per_token_if_dynamic=use_per_token_if_dynamic,
-        )
+        with _fp8_profile_range("sglang.fp8.activation_quant"):
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=num_token_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
     else:
         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
         if input_scale is not None:
             assert input_scale.numel() == 1
             # broadcast per-tensor scale to per-token scale when supporting cutlass
-            qinput, x_scale = static_quant_fp8(
-                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
-            )
+            with _fp8_profile_range("sglang.fp8.activation_quant"):
+                qinput, x_scale = static_quant_fp8(
+                    input_2d, input_scale, repeat_scale=cutlass_fp8_supported
+                )
         else:
             # default use per-token quantization if dynamic
             if _is_cuda:
-                qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+                with _fp8_profile_range("sglang.fp8.activation_quant"):
+                    qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
             else:
                 # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
                 # final solution should be: 1. add support to per-tensor activation scaling.
                 # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
                 if _is_hip and weight_scale.numel() == 1:
-                    qinput, x_scale = scaled_fp8_quant(
-                        input_2d,
-                        input_scale,
-                        use_per_token_if_dynamic=use_per_token_if_dynamic,
-                    )
+                    with _fp8_profile_range("sglang.fp8.activation_quant"):
+                        qinput, x_scale = scaled_fp8_quant(
+                            input_2d,
+                            input_scale,
+                            use_per_token_if_dynamic=use_per_token_if_dynamic,
+                        )
                 else:
-                    qinput, x_scale = per_token_group_quant_fp8(
-                        input_2d, group_size=input_2d.shape[1]
-                    )
+                    with _fp8_profile_range("sglang.fp8.activation_quant"):
+                        qinput, x_scale = per_token_group_quant_fp8(
+                            input_2d, group_size=input_2d.shape[1]
+                        )
 
-    if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-        cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-        if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
-            # Massage the input to be 2D
+    if quant_nvtx_pushed:
+        torch.cuda.nvtx.range_pop()
+
+    if selected_gemm_backend in ("sgl_cutlass", "triton"):
+        if selected_gemm_backend == "triton":
             qinput = qinput.view(-1, qinput.shape[-1])
-            output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, input.dtype, bias
+            triton_weight_scale = normalize_fp8_weight_scale_for_triton(
+                weight_scale, weight.shape[1]
             )
+            with _fp8_profile_range("sglang.fp8.gemm"):
+                with _fp8_nvtx_range("sglang.fp8.gemm.triton", input):
+                    output = triton_scaled_mm(
+                        qinput,
+                        weight,
+                        x_scale,
+                        triton_weight_scale,
+                        input.dtype,
+                        bias,
+                    )
         else:
-            output = fp8_scaled_mm(
-                qinput,
-                weight,
-                x_scale,
-                weight_scale,
-                out_dtype=input.dtype,
-                bias=bias,
-            )
+            with _fp8_profile_range("sglang.fp8.gemm"):
+                with _fp8_nvtx_range("sglang.fp8.gemm.sgl_cutlass", input):
+                    output = fp8_scaled_mm(
+                        qinput,
+                        weight,
+                        x_scale,
+                        weight_scale,
+                        out_dtype=input.dtype,
+                        bias=bias,
+                    )
         return output.view(*output_shape)
 
     # torch.scaled_mm supports per tensor weights + activations only

@@ -66,8 +66,8 @@ class SchedulerClient:
         # Set socket options for the main communication socket
         self.scheduler_socket.setsockopt(zmq.LINGER, 0)
 
-        # 100 minute timeout for generation
-        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        # Wait indefinitely for long VideoEdit jobs.
+        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, -1)
 
         scheduler_endpoint = self.server_args.scheduler_endpoint
         self.scheduler_socket.connect(scheduler_endpoint)
@@ -153,8 +153,8 @@ class AsyncSchedulerClient:
         # Create a temporary REQ socket for this request to allow concurrency
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        # Wait indefinitely for long VideoEdit jobs.
+        socket.setsockopt(zmq.RCVTIMEO, -1)
 
         endpoint = self.server_args.scheduler_endpoint
         socket.connect(endpoint)

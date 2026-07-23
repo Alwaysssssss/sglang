@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/linear.py
 
+import json
+import os
 from abc import abstractmethod
 
 import torch
@@ -40,6 +42,59 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_LINEAR_RUNTIME_AUDIT_ENABLED = os.getenv(
+    "SGLANG_DIFFUSION_LINEAR_RUNTIME_AUDIT", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+_LINEAR_RUNTIME_AUDIT_SEEN: set[tuple[object, ...]] = set()
+
+
+def maybe_log_linear_runtime_shape(
+    layer: torch.nn.Module,
+    x: torch.Tensor | tuple[torch.Tensor, ...],
+    method: str,
+    kernel: str,
+) -> None:
+    """Log the first occurrence of each Linear shape for diagnostic runs."""
+    if not _LINEAR_RUNTIME_AUDIT_ENABLED:
+        return
+
+    input_tensor = x[0] if isinstance(x, tuple) else x
+    if not isinstance(input_tensor, torch.Tensor) or input_tensor.ndim == 0:
+        return
+
+    k = int(input_tensor.shape[-1])
+    m = int(input_tensor.numel() // max(k, 1))
+    n = int(
+        getattr(
+            layer,
+            "output_size_per_partition",
+            getattr(layer, "output_size", 0),
+        )
+    )
+    weight = getattr(layer, "weight", None)
+    weight_dtype = str(getattr(weight, "dtype", None))
+    key = (method, kernel, m, k, n, str(input_tensor.dtype), weight_dtype)
+    if key in _LINEAR_RUNTIME_AUDIT_SEEN:
+        return
+    _LINEAR_RUNTIME_AUDIT_SEEN.add(key)
+
+    payload = {
+        "rank": os.getenv("RANK"),
+        "method": method,
+        "kernel": kernel,
+        "m": m,
+        "k": k,
+        "n": n,
+        "input_dtype": str(input_tensor.dtype),
+        "weight_dtype": weight_dtype,
+        "representative_layer": getattr(layer, "prefix", None),
+    }
+    logger.info(
+        "LINEAR_RUNTIME_AUDIT %s",
+        json.dumps(payload, ensure_ascii=True, sort_keys=True),
+    )
+
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -154,6 +209,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        maybe_log_linear_runtime_shape(
+            layer,
+            x,
+            method=type(self).__name__,
+            kernel="torch.nn.functional.linear",
+        )
         output = (
             F.linear(x, layer.weight, bias)
             if current_platform.is_amp_supported() or bias is None

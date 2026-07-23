@@ -157,6 +157,13 @@ class ServerArgs:
     transformer_weights_path: str | None = None
     # Runtime transformer quantization override for unquantized checkpoints.
     transformer_quantization: str | None = None
+    # Row-wise W8A8 FP8 GEMM backend used by the diffusion transformer.
+    transformer_fp8_gemm_backend: str = "auto"
+    # Fuse Wan QKV/KV projections so dynamic FP8 quantizes shared inputs once.
+    transformer_fp8_fused_projections: bool = False
+    # Optional per-role Attention overrides for the native VideoEdit pipeline.
+    videoedit_self_attention_backend: str | None = None
+    videoedit_cross_attention_backend: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -359,6 +366,35 @@ class ServerArgs:
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+
+        valid_videoedit_backends = {"fa", "sage_attn"}
+        for field_name in (
+            "videoedit_self_attention_backend",
+            "videoedit_cross_attention_backend",
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            value = value.lower()
+            if value not in valid_videoedit_backends:
+                raise ValueError(
+                    f"{field_name} must be one of "
+                    f"{sorted(valid_videoedit_backends)}, got {value!r}"
+                )
+            setattr(self, field_name, value)
+
+        if (
+            self.videoedit_self_attention_backend == "sage_attn"
+            and self.videoedit_cross_attention_backend is None
+        ):
+            self.videoedit_cross_attention_backend = "fa"
+
+        if self.videoedit_self_attention_backend is not None:
+            logger.info(
+                "VideoEdit Attention override: self=%s, cross=%s",
+                self.videoedit_self_attention_backend,
+                self.videoedit_cross_attention_backend or "global",
+            )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -830,6 +866,56 @@ class ServerArgs:
 
         # Nunchaku SVDQuant quantization parameters
         NunchakuSVDQuantArgs.add_cli_args(parser)
+        parser.add_argument(
+            "--transformer-quantization",
+            type=str,
+            choices=["fp8_dynamic"],
+            default=ServerArgs.transformer_quantization,
+            help=(
+                "Runtime transformer quantization override for unquantized checkpoints. "
+                "Currently supports fp8_dynamic."
+            ),
+        )
+        parser.add_argument(
+            "--transformer-fp8-gemm-backend",
+            type=str,
+            choices=["auto", "sgl_cutlass", "triton", "hybrid"],
+            default=ServerArgs.transformer_fp8_gemm_backend,
+            help=(
+                "Row-wise W8A8 FP8 GEMM backend for the diffusion transformer. "
+                "Hybrid selects Triton for large token matrices."
+            ),
+        )
+        parser.add_argument(
+            "--transformer-fp8-fused-projections",
+            action=StoreBoolean,
+            default=ServerArgs.transformer_fp8_fused_projections,
+            help=(
+                "Fuse supported Wan self-attention QKV and cross-attention KV "
+                "projections so dynamic FP8 activation quantization runs once "
+                "per shared input. Disabled by default for controlled rollout."
+            ),
+        )
+        parser.add_argument(
+            "--videoedit-self-attention-backend",
+            type=str,
+            choices=["fa", "sage_attn"],
+            default=ServerArgs.videoedit_self_attention_backend,
+            help=(
+                "Override only VideoEdit self-attention. sage_attn uses the "
+                "explicit L20 8-bit path (INT8 QK and FP8 PV)."
+            ),
+        )
+        parser.add_argument(
+            "--videoedit-cross-attention-backend",
+            type=str,
+            choices=["fa", "sage_attn"],
+            default=ServerArgs.videoedit_cross_attention_backend,
+            help=(
+                "Override VideoEdit text/image cross-attention independently. "
+                "Use fa while evaluating Sage self-attention."
+            ),
+        )
 
         # Master port for distributed inference
         parser.add_argument(

@@ -48,7 +48,11 @@ from sglang.multimodal_gen.runtime.request_timeout import (
     check_request_timeout,
 )
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
+from sglang.multimodal_gen.runtime.utils.common import (
+    get_bool_env_var,
+    set_cuda_arch,
+    set_musa_arch,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
@@ -61,6 +65,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
+)
+from sglang.multimodal_gen.runtime.utils.quantization_audit import (
+    log_quantization_audit,
 )
 from sglang.srt.utils.network import NetworkAddress
 
@@ -139,17 +146,26 @@ class GPUWorker:
 
         self.pipeline = build_pipeline(self.server_args)
 
-        # apply layerwise offload after lora is applied while building LoRAPipeline
-        # otherwise empty offloaded weights could fail lora converting
+        dit_module_names = [
+            "transformer",
+            "transformer_2",
+            "video_dit",
+            "video_dit_2",
+            "audio_dit",
+        ]
+        if get_bool_env_var("SGLANG_DIFFUSION_QUANT_AUDIT"):
+            for module_name in dit_module_names:
+                dit = self.pipeline.get_module(module_name)
+                if dit:
+                    log_quantization_audit(
+                        dit,
+                        component=module_name,
+                        rank=self.rank,
+                    )
+
+        # Apply layerwise offload after auditing materialized GPU weights.
         if self.server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            for module_name in [
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "video_dit_2",
-                "audio_dit",
-            ]:
+            for module_name in dit_module_names:
                 dit = self.pipeline.get_module(module_name)
                 if dit:
                     if isinstance(dit, OffloadableDiTMixin):
