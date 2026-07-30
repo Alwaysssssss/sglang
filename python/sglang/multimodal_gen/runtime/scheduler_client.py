@@ -10,6 +10,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _scheduler_response_timeout_ms(server_args: ServerArgs) -> int:
+    return int(getattr(server_args, "scheduler_response_timeout", 6_000_000))
+
+
 async def run_zeromq_broker(server_args: ServerArgs):
     """
     This function runs as a background task in the FastAPI process.
@@ -66,8 +70,9 @@ class SchedulerClient:
         # Set socket options for the main communication socket
         self.scheduler_socket.setsockopt(zmq.LINGER, 0)
 
-        # 100 minute timeout for generation
-        self.scheduler_socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        self.scheduler_socket.setsockopt(
+            zmq.RCVTIMEO, _scheduler_response_timeout_ms(server_args)
+        )
 
         scheduler_endpoint = self.server_args.scheduler_endpoint
         self.scheduler_socket.connect(scheduler_endpoint)
@@ -153,8 +158,9 @@ class AsyncSchedulerClient:
         # Create a temporary REQ socket for this request to allow concurrency
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        socket.setsockopt(
+            zmq.RCVTIMEO, _scheduler_response_timeout_ms(self.server_args)
+        )
 
         endpoint = self.server_args.scheduler_endpoint
         socket.connect(endpoint)

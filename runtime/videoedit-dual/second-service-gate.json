@@ -1,0 +1,33 @@
+{
+  "current": {
+    "cgroup_memory_current": 177839579136,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 40160,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 5299
+      },
+      {
+        "free_mib": 40160,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 5299
+      }
+    ],
+    "mem_available_bytes": 707597967360,
+    "timestamp": 1785210383.0017507
+  },
+  "ok": true,
+  "reasons": []
+}

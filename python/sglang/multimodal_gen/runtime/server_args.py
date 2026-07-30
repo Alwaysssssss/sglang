@@ -201,6 +201,8 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    # ZMQ scheduler response timeout in milliseconds. -1 means wait forever.
+    scheduler_response_timeout: int = 6_000_000
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -272,6 +274,8 @@ class ServerArgs:
         self._validate_offload()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+        if self.scheduler_response_timeout < -1:
+            raise ValueError("scheduler_response_timeout must be -1 or non-negative")
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -790,10 +794,25 @@ class ServerArgs:
             help="Master port for distributed inference. If not set, a random free port will be used.",
         )
         parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="Fixed port for NCCL initialization. By default an available port is selected.",
+        )
+        parser.add_argument(
             "--scheduler-port",
             type=int,
             default=ServerArgs.scheduler_port,
             help="Port for the scheduler server.",
+        )
+        parser.add_argument(
+            "--scheduler-response-timeout",
+            type=int,
+            default=ServerArgs.scheduler_response_timeout,
+            help=(
+                "Timeout in milliseconds while waiting for a scheduler response. "
+                "Use -1 to wait indefinitely."
+            ),
         )
         parser.add_argument(
             "--host",

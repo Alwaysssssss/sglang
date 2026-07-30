@@ -1,0 +1,100 @@
+{
+  "baseline": {
+    "cgroup_memory_current": 32931627008,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 45458,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 0
+      },
+      {
+        "free_mib": 45458,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 0
+      }
+    ],
+    "mem_available_bytes": 820612550656,
+    "timestamp": 1785210157.3989942
+  },
+  "cgroup_peak_delta_bytes": 144910036992,
+  "final": {
+    "cgroup_memory_current": 177841143808,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 40160,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 5299
+      },
+      {
+        "free_mib": 40160,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 5299
+      }
+    ],
+    "mem_available_bytes": 707572244480,
+    "timestamp": 1785210381.9569876
+  },
+  "gpu_idle_delta_mib": [
+    5299,
+    5299
+  ],
+  "gpu_peak_delta_mib": [
+    36989,
+    36989
+  ],
+  "healthy_at": 1785210371.0901668,
+  "peak": {
+    "cgroup_memory_current": 177841664000,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 40160,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 36989
+      },
+      {
+        "free_mib": 40160,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 36989
+      }
+    ],
+    "mem_available_bytes": 820612550656,
+    "timestamp": 1785210157.3989942
+  },
+  "sample_count": 207
+}

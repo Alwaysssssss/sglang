@@ -1,0 +1,100 @@
+{
+  "baseline": {
+    "cgroup_memory_current": 177870589952,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 40160,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 5299
+      },
+      {
+        "free_mib": 40160,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 5299
+      }
+    ],
+    "mem_available_bytes": 707559645184,
+    "timestamp": 1785210383.1555214
+  },
+  "cgroup_peak_delta_bytes": 131207491584,
+  "final": {
+    "cgroup_memory_current": 307268583424,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 34862,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 10596
+      },
+      {
+        "free_mib": 34862,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 10596
+      }
+    ],
+    "mem_available_bytes": 594362527744,
+    "timestamp": 1785210572.6301281
+  },
+  "gpu_idle_delta_mib": [
+    5297,
+    5297
+  ],
+  "gpu_peak_delta_mib": [
+    36987,
+    36987
+  ],
+  "healthy_at": 1785210560.671513,
+  "peak": {
+    "cgroup_memory_current": 309078081536,
+    "cgroup_memory_events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_kill": 0
+    },
+    "cgroup_memory_max": null,
+    "gpus": [
+      {
+        "free_mib": 34862,
+        "index": 0,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 42286
+      },
+      {
+        "free_mib": 34862,
+        "index": 1,
+        "name": "NVIDIA L20",
+        "total_mib": 46068,
+        "used_mib": 42286
+      }
+    ],
+    "mem_available_bytes": 707559645184,
+    "timestamp": 1785210383.1555214
+  },
+  "sample_count": 175
+}

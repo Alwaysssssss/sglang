@@ -67,6 +67,26 @@ from sglang.srt.utils.network import NetworkAddress
 logger = init_logger(__name__)
 
 
+def trim_layerwise_offload_device_cache(rank: int) -> None:
+    """Release allocator cache left behind while constructing offload buffers."""
+    device_module = torch.get_device_module()
+    allocated_before = device_module.memory_allocated()
+    reserved_before = device_module.memory_reserved()
+    gc.collect()
+    device_module.empty_cache()
+    allocated_after = device_module.memory_allocated()
+    reserved_after = device_module.memory_reserved()
+    logger.info(
+        "Worker %s: layerwise offload cache trim: "
+        "allocated %.2f -> %.2f GiB, reserved %.2f -> %.2f GiB",
+        rank,
+        allocated_before / (1024**3),
+        allocated_after / (1024**3),
+        reserved_before / (1024**3),
+        reserved_after / (1024**3),
+    )
+
+
 class GPUWorker:
     """
     A worker that executes the model on a single GPU.
@@ -158,6 +178,7 @@ class GPUWorker:
                         logger.info(
                             f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
                         )
+            trim_layerwise_offload_device_cache(self.rank)
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."

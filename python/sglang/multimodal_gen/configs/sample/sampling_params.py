@@ -104,6 +104,7 @@ class SamplingParams:
 
     request_id: str | None = None
     request_timeout_deadline: float | None = None
+    request_cancel_path: str | None = None
 
     # All fields below are copied from ForwardBatch
 
