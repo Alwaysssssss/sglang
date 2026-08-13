@@ -4,7 +4,7 @@
 
 **目标：** 在不改变 VividVR 已验收的 Phase C/D/E 语义和正式默认配置的前提下，让 CogVideoX VAE 在现有 SP subgroup 内并行解码空间 tiles，并用 `R99 + vae_sp`、`R100 + vae_sp` 两个正式 treatment 验证质量与端到端收益。
 
-**架构：** 保留 Diffusers 0.37.0 的 CogVideoX temporal decode、conv cache、tile overlap、`blend_v -> blend_h -> crop` 和 row-major merge 语义，只把空间 tile 按 `global_tile_index % sp_world_size` 分配给当前 `get_sp_group()` 的 ranks。各 rank 用固定 metadata 和 padded tensor payload 做两阶段 subgroup all-gather，随后都恢复完整 tile 集并独立执行原顺序 merge；VividVR stage 只传播开关和统计，不承载 tile 算法。
+**架构：** 保留 Diffusers 0.37.0 的 CogVideoX temporal decode、conv cache、tile overlap、`blend_v -> blend_h -> crop` 和 row-major merge 语义，只把空间 tile 按 `global_tile_index % sp_world_size` 分配给当前 `get_sp_group()` 的 ranks。各 rank 用固定 metadata 和 padded tensor payload 做两阶段 subgroup all-gather，随后都恢复完整 tile 集并独立执行原顺序 merge；VividVR stage 只传播开关和统计，不承载 tile 算法。正式验收继续由 benchmark runner 记录结构化结果，但服务生命周期必须是 `docs_xzh/run_command/mock_test.md` 的程序化复刻，不允许绕过 FlowCut 服务直接调用 pipeline。
 
 **技术栈：** Python 3.10、PyTorch CUDA/NCCL distributed、Diffusers 0.37.0 `AutoencoderKLCogVideoX`、SGLang multimodal runtime、pytest、torchrun、tmux。
 
@@ -21,6 +21,8 @@
 - 开发期只执行固定 latent 的 SP2、SP4、CFG2×SP2 正确性验证。
 - 正式 `130f / 20 step` 只运行 `R99_VAE_SP` 和 `R100_VAE_SP`，直接读取历史 R99/R100 JSON 作为控制组；不重跑单卡、Phase C/D/E、SDPA、SP4 全量或关闭 `vae_sp` 的 R99/R100。
 - 正式历史控制目录固定为 `Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716`。
+- 正式服务验收以 `docs_xzh/run_command/mock_test.md` 的第 1、3、4、5.3、6、9 节为合同：必须经过 Moto S3、callback receiver、固定 caption sidecar mock、`sglang serve`、FlowCut POST/轮询、对象下载、compare 和有所有权边界的清理。
+- 正式权重只从 `/home/zhiheng/ckpts` 加载：基础模型固定为 `/home/zhiheng/ckpts/CogVideoX1.5-5B`，VividVR 组件固定为 `/home/zhiheng/ckpts/Vivid-VR`；禁止回退到原版 `/home/zhiheng/Vivid-VR` 的运行时代码或从其他目录隐式加载同名权重。
 
 历史控制值必须直接从原 JSON 读取；下表仅用于执行前交叉检查：
 
@@ -36,6 +38,46 @@
 | failed frame ratio | 0 | 0.015384615 |
 
 R100 历史记录因 2/130 帧未过原阈值而标记为 `quality_failed`，但它仍是本实验唯一合法的四卡性能控制。控制读取不能把 `status == "succeeded"` 或 `quality.pass_compare is True` 当成前置条件；新 treatment 的质量判定必须同时报告原 compare 结果和相对各自历史控制是否回归。
+
+## 正式服务验收合同
+
+`run_vividvr_acceleration_benchmark.py run-one` 仍是正式执行入口，因为它负责配置指纹、warmup/formal 分离、显存采样、历史控制读取和标准 JSON 落盘；但 runner 的 `TmuxBenchmarkLifecycle` 与 `FlowCutRequestExecutor` 必须逐项保持下列 `mock_test.md` 服务语义，不能把它理解为另一条直接推理入口：
+
+1. 在独立且带 batch ownership 的 tmux sessions 中启动 `moto_server`、callback receiver 和固定 caption sidecar mock；健康检查通过后才能启动主服务。
+2. Moto 固定监听 `127.0.0.1:4566`，bucket 为 `flowcut`；callback 固定监听 `127.0.0.1:39090`；caption mock 固定监听 `127.0.0.1:31200`，读取已验收 sidecar：
+
+   ```text
+   /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt
+   ```
+
+   正式性能验收禁止启动真实 CogVLM2 caption 模型，避免额外 GPU 占用和 caption 随机性；请求中不传 `prompt_file_path` 或 `caption_file_path`，由 caption bridge 按 HTTP 契约生成本次任务的 sidecar。
+3. 主服务固定使用 `/home/zhiheng/sglang/.venv/bin/sglang serve`，并显式包含：
+
+   ```text
+   --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B
+   --component-paths.vividvr /home/zhiheng/ckpts/Vivid-VR
+   --model-id VividVR
+   --pipeline-class-name CogVideoXVividVRControlNetPipeline
+   --attention-backend fa
+   --enable-torch-compile
+   --enable-cogvideox-modulation-fusion
+   --cogvideox-modulation-fusion-targets transformer,controlnet
+   --vividvr-caption-bridge
+   --vividvr-caption-sidecar-url http://127.0.0.1:31200
+   --vae-sp
+   ```
+
+4. 两条 treatment 的主服务拓扑固定如下，除 `--vae-sp` 外必须复用各自历史 control 的完整 service command 和环境：
+
+   | treatment | GPU | topology | 必需参数 |
+   | --- | ---: | --- | --- |
+   | `R99_VAE_SP` | 2 | 纯 `SP=2` | `--sp-degree 2 --ulysses-degree 2 --vividvr-parallel-mode sp` |
+   | `R100_VAE_SP` | 4 | `CFG=2 × SP=2` | `--sp-degree 2 --ulysses-degree 2 --enable-cfg-parallel --vividvr-parallel-mode cfg_sp` |
+
+   四卡 treatment 不是 `SP=4`；VAE collective 只能发生在两个独立的 SP subgroup 内。
+5. 每个 compile treatment 在同一个已启动服务上先提交一次 `1 step` 完整 FlowCut warmup，再提交一次 `20 step` formal；formal 请求固定为 `130f`、seed 42、temporal process frames 121，并包含必填 `callbackUrl`、`outputObjectKey`、`perf_dump_path` 与 `minioConfig`。
+6. runner 必须轮询 `/v1/videos/repairs/flowcut/{taskId}/progress` 到 completed，再读取 detail URL、从 Moto S3 下载结果、运行逐帧 compare，并保留 request payload、callback JSONL、service log、perf JSON、compare JSON 和下载视频。只有这些服务证据完整时，正式 record 才有效。
+7. R99 与 R100 串行执行。每条结束或失败时只清理由当前 batch ownership marker 创建的 tmux sessions；清理顺序为主服务、caption、callback、Moto，且不能 kill 用户已有的同名外部服务。
 
 ## 文件结构
 
@@ -55,7 +97,7 @@ R100 历史记录因 2/130 帧未过原阈值而标记为 `quality_failed`，但
 - `python/sglang/multimodal_gen/test/unit/test_stage_d_vividvr_temporal_orchestration.py`：保护长视频逐 clip 聚合字段和既有 trim/stitch 语义。
 - `python/sglang/multimodal_gen/test/unit/test_stage_e_vividvr_attention_backend.py`：保护 pipeline 初始化时 VAE 并行配置与 fail-fast。
 - `python/sglang/multimodal_gen/tools/run_vividvr_acceleration_benchmark.py`：增加两个不进入默认 `run-all` 的 VAE SP treatment、历史控制读取和有效配置校验。
-- `python/sglang/multimodal_gen/test/unit/test_vividvr_acceleration_benchmark.py`：保护 treatment 命令、默认矩阵隔离、历史控制派生指标和 debug 校验。
+- `python/sglang/multimodal_gen/test/unit/test_vividvr_acceleration_benchmark.py`：保护 treatment 命令、`mock_test.md` 服务合同、`/home/zhiheng/ckpts` 权重默认值、默认矩阵隔离、历史控制派生指标和 debug 校验。
 - `docs_xzh/hand_over/2026-07-16-vividvr-vae-spatial-tile-parallel-design.md`：实现完成后追加实际结果与偏差；不改已确认设计结论。
 - `docs_xzh/hand_over/vividvr_vae_tile_parallel_next_handover_20260716.md`：实现完成后更新状态、提交、产物和下一步。
 
@@ -1055,12 +1097,20 @@ git commit -m "feat(vividvr): report VAE tile parallel decode metrics"
 - 修改：`python/sglang/multimodal_gen/tools/run_vividvr_acceleration_benchmark.py:61-2501`
 - 测试：`python/sglang/multimodal_gen/test/unit/test_vividvr_acceleration_benchmark.py`
 
-- [ ] **步骤 1：增加 treatment registry 和命令失败测试**
+- [ ] **步骤 1：增加 treatment registry、服务合同和命令失败测试**
 
 ```python
+from dataclasses import replace
+from pathlib import Path
+
 from sglang.multimodal_gen.tools.run_vividvr_acceleration_benchmark import (
     ALL_SCHEMES,
+    BenchmarkConfig,
+    RunRole,
+    SCHEMES,
     VAE_SP_TREATMENTS,
+    build_request_payload,
+    build_service_command,
 )
 
 
@@ -1079,6 +1129,44 @@ def test_vae_sp_treatment_adds_only_vae_sp_to_control_command(tmp_path, scheme_i
     treatment_command = build_service_command(treatment, make_config(tmp_path))
     control_command = build_service_command(control, make_config(tmp_path))
     assert treatment_command == control_command + ["--vae-sp"]
+
+
+def test_vae_sp_formal_defaults_follow_mock_test_service_contract():
+    config = BenchmarkConfig()
+    assert config.model_path == Path("/home/zhiheng/ckpts/CogVideoX1.5-5B")
+    assert config.vividvr_path == Path("/home/zhiheng/ckpts/Vivid-VR")
+    assert config.service_port == 31221
+    assert config.caption_port == 31200
+    assert config.callback_port == 39090
+    assert config.s3_port == 4566
+    assert config.s3_bucket == "flowcut"
+
+    r99 = build_service_command(ALL_SCHEMES["R99_VAE_SP"], config)
+    assert r99[r99.index("--model-path") + 1] == str(config.model_path)
+    assert r99[r99.index("--component-paths.vividvr") + 1] == str(
+        config.vividvr_path
+    )
+    assert "--vividvr-caption-bridge" in r99
+    assert "--vae-sp" in r99
+
+
+def test_vae_sp_formal_request_keeps_flowcut_contract(tmp_path):
+    config = replace(BenchmarkConfig(), output_root=tmp_path)
+    payload = build_request_payload(
+        config,
+        role=RunRole.FORMAL,
+        task_id="r99-vae-sp-formal",
+        callback_url="http://127.0.0.1:39090/tasks/r99/callback",
+        output_path=tmp_path / "service-output.mp4",
+        perf_path=tmp_path / "perf.json",
+    )
+    assert payload["num_inference_steps"] == 20
+    assert payload["seed"] == 42
+    assert payload["num_temporal_process_frames"] == 121
+    assert payload["callbackUrl"].startswith("http://127.0.0.1:39090/")
+    assert payload["minioConfig"]["endpoint"] == "127.0.0.1:4566"
+    assert "caption_file_path" not in payload
+    assert "prompt_file_path" not in payload
 ```
 
 - [ ] **步骤 2：增加 effective debug 失败测试**
@@ -1198,6 +1286,8 @@ ALL_SCHEMES = {**SCHEMES, **VAE_SP_TREATMENTS}
 if scheme.vae_sp:
     command.append("--vae-sp")
 ```
+
+`BenchmarkConfig` 的正式默认值保持与 `mock_test.md` 一致：`model_path=/home/zhiheng/ckpts/CogVideoX1.5-5B`、`vividvr_path=/home/zhiheng/ckpts/Vivid-VR`、service/caption/callback/S3 ports 为 `31221/31200/39090/4566`，bucket 为 `flowcut`。`TmuxBenchmarkLifecycle` 必须继续依次启动 Moto、callback、固定 caption mock 和 scheme service；`FlowCutRequestExecutor` 必须继续通过 `/v1/videos/repairs/flowcut` 提交、轮询、下载并 compare。VAE SP treatment 不增加任何直接调用 pipeline 的旁路。
 
 `validate_effective_config` 只在 `scheme.vae_sp` 为真时要求：requested/effective 都为真、fallback reason 为 `effective`、group type 为 `sp`、world size 等于 `sp_degree`、local count 长度等于 SP world size、local count 求和等于 total tiles、所有时间字段为非负数。现有 R0-R100 不强制包含新字段，以便历史记录仍可读取。
 
@@ -1440,12 +1530,21 @@ PY
 
 - 读取：`Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R99_formal.json`
 - 读取：`Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R100_formal.json`
+- 读取：`docs_xzh/run_command/mock_test.md`
+- 读取权重：`/home/zhiheng/ckpts/CogVideoX1.5-5B`
+- 读取权重：`/home/zhiheng/ckpts/Vivid-VR`
 - 产出：`Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r99_20260716`
 - 产出：`Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r100_20260716`
 
-- [ ] **步骤 1：dry-run 两个 treatment 并验证唯一变量**
+- [ ] **步骤 1：预检权重、服务依赖和两个 treatment 的唯一变量**
 
 ```bash
+test -d /home/zhiheng/ckpts/CogVideoX1.5-5B
+test -d /home/zhiheng/ckpts/CogVideoX1.5-5B/vae
+test -d /home/zhiheng/ckpts/Vivid-VR
+test -d /home/zhiheng/ckpts/Vivid-VR/controlnet
+test -f /home/zhiheng/sglang/Vivid_Acceptance/captions/service_sidecars/quad-test-video-long-960x720-130f-run2-20260708T060202Z.txt
+test -f /home/zhiheng/input/test_video_long_960x720_130f.mp4
 stat -c '%n %Y' \
   Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R99_formal.json \
   Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716/records/R100_formal.json
@@ -1456,16 +1555,20 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   python/sglang/multimodal_gen/tools/run_vividvr_acceleration_benchmark.py \
   dry-run --scheme R99_VAE_SP \
+  --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+  --vividvr-path /home/zhiheng/ckpts/Vivid-VR \
   --control-batch-dir Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   python/sglang/multimodal_gen/tools/run_vividvr_acceleration_benchmark.py \
   dry-run --scheme R100_VAE_SP \
+  --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+  --vividvr-path /home/zhiheng/ckpts/Vivid-VR \
   --control-batch-dir Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716
 ```
 
-保存两行 mtime 输出。检查第一次 dry-run 的默认矩阵仍止于 R100，不包含 treatment。后两次分别只输出一个 treatment；逐项比较 service command 与历史 JSON 中 `reproducibility.service_command`，差异必须只有末尾 `--vae-sp`。两者都必须显示 compile 的一次 1-step warmup 和 20-step formal 请求，dry-run 全程不得启动服务。
+任一 `test` 失败都停止，不从其他目录猜测或复制权重。保存两行 mtime 输出。检查第一次 dry-run 的默认矩阵仍止于 R100，不包含 treatment。后两次分别只输出一个 treatment；逐项比较 service command 与历史 JSON 中 `reproducibility.service_command`，差异必须只有末尾 `--vae-sp`。两者都必须显示 `/home/zhiheng/ckpts` 下的两条权重路径、compile 的一次 1-step warmup 和 20-step formal 请求，dry-run 全程不得启动服务。
 
-- [ ] **步骤 2：通过 benchmark runner 启动 R99_VAE_SP 的 tmux batch**
+- [ ] **步骤 2：按 `mock_test.md` 生命周期启动 R99_VAE_SP 的服务验收**
 
 ```bash
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
@@ -1473,12 +1576,26 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   run-one --scheme R99_VAE_SP \
   --batch-id vividvr_vae_sp_r99_20260716 \
   --control-batch-dir Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716 \
+  --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+  --vividvr-path /home/zhiheng/ckpts/Vivid-VR \
   --gpu-ids 0,1
 ```
 
-该 runner 自己创建 tmux，禁止再套一层 tmux。确认启动 JSON 中 session 为 `vividvr_accel_batch_vividvr_vae_sp_r99_20260716`；只读查看：`tmux attach -r -t vividvr_accel_batch_vividvr_vae_sp_r99_20260716`。预期 treatment formal `succeeded`、质量 compare passed、runtime 中 `vae_sp_effective=true`，历史 R99 文件 mtime 不变。
+该 runner 自己创建 batch tmux，禁止再套一层 tmux。确认启动 JSON 中 session 为 `vividvr_accel_batch_vividvr_vae_sp_r99_20260716`；只读查看：`tmux attach -r -t vividvr_accel_batch_vividvr_vae_sp_r99_20260716`。batch 内部必须按顺序出现带同一 ownership token 的 Moto、callback、caption 和 `R99_VAE_SP_service` sessions，三个 HTTP health check 全部成功后才允许提交 FlowCut warmup。正式请求只能在同一服务完成 1-step warmup 后提交。预期 formal `succeeded`、质量 compare passed、runtime 中 `vae_sp_effective=true`，历史 R99 文件 mtime 不变。
 
-- [ ] **步骤 3：R99 完成后再启动 R100_VAE_SP**
+- [ ] **步骤 3：核对 R99 服务证据并清理，再启动 R100_VAE_SP**
+
+R99 batch 退出后先检查下列文件均存在且非空：
+
+```bash
+test -s Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r99_20260716/logs/moto.log
+test -s Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r99_20260716/logs/callbacks.jsonl
+test -s Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r99_20260716/logs/caption.log
+test -s Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r99_20260716/logs/R99_VAE_SP_service.log
+test -s Vivid_Acceptance/acceleration_benchmark/vividvr_vae_sp_r99_20260716/records/R99_VAE_SP_formal.json
+```
+
+确认 callback JSONL 含 `accepted`、`input_ready`、`caption_ready`、`denoising`、`uploading_result` 和最终 `succeeded`，formal record 的 `artifacts.result_video`、`perf_json`、`compare_json` 均存在；确认当前 batch 创建的全部 tmux sessions 已清理且 GPU 无残留推理进程，再执行：
 
 ```bash
 PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
@@ -1486,12 +1603,26 @@ PYTHONPATH=python /home/zhiheng/sglang/.venv/bin/python \
   run-one --scheme R100_VAE_SP \
   --batch-id vividvr_vae_sp_r100_20260716 \
   --control-batch-dir Vivid_Acceptance/acceleration_benchmark/vividvr_accel_full_warmup1_20260716 \
+  --model-path /home/zhiheng/ckpts/CogVideoX1.5-5B \
+  --vividvr-path /home/zhiheng/ckpts/Vivid-VR \
   --gpu-ids 0,1,2,3
 ```
 
-确认 R99 的 batch tmux 已退出且 GPU 无推理进程后才执行。只读查看：`tmux attach -r -t vividvr_accel_batch_vividvr_vae_sp_r100_20260716`。预期 CFG parallel 开启、SP world size 为 2、每个 clip effective，R100 历史文件 mtime 不变。由于历史 R100 自身为 `quality_failed`，新记录允许按原 compare 规则保持同一 status，但必须满足下面的相对质量门槛。
+只读查看：`tmux attach -r -t vividvr_accel_batch_vividvr_vae_sp_r100_20260716`。内部必须复用同一套 `mock_test.md` 依赖服务，但主服务为四卡 `cfg_sp`；预期 CFG parallel 开启、SP world size 为 2、每个 clip effective，R100 历史文件 mtime 不变。由于历史 R100 自身为 `quality_failed`，新记录允许按原 compare 规则保持同一 status，但必须满足下面的相对质量门槛。
 
-- [ ] **步骤 4：检查正式结果门槛**
+- [ ] **步骤 4：核对 R100 服务证据和两条 record 的可复现配置**
+
+对 R100 重复 R99 的 Moto/callback/caption/service log、callback 阶段、下载视频、perf JSON 和 compare JSON 检查。然后从两条 formal record 的 `reproducibility` 校验：
+
+- `model_path == /home/zhiheng/ckpts/CogVideoX1.5-5B`；
+- `vividvr_path == /home/zhiheng/ckpts/Vivid-VR`；
+- service command 包含 caption bridge、FA、compile、modulation fusion 和 `--vae-sp`；
+- R99 为 2 GPU、`sp`、SP degree 2，R100 为 4 GPU、`cfg_sp`、CFG enabled、SP degree 2；
+- formal request 为 20 steps、seed 42、121 temporal process frames，并包含 callback、Moto S3 object key 和 perf dump path；
+- caption/prompt path 均未直接写进 FlowCut request；
+- 两个历史 control 文件的 mtime 与步骤 1 完全一致。
+
+- [ ] **步骤 5：检查正式结果门槛**
 
 两条 treatment 共同检查：
 
@@ -1507,7 +1638,7 @@ derived.total_runtime_speedup >= 1.0
 
 同时记录 tile decode/gather/merge、总 model inference、总 runtime、GPU·秒和每 rank 峰值显存。若正确性通过但任一端到端 speedup 小于 1，保留实验开关但不晋升默认配置。
 
-- [ ] **步骤 5：人工检查两条结果视频**
+- [ ] **步骤 6：人工检查两条结果视频**
 
 重点查看空间 tile 接缝、闪烁、颜色漂移、temporal clip stitch 边界、首三帧删除和末尾 crop。人工结论以 `pass/fail + 观察说明` 写入 acceptance 文档，不用肉眼判断替代 JSON 数值门槛。
 

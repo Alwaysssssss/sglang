@@ -118,3 +118,50 @@ Model/Total 列写作 “treatment 秒数 / 相对 Control speedup”，Denoise 
 | 1 | R2：FA + `torch.compile` | 941.516 | 936.101 | 772.493 | 1.18× |
 | 2 | R99：SP=2 + FA-SP + `torch.compile` + modulation fusion | 551.119 | 544.321 | 380.176 | 2.03× |
 | 4 | R100：CFG=2 × SP=2 + FA-SP + `torch.compile` + modulation fusion | 370.881 | 365.067 | 195.652 | 3.02× |
+
+## VAE 空间 Tile 并行专项验收补充（2026-07-16 至 2026-07-17）
+
+本节补充 VAE tiled decode、VAE tiled encode 和纯净 SP 扩展的专项验收结果。它们使用独立的 Control/Treatment 配对或专项服务口径，不能回填或改写上文 R0–R100 主表的历史总体排行。除非另有说明，正式请求均为相同的 `130f / 20 step / seed 42` 长视频服务请求。
+
+### VAE tiled decode SP：通过专项验收，但保持 opt-in
+
+CogVideoX VAE tiled decode 已实现 SP subgroup 内的空间 tile 分配、transport 和原序 merge。固定 latent 的 SP2、SP4、CFG2×SP2 验证均与串行结果 bitwise equal；collective 仅使用对应 SP subgroup。以下是与同拓扑 decode-only Control 的正式 A/B 结果：
+
+| Treatment | Topology | Decode/Trim（s / speedup） | 模型推理（s / speedup） | 总耗时（s / speedup） | GPU·秒（treatment / control） |
+| --- | --- | ---: | ---: | ---: | ---: |
+| R99 + VAE SP | SP2 | 58.938 / 1.7014× | 502.578 / 1.0831× | 510.931 / 1.0787× | 1021.862 / 1102.238 |
+| R100 + VAE SP | CFG2×SP2 | 60.179 / 1.6914× | 334.402 / 1.0917× | 341.004 / 1.0876× | 1364.017 / 1483.526 |
+
+R99 的一次独立 formal 重复运行得到 `58.198 s` Decode/Trim（`1.7230×`）和 `510.965 s` 总耗时（`1.0786×`），证明主要收益可复现。端到端人工检查未见 tile 接缝、闪烁、颜色漂移或 trim/stitch 边界异常。严格逐帧 compare 仍会将原始 record 标为 `quality_failed`：R99/R100 均按已记录的人工豁免口径通过，原始机器门禁状态未被修改。
+
+该能力当前仍为 `vae_sp=False` 默认关闭的实验性 opt-in 开关：各 SP rank 仍需恢复完整 decoded tile 集，gather staging 与 replicated merge 会带来额外显存；因此不替换 `single_gpu_fa_compile`、`dual_gpu_fa_eager_compile` 或其他正式服务默认配置。完整证据见 [VAE spatial tile parallel 验收记录](../distribute/vividvr_vae_spatial_tile_parallel_acceptance_20260716.md)。
+
+### VAE tiled encode SP：bitwise 正确，但未通过性能门槛
+
+上文的 `VAE tiled encode SP Treatment` 表是 encode 专项的完整性能结果。三种拓扑的 posterior moments 与等价 sampled latents 均为 bitwise equal，且模型总耗时均改善；但 Long Clip Preparation 或 Decode/Trim 未满足既定门槛，三条 treatment 的正式性能验收均为 FAIL。因此 `--vae-encode-sp` 与 `--vae-sp` 相互独立，且继续默认关闭，不进入任何正式默认配置。完整门禁和失败分析见 [VAE spatial tiled encode 并行验收记录](../distribute/vividvr_vae_spatial_tiled_encode_parallel_acceptance_20260717.md)。
+
+### R0 纯净基线下的 SP2/SP4 扩展
+
+为隔离多卡 SP 拓扑和 VAE tiled encode/decode 空间并行的端到端收益，以下测试相对历史 R0 关闭了 `torch.compile`、modulation fusion、CFG parallel、cache 和 quantization；两组 treatment 均为 eager 且没有 warmup。R0 使用单卡 `SDPA eager`，SP2/SP4 在多卡运行时有效 backend 分别为 `sdpa_sp`。
+
+| 方案 | 准备阶段（s / speedup） | Decode/Trim（s / speedup） | Denoise（s / speedup） | 模型推理（s / speedup） | 端到端（s / speedup） | 相对 R0 资源效率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| R0，单卡 | 60.293 / 1.0000× | 111.985 / 1.0000× | 928.872 / 1.0000× | 1102.828 / 1.0000× | 1111.828 / 1.0000× | 1.0000× |
+| SP2 | 36.663 / 1.6445× | 57.720 / 1.9401× | 471.769 / 1.9689× | 567.547 / 1.9431× | 571.113 / 1.9468× | 0.9734× |
+| SP4 | 22.738 / 2.6516× | 29.041 / 3.8560× | 258.643 / 3.5913× | 311.990 / 3.5348× | 320.751 / 3.4663× | 0.8666× |
+
+SP2 是延迟与资源效率更均衡的选择；SP4 将端到端延迟再降低到 `320.751 s`，但以更多 GPU·秒为代价。两组请求的服务生命周期（推理、上传、进度查询和 callback）均成功完成。严格逐帧门禁在 R0、SP2 和 SP4 上均存在极少量失败帧，属于质量 comparator 的严格状态，而非服务或性能采集失败。完整测试口径见 [R0 基线 VAE SP2/SP4 纯净服务测试验收](../distribute/vividvr_r0_vae_sp_clean_benchmark_20260717.md)。
+
+### 四卡 VAE-SP 拓扑选择：SP4 优于 CFG2×SP2
+
+在同为四卡、均开启 `FA-SP`、`torch.compile`、modulation/residual fusion 和 VAE spatial tile parallel 的条件下，纯 SP4 优于 CFG2×SP2：
+
+| 指标 | 纯 SP4 | CFG2×SP2 | SP4 相对 CFG2×SP2 |
+| --- | ---: | ---: | ---: |
+| 总耗时 | 310.786 s | 341.004 s | 1.0972× |
+| 模型推理 | 298.988 s | 334.402 s | 1.1184× |
+| Denoise | 202.965 s | 198.751 s | 0.9792× |
+| Decode/Trim | 29.996 s | 60.179 s | 2.0062× |
+| VAE decode | 29.699 s | 59.919 s | 2.0175× |
+
+CFG2×SP2 的 denoise 快 `2.12%`，但 SP4 的 VAE decode 约减半，足以使整体更快。SP4 的 SSIM mean/min 分别为 `0.984631 / 0.979781`，优于 CFG2×SP2 的 `0.984603 / 0.977484`；严格 comparator 因 `1/130` 帧低于阈值保留 `quality_failed`，但按与 R100 相同的已确认容差口径，专项质量验收通过。完整对比见 [纯 SP4 与 CFG2×SP2 四卡性能对比](../distribute/vividvr_vae_sp4_vs_cfg2_sp2_benchmark_20260717.md)。
