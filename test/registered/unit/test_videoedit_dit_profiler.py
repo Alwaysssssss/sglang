@@ -85,6 +85,31 @@ def test_serialized_fp8_variant_uses_checkpoint_quantization(tmp_path):
     assert command[command.index("--transformer-path") + 1] == str(transformer_path)
 
 
+def test_static_fp8_variant_requires_static_activation_checkpoint(tmp_path):
+    module = load_diagnose_module()
+    transformer_path = tmp_path / "transformer"
+    transformer_path.mkdir()
+    (transformer_path / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "static",
+                    "weight_scale_granularity": "channel",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(transformer_path=transformer_path)
+
+    module.validate_variant_checkpoint(args, module.VARIANTS["fp8_static_layerwise"])
+    with pytest.raises(ValueError, match="activation_scheme='dynamic'"):
+        module.validate_variant_checkpoint(
+            args, module.VARIANTS["fp8_serialized_layerwise"]
+        )
+
+
 def test_serialized_fp8_variant_rejects_non_channel_checkpoint(tmp_path):
     module = load_diagnose_module()
     transformer_path = tmp_path / "transformer"

@@ -48,6 +48,9 @@ from sglang.multimodal_gen.runtime.request_timeout import (
     check_request_timeout,
 )
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.utils.activation_calibration import (
+    maybe_register_activation_calibration,
+)
 from sglang.multimodal_gen.runtime.utils.common import (
     get_bool_env_var,
     set_cuda_arch,
@@ -153,6 +156,7 @@ class GPUWorker:
             "video_dit_2",
             "audio_dit",
         ]
+        self.activation_calibrator = None
         if get_bool_env_var("SGLANG_DIFFUSION_QUANT_AUDIT"):
             for module_name in dit_module_names:
                 dit = self.pipeline.get_module(module_name)
@@ -162,6 +166,22 @@ class GPUWorker:
                         component=module_name,
                         rank=self.rank,
                     )
+
+        for module_name in dit_module_names:
+            dit = self.pipeline.get_module(module_name)
+            if not dit:
+                continue
+            calibrator = maybe_register_activation_calibration(
+                dit,
+                rank=self.rank,
+            )
+            if calibrator is None:
+                continue
+            if self.activation_calibrator is not None:
+                raise ValueError(
+                    "Activation calibration currently supports one DiT component"
+                )
+            self.activation_calibrator = calibrator
 
         # Apply layerwise offload after auditing materialized GPU weights.
         if self.server_args.dit_layerwise_offload:
@@ -355,6 +375,32 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+        finally:
+            if self.activation_calibrator is not None:
+                try:
+                    self.activation_calibrator.finish_request(
+                        req,
+                        success=output_batch is not None
+                        and not bool(getattr(output_batch, "error", None)),
+                    )
+                except Exception as calibration_error:
+                    logger.error(
+                        "Failed to finalize activation calibration for request %s: %s",
+                        req.request_id,
+                        calibration_error,
+                        exc_info=True,
+                    )
+                    if output_batch is None:
+                        output_batch = OutputBatch()
+                    calibration_message = (
+                        f"Activation calibration failed: {calibration_error}"
+                    )
+                    if output_batch.error:
+                        output_batch.error = (
+                            f"{output_batch.error}; {calibration_message}"
+                        )
+                    else:
+                        output_batch.error = calibration_message
         return output_batch
 
     def get_can_stay_resident_components(

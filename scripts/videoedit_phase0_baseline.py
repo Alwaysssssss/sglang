@@ -47,6 +47,15 @@ DEFAULT_PROMPT = (
 
 
 SCENARIOS: dict[str, dict[str, Any]] = {
+    # Minimal end-to-end service, loading, denoising, and video-output check.
+    "smoke1": {
+        "num_frames": 16,
+        "infer_len": 81,
+        "overlap": 0,
+        "num_inference_steps": 1,
+        "warmups": 0,
+        "runs": 1,
+    },
     # Fast endpoint/path/mask smoke test; reference image is optional.
     "smoke": {
         "num_frames": 16,
@@ -621,7 +630,7 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=["smoke"],
         help=(
-            "Scenarios to run: smoke, profile81, single81, full, or all. "
+            "Scenarios to run: smoke1, smoke, profile81, single81, full, or all. "
             "Default: smoke. 'all' retains the Phase 0 smoke/single81/full set."
         ),
     )

@@ -328,7 +328,12 @@ class FP32LayerNorm(nn.LayerNorm):
 # Fused norm kernel
 ################################################################################
 def _ensure_contiguous(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    return tensor.contiguous() if tensor is not None else None
+    if tensor is None:
+        return None
+    tensor = tensor.contiguous()
+    if tensor.data_ptr() % 32 != 0:
+        tensor = tensor.clone()
+    return tensor
 
 
 class _ScaleResidualNormScaleShift(CustomOp):
@@ -389,13 +394,13 @@ class _ScaleResidualNormScaleShift(CustomOp):
             )
 
         return fused_scale_residual_norm_scale_shift(
-            residual.contiguous(),
-            x.contiguous(),
-            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+            _ensure_contiguous(residual),
+            _ensure_contiguous(x),
+            _ensure_contiguous(gate) if isinstance(gate, torch.Tensor) else None,
             _ensure_contiguous(getattr(self.norm, "weight", None)),
             _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
+            _ensure_contiguous(scale),
+            _ensure_contiguous(shift),
             self.norm_type,
             self.eps,
         )

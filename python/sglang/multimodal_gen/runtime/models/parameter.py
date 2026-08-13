@@ -256,9 +256,17 @@ class PerTensorScaleParameter(BasevLLMParameter):
         super().load_row_parallel_weight(*args, **kwargs)
 
     def load_merged_column_weight(self, *args, **kwargs) -> None:
+        loaded_weight = kwargs.get("loaded_weight", args[0] if args else None)
+        if loaded_weight is not None and self.data.shape == loaded_weight.shape:
+            self.data.copy_(loaded_weight)
+            return
         self._load_into_shard_id(*args, **kwargs)
 
     def load_qkv_weight(self, *args, **kwargs) -> None:
+        loaded_weight = kwargs.get("loaded_weight", args[0] if args else None)
+        if loaded_weight is not None and self.data.shape == loaded_weight.shape:
+            self.data.copy_(loaded_weight)
+            return
         self._load_into_shard_id(*args, **kwargs)
 
     def load_column_parallel_weight(self, *args, **kwargs) -> None:

@@ -469,6 +469,72 @@ x3      = x2 + c_gate_msa ⊙ ffn_out
 
 40 个 block 因而有 `40×12=480` 个 Linear。再加 condition embedder 的 7 个和 `proj_out` 的 1 个，整个 DiT 一共有 488 个 `LinearBase` 实例。
 
+### 5.7 每个 block 到底执行几次 attention
+
+需要同时从“模块”和“底层 attention 计算”两个角度看：
+
+```text
+模块视角：
+  attn1 = 1 个 self-attention 模块
+  attn2 = 1 个 cross-attention 模块
+
+底层 attention 计算视角：
+  1 × video self-attention
+  1 × text cross-attention
+  1 × image cross-attention     # 有 image context 时
+```
+
+也就是说，VideoEdit 每个 block 固定执行一次 self-attention 和一次 text cross-attention；当前带参考图的正常路径还会执行一次 image cross-attention，因此底层一共是 **3 次 attention compute**。`attn2` 虽然在 Python 模块层面只有一个，但其内部对 text 和 image 分别做独立 softmax，再把输出相加。
+
+| attention | 每个 block 的次数 | Q 来源 | K/V 来源 | 当前实测 backend |
+|---|---:|---|---|---|
+| Video self-attention | 1 | video token | video token | SageAttention `qk_int8_pv_fp8_cuda` |
+| Text cross-attention | 1 | video token | 512 个 text token | FlashAttention BF16 |
+| Image cross-attention | 0 或 1 | video token | 257 个 image token | FlashAttention BF16 |
+
+当前双卡 SP2 实测 shape 为：
+
+```text
+self:       Q/K/V = [1, 83916, 20, 128]    # Ulysses 后完整序列、每卡 20 heads
+text cross: Q     = [1, 41958, 40, 128]
+            K/V   = [1,   512, 40, 128]
+image cross:Q     = [1, 41958, 40, 128]
+            K/V   = [1,   257, 40, 128]
+```
+
+### 5.8 Self、cross 和量化 Linear 的实测耗时占比
+
+以下数据来自最终的 **FP8 Linear + fused QKV/KV + Sage self-attention + Flash cross-attention** 配置。Profiler 采样了一个 denoise timestep；该 timestep 开启 CFG，因此包含 2 次 DiT forward，也就是：
+
+```text
+2 次 DiT forward × 40 blocks = 80 次 block forward
+```
+
+调用数也与此完全对应：80 次 Sage self-attention，以及 160 次 FlashAttention cross kernel，即 80 次 text cross 加 80 次 image cross。
+
+| GPU kernel 类别 | 一个被采样 timestep 的累计 GPU 时间 | 占全部 GPU kernel 时间 | 均摊到一次 block forward |
+|---|---:|---:|---:|
+| Self-attention 核心计算 | 28.261 s | **61.45%** | 353.27 ms |
+| Text cross-attention 核心计算 | 0.346 s | **0.75%** | 4.33 ms |
+| Image cross-attention 核心计算 | 0.265 s | **0.58%** | 3.31 ms |
+| Text + image cross-attention | 0.611 s | **1.33%** | 7.64 ms |
+| 全部 attention 核心计算 | 28.872 s | **62.78%** | 360.91 ms |
+| SP communication | 3.088 s | **6.71%** | 38.59 ms |
+| FP8 GEMM | 9.204 s | **20.01%** | — |
+| Dynamic activation quant | 0.715 s | **1.56%** | — |
+| 量化 Linear 主路径：quant + GEMM | 9.920 s | **21.57%** | 约 124.00 ms，见下方说明 |
+| Norm、RoPE、GELU、残差等其他 kernel | 4.113 s | **8.94%** | — |
+| 全部 GPU kernel | 45.992 s | **100%** | — |
+
+这里的统计口径非常重要：
+
+1. 表里的 self/cross-attention 只表示 `QKᵀ → softmax → PV` 的 **attention 核心 kernel**；不包含 Q/K/V projection、output projection、RMSNorm、RoPE 和 residual。
+2. QKV、KV、attention output projection 和 FFN 的 Linear 都被归入 `FP8 GEMM`；Linear 输入的 dynamic per-token FP8 量化则归入 `FP8 activation quant`。因此量化 Linear 的核心路径合计约为 `20.01% + 1.56% = 21.57%`。
+3. `SP communication` 主要由长序列 self-attention 的 Ulysses all-to-all 产生。如果把它也算作 self-attention 子系统，则 attention compute 加通信约为 `62.78% + 6.71% = 69.49%`。
+4. `124.00 ms` 是把该 timestep 中所有量化 Linear 时间除以 80 次 block forward 得到的均摊值。它还包含两次 DiT forward 中 condition embedder 和 `proj_out` 的 16 次 block 外 Linear，所以不是严格的“单个 block 内 Linear 时间”。当前 profiler 尚未把 Linear 时间继续细分为 self projection、cross projection 和 FFN；若要得到这三者的精确占比，需要按 layer prefix 增加更细粒度的 profiler range。
+
+Self-attention 占比远高于 cross-attention，根本原因是序列长度：self 需要处理约 `83916 × 83916` 的全视频 token 关系；cross 的 K/V 长度只有 512 和 257。即使两路 cross 都存在，其核心计算加起来也只占当前 GPU kernel 时间的约 1.33%。
+
 ## 6. 40 个 block 之后
 
 最后一层输出仍为 `[B,L,5120]`。输出头执行：

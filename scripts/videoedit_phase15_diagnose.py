@@ -9,7 +9,8 @@ Default order:
   fp8_nooffload -> bf16_nooffload -> bf16_layerwise -> fp8_layerwise
 
 Use fp8_serialized_layerwise explicitly when --transformer-path points to an
-offline FP8 checkpoint containing quantization metadata.
+offline dynamic-activation FP8 checkpoint. Use fp8_static_layerwise for an
+offline checkpoint containing calibrated static activation scales.
 """
 
 from __future__ import annotations
@@ -75,6 +76,7 @@ class Variant:
     quantization: str | None
     layerwise_offload: bool
     serialized_checkpoint: bool = False
+    checkpoint_activation_scheme: str | None = None
 
 
 VARIANTS = {
@@ -83,7 +85,18 @@ VARIANTS = {
     "bf16_layerwise": Variant("bf16_layerwise", None, True),
     "fp8_layerwise": Variant("fp8_layerwise", "fp8_dynamic", True),
     "fp8_serialized_layerwise": Variant(
-        "fp8_serialized_layerwise", None, True, serialized_checkpoint=True
+        "fp8_serialized_layerwise",
+        None,
+        True,
+        serialized_checkpoint=True,
+        checkpoint_activation_scheme="dynamic",
+    ),
+    "fp8_static_layerwise": Variant(
+        "fp8_static_layerwise",
+        None,
+        True,
+        serialized_checkpoint=True,
+        checkpoint_activation_scheme="static",
     ),
 }
 DEFAULT_VARIANTS = [
@@ -665,16 +678,23 @@ def validate_variant_checkpoint(args: argparse.Namespace, variant: Variant) -> N
     quantization_config = transformer_config.get("quantization_config")
     if not isinstance(quantization_config, dict):
         raise ValueError(
-            "fp8_serialized_layerwise requires quantization_config in the "
+            f"{variant.name} requires quantization_config in the "
             f"transformer config: {config_path}"
         )
     if quantization_config.get("quant_method") != "fp8":
         raise ValueError(
-            "fp8_serialized_layerwise requires quant_method=fp8, got "
+            f"{variant.name} requires quant_method=fp8, got "
             f"{quantization_config.get('quant_method')!r}"
         )
     if quantization_config.get("weight_scale_granularity") != "channel":
-        raise ValueError("fp8_serialized_layerwise requires per-channel weight scales")
+        raise ValueError(f"{variant.name} requires per-channel weight scales")
+    expected_scheme = variant.checkpoint_activation_scheme
+    actual_scheme = quantization_config.get("activation_scheme")
+    if expected_scheme is not None and actual_scheme != expected_scheme:
+        raise ValueError(
+            f"{variant.name} requires activation_scheme={expected_scheme!r}, "
+            f"got {actual_scheme!r}"
+        )
 
 
 def calculate_comparisons(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -925,7 +945,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scenarios",
         nargs="+",
-        choices=["smoke", "profile81", "single81", "full"],
+        choices=["smoke1", "smoke", "profile81", "single81", "full"],
         default=["profile81"],
         help="Benchmark scenarios for each service. Default: profile81.",
     )

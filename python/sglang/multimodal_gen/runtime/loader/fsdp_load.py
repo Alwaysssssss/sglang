@@ -391,7 +391,15 @@ def load_model_from_full_model_state_dict(
                 ):
                     requires_grad = False
                 temp_param.requires_grad = requires_grad
-                weight_loader(temp_param, full_tensor)
+                try:
+                    weight_loader(temp_param, full_tensor)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Failed to load parameter {target_param_name!r}: "
+                        f"checkpoint_shape={tuple(full_tensor.shape)}, "
+                        f"target_shape={tuple(sharded_tensor.shape)}, "
+                        f"parameter_type={type(actual_param).__name__}"
+                    ) from error
                 sharded_tensor = temp_param.data
             else:
                 # In cases where parts of the model aren't sharded, some parameters will be plain tensors
