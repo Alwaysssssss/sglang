@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
+    VIDEOEDIT_SUPPORTED_INFER_LENS,
     WanVideoEditSamplingParams,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -188,8 +189,13 @@ class VideoEditWindowValidationStage(PipelineStage):
             raise ValueError(
                 f"VideoEdit window must contain {params.infer_len} masks, got {len(masks)}"
             )
-        if params.infer_len != 81 or (params.infer_len - 1) % 4 != 0:
-            raise ValueError("VideoEdit stages require infer_len=81 and (infer_len-1)%4=0")
+        if params.infer_len not in VIDEOEDIT_SUPPORTED_INFER_LENS or (
+            params.infer_len - 1
+        ) % 4 != 0:
+            raise ValueError(
+                "VideoEdit stages require infer_len in "
+                f"{VIDEOEDIT_SUPPORTED_INFER_LENS} and (infer_len-1)%4=0"
+            )
 
         width, height = frames[0].size
         if height % 16 != 0 or width % 16 != 0:

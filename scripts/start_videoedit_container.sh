@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start the local VideoEdit SGLang service from an existing Docker image.
+# Start the existing VideoEdit normal+DMD dual-service stack in one container.
 # Override any variable at invocation time, for example:
-#   HOST_GPUS=2,3 HOST_PORT=30000 bash docs_tyx/scrips/start_videoedit_container.sh
+#   RECREATE=1 HOST_GPUS=2,3 bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
+# Both backends use both GPUs; the gateway serializes requests on port 30000.
 # If the container already exists, the default is to remove and recreate it.
 # Set RESTART_EXISTING=1 to restart the existing container instead.
 
@@ -14,8 +15,9 @@ PROJECT_ROOT="${PROJECT_ROOT:-/root/VideoEdit}"
 HOST_REPO_DIR="${HOST_REPO_DIR:-/root/VideoEdit/sglang}"
 CONTAINER_REPO_DIR="${CONTAINER_REPO_DIR:-/sgl-workspace/sglang}"
 WORKDIR_IN_CONTAINER="${WORKDIR_IN_CONTAINER:-/root/VideoEdit/sglang}"
-MODEL_PATH="${MODEL_PATH:-/root/VideoEdit/model/DifusserEdit/pretrain_models/VideoEdit-diffusers-model}"
-TRANSFORMER_PATH="${TRANSFORMER_PATH:-${MODEL_PATH}/transformer}"
+DUAL_SERVICE_DIR_HOST="${DUAL_SERVICE_DIR_HOST:-${HOST_REPO_DIR}/scripts/videoedit_dual_service}"
+DUAL_SERVICE_CONFIG_HOST="${DUAL_SERVICE_CONFIG_HOST:-${DUAL_SERVICE_DIR_HOST}/config.env}"
+DUAL_SERVICE_CONFIG_CONTAINER="${DUAL_SERVICE_CONFIG_CONTAINER:-${CONTAINER_REPO_DIR}/scripts/videoedit_dual_service/config.env}"
 
 INPUT_SAVE_DIR="${INPUT_SAVE_DIR:-/root/VideoEdit/tmp/sglang-videoedit-cloud-inputs}"
 VIDEOEDIT_OUTPUT_DIR="${VIDEOEDIT_OUTPUT_DIR:-/root/VideoEdit/tmp/sglang-videoedit-outputs}"
@@ -29,14 +31,12 @@ HOST_GPUS="${HOST_GPUS:-2,3}"
 CONTAINER_CUDA_VISIBLE_DEVICES="${CONTAINER_CUDA_VISIBLE_DEVICES:-0,1}"
 HOST_PORT="${HOST_PORT:-30000}"
 CONTAINER_PORT="${CONTAINER_PORT:-30000}"
-BACKEND="${BACKEND:-sglang}"
 AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-WHEN_REQUIRED}"
 AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-WHEN_REQUIRED}"
 
 VIDEOEDIT_QUEUE_CAPACITY="${VIDEOEDIT_QUEUE_CAPACITY:-1}"
 PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-ENABLE_TORCH_COMPILE="${ENABLE_TORCH_COMPILE:-false}"
 
 RUN_AS_USER="${RUN_AS_USER:-root}"
 RESTART_EXISTING="${RESTART_EXISTING:-0}"
@@ -90,8 +90,10 @@ require_path "$PROJECT_ROOT"
 require_path "$HOST_REPO_DIR"
 require_path "$HOST_REPO_DIR/python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py"
 require_path "$WORKDIR_IN_CONTAINER"
-require_path "$MODEL_PATH"
-require_path "$TRANSFORMER_PATH"
+require_path "$DUAL_SERVICE_DIR_HOST/start.sh"
+require_path "$DUAL_SERVICE_DIR_HOST/status.sh"
+require_path "$DUAL_SERVICE_DIR_HOST/stop.sh"
+require_path "$DUAL_SERVICE_CONFIG_HOST"
 
 mkdir -p "$INPUT_SAVE_DIR" "$VIDEOEDIT_OUTPUT_DIR" "$VIDEOEDIT_REQUEST_LOG_DIR" "$CACHE_DIR" "$FLASHINFER_WORKSPACE_BASE" "$XDG_CACHE_HOME"
 
@@ -99,9 +101,8 @@ docker_gpu_arg="\"device=${HOST_GPUS}\""
 
 echo "Starting container '$CONTAINER_NAME' from image '$IMAGE_NAME'"
 echo "Host GPUs: ${HOST_GPUS}; container CUDA_VISIBLE_DEVICES: ${CONTAINER_CUDA_VISIBLE_DEVICES}"
-echo "Torch compile: ${ENABLE_TORCH_COMPILE}"
-echo "Service URL: http://0.0.0.0:${HOST_PORT}"
-echo "VideoEdit outputs: ${VIDEOEDIT_OUTPUT_DIR}"
+echo "Unified gateway URL: http://0.0.0.0:${HOST_PORT}"
+echo "Both normal and DMD backends use both GPUs; requests are serialized by the gateway"
 echo "Request logs: ${VIDEOEDIT_REQUEST_LOG_DIR}"
 echo "Log sensitive request values: ${VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES}"
 echo "S3 checksum mode: request=${AWS_REQUEST_CHECKSUM_CALCULATION}, response=${AWS_RESPONSE_CHECKSUM_VALIDATION}"
@@ -116,8 +117,8 @@ docker run -d \
   -v "${PROJECT_ROOT}:${PROJECT_ROOT}" \
   -v "${HOST_REPO_DIR}:${CONTAINER_REPO_DIR}" \
   -w "$WORKDIR_IN_CONTAINER" \
-  -e MODEL_PATH="$MODEL_PATH" \
-  -e TRANSFORMER_PATH="$TRANSFORMER_PATH" \
+  -e CONTAINER_REPO_DIR="$CONTAINER_REPO_DIR" \
+  -e VIDEOEDIT_DUAL_CONFIG="$DUAL_SERVICE_CONFIG_CONTAINER" \
   -e INPUT_SAVE_DIR="$INPUT_SAVE_DIR" \
   -e VIDEOEDIT_OUTPUT_DIR="$VIDEOEDIT_OUTPUT_DIR" \
   -e VIDEOEDIT_REQUEST_LOG_DIR="$VIDEOEDIT_REQUEST_LOG_DIR" \
@@ -130,10 +131,8 @@ docker run -d \
   -e PYTORCH_ALLOC_CONF="$PYTORCH_ALLOC_CONF" \
   -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
   -e PYTHONPATH="${CONTAINER_REPO_DIR}/python" \
-  -e BACKEND="$BACKEND" \
   -e AWS_REQUEST_CHECKSUM_CALCULATION="$AWS_REQUEST_CHECKSUM_CALCULATION" \
   -e AWS_RESPONSE_CHECKSUM_VALIDATION="$AWS_RESPONSE_CHECKSUM_VALIDATION" \
-  -e ENABLE_TORCH_COMPILE="$ENABLE_TORCH_COMPILE" \
   "$IMAGE_NAME" \
   bash -lc '
     set -euo pipefail
@@ -151,33 +150,66 @@ print(
 )
 PY
 
-    exec sglang serve \
-      --model-type diffusion \
-      --backend "$BACKEND" \
-      --model-path "$MODEL_PATH" \
-      --host 0.0.0.0 \
-      --port 30000 \
-      --num-gpus 2 \
-      --sp-degree 2 \
-      --ulysses-degree 2 \
-      --ring-degree 1 \
-      --enable-torch-compile "$ENABLE_TORCH_COMPILE" \
-      --dit-cpu-offload true \
-      --dit-layerwise-offload true \
-      --text-encoder-cpu-offload true \
-      --image-encoder-cpu-offload true \
-      --vae-cpu-offload true \
-      --vae-tiling true \
-      --vae-config.use-tiling true \
-      --vae-config.use-temporal-tiling false \
-      --vae-config.use-feature-cache true \
-      --warmup true \
-      --warmup-steps 1 \
-      --output-path "$VIDEOEDIT_OUTPUT_DIR" \
-      --input-save-path "$INPUT_SAVE_DIR" \
-      --videoedit-request-log-dir "$VIDEOEDIT_REQUEST_LOG_DIR" \
-      --videoedit-request-log-sensitive-values "$VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES" \
-      --transformer-path "$TRANSFORMER_PATH"
+    dual_service_dir="$CONTAINER_REPO_DIR/scripts/videoedit_dual_service"
+    # shellcheck disable=SC1090
+    source "$VIDEOEDIT_DUAL_CONFIG"
+
+    tail_pid=""
+    cleanup() {
+      trap - EXIT INT TERM
+      if [[ -n "$tail_pid" ]]; then
+        kill -TERM "$tail_pid" 2>/dev/null || true
+        wait "$tail_pid" 2>/dev/null || true
+      fi
+      bash "$dual_service_dir/stop.sh" || true
+    }
+    trap cleanup EXIT INT TERM
+
+    mkdir -p "$LOG_DIR"
+    tail -n +1 -F \
+      "$LOG_DIR/normal.log" \
+      "$LOG_DIR/dmd.log" \
+      "$LOG_DIR/gateway.log" &
+    tail_pid=$!
+
+    bash "$dual_service_dir/start.sh"
+
+    normal_pid="$(<"$PID_DIR/normal.pid")"
+    gateway_pid="$(<"$PID_DIR/gateway.pid")"
+
+    for pid in "$normal_pid" "$gateway_pid"; do
+      if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "VideoEdit startup did not leave normal and gateway running." >&2
+        exit 1
+      fi
+    done
+
+    dmd_pid=""
+    if [[ -r "$PID_DIR/dmd.pid" ]]; then
+      candidate_dmd_pid="$(<"$PID_DIR/dmd.pid")"
+      if [[ "$candidate_dmd_pid" =~ ^[0-9]+$ ]] && kill -0 "$candidate_dmd_pid" 2>/dev/null; then
+        dmd_pid="$candidate_dmd_pid"
+      fi
+    fi
+
+    if [[ -n "$dmd_pid" ]]; then
+      echo "VideoEdit dual-service stack is ready on gateway port $GATEWAY_PORT"
+      echo "normal=$normal_pid dmd=$dmd_pid gateway=$gateway_pid"
+    else
+      echo "VideoEdit is running in degraded normal-only mode on gateway port $GATEWAY_PORT" >&2
+    fi
+
+    while kill -0 "$normal_pid" 2>/dev/null \
+      && kill -0 "$gateway_pid" 2>/dev/null; do
+      if [[ -n "$dmd_pid" ]] && ! kill -0 "$dmd_pid" 2>/dev/null; then
+        echo "DMD backend exited; keeping normal and gateway running." >&2
+        dmd_pid=""
+      fi
+      sleep 5
+    done
+
+    echo "The normal backend or gateway exited; stopping the stack." >&2
+    exit 1
   '
 
 echo
@@ -185,3 +217,7 @@ echo "Container started. Useful commands:"
 echo "  docker logs -f ${CONTAINER_NAME}"
 echo "  docker ps --filter name=^/${CONTAINER_NAME}$"
 echo "  docker exec -it ${CONTAINER_NAME} nvidia-smi"
+echo "  docker exec ${CONTAINER_NAME} bash scripts/videoedit_dual_service/status.sh"
+echo "  docker stop ${CONTAINER_NAME}"
+echo "  curl --noproxy '*' -sS http://127.0.0.1:${HOST_PORT}/health"
+echo "Model routing: videoedit-normal -> normal; videoedit-dmd -> DMD"

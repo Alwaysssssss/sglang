@@ -198,15 +198,19 @@ if (( ! dmd_eligible )); then
   exit 0
 fi
 
-if ! "$PYTHON_BIN" "$PROBE" gate-second \
-  --metrics "$NORMAL_METRICS" \
-  --output "$RUNTIME_DIR/second-service-gate.json" \
-  --gpu-headroom-gib "$MIN_STARTUP_GPU_HEADROOM_GIB" \
-  --host-headroom-gib "$MIN_HOST_HEADROOM_GIB" \
-  --cgroup-headroom-gib "$MIN_CGROUP_HEADROOM_GIB"; then
-  echo "Second-service resource gate failed; starting normal-only gateway." >&2
-  start_gateway
-  exit 0
+if [[ "${SKIP_SECOND_SERVICE_RESOURCE_GATE:-false}" == "true" ]]; then
+  echo "Skipping predictive second-service resource gate; DMD startup will be attempted."
+else
+  if ! "$PYTHON_BIN" "$PROBE" gate-second \
+    --metrics "$NORMAL_METRICS" \
+    --output "$RUNTIME_DIR/second-service-gate.json" \
+    --gpu-headroom-gib "$MIN_STARTUP_GPU_HEADROOM_GIB" \
+    --host-headroom-gib "$MIN_HOST_HEADROOM_GIB" \
+    --cgroup-headroom-gib "$MIN_CGROUP_HEADROOM_GIB"; then
+    echo "Second-service resource gate failed; starting normal-only gateway." >&2
+    start_gateway
+    exit 0
+  fi
 fi
 
 echo "Starting DMD VideoEdit backend..."

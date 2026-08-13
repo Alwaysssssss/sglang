@@ -19,6 +19,7 @@ VIDEOEDIT_INIT_LATENT_MODES = ("noise", "add_noise")
 VIDEOEDIT_MASK_DOWNSAMPLE_MODES = ("nearest", "nearest-exact")
 VIDEOEDIT_OVERLAP_COMMIT_MODES = ("native_skip", "weighted")
 VIDEOEDIT_TAIL_PADDING_MODES = ("native_reverse_mirror", "reflect")
+VIDEOEDIT_SUPPORTED_INFER_LENS = (49, 81)
 
 
 def build_videoedit_teacache_params(
@@ -174,8 +175,12 @@ class WanVideoEditSamplingParams(SamplingParams):
         self._validate_videoedit()
 
     def _validate_videoedit(self) -> None:
-        if self.infer_len != 81:
-            raise ValueError(f"VideoEdit infer_len must be 81, got {self.infer_len}")
+        if self.infer_len not in VIDEOEDIT_SUPPORTED_INFER_LENS:
+            raise ValueError(
+                "VideoEdit infer_len must be one of "
+                f"{'/'.join(str(v) for v in VIDEOEDIT_SUPPORTED_INFER_LENS)}, "
+                f"got {self.infer_len}"
+            )
         if (self.infer_len - 1) % 4 != 0:
             raise ValueError("VideoEdit infer_len must satisfy (infer_len - 1) % 4 == 0")
         if self.num_frames is not None and self.num_frames <= 0:
