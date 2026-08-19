@@ -1,0 +1,5 @@
+interface:
+  display_name: "议题分诊"
+  short_description: "让议题依次经过各分诊角色"
+policy:
+  allow_implicit_invocation: false

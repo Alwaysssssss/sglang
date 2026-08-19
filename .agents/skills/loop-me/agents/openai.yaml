@@ -1,0 +1,5 @@
+interface:
+  display_name: "循环设计"
+  short_description: "为想构建的工作流编写规格"
+policy:
+  allow_implicit_invocation: false

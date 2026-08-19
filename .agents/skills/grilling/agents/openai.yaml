@@ -1,0 +1,3 @@
+interface:
+  display_name: "持续追问"
+  short_description: "逐个问题对思路做压力测试"

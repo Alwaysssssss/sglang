@@ -1,0 +1,3 @@
+interface:
+  display_name: "质量验证"
+  short_description: "通过对话验证质量并创建议题"

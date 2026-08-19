@@ -1,0 +1,5 @@
+interface:
+  display_name: "转为问卷"
+  short_description: "将待确认问题前置整理成文档"
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,5 @@
+interface:
+  display_name: "批量追问我"
+  short_description: "通过逐轮提问打磨计划"
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,5 @@
+interface:
+  display_name: "探路者"
+  short_description: "将大型工作绘制为决策工单地图"
+policy:
+  allow_implicit_invocation: false

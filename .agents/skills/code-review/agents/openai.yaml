@@ -1,0 +1,3 @@
+interface:
+  display_name: "代码审查"
+  short_description: "从规范与规格两个维度审查差异"
