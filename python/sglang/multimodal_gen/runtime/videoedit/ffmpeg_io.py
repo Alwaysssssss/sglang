@@ -75,6 +75,8 @@ def probe_video_profile(video_path: str) -> dict[str, Any]:
         "codec_name": stream.get("codec_name"),
         "codec_tag_string": stream.get("codec_tag_string"),
         "pix_fmt": stream.get("pix_fmt"),
+        "sample_aspect_ratio": stream.get("sample_aspect_ratio"),
+        "display_aspect_ratio": stream.get("display_aspect_ratio"),
         "bit_rate": int(bit_rate) if bit_rate else None,
         "bits_per_raw_sample": stream.get("bits_per_raw_sample"),
         "bits_per_sample": stream.get("bits_per_sample"),
@@ -96,6 +98,18 @@ def _encoder_for_codec(codec_name: str | None) -> str:
 def _quality_to_crf(quality: int | float) -> int:
     quality = max(0.0, min(10.0, float(quality)))
     return int(round(51 - quality * 5.1))
+
+
+def _aspect_ratio_for_filter(value: str | None) -> str | None:
+    if not value or value in {"N/A", "unknown", "0:1", "0/1"}:
+        return None
+    try:
+        ratio = Fraction(value.replace(":", "/"))
+    except (ValueError, ZeroDivisionError):
+        return None
+    if ratio <= 0:
+        return None
+    return f"{ratio.numerator}/{ratio.denominator}"
 
 
 def _as_rgb24_array(frame: Image.Image | np.ndarray) -> np.ndarray:
@@ -125,11 +139,46 @@ def _build_ffmpeg_cmd(
     profile: dict[str, Any],
     quality: int | float | None,
     loglevel: str,
+    bit_rate: int | None = None,
+    copy_color_metadata: bool = True,
 ) -> list[str]:
     encoder = _encoder_for_codec(profile.get("codec_name"))
     pix_fmt = profile.get("pix_fmt") or "yuv420p"
-    padded_width = width + (width % 2)
-    padded_height = height + (height % 2)
+    has_odd_dimension = bool(width % 2 or height % 2)
+    preserve_odd_geometry = has_odd_dimension and encoder in {"libx264", "libx265"}
+    if preserve_odd_geometry:
+        # 4:2:0 requires even dimensions.  VideoEdit crop sidecars are an
+        # algorithm boundary, so keep their exact bbox geometry and switch to
+        # a 4:4:4 pixel format instead of silently padding one pixel.
+        pix_fmt = "yuv444p"
+        padded_width, padded_height = width, height
+    else:
+        padded_width = width + (width % 2)
+        padded_height = height + (height % 2)
+    video_filters = []
+    if padded_width != width or padded_height != height:
+        video_filters.append(f"pad={padded_width}:{padded_height}:0:0")
+
+    if copy_color_metadata:
+        setparams = []
+        for profile_field, filter_option in (
+            ("color_range", "range"),
+            ("color_primaries", "color_primaries"),
+            ("color_transfer", "color_trc"),
+            ("color_space", "colorspace"),
+        ):
+            value = profile.get(profile_field)
+            if value and value != "unknown":
+                setparams.append(f"{filter_option}={value}")
+        if setparams:
+            video_filters.append(f"setparams={':'.join(setparams)}")
+
+        sample_aspect_ratio = _aspect_ratio_for_filter(
+            profile.get("sample_aspect_ratio")
+        )
+        if sample_aspect_ratio:
+            video_filters.append(f"setsar={sample_aspect_ratio}")
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -148,8 +197,8 @@ def _build_ffmpeg_cmd(
         "-an",
     ]
 
-    if padded_width != width or padded_height != height:
-        cmd.extend(["-vf", f"pad={padded_width}:{padded_height}:0:0"])
+    if video_filters:
+        cmd.extend(["-vf", ",".join(video_filters)])
 
     cmd.extend([
         "-c:v",
@@ -162,21 +211,24 @@ def _build_ffmpeg_cmd(
 
     if quality is not None and encoder in {"libx264", "libx265"}:
         cmd.extend(["-crf", str(_quality_to_crf(quality))])
+    elif bit_rate is not None:
+        cmd.extend(["-b:v", str(bit_rate)])
     elif profile.get("bit_rate"):
         cmd.extend(["-b:v", str(profile["bit_rate"])])
 
-    if profile.get("color_range") and profile["color_range"] != "unknown":
-        cmd.extend(["-color_range", profile["color_range"]])
-    if profile.get("color_space") and profile["color_space"] != "unknown":
-        cmd.extend(["-colorspace", profile["color_space"]])
-    if profile.get("color_transfer") and profile["color_transfer"] != "unknown":
-        cmd.extend(["-color_trc", profile["color_transfer"]])
-    if profile.get("color_primaries") and profile["color_primaries"] != "unknown":
-        cmd.extend(["-color_primaries", profile["color_primaries"]])
+    if copy_color_metadata:
+        if profile.get("color_range") and profile["color_range"] != "unknown":
+            cmd.extend(["-color_range", profile["color_range"]])
+        if profile.get("color_space") and profile["color_space"] != "unknown":
+            cmd.extend(["-colorspace", profile["color_space"]])
+        if profile.get("color_transfer") and profile["color_transfer"] != "unknown":
+            cmd.extend(["-color_trc", profile["color_transfer"]])
+        if profile.get("color_primaries") and profile["color_primaries"] != "unknown":
+            cmd.extend(["-color_primaries", profile["color_primaries"]])
 
-    field_order = profile.get("field_order")
-    if field_order in {"progressive", "tt", "bb", "tb", "bt"}:
-        cmd.extend(["-field_order", field_order])
+        field_order = profile.get("field_order")
+        if field_order in {"progressive", "tt", "bb", "tb", "bt"}:
+            cmd.extend(["-field_order", field_order])
 
     cmd.append(output_path)
     return cmd
@@ -189,6 +241,8 @@ def save_video_frames_like_reference(
     fps: float | None = None,
     quality: int | float | None = None,
     loglevel: str = "warning",
+    bit_rate: int | None = None,
+    copy_color_metadata: bool = True,
 ) -> str:
     if not frames:
         raise ValueError("No video frames to save")
@@ -207,6 +261,8 @@ def save_video_frames_like_reference(
         profile=profile,
         quality=quality,
         loglevel=loglevel,
+        bit_rate=bit_rate,
+        copy_color_metadata=copy_color_metadata,
     )
 
     process = subprocess.Popen(

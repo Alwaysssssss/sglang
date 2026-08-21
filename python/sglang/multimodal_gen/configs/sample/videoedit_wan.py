@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -15,11 +15,7 @@ DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 VIDEOEDIT_DECODE_MODES = ("eager", "stream")
-VIDEOEDIT_INIT_LATENT_MODES = ("noise", "add_noise")
-VIDEOEDIT_MASK_DOWNSAMPLE_MODES = ("nearest", "nearest-exact")
-VIDEOEDIT_OVERLAP_COMMIT_MODES = ("native_skip", "weighted")
-VIDEOEDIT_TAIL_PADDING_MODES = ("native_reverse_mirror", "reflect")
-VIDEOEDIT_SUPPORTED_INFER_LENS = (49, 81)
+VIDEOEDIT_CLIP_PREPROCESS_MODES = ("diffuser", "diffsynth")
 
 
 def build_videoedit_teacache_params(
@@ -50,9 +46,10 @@ class WanVideoEditSamplingParams(SamplingParams):
     video_input_path: str | None = None
     mask_input_path: str | None = None
     reference_image_path: str | None = None
-    infer_len: int = 81
-    overlap: int = 10
-    strength: float = 1.0
+    ref_frame_idx: int = 0
+    bridge_overlap: int = 5
+    infer_len: int = 49
+    overlap: int = 5
     dtype: str = "bf16"
 
     dynamic_cfg: bool = True
@@ -61,27 +58,33 @@ class WanVideoEditSamplingParams(SamplingParams):
 
     bbox_padding: int = 0
     bbox_expand_scale: float = 0.3
-    dilate_px: int = 0
+    dilate_px: int = 8
     mask_scale: float = 1.0
-    feather_px: int = 0
+    feather_px: int = 8
     adain_boundary_dilate: int = 0
 
     enable_paste_back: bool = True
     save_crop_only: bool = False
-    drop_reference_frame: bool = True
-    keep_intermediate_windows: bool = False
     use_clip: bool = True
-    use_repaired_context: bool = False
-    vary_seed_by_window: bool = False
-    init_latent_mode: str = "noise"
-    mask_downsample_mode: str = "nearest"
-    overlap_commit_mode: str = "weighted"
-    tail_padding_mode: str = "reflect"
+    clip_preprocess: str = "diffuser"
     decode_mode: str = "stream"
     progress_path: str | None = None
 
+    # Fixed algorithm semantics.  Class variables remain readable by the
+    # execution layer but are absent from the dataclass request constructor.
+    strength: ClassVar[float] = 1.0
+    generator_device: ClassVar[str] = "cpu"
+    drop_reference_frame: ClassVar[bool] = False
+    keep_intermediate_windows: ClassVar[bool] = False
+    use_repaired_context: ClassVar[bool] = False
+    vary_seed_by_window: ClassVar[bool] = False
+    init_latent_mode: ClassVar[str] = "noise"
+    mask_downsample_mode: ClassVar[str] = "nearest"
+    overlap_commit_mode: ClassVar[str] = "native_skip"
+    tail_padding_mode: ClassVar[str] = "native_reverse_mirror"
+
     # VideoEdit defaults
-    num_frames: int = 81
+    num_frames: int | None = None
     fps: int = 16
     guidance_scale: float = 5.0
     num_inference_steps: int = 40
@@ -166,34 +169,70 @@ class WanVideoEditSamplingParams(SamplingParams):
         super()._set_output_file_ext()
 
     def __post_init__(self) -> None:
-        if self.num_frames is not None and self.num_frames <= 0:
+        if isinstance(self.num_frames, bool) or (
+            self.num_frames is not None
+            and (not isinstance(self.num_frames, int) or self.num_frames < -1)
+        ):
             raise ValueError(
-                "VideoEdit num_frames must be positive after request normalization. "
-                "Use num_frames=-1 only at API/CLI entrypoints to mean all frames."
+                "VideoEdit num_frames must be a positive integer, -1, or None"
             )
+        if self.num_frames == 0:
+            raise ValueError("VideoEdit num_frames must not be zero")
+
+        # SamplingParams currently requires a resolved positive frame count.
+        # Validate its shared fields with a sentinel, then restore the VideoEdit
+        # full-video marker.  ``_adjust`` resolves it before shared adjustment.
+        full_video = self.num_frames in (-1, None)
+        if full_video:
+            self.num_frames = 1
         super().__post_init__()
+        if full_video:
+            self.num_frames = None
         self._validate_videoedit()
 
     def _validate_videoedit(self) -> None:
-        if self.infer_len not in VIDEOEDIT_SUPPORTED_INFER_LENS:
+        if (
+            isinstance(self.infer_len, bool)
+            or not isinstance(self.infer_len, int)
+            or self.infer_len < 1
+            or (self.infer_len - 1) % 4 != 0
+        ):
             raise ValueError(
-                "VideoEdit infer_len must be one of "
-                f"{'/'.join(str(v) for v in VIDEOEDIT_SUPPORTED_INFER_LENS)}, "
-                f"got {self.infer_len}"
+                "VideoEdit infer_len must be >= 1 and satisfy "
+                f"(infer_len - 1) % 4 == 0, got {self.infer_len!r}"
             )
-        if (self.infer_len - 1) % 4 != 0:
-            raise ValueError("VideoEdit infer_len must satisfy (infer_len - 1) % 4 == 0")
-        if self.num_frames is not None and self.num_frames <= 0:
-            raise ValueError(
-                "VideoEdit num_frames must be positive after request normalization. "
-                "Use num_frames=-1 only at API/CLI entrypoints to mean all frames."
-            )
-        if not (0 <= self.overlap < self.infer_len):
+        if (
+            isinstance(self.overlap, bool)
+            or not isinstance(self.overlap, int)
+            or not (0 <= self.overlap < self.infer_len)
+        ):
             raise ValueError(
                 f"overlap must be in [0, {self.infer_len}), got {self.overlap}"
             )
-        if not (0.0 < float(self.strength) <= 1.0):
-            raise ValueError(f"strength must be in (0, 1], got {self.strength!r}")
+        if (
+            isinstance(self.ref_frame_idx, bool)
+            or not isinstance(self.ref_frame_idx, int)
+            or self.ref_frame_idx < 0
+        ):
+            raise ValueError(
+                "VideoEdit ref_frame_idx must be a non-negative integer, "
+                f"got {self.ref_frame_idx!r}"
+            )
+        if self.num_frames is not None and self.ref_frame_idx >= self.num_frames:
+            raise ValueError(
+                "VideoEdit ref_frame_idx must be smaller than num_frames, "
+                f"got ref_frame_idx={self.ref_frame_idx}, num_frames={self.num_frames}"
+            )
+        if (
+            isinstance(self.bridge_overlap, bool)
+            or not isinstance(self.bridge_overlap, int)
+            or self.bridge_overlap < 1
+            or (self.bridge_overlap - 1) % 4 != 0
+        ):
+            raise ValueError(
+                "VideoEdit bridge_overlap must be >= 1 and satisfy "
+                f"(bridge_overlap - 1) % 4 == 0, got {self.bridge_overlap!r}"
+            )
         if self.num_outputs_per_prompt != 1:
             raise ValueError("VideoEdit only supports num_outputs_per_prompt=1")
         if self.dtype not in {"bf16", "fp16", "fp32"}:
@@ -203,26 +242,28 @@ class WanVideoEditSamplingParams(SamplingParams):
                 "decode_mode must be one of "
                 f"{'/'.join(VIDEOEDIT_DECODE_MODES)}, got {self.decode_mode!r}"
             )
-        if self.init_latent_mode not in VIDEOEDIT_INIT_LATENT_MODES:
+        if self.clip_preprocess not in VIDEOEDIT_CLIP_PREPROCESS_MODES:
             raise ValueError(
-                "init_latent_mode must be one of "
-                f"{'/'.join(VIDEOEDIT_INIT_LATENT_MODES)}, got {self.init_latent_mode!r}"
+                "clip_preprocess must be one of "
+                f"{'/'.join(VIDEOEDIT_CLIP_PREPROCESS_MODES)}, "
+                f"got {self.clip_preprocess!r}"
             )
-        if self.mask_downsample_mode not in VIDEOEDIT_MASK_DOWNSAMPLE_MODES:
-            raise ValueError(
-                "mask_downsample_mode must be one of "
-                f"{'/'.join(VIDEOEDIT_MASK_DOWNSAMPLE_MODES)}, got {self.mask_downsample_mode!r}"
+
+    def _adjust(self, server_args) -> None:
+        if self.num_frames is None:
+            from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+                resolve_videoedit_num_frames,
             )
-        if self.overlap_commit_mode not in VIDEOEDIT_OVERLAP_COMMIT_MODES:
-            raise ValueError(
-                "overlap_commit_mode must be one of "
-                f"{'/'.join(VIDEOEDIT_OVERLAP_COMMIT_MODES)}, got {self.overlap_commit_mode!r}"
+
+            if not self.video_input_path or not self.mask_input_path:
+                raise ValueError(
+                    "VideoEdit full-video mode requires video_input_path and mask_input_path"
+                )
+            self.num_frames = resolve_videoedit_num_frames(
+                -1, self.video_input_path, self.mask_input_path
             )
-        if self.tail_padding_mode not in VIDEOEDIT_TAIL_PADDING_MODES:
-            raise ValueError(
-                "tail_padding_mode must be one of "
-                f"{'/'.join(VIDEOEDIT_TAIL_PADDING_MODES)}, got {self.tail_padding_mode!r}"
-            )
+        super()._adjust(server_args)
+        self._validate_videoedit()
 
     def _validate_with_pipeline_config(self, pipeline_config):
         super()._validate_with_pipeline_config(pipeline_config)
@@ -230,6 +271,8 @@ class WanVideoEditSamplingParams(SamplingParams):
             raise ValueError("VideoEdit requires video_input_path")
         if self.mask_input_path is None:
             raise ValueError("VideoEdit requires mask_input_path")
+        if self.reference_image_path is None:
+            raise ValueError("VideoEdit requires reference_image_path")
 
     @classmethod
     def from_user_kwargs(cls, server_args, *args, **kwargs) -> "WanVideoEditSamplingParams":

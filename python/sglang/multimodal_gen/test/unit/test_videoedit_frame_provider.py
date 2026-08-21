@@ -14,6 +14,10 @@ from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     prepare_global_inputs,
     scan_global_bbox,
 )
+from sglang.multimodal_gen.runtime.videoedit.windowing import (
+    build_videoedit_pass_window_specs,
+    plan_videoedit_passes,
+)
 
 
 def _write_rgb_video(path: Path, frames: list[np.ndarray], fps: float = 5.0) -> None:
@@ -205,7 +209,7 @@ class TestVideoEditFrameProvider(unittest.TestCase):
             if thread is not None:
                 self.assertFalse(thread.is_alive())
 
-    def test_reference_frame_materialize_matches_eager(self):
+    def test_reference_stays_out_of_band_and_matches_eager(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = Path(temp_dir) / "video.avi"
             mask_path = Path(temp_dir) / "mask.avi"
@@ -244,6 +248,79 @@ class TestVideoEditFrameProvider(unittest.TestCase):
             )
             try:
                 frames_out, masks_out = provider.materialize_window([0, 1, 2])
+                resized_reference = provider.get_resized_reference_frame()
+
+                long_plan = plan_videoedit_passes(5, 0, bridge_overlap=5).long
+                first_spec = build_videoedit_pass_window_specs(
+                    long_plan.sequence_indices,
+                    infer_len=5,
+                    overlap=0,
+                )[0]
+                pass_window = provider.materialize_pass_window(
+                    long_plan, first_spec
+                )
+                overlap_specs = build_videoedit_pass_window_specs(
+                    long_plan.sequence_indices,
+                    infer_len=5,
+                    overlap=1,
+                )
+                overlap_previous = [
+                    Image.new(
+                        "RGB",
+                        (scanned["aligned_w"], scanned["aligned_h"]),
+                        (230 + i, 230 + i, 230 + i),
+                    )
+                    for i in range(5)
+                ]
+                overlap_window = provider.materialize_pass_window(
+                    long_plan,
+                    overlap_specs[1],
+                    previous_output_frames=overlap_previous,
+                )
+
+                backward_plans = plan_videoedit_passes(
+                    5, 3, bridge_overlap=5
+                )
+                backward_spec = build_videoedit_pass_window_specs(
+                    backward_plans.long.sequence_indices,
+                    infer_len=5,
+                    overlap=0,
+                )[0]
+                backward_window = provider.materialize_pass_window(
+                    backward_plans.long, backward_spec
+                )
+                assert backward_plans.short is not None
+                short_spec = build_videoedit_pass_window_specs(
+                    backward_plans.short.sequence_indices,
+                    infer_len=5,
+                    overlap=0,
+                )[0]
+                short_window = provider.materialize_pass_window(
+                    backward_plans.short,
+                    short_spec,
+                    bridge_frames=[
+                        Image.new(
+                            "RGB",
+                            (scanned["aligned_w"], scanned["aligned_h"]),
+                            (222, 222, 222),
+                        )
+                    ],
+                )
+                eager_paste = paste_back(
+                    original_frames=eager["original_frames"],
+                    generated_frames=eager["resized_video"],
+                    mask_frames=eager["dilated_cropped_masks"],
+                    bbox=eager["bbox"],
+                    crop_h=eager["crop_h"],
+                    crop_w=eager["crop_w"],
+                    feather_px=12,
+                    adain_boundary_dilate=15,
+                )
+                stream_paste = provider.paste_back_frames(
+                    eager["resized_video"],
+                    feather_px=12,
+                    adain_boundary_dilate=15,
+                )
             finally:
                 provider.close()
 
@@ -251,7 +328,41 @@ class TestVideoEditFrameProvider(unittest.TestCase):
                 self.assertTrue(np.array_equal(np.asarray(out), np.asarray(expected)))
             for out, expected in zip(masks_out, eager["resized_masks"][:3], strict=True):
                 self.assertTrue(np.array_equal(np.asarray(out), np.asarray(expected)))
-            self.assertEqual(int(np.asarray(masks_out[0]).sum()), 0)
+            self.assertGreater(int(np.asarray(masks_out[0]).sum()), 0)
+            self.assertIsNotNone(resized_reference)
+            assert resized_reference is not None
+            self.assertTrue(
+                np.array_equal(
+                    np.asarray(resized_reference),
+                    np.asarray(eager["resized_reference"]),
+                )
+            )
+            self.assertEqual(pass_window.global_indices, (None, 0, 1, 2, 3))
+            self.assertEqual(int(np.asarray(pass_window.masks[0]).sum()), 0)
+            self.assertGreater(int(np.asarray(pass_window.masks[1]).sum()), 0)
+            self.assertEqual(overlap_window.global_indices, (3, 4, None, None, None))
+            self.assertEqual(int(np.asarray(overlap_window.frames[0])[0, 0, 0]), 234)
+            self.assertEqual(int(np.asarray(overlap_window.masks[0]).sum()), 0)
+            self.assertGreater(int(np.asarray(overlap_window.masks[1]).sum()), 0)
+            self.assertEqual(overlap_specs[1].commit_local_to_global, {1: 4})
+            self.assertEqual(backward_window.global_indices, (None, 3, 2, 1, 0))
+            self.assertEqual(int(np.asarray(backward_window.masks[0]).sum()), 0)
+            self.assertTrue(
+                np.array_equal(
+                    np.asarray(backward_window.masks[1]),
+                    np.asarray(eager["resized_masks"][3]),
+                )
+            )
+            self.assertEqual(short_window.global_indices, (None, 4, None, None, None))
+            self.assertEqual(int(np.asarray(short_window.masks[0]).sum()), 0)
+            self.assertGreater(int(np.asarray(short_window.masks[1]).sum()), 0)
+            self.assertEqual(int(np.asarray(short_window.frames[0])[0, 0, 0]), 222)
+            for expected, actual in zip(
+                eager_paste, stream_paste, strict=True
+            ):
+                self.assertTrue(
+                    np.array_equal(np.asarray(expected), np.asarray(actual))
+                )
 
 
 if __name__ == "__main__":

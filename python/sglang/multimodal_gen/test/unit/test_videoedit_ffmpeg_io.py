@@ -82,6 +82,47 @@ def _write_reference_mov(path: Path, frames: list[np.ndarray], fps: int = 6) -> 
     return result.returncode == 0
 
 
+def _write_profiled_mp4(path: Path, frames: list[np.ndarray], fps: int = 6) -> bool:
+    height, width = frames[0].shape[:2]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-an",
+        "-vf",
+        (
+            "setparams=range=tv:color_primaries=bt709:"
+            "color_trc=bt709:colorspace=bt709,setsar=1/1"
+        ),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-b:v",
+        "120k",
+        str(path),
+    ]
+    result = subprocess.run(
+        cmd,
+        input=b"".join(frame.tobytes() for frame in frames),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 class TestVideoEditFfmpegIO(unittest.TestCase):
     def setUp(self):
         if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
@@ -141,7 +182,37 @@ class TestVideoEditFfmpegIO(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-color_trc") + 1], "bt709")
         self.assertEqual(cmd[cmd.index("-color_primaries") + 1], "bt709")
 
-    def test_save_odd_sized_frames_pads_for_yuv420(self):
+    def test_build_ffmpeg_cmd_can_match_original_videoedit_writer(self):
+        profile = {
+            "codec_name": "h264",
+            "pix_fmt": "yuv444p",
+            "bit_rate": 123456,
+            "color_range": "tv",
+            "color_space": "bt709",
+            "color_transfer": "bt709",
+            "color_primaries": "bt709",
+        }
+
+        cmd = _build_ffmpeg_cmd(
+            "output.mp4",
+            width=17,
+            height=15,
+            fps=50,
+            profile=profile,
+            quality=None,
+            loglevel="error",
+            bit_rate=10_000_000,
+            copy_color_metadata=False,
+        )
+
+        self.assertEqual(cmd[cmd.index("-c:v") + 1], "libx264")
+        self.assertEqual(cmd[cmd.index("-b:v") + 1], "10000000")
+        self.assertNotIn("-color_range", cmd)
+        self.assertNotIn("-colorspace", cmd)
+        self.assertNotIn("-color_trc", cmd)
+        self.assertNotIn("-color_primaries", cmd)
+
+    def test_save_odd_sized_frames_preserves_crop_geometry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             ref_path = Path(temp_dir) / "reference.mov"
             out_path = Path(temp_dir) / "output.mov"
@@ -163,8 +234,8 @@ class TestVideoEditFfmpegIO(unittest.TestCase):
             out_profile = probe_video_profile(str(out_path))
 
             self.assertEqual(out_profile["codec_name"], ref_profile["codec_name"])
-            self.assertEqual(out_profile["pix_fmt"], ref_profile["pix_fmt"])
-            self.assertEqual(out_profile["width"], 18)
+            self.assertEqual(out_profile["pix_fmt"], "yuv444p")
+            self.assertEqual(out_profile["width"], 17)
             self.assertEqual(out_profile["height"], 16)
 
     def test_save_mov_frames_like_reference_profile(self):
@@ -198,6 +269,38 @@ class TestVideoEditFfmpegIO(unittest.TestCase):
             if ref_profile.get("bit_rate") and out_profile.get("bit_rate"):
                 delta = abs(out_profile["bit_rate"] - ref_profile["bit_rate"])
                 self.assertLessEqual(delta / ref_profile["bit_rate"], 0.75)
+
+    def test_save_mp4_frames_preserves_aspect_and_color_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ref_path = Path(temp_dir) / "reference.mp4"
+            out_path = Path(temp_dir) / "output.mp4"
+            base = np.arange(12 * 16 * 3, dtype=np.uint16).reshape(12, 16, 3)
+            frames = [((base + i * 17) % 256).astype(np.uint8) for i in range(12)]
+            if not _write_profiled_mp4(ref_path, frames):
+                self.skipTest("ffmpeg could not create profiled reference mp4")
+
+            ref_profile = probe_video_profile(str(ref_path))
+            expected_profile = {
+                "sample_aspect_ratio": "1:1",
+                "display_aspect_ratio": "4:3",
+                "color_range": "tv",
+                "color_space": "bt709",
+                "color_transfer": "bt709",
+                "color_primaries": "bt709",
+            }
+            for field, expected in expected_profile.items():
+                self.assertEqual(ref_profile[field], expected)
+
+            save_video_frames_like_reference(
+                [Image.fromarray(frame) for frame in frames],
+                str(out_path),
+                refer_file=str(ref_path),
+                fps=ref_profile["fps"],
+            )
+            out_profile = probe_video_profile(str(out_path))
+
+            for field, expected in expected_profile.items():
+                self.assertEqual(out_profile[field], expected)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
-    VIDEOEDIT_SUPPORTED_INFER_LENS,
     WanVideoEditSamplingParams,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -172,6 +171,58 @@ def calc_current_cfg(
     return max_cfg, max_cfg != 1.0
 
 
+def _prepare_clip_pixel_values(
+    image,
+    *,
+    clip_preprocess: str,
+    image_processor: Any | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if clip_preprocess == "diffuser":
+        if image_processor is None:
+            raise ValueError(
+                "VideoEdit clip_preprocess='diffuser' requires the checkpoint "
+                "image_processor component"
+            )
+        processed = image_processor(images=image, return_tensors="pt")
+        pixel_values = (
+            processed["pixel_values"]
+            if isinstance(processed, dict)
+            else processed.pixel_values
+        )
+        return pixel_values.to(device=device, dtype=torch.float32)
+
+    if clip_preprocess != "diffsynth":
+        raise ValueError(f"Unsupported VideoEdit clip_preprocess={clip_preprocess!r}")
+
+    pixel_values = (
+        torch.from_numpy(np.array(image).astype(np.float32) / 255.0)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+    )
+    pixel_values = pixel_values.mul(2.0).sub(1.0).to(
+        device=device, dtype=torch.float32
+    )
+    pixel_values = F.interpolate(
+        pixel_values,
+        size=(224, 224),
+        mode="bicubic",
+        align_corners=False,
+    )
+    pixel_values = pixel_values.mul(0.5).add(0.5)
+    mean = torch.tensor(
+        [0.48145466, 0.4578275, 0.40821073],
+        device=device,
+        dtype=torch.float32,
+    ).view(1, 3, 1, 1)
+    std = torch.tensor(
+        [0.26862954, 0.26130258, 0.27577711],
+        device=device,
+        dtype=torch.float32,
+    ).view(1, 3, 1, 1)
+    return (pixel_values - mean) / std
+
+
 class VideoEditWindowValidationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         del server_args
@@ -189,12 +240,10 @@ class VideoEditWindowValidationStage(PipelineStage):
             raise ValueError(
                 f"VideoEdit window must contain {params.infer_len} masks, got {len(masks)}"
             )
-        if params.infer_len not in VIDEOEDIT_SUPPORTED_INFER_LENS or (
-            params.infer_len - 1
-        ) % 4 != 0:
+        if params.infer_len < 1 or (params.infer_len - 1) % 4 != 0:
             raise ValueError(
-                "VideoEdit stages require infer_len in "
-                f"{VIDEOEDIT_SUPPORTED_INFER_LENS} and (infer_len-1)%4=0"
+                "VideoEdit stages require infer_len >= 1 and "
+                "(infer_len-1)%4=0"
             )
 
         width, height = frames[0].size
@@ -216,47 +265,59 @@ class VideoEditWindowValidationStage(PipelineStage):
 class VideoEditTextEncodingStage(PipelineStage):
     def __init__(self, text_encoder: torch.nn.Module, tokenizer: Any, transformer: torch.nn.Module):
         super().__init__()
+        self.text_encoder = text_encoder
         self.text_stage = TextEncodingStage([text_encoder], [tokenizer])
         self.transformer = transformer
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         params = _videoedit_params(batch)
+        device = get_local_torch_device()
         target_dtype = _module_dtype(
             self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         )
         autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=target_dtype,
-            enabled=autocast_enabled,
-        ):
-            prompt_embeds, _, _ = self.text_stage.encode_text(
-                params.prompt or " ",
-                server_args,
-                encoder_index=[0],
-                return_attention_mask=True,
-                dtype=target_dtype,
-            )
-        params.runtime_prompt_embeds = prompt_embeds[0]
-
-        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
-        if params.runtime_do_cfg:
+        try:
+            if hasattr(self.text_encoder, "to"):
+                self.text_encoder = self.text_encoder.to(device)
+                self.text_stage.text_encoders[0] = self.text_encoder
             with torch.autocast(
                 device_type=current_platform.device_type,
                 dtype=target_dtype,
                 enabled=autocast_enabled,
             ):
-                neg_embeds, _, _ = self.text_stage.encode_text(
-                    params.negative_prompt or "",
+                prompt_embeds, _, _ = self.text_stage.encode_text(
+                    params.prompt or " ",
                     server_args,
                     encoder_index=[0],
                     return_attention_mask=True,
                     dtype=target_dtype,
                 )
-            params.runtime_negative_prompt_embeds = neg_embeds[0]
-        else:
-            params.runtime_negative_prompt_embeds = None
+            params.runtime_prompt_embeds = prompt_embeds[0]
+
+            params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+            if params.runtime_do_cfg:
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
+                ):
+                    neg_embeds, _, _ = self.text_stage.encode_text(
+                        params.negative_prompt or "",
+                        server_args,
+                        encoder_index=[0],
+                        return_attention_mask=True,
+                        dtype=target_dtype,
+                    )
+                params.runtime_negative_prompt_embeds = neg_embeds[0]
+            else:
+                params.runtime_negative_prompt_embeds = None
+        finally:
+            if server_args.text_encoder_cpu_offload and hasattr(
+                self.text_encoder, "to"
+            ):
+                self.text_encoder = self.text_encoder.to("cpu")
+                self.text_stage.text_encoders[0] = self.text_encoder
         return batch
 
 
@@ -264,10 +325,12 @@ class VideoEditImageEncodingStage(PipelineStage):
     def __init__(
         self,
         image_encoder: torch.nn.Module | None,
+        image_processor: Any | None,
         transformer: torch.nn.Module,
     ):
         super().__init__()
         self.image_encoder = image_encoder
+        self.image_processor = image_processor
         self.transformer = transformer
 
     @torch.no_grad()
@@ -287,35 +350,17 @@ class VideoEditImageEncodingStage(PipelineStage):
             raise ValueError("VideoEdit window must be validated before image encoding")
 
         device = get_local_torch_device()
-        if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
+        if hasattr(self.image_encoder, "to"):
             self.image_encoder = self.image_encoder.to(device)
 
         image = params.runtime_window_frames[0].convert("RGB")
         image = image.resize((params.runtime_width, params.runtime_height))
-        pixel_values = (
-            torch.from_numpy(np.array(image).astype(np.float32) / 255.0)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-        )
-        pixel_values = pixel_values.mul(2.0).sub(1.0).to(device=device, dtype=torch.float32)
-        pixel_values = F.interpolate(
-            pixel_values,
-            size=(224, 224),
-            mode="bicubic",
-            align_corners=False,
-        )
-        pixel_values = pixel_values.mul(0.5).add(0.5)
-        mean = torch.tensor(
-            [0.48145466, 0.4578275, 0.40821073],
+        pixel_values = _prepare_clip_pixel_values(
+            image,
+            clip_preprocess=params.clip_preprocess,
+            image_processor=self.image_processor,
             device=device,
-            dtype=torch.float32,
-        ).view(1, 3, 1, 1)
-        std = torch.tensor(
-            [0.26862954, 0.26130258, 0.27577711],
-            device=device,
-            dtype=torch.float32,
-        ).view(1, 3, 1, 1)
-        pixel_values = (pixel_values - mean) / std
+        )
 
         image_dtype = _module_dtype(self.image_encoder, torch.float32)
         target_dtype = _module_dtype(
@@ -323,6 +368,8 @@ class VideoEditImageEncodingStage(PipelineStage):
         )
         autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
         try:
+            # The reference keeps CLIP's parameters in FP32 but calls the whole
+            # pipeline under BF16 autocast, then casts hidden_states[-2].
             with torch.autocast(
                 device_type=current_platform.device_type,
                 dtype=target_dtype,
@@ -386,10 +433,9 @@ class VideoEditConditionEncodingStage(PipelineStage):
             device=device,
             dtype=tensor_dtype,
             mask_downsample_mode=params.mask_downsample_mode,
-            preserve_first_frame=(params.runtime_window_index in (None, 0)),
+            preserve_first_frame=True,
         )
         params.runtime_masked_video_tensor = prepared["masked_video_tensor"]
-        params.runtime_raw_video_tensor = prepared["video_tensor"]
         params.runtime_mask_video_tensor = prepared["mask_video_tensor"]
         params.runtime_cond_masks = prepared["cond_masks"]
 
@@ -400,16 +446,9 @@ class VideoEditConditionEncodingStage(PipelineStage):
         autocast_enabled = tensor_dtype != torch.float32 and not server_args.disable_autocast
 
         masked_video = params.runtime_masked_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
-        raw_video = params.runtime_raw_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
 
         params.runtime_cond_latents = self._encode_video_latents(
             masked_video,
-            vae_dtype=vae_dtype,
-            output_dtype=tensor_dtype,
-            autocast_enabled=autocast_enabled,
-        )
-        params.runtime_video_latents = self._encode_video_latents(
-            raw_video,
             vae_dtype=vae_dtype,
             output_dtype=tensor_dtype,
             autocast_enabled=autocast_enabled,
@@ -422,39 +461,20 @@ class VideoEditConditionEncodingStage(PipelineStage):
 
 class VideoEditLatentPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        del server_args
         params = _videoedit_params(batch)
-        shape_source = (
-            params.runtime_video_latents
-            if params.runtime_video_latents is not None
-            else params.runtime_cond_latents
-        )
+        shape_source = params.runtime_cond_latents
         if shape_source is None:
             raise ValueError("VideoEdit latent shape source must be prepared before noise")
         device = shape_source.device
-        seed = int(params.seed)
-        if params.vary_seed_by_window and params.runtime_window_index is not None:
-            seed += int(params.runtime_window_index)
-        generator_device = (
-            params.generator_device
-            or getattr(server_args.pipeline_config, "generator_device", None)
-            or device.type
-        )
-        generator = torch.Generator(device=generator_device).manual_seed(seed)
+        generator = torch.Generator(device="cpu").manual_seed(int(params.seed))
         params.runtime_generator = generator
-        if generator_device == "cpu":
-            params.runtime_noise = torch.randn(
-                shape_source.shape,
-                generator=generator,
-                device="cpu",
-                dtype=torch.float32,
-            ).to(device=device)
-        else:
-            params.runtime_noise = torch.randn(
-                shape_source.shape,
-                generator=generator,
-                device=device,
-                dtype=torch.float32,
-            )
+        params.runtime_noise = torch.randn(
+            shape_source.shape,
+            generator=generator,
+            device="cpu",
+            dtype=torch.float32,
+        ).to(device=device)
         params.runtime_latents = params.runtime_noise
         batch.generator = generator
         batch.latents = params.runtime_latents
@@ -475,13 +495,8 @@ class VideoEditTimestepPreparationStage(PipelineStage):
             shift=server_args.pipeline_config.flow_shift or 5.0,
             device=device,
         )
-        if params.strength < 1.0:
-            timesteps, effective_steps = self.scheduler.get_timesteps(
-                params.num_inference_steps, self.scheduler.timesteps, params.strength
-            )
-        else:
-            timesteps = self.scheduler.timesteps
-            effective_steps = params.num_inference_steps
+        timesteps = self.scheduler.timesteps
+        effective_steps = params.num_inference_steps
 
         params.runtime_timesteps = timesteps.to(device)
         params.runtime_effective_num_inference_steps = int(effective_steps)
@@ -501,18 +516,7 @@ class VideoEditLatentInitStage(PipelineStage):
         if params.runtime_timesteps is None:
             raise ValueError("VideoEdit timesteps must be prepared before latent init")
         params.runtime_initial_timestep = params.runtime_timesteps[:1]
-        if params.init_latent_mode == "noise":
-            params.runtime_latents = params.runtime_noise
-            batch.latents = params.runtime_latents
-            batch.raw_latent_shape = tuple(params.runtime_latents.shape)
-            return batch
-        if params.runtime_video_latents is None:
-            raise ValueError("VideoEdit video latents are required for add_noise init")
-        params.runtime_latents = self.scheduler.add_noise(
-            params.runtime_video_latents.to(dtype=torch.float32),
-            params.runtime_noise,
-            params.runtime_initial_timestep,
-        )
+        params.runtime_latents = params.runtime_noise
         batch.latents = params.runtime_latents
         batch.raw_latent_shape = tuple(params.runtime_latents.shape)
         return batch
@@ -612,7 +616,8 @@ class VideoEditDenoisingStage(DenoisingStage):
                         [latents, params.runtime_cond_masks, params.runtime_cond_latents],
                         dim=1,
                     ).to(target_dtype)
-                    timestep = t_device.to(dtype=target_dtype).expand(latents.shape[0])
+                    scheduler_timestep = t_device.to(dtype=target_dtype)
+                    timestep = scheduler_timestep.expand(latents.shape[0])
                     attn_metadata = self._build_attn_metadata(
                         i,
                         batch,
@@ -665,7 +670,9 @@ class VideoEditDenoisingStage(DenoisingStage):
                         )
                         batch.is_cfg_negative = False
 
-                    latents = self.scheduler.step(noise_pred, t_device, latents)
+                    latents = self.scheduler.step(
+                        noise_pred, scheduler_timestep, latents
+                    )
                     params.runtime_latents = latents
                     batch.latents = latents
                     params.runtime_progress = float(i + 1) / float(len(timesteps))

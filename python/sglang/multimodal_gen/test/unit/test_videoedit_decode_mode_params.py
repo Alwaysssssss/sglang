@@ -3,6 +3,8 @@ import unittest
 from datetime import datetime
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 import sglang.multimodal_gen.runtime.entrypoints.openai.video_api as video_api_mod
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
@@ -22,6 +24,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _split_output_path,
     _store_failed_video_repair_submission,
     _task_id_from_video_repair_body,
+    _validate_video_repair_request,
+    _video_repair_sampling_kwargs,
     _video_repair_submit_response,
     _with_video_extension,
 )
@@ -36,17 +40,22 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
     def test_sampling_params_default_num_inference_steps_is_40(self):
         params = WanVideoEditSamplingParams()
         self.assertEqual(params.num_inference_steps, 40)
-        self.assertEqual(params.overlap, 10)
-        self.assertEqual(params.dilate_px, 0)
+        self.assertEqual(params.overlap, 5)
+        self.assertEqual(params.dilate_px, 8)
         self.assertEqual(params.mask_scale, 1.0)
-        self.assertEqual(params.feather_px, 0)
+        self.assertEqual(params.feather_px, 8)
         self.assertEqual(params.bbox_expand_scale, 0.3)
         self.assertTrue(params.use_clip)
+        self.assertIsNone(params.num_frames)
+        self.assertEqual(params.ref_frame_idx, 0)
+        self.assertEqual(params.bridge_overlap, 5)
         self.assertFalse(params.use_repaired_context)
         self.assertEqual(params.init_latent_mode, "noise")
         self.assertEqual(params.mask_downsample_mode, "nearest")
-        self.assertEqual(params.overlap_commit_mode, "weighted")
-        self.assertEqual(params.tail_padding_mode, "reflect")
+        self.assertEqual(params.overlap_commit_mode, "native_skip")
+        self.assertEqual(params.tail_padding_mode, "native_reverse_mirror")
+        self.assertEqual(params.generator_device, "cpu")
+        self.assertFalse(params.save_crop_only)
         self.assertTrue(params.enable_teacache)
 
     def test_sampling_params_default_teacache_matches_wan_i2v_14b_720p(self):
@@ -62,25 +71,72 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             _wan_14b_coefficients(teacache_params),
         )
 
-    def test_sampling_params_accept_stream_decode_mode(self):
-        params = WanVideoEditSamplingParams(decode_mode="stream")
-        self.assertEqual(params.decode_mode, "stream")
+    def test_sampling_params_accept_explicit_validation_output_and_eager_decode(self):
+        params = WanVideoEditSamplingParams(
+            decode_mode="eager", save_crop_only=True
+        )
+        self.assertEqual(params.decode_mode, "eager")
+        self.assertTrue(params.save_crop_only)
 
     def test_sampling_params_reject_unknown_decode_mode(self):
         with self.assertRaisesRegex(ValueError, "decode_mode must be one of"):
             WanVideoEditSamplingParams(decode_mode="invalid")
 
-    def test_sampling_params_reject_unknown_native_alignment_modes(self):
-        with self.assertRaisesRegex(ValueError, "init_latent_mode must be one of"):
-            WanVideoEditSamplingParams(init_latent_mode="bad")
-        with self.assertRaisesRegex(ValueError, "mask_downsample_mode must be one of"):
-            WanVideoEditSamplingParams(mask_downsample_mode="linear")
-        with self.assertRaisesRegex(ValueError, "overlap_commit_mode must be one of"):
-            WanVideoEditSamplingParams(overlap_commit_mode="blend")
-        with self.assertRaisesRegex(ValueError, "tail_padding_mode must be one of"):
-            WanVideoEditSamplingParams(tail_padding_mode="pad_last")
+    def test_sampling_params_remove_legacy_alignment_knobs_from_constructor(self):
+        removed = {
+            "strength": 1.0,
+            "drop_reference_frame": True,
+            "keep_intermediate_windows": False,
+            "use_repaired_context": False,
+            "vary_seed_by_window": False,
+            "init_latent_mode": "noise",
+            "mask_downsample_mode": "nearest",
+            "overlap_commit_mode": "native_skip",
+            "tail_padding_mode": "native_reverse_mirror",
+            "generator_device": "cpu",
+        }
+        for name, value in removed.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(TypeError, name):
+                    WanVideoEditSamplingParams(**{name: value})
 
-    def test_video_repair_request_defaults_to_stream(self):
+    def test_sampling_params_accept_all_structural_infer_lengths(self):
+        for infer_len, overlap in ((1, 0), (5, 0), (13, 5), (49, 5), (85, 5)):
+            with self.subTest(infer_len=infer_len):
+                self.assertEqual(
+                    WanVideoEditSamplingParams(
+                        infer_len=infer_len, overlap=overlap
+                    ).infer_len,
+                    infer_len,
+                )
+        for infer_len in (0, 2, 48, 50):
+            with self.subTest(infer_len=infer_len):
+                with self.assertRaisesRegex(ValueError, "infer_len"):
+                    WanVideoEditSamplingParams(infer_len=infer_len, overlap=0)
+
+    def test_sampling_params_validate_reference_and_bridge_contract(self):
+        for bridge_overlap in (1, 5, 9):
+            self.assertEqual(
+                WanVideoEditSamplingParams(
+                    bridge_overlap=bridge_overlap
+                ).bridge_overlap,
+                bridge_overlap,
+            )
+        for bridge_overlap in (0, 2, 6):
+            with self.subTest(bridge_overlap=bridge_overlap):
+                with self.assertRaisesRegex(ValueError, "bridge_overlap"):
+                    WanVideoEditSamplingParams(bridge_overlap=bridge_overlap)
+        for ref_frame_idx in (0, 4, 8):
+            self.assertEqual(
+                WanVideoEditSamplingParams(
+                    num_frames=9, ref_frame_idx=ref_frame_idx
+                ).ref_frame_idx,
+                ref_frame_idx,
+            )
+        with self.assertRaisesRegex(ValueError, "ref_frame_idx"):
+            WanVideoEditSamplingParams(num_frames=9, ref_frame_idx=9)
+
+    def test_video_repair_request_uses_production_defaults(self):
         request = VideoRepairRequest(
             task_id="task-1",
             callback_url="http://127.0.0.1/callback",
@@ -89,21 +145,144 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             mask_input_path="/tmp/mask.mp4",
         )
         self.assertEqual(request.decode_mode, "stream")
-        self.assertEqual(request.overlap, 10)
-        self.assertEqual(request.dilate_px, 0)
+        self.assertEqual(request.num_frames, -1)
+        self.assertEqual(request.ref_frame_idx, 0)
+        self.assertEqual(request.bridge_overlap, 5)
+        self.assertEqual(request.infer_len, 49)
+        self.assertEqual(request.overlap, 5)
+        self.assertEqual(request.dilate_px, 8)
         self.assertEqual(request.mask_scale, 1.0)
-        self.assertEqual(request.feather_px, 0)
+        self.assertEqual(request.feather_px, 8)
         self.assertEqual(request.bbox_expand_scale, 0.3)
         self.assertTrue(request.use_clip)
-        self.assertFalse(request.use_repaired_context)
-        self.assertEqual(request.init_latent_mode, "noise")
-        self.assertEqual(request.mask_downsample_mode, "nearest")
-        self.assertEqual(request.overlap_commit_mode, "weighted")
-        self.assertEqual(request.tail_padding_mode, "reflect")
+        self.assertEqual(request.clip_preprocess, "diffuser")
+        self.assertFalse(request.save_crop_only)
         self.assertTrue(request.enable_teacache)
         self.assertEqual(request.teacache_thresh, 0.3)
         self.assertEqual(request.teacache_start_skipping, 5)
         self.assertEqual(request.teacache_end_skipping, 1.0)
+
+    def test_video_repair_request_accepts_none_for_full_video(self):
+        request = VideoRepairRequest(prompt="repair video", num_frames=None)
+        self.assertIsNone(request.num_frames)
+
+    def test_video_repair_request_normalizes_clip_preprocess(self):
+        payload = _normalize_video_repair_payload(
+            {
+                "taskId": "task-1",
+                "prompt": "repair video",
+                "video_input_path": "/tmp/video.mp4",
+                "mask_input_path": "/tmp/mask.mp4",
+                "clipPreprocess": "diffsynth",
+            }
+        )
+
+        request = VideoRepairRequest(**payload)
+
+        self.assertEqual(request.clip_preprocess, "diffsynth")
+
+    def test_video_repair_request_normalizes_phase_two_fields(self):
+        payload = _normalize_video_repair_payload(
+            {
+                "taskId": "task-1",
+                "prompt": "repair video",
+                "video_input_path": "/tmp/video.mp4",
+                "mask_input_path": "/tmp/mask.mp4",
+                "referenceImagePath": "/tmp/reference.png",
+                "refFrameIdx": 7,
+                "bridgeOverlap": 9,
+            }
+        )
+
+        request = VideoRepairRequest(**payload)
+
+        self.assertEqual(request.reference_image_path, "/tmp/reference.png")
+        self.assertEqual(request.ref_frame_idx, 7)
+        self.assertEqual(request.bridge_overlap, 9)
+
+    def test_video_repair_request_rejects_removed_fields(self):
+        for name, value in (
+            ("chunks", 2),
+            ("strength", 1.0),
+            ("drop_reference_frame", True),
+            ("overlapCommitMode", "native_skip"),
+            ("maskDownsampleMode", "nearest"),
+            ("generator_device", "cpu"),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValidationError, name):
+                    VideoRepairRequest(prompt="repair video", **{name: value})
+
+    def test_video_repair_validation_requires_reference(self):
+        request = VideoRepairRequest(
+            task_id="task-1",
+            prompt="repair video",
+            video_input_path="/tmp/video.mp4",
+            mask_input_path="/tmp/mask.mp4",
+        )
+        with self.assertRaisesRegex(ValueError, "reference"):
+            _validate_video_repair_request(request)
+
+    def test_video_repair_validation_rejects_invalid_phase_two_contract(self):
+        common = {
+            "task_id": "task-1",
+            "prompt": "repair video",
+            "video_input_path": "/tmp/video.mp4",
+            "mask_input_path": "/tmp/mask.mp4",
+            "reference_image_path": "/tmp/reference.png",
+        }
+        invalid = (
+            ({"ref_frame_idx": -1}, "ref_frame_idx"),
+            ({"num_frames": 8, "ref_frame_idx": 8}, "ref_frame_idx"),
+            ({"bridge_overlap": 2}, "bridge_overlap"),
+            ({"infer_len": 48}, "infer_len"),
+            ({"infer_len": 5, "overlap": 5}, "overlap"),
+        )
+        for overrides, message in invalid:
+            with self.subTest(overrides=overrides):
+                request = VideoRepairRequest(**common, **overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    _validate_video_repair_request(request)
+
+    def test_video_repair_sampling_kwargs_pass_phase_two_contract(self):
+        request = VideoRepairRequest(
+            task_id="task-1",
+            prompt="repair video",
+            video_input_path="/tmp/video.mp4",
+            mask_input_path="/tmp/mask.mp4",
+            reference_image_path="/tmp/reference.png",
+            ref_frame_idx=7,
+            bridge_overlap=9,
+        )
+        kwargs = _video_repair_sampling_kwargs(
+            request,
+            request_id="task-1",
+            timeout_deadline=None,
+            request_cancel_path="/tmp/task.cancel",
+            video_input_path=request.video_input_path,
+            mask_input_path=request.mask_input_path,
+            reference_image_path=request.reference_image_path,
+            output_dir="/tmp/output",
+            output_file_name="result.mp4",
+            resolved_num_frames=20,
+            progress_path="/tmp/progress.json",
+        )
+
+        self.assertEqual(kwargs["ref_frame_idx"], 7)
+        self.assertEqual(kwargs["bridge_overlap"], 9)
+        self.assertEqual(kwargs["num_frames"], 20)
+        for removed in (
+            "strength",
+            "drop_reference_frame",
+            "overlap_commit_mode",
+            "tail_padding_mode",
+            "mask_downsample_mode",
+            "use_repaired_context",
+            "init_latent_mode",
+            "vary_seed_by_window",
+            "generator_device",
+        ):
+            self.assertNotIn(removed, kwargs)
 
     def test_video_repair_request_accepts_teacache_overrides(self):
         request = VideoRepairRequest(
@@ -245,16 +424,18 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             generated_key,
         )
 
-    def test_video_repair_request_accepts_stream(self):
+    def test_video_repair_request_accepts_explicit_eager_decode(self):
         request = VideoRepairRequest(
             task_id="task-1",
             callback_url="http://127.0.0.1/callback",
             prompt="repair video",
             video_input_path="/tmp/video.mp4",
             mask_input_path="/tmp/mask.mp4",
-            decode_mode="stream",
+            decode_mode="eager",
+            save_crop_only=True,
         )
-        self.assertEqual(request.decode_mode, "stream")
+        self.assertEqual(request.decode_mode, "eager")
+        self.assertTrue(request.save_crop_only)
 
     def test_sampling_params_output_file_name_follows_mov_source(self):
         params = WanVideoEditSamplingParams(
@@ -334,7 +515,7 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(output_dir, "/srv/output")
         self.assertEqual(output_file_name, "job-1.mov")
 
-    def test_cli_parser_accepts_decode_mode(self):
+    def test_cli_parser_uses_production_and_adaptive_runtime_defaults(self):
         parser = build_parser()
         args = parser.parse_args(
             [
@@ -347,28 +528,48 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
                 "/tmp/video.mp4",
                 "--mask-input-path",
                 "/tmp/mask.mp4",
+                "--reference-image-path",
+                "/tmp/reference.png",
                 "--output-path",
                 "/tmp/output.mp4",
-                "--decode-mode",
-                "stream",
             ]
         )
         self.assertEqual(args.decode_mode, "stream")
         self.assertEqual(args.num_inference_steps, 40)
-        self.assertEqual(args.overlap, 10)
-        self.assertEqual(args.dilate_px, 0)
+        self.assertEqual(args.overlap, 5)
+        self.assertEqual(args.num_frames, -1)
+        self.assertEqual(args.ref_frame_idx, 0)
+        self.assertEqual(args.bridge_overlap, 5)
+        self.assertEqual(args.dilate_px, 8)
         self.assertEqual(args.mask_scale, 1.0)
+        self.assertEqual(args.feather_px, 8)
         self.assertEqual(args.bbox_expand_scale, 0.3)
         self.assertTrue(args.use_clip)
-        self.assertFalse(args.use_repaired_context)
-        self.assertEqual(args.init_latent_mode, "noise")
-        self.assertEqual(args.mask_downsample_mode, "nearest")
-        self.assertEqual(args.overlap_commit_mode, "weighted")
-        self.assertEqual(args.tail_padding_mode, "reflect")
+        self.assertFalse(args.save_crop_only)
+        self.assertFalse(hasattr(args, "use_repaired_context"))
+        self.assertFalse(hasattr(args, "init_latent_mode"))
+        self.assertFalse(hasattr(args, "mask_downsample_mode"))
+        self.assertFalse(hasattr(args, "overlap_commit_mode"))
+        self.assertFalse(hasattr(args, "tail_padding_mode"))
+        self.assertFalse(hasattr(args, "strength"))
+        self.assertFalse(hasattr(args, "generator_device"))
         self.assertTrue(args.enable_teacache)
         self.assertEqual(args.teacache_thresh, 0.3)
         self.assertEqual(args.teacache_start_skipping, 5)
         self.assertEqual(args.teacache_end_skipping, 1.0)
+        self.assertIsNone(args.dit_cpu_offload)
+        self.assertIsNone(args.dit_layerwise_offload)
+        self.assertEqual(args.dit_offload_prefetch_size, 0.0)
+        self.assertIsNone(args.text_encoder_cpu_offload)
+        self.assertIsNone(args.image_encoder_cpu_offload)
+        self.assertIsNone(args.vae_cpu_offload)
+        self.assertIsNone(args.pin_cpu_memory)
+        self.assertEqual(args.num_gpus, 1)
+        self.assertEqual(args.tp_size, 1)
+        self.assertIsNone(args.sp_degree)
+        self.assertIsNone(args.ulysses_degree)
+        self.assertIsNone(args.ring_degree)
+        self.assertIsNone(args.attention_backend)
 
     def test_cli_parser_accepts_teacache_overrides(self):
         parser = build_parser()
@@ -383,8 +584,14 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
                 "/tmp/video.mp4",
                 "--mask-input-path",
                 "/tmp/mask.mp4",
+                "--reference-image-path",
+                "/tmp/reference.png",
                 "--output-path",
                 "/tmp/output.mp4",
+                "--save-crop-only",
+                "--decode-mode",
+                "stream",
+                "--no-enable-teacache",
                 "--teacache-thresh",
                 "0.2",
                 "--teacache-start-skipping",
@@ -397,6 +604,9 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
         self.assertEqual(args.teacache_thresh, 0.2)
         self.assertEqual(args.teacache_start_skipping, 8)
         self.assertEqual(args.teacache_end_skipping, 0.9)
+        self.assertFalse(args.enable_teacache)
+        self.assertTrue(args.save_crop_only)
+        self.assertEqual(args.decode_mode, "stream")
 
     def test_failed_job_reason_uses_error_message(self):
         job = {"status": "failed", "error": {"message": "mask file not found"}}

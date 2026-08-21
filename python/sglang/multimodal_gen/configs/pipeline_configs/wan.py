@@ -24,7 +24,9 @@ logger = init_logger(__name__)
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    mask: torch.Tensor = outputs.attention_mask
+    mask: torch.Tensor | None = getattr(outputs, "attention_mask", None)
+    if mask is None:
+        mask = _text_inputs["attention_mask"]
     hidden_state: torch.Tensor = outputs.last_hidden_state
     seq_lens = mask.gt(0).sum(dim=1).long()
     assert torch.isnan(hidden_state).sum() == 0

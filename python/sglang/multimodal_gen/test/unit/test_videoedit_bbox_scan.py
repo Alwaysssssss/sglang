@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+    expand_bbox,
     prepare_global_inputs,
     scan_global_bbox,
 )
@@ -33,6 +34,29 @@ def _write_test_video(path: Path, frame_count: int, size: tuple[int, int]) -> No
 
 
 class TestVideoEditBBoxScan(unittest.TestCase):
+    def test_bbox_expansion_matches_videoedit_multiplier_geometry(self):
+        # Public VideoEdit requests express expansion per side (0.3), while the
+        # reference algorithm receives the equivalent final-size multiplier
+        # (1 + 2 * 0.3 = 1.6).
+        multiplier = 1.6
+        self.assertEqual(
+            expand_bbox((381, 269, 1492, 736), 1080, 1920, scale=multiplier),
+            (48, 129, 1826, 876),
+        )
+
+        # Preserve target dimensions by shifting a box that meets an edge.
+        self.assertEqual(
+            expand_bbox((0, 100, 200, 300), 600, 800, scale=multiplier),
+            (0, 40, 320, 360),
+        )
+
+        # If one scaled dimension exceeds the frame, compensate in the other
+        # dimension to preserve as much of the target area as possible.
+        self.assertEqual(
+            expand_bbox((300, 100, 500, 500), 500, 800, scale=multiplier),
+            (195, 0, 605, 500),
+        )
+
     def test_bbox_scan_matches_eager_prepare_geometry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = Path(temp_dir) / "video.avi"

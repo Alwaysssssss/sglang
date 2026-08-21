@@ -39,13 +39,14 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--negative-prompt", default=DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT)
     parser.add_argument("--video-input-path", required=True)
     parser.add_argument("--mask-input-path", required=True)
-    parser.add_argument("--reference-image-path")
+    parser.add_argument("--reference-image-path", required=True)
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--output-file-name")
-    parser.add_argument("--num-frames", type=int, default=81)
-    parser.add_argument("--infer-len", type=int, default=81)
-    parser.add_argument("--overlap", type=int, default=10)
-    parser.add_argument("--strength", type=float, default=1.0)
+    parser.add_argument("--num-frames", type=int, default=-1)
+    parser.add_argument("--ref-frame-idx", type=int, default=0)
+    parser.add_argument("--bridge-overlap", type=int, default=5)
+    parser.add_argument("--infer-len", type=int, default=49)
+    parser.add_argument("--overlap", type=int, default=5)
     parser.add_argument("--num-inference-steps", type=int, default=40)
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -55,23 +56,19 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dynamic-cfg-min", type=float, default=1.0)
     parser.add_argument("--bbox-padding", type=int, default=0)
     parser.add_argument("--bbox-expand-scale", type=float, default=0.3)
-    parser.add_argument("--dilate-px", type=int, default=0)
+    parser.add_argument("--dilate-px", type=int, default=8)
     parser.add_argument("--mask-scale", type=float, default=1.0)
-    parser.add_argument("--feather-px", type=int, default=0)
+    parser.add_argument("--feather-px", type=int, default=8)
     parser.add_argument("--adain-boundary-dilate", type=int, default=0)
     parser.add_argument("--enable-paste-back", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-crop-only", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--drop-reference-frame", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--keep-intermediate-windows", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-clip", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--use-repaired-context", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--vary-seed-by-window", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--init-latent-mode", choices=["noise", "add_noise"], default="noise")
-    parser.add_argument("--mask-downsample-mode", choices=["nearest", "nearest-exact"], default="nearest")
-    parser.add_argument("--overlap-commit-mode", choices=["native_skip", "weighted"], default="weighted")
-    parser.add_argument("--tail-padding-mode", choices=["native_reverse_mirror", "reflect"], default="reflect")
+    parser.add_argument(
+        "--clip-preprocess",
+        choices=["diffuser", "diffsynth"],
+        default="diffuser",
+    )
     parser.add_argument("--decode-mode", choices=["eager", "stream"], default="stream")
-    parser.add_argument("--generator-device")
     parser.add_argument("--output-quality", default="default")
     parser.add_argument("--output-compression", type=int)
     parser.add_argument("--enable-teacache", action=argparse.BooleanOptionalAction, default=True)
@@ -237,13 +234,13 @@ def repair_cmd(args: argparse.Namespace) -> int:
         output_path=args.output_path,
         output_file_name=args.output_file_name,
         num_frames=resolved_num_frames,
+        ref_frame_idx=args.ref_frame_idx,
+        bridge_overlap=args.bridge_overlap,
         infer_len=args.infer_len,
         overlap=args.overlap,
-        strength=args.strength,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
         seed=args.seed,
-        generator_device=args.generator_device,
         dtype=args.dtype,
         dynamic_cfg=args.dynamic_cfg,
         dynamic_cfg_max_step=args.dynamic_cfg_max_step,
@@ -256,15 +253,8 @@ def repair_cmd(args: argparse.Namespace) -> int:
         adain_boundary_dilate=args.adain_boundary_dilate,
         enable_paste_back=args.enable_paste_back,
         save_crop_only=args.save_crop_only,
-        drop_reference_frame=args.drop_reference_frame,
-        keep_intermediate_windows=args.keep_intermediate_windows,
         use_clip=args.use_clip,
-        use_repaired_context=args.use_repaired_context,
-        vary_seed_by_window=args.vary_seed_by_window,
-        init_latent_mode=args.init_latent_mode,
-        mask_downsample_mode=args.mask_downsample_mode,
-        overlap_commit_mode=args.overlap_commit_mode,
-        tail_padding_mode=args.tail_padding_mode,
+        clip_preprocess=args.clip_preprocess,
         decode_mode=args.decode_mode,
         output_quality=args.output_quality,
         output_compression=args.output_compression,

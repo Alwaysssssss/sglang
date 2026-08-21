@@ -216,6 +216,7 @@ class GatewayDispatcherTest(unittest.IsolatedAsyncioTestCase):
             "prompt": "test",
             "video_input_path": "/tmp/video.mp4",
             "mask_input_path": "/tmp/mask.mp4",
+            "reference_image_path": "/tmp/reference.png",
             "num_inference_steps": 20,
             "guidance_scale": 5.0,
             "dynamic_cfg": True,

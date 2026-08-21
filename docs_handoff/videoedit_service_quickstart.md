@@ -15,6 +15,12 @@ RECREATE=1 bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
 RESTART_EXISTING=1 bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
 ```
 
+查看服务日志：
+
+```bash
+docker logs -f videoedit_reset
+```
+
 启动后确认服务就绪：
 
 ```bash

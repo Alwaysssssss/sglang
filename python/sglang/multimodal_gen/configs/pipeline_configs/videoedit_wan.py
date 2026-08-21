@@ -26,10 +26,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import t5_postprocess_te
 def videoedit_prompt_clean(text: str) -> str:
     try:
         import ftfy
-
-        text = ftfy.fix_text(text)
-    except ImportError:
-        pass
+    except ImportError as exc:
+        raise RuntimeError(
+            "VideoEdit prompt preprocessing requires ftfy==6.3.1; "
+            "install the sglang[diffusion] dependencies"
+        ) from exc
+    text = ftfy.fix_text(text)
     text = html.unescape(html.unescape(text))
     text = re.sub(r"\s+", " ", text)
     return text.strip()

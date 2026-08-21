@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-logger = init_logger(__name__)
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.wan_videoedit import (
@@ -9,8 +7,12 @@ from sglang.multimodal_gen.configs.models.dits.wan_videoedit import (
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanI2VCrossAttention,
     WanTransformer3DModel,
+    _videoedit_rms_norm,
     tensor_parallel_rms_norm,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class WanVideoEditCrossAttention(WanI2VCrossAttention):
@@ -34,14 +36,14 @@ class WanVideoEditCrossAttention(WanI2VCrossAttention):
         if self.tp_rmsnorm:
             q = tensor_parallel_rms_norm(q, self.norm_q)
         else:
-            q = self.norm_q(q)
+            q = _videoedit_rms_norm(self.norm_q, q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
         k, _ = self.to_k(context)
         if self.tp_rmsnorm:
             k = tensor_parallel_rms_norm(k, self.norm_k)
         else:
-            k = self.norm_k(k)
+            k = _videoedit_rms_norm(self.norm_k, k)
         k = k.unflatten(2, (self.local_num_heads, self.head_dim))
 
         v, _ = self.to_v(context)
@@ -54,7 +56,7 @@ class WanVideoEditCrossAttention(WanI2VCrossAttention):
             if self.tp_rmsnorm:
                 k_img = tensor_parallel_rms_norm(k_img, self.norm_added_k)
             else:
-                k_img = self.norm_added_k(k_img)
+                k_img = _videoedit_rms_norm(self.norm_added_k, k_img)
             k_img = k_img.unflatten(2, (self.local_num_heads, self.head_dim))
 
             v_img, _ = self.add_v_proj(context_img)
@@ -79,7 +81,9 @@ class WanVideoEditTransformer3DModel(WanTransformer3DModel):
             "This means WanVideoEditTransformer3DModel is being used."
         )
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
+        self.strict_videoedit_math = False
         for i, block in enumerate(self.blocks):
+            block.strict_videoedit_math = False
             block.attn2 = WanVideoEditCrossAttention(
                 config.hidden_size,
                 config.num_attention_heads,

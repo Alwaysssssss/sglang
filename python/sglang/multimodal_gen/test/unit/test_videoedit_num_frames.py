@@ -31,11 +31,19 @@ def _write_test_video(path: Path, frame_count: int) -> None:
 
 
 class TestVideoEditNumFrames(unittest.TestCase):
-    def test_positive_num_frames_is_returned_without_probing(self):
-        self.assertEqual(
-            resolve_videoedit_num_frames(81, "missing_video.avi", "missing_mask.avi"),
-            81,
-        )
+    def test_positive_num_frames_validates_inputs_and_clamps_to_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video = Path(temp_dir) / "video.avi"
+            mask = Path(temp_dir) / "mask.avi"
+            _write_test_video(video, 12)
+            _write_test_video(mask, 12)
+
+            self.assertEqual(
+                resolve_videoedit_num_frames(7, str(video), str(mask)), 7
+            )
+            self.assertEqual(
+                resolve_videoedit_num_frames(81, str(video), str(mask)), 12
+            )
 
     def test_minus_one_resolves_to_all_available_frames(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -45,23 +53,25 @@ class TestVideoEditNumFrames(unittest.TestCase):
             _write_test_video(mask, 12)
 
             self.assertEqual(resolve_videoedit_num_frames(-1, str(video), str(mask)), 12)
+            self.assertEqual(resolve_videoedit_num_frames(None, str(video), str(mask)), 12)
 
-    def test_minus_one_uses_shorter_video_or_mask(self):
+    def test_mismatched_video_and_mask_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video = Path(temp_dir) / "video.avi"
             mask = Path(temp_dir) / "mask.avi"
             _write_test_video(video, 12)
             _write_test_video(mask, 7)
 
-            self.assertEqual(resolve_videoedit_num_frames(-1, str(video), str(mask)), 7)
+            with self.assertRaisesRegex(ValueError, "length mismatch"):
+                resolve_videoedit_num_frames(-1, str(video), str(mask))
 
     def test_minus_one_missing_video_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
             resolve_videoedit_num_frames(-1, "missing_video.avi", "missing_mask.avi")
 
-    def test_sampling_params_rejects_unresolved_minus_one(self):
-        with self.assertRaisesRegex(ValueError, "API/CLI entrypoints"):
-            WanVideoEditSamplingParams(num_frames=-1)
+    def test_sampling_params_defaults_to_full_video(self):
+        self.assertIsNone(WanVideoEditSamplingParams().num_frames)
+        self.assertIsNone(WanVideoEditSamplingParams(num_frames=-1).num_frames)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, StrictFloat, StrictInt
+from pydantic import BaseModel, Field, StrictFloat, StrictInt, model_validator
 
 
 # Image API protocol models
@@ -130,6 +130,32 @@ class VideoRepairMinioConfig(BaseModel):
     prefix: Optional[str] = None
 
 
+_REMOVED_VIDEOEDIT_REQUEST_FIELDS = frozenset(
+    {
+        "chunks",
+        "drop_reference_frame",
+        "dropReferenceFrame",
+        "keep_intermediate_windows",
+        "keepIntermediateWindows",
+        "overlap_commit_mode",
+        "overlapCommitMode",
+        "tail_padding_mode",
+        "tailPaddingMode",
+        "mask_downsample_mode",
+        "maskDownsampleMode",
+        "use_repaired_context",
+        "useRepairedContext",
+        "init_latent_mode",
+        "initLatentMode",
+        "strength",
+        "vary_seed_by_window",
+        "varySeedByWindow",
+        "generator_device",
+        "generatorDevice",
+    }
+)
+
+
 def default_video_repair_output_object_key(
     request_id: str, now: datetime | None = None, extension: str = ".mp4"
 ) -> str:
@@ -139,6 +165,18 @@ def default_video_repair_output_object_key(
 
 
 class VideoRepairRequest(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_videoedit_fields(cls, value):
+        if isinstance(value, dict):
+            removed = sorted(_REMOVED_VIDEOEDIT_REQUEST_FIELDS.intersection(value))
+            if removed:
+                raise ValueError(
+                    "removed VideoEdit request fields are not supported: "
+                    + ", ".join(removed)
+                )
+        return value
+
     task_id: Optional[str] = None
     timeout: int = -1
     prompt: str
@@ -149,6 +187,7 @@ class VideoRepairRequest(BaseModel):
     mask_input_path: Optional[str] = None
     video_url: Optional[str] = None
     mask_url: Optional[str] = None
+    reference_image_path: Optional[str] = None
     reference_image_url: Optional[str] = None
 
     callback_url: Optional[str] = None
@@ -158,14 +197,14 @@ class VideoRepairRequest(BaseModel):
     output_bucket: Optional[str] = None
     output_object_key: Optional[str] = None
 
-    num_frames: int = -1
-    infer_len: int = 81
-    overlap: int = 10
-    strength: float = 1.0
+    num_frames: Optional[int] = -1
+    ref_frame_idx: StrictInt = 0
+    bridge_overlap: StrictInt = 5
+    infer_len: int = 49
+    overlap: int = 5
     num_inference_steps: int = 40
     guidance_scale: float = 5.0
     seed: int = 42
-    generator_device: Optional[str] = None
     dtype: str = "bf16"
     dynamic_cfg: bool = True
     dynamic_cfg_max_step: int = 15
@@ -173,21 +212,14 @@ class VideoRepairRequest(BaseModel):
 
     bbox_padding: int = 0
     bbox_expand_scale: float = 0.3
-    dilate_px: int = 0
+    dilate_px: int = 8
     mask_scale: float = 1.0
-    feather_px: int = 0
+    feather_px: int = 8
     adain_boundary_dilate: int = 0
     enable_paste_back: bool = True
     save_crop_only: bool = False
-    drop_reference_frame: Optional[bool] = None
-    keep_intermediate_windows: bool = False
     use_clip: bool = True
-    use_repaired_context: bool = False
-    vary_seed_by_window: bool = False
-    init_latent_mode: Literal["noise", "add_noise"] = "noise"
-    mask_downsample_mode: Literal["nearest", "nearest-exact"] = "nearest"
-    overlap_commit_mode: Literal["native_skip", "weighted"] = "weighted"
-    tail_padding_mode: Literal["native_reverse_mirror", "reflect"] = "reflect"
+    clip_preprocess: Literal["diffuser", "diffsynth"] = "diffuser"
     decode_mode: Literal["eager", "stream"] = "stream"
     enable_teacache: bool = True
     teacache_thresh: float = 0.3

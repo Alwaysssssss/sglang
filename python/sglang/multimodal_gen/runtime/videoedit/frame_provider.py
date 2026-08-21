@@ -4,11 +4,15 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import threading
+from typing import Sequence
 
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.videoedit.contracts import VideoEditWindowSpec
 from sglang.multimodal_gen.runtime.videoedit.postprocess import paste_back_frame
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
+    VideoEditSequence,
+    apply_videoedit_overlap,
     crop_frame,
     expand_mask_frame,
     resize_frame,
@@ -17,6 +21,7 @@ from sglang.multimodal_gen.runtime.videoedit.stream_decoder import (
     SequentialMaskDecoder,
     SequentialVideoDecoder,
 )
+from sglang.multimodal_gen.runtime.videoedit.windowing import VideoEditPassPlan
 
 
 @dataclass
@@ -64,8 +69,8 @@ class WindowFrameProvider:
         self.enable_prefetch = enable_prefetch
         self.cache_max_frames = cache_max_frames or max(infer_len * 2, infer_len + 8)
         self.prefetch_ahead_frames = prefetch_ahead_frames or infer_len
-        self.reference_offset = 1 if reference_image_path else 0
         self._reference_frame = self._load_reference_frame()
+        self._resized_reference_frame: Image.Image | None = None
         self._video_decoder = SequentialVideoDecoder(video_input_path)
         self._mask_decoder = SequentialMaskDecoder(mask_input_path, target_size=frame_size)
         self._next_decode_index = 0
@@ -118,7 +123,12 @@ class WindowFrameProvider:
         if self.reference_image_path is None:
             return None
         with Image.open(self.reference_image_path) as image:
-            return image.convert("RGB").resize(self.frame_size)
+            reference = image.convert("RGB")
+        if reference.size != self.frame_size:
+            reference = reference.resize(
+                self.frame_size, Image.Resampling.BICUBIC
+            )
+        return reference
 
     def _make_video_decoder(self) -> SequentialVideoDecoder:
         return SequentialVideoDecoder(self.video_input_path)
@@ -157,23 +167,18 @@ class WindowFrameProvider:
             self._cache.popitem(last=False)
 
     def _decode_one(self, global_index: int) -> _FrameEntry:
-        if global_index == 0 and self.reference_offset == 1:
-            assert self._reference_frame is not None
-            frame = self._reference_frame.copy()
-            raw_mask = Image.new("L", self.frame_size, 0)
-        else:
-            frame = self._video_decoder.read_next()
-            raw_mask = self._mask_decoder.read_next()
-            if frame is None or raw_mask is None:
-                raise RuntimeError(
-                    "Unexpected end of input while streaming VideoEdit frames "
-                    f"at global index {global_index}"
-                )
+        frame = self._video_decoder.read_next()
+        raw_mask = self._mask_decoder.read_next()
+        if frame is None or raw_mask is None:
+            raise RuntimeError(
+                "Unexpected end of input while streaming VideoEdit frames "
+                f"at global index {global_index}"
+            )
         expanded_mask = expand_mask_frame(
             raw_mask,
             dilate_px=self.dilate_px,
             scale=self.mask_scale,
-            force_zero=global_index == 0,
+            force_zero=False,
         )
         cropped_frame = crop_frame(frame, self.bbox)
         cropped_mask = crop_frame(expanded_mask, self.bbox)
@@ -213,25 +218,19 @@ class WindowFrameProvider:
         video_decoder = self._make_video_decoder()
         mask_decoder = self._make_mask_decoder()
         try:
-            reference_frame = self._reference_frame.copy() if self._reference_frame is not None else None
             for global_index in range(index + 1):
-                if global_index == 0 and self.reference_offset == 1:
-                    assert reference_frame is not None
-                    frame = reference_frame
-                    raw_mask = Image.new("L", self.frame_size, 0)
-                else:
-                    frame = video_decoder.read_next()
-                    raw_mask = mask_decoder.read_next()
-                    if frame is None or raw_mask is None:
-                        raise RuntimeError(
-                            f"Unexpected end of input while reopening frame {index}"
-                        )
+                frame = video_decoder.read_next()
+                raw_mask = mask_decoder.read_next()
+                if frame is None or raw_mask is None:
+                    raise RuntimeError(
+                        f"Unexpected end of input while reopening frame {index}"
+                    )
                 if global_index == index:
                     expanded_mask = expand_mask_frame(
                         raw_mask,
                         dilate_px=self.dilate_px,
                         scale=self.mask_scale,
-                        force_zero=global_index == 0,
+                        force_zero=False,
                     )
                     cropped_frame = crop_frame(frame, self.bbox)
                     cropped_mask = crop_frame(expanded_mask, self.bbox)
@@ -271,6 +270,99 @@ class WindowFrameProvider:
         self._ensure_decoded_through(index)
         return self._lookup_entry(index).resized_frame.copy()
 
+    def get_resized_reference_frame(self) -> Image.Image | None:
+        """Return the edited reference through the same crop/resize geometry."""
+
+        if self._reference_frame is None:
+            return None
+        if self._resized_reference_frame is None:
+            cropped = crop_frame(self._reference_frame, self.bbox)
+            self._resized_reference_frame = resize_frame(
+                cropped, self.aligned_h, self.aligned_w
+            )
+        return self._resized_reference_frame.copy()
+
+    def materialize_pass_window(
+        self,
+        pass_plan: VideoEditPassPlan,
+        spec: VideoEditWindowSpec,
+        *,
+        bridge_frames: Sequence[Image.Image] | None = None,
+        previous_output_frames: Sequence[Image.Image] | None = None,
+    ) -> VideoEditSequence:
+        """Materialize one strict pass window without changing source indices."""
+
+        if pass_plan.prefix_kind == "reference":
+            if pass_plan.prefix_length != 1:
+                raise ValueError(
+                    "Reference conditioning prefix must contain exactly one frame, "
+                    f"got {pass_plan.prefix_length}"
+                )
+            reference = self.get_resized_reference_frame()
+            if reference is None:
+                raise ValueError("Long VideoEdit pass requires an edited reference")
+            prefix_frames = (reference,)
+        else:
+            if bridge_frames is None:
+                raise ValueError("Short VideoEdit pass requires bridge frames")
+            if len(bridge_frames) != pass_plan.prefix_length:
+                raise ValueError(
+                    "VideoEdit bridge length mismatch: "
+                    f"expected {pass_plan.prefix_length}, got {len(bridge_frames)}"
+                )
+            prefix_frames = tuple(frame.copy() for frame in bridge_frames)
+
+        expected_size = (self.aligned_w, self.aligned_h)
+        if any(frame.size != expected_size for frame in prefix_frames):
+            raise ValueError(
+                "VideoEdit conditioning frames must match inference size "
+                f"{expected_size}"
+            )
+
+        source_global_indices = []
+        for pass_local_idx in spec.input_indices:
+            if pass_local_idx >= pass_plan.prefix_length:
+                source_position = pass_local_idx - pass_plan.prefix_length
+                if source_position >= len(pass_plan.source_indices):
+                    raise IndexError(
+                        f"Pass-local index {pass_local_idx} out of range for "
+                        f"{pass_plan.name} sequence"
+                    )
+                source_global_indices.append(
+                    pass_plan.source_indices[source_position]
+                )
+        if source_global_indices:
+            self._ensure_decoded_through(max(source_global_indices))
+
+        frames: list[Image.Image] = []
+        masks: list[Image.Image] = []
+        for pass_local_idx in spec.input_indices:
+            if pass_local_idx < pass_plan.prefix_length:
+                frame = prefix_frames[pass_local_idx].copy()
+                frames.append(frame)
+                masks.append(Image.new("L", frame.size, 0))
+                continue
+            source_position = pass_local_idx - pass_plan.prefix_length
+            global_idx = pass_plan.source_indices[source_position]
+            entry = self._lookup_entry(global_idx)
+            frames.append(entry.resized_frame.copy())
+            masks.append(entry.resized_mask.copy())
+
+        global_indices = tuple(
+            pass_plan.sequence_indices[spec.start_index + local_idx]
+            if spec.start_index + local_idx < len(pass_plan.sequence_indices)
+            else None
+            for local_idx in range(len(spec.input_indices))
+        )
+        raw_window = VideoEditSequence(
+            frames=tuple(frames),
+            masks=tuple(masks),
+            global_indices=global_indices,
+        )
+        return apply_videoedit_overlap(
+            raw_window, spec, previous_output_frames
+        )
+
     def paste_back_frames(
         self,
         generated_frames: list[Image.Image],
@@ -287,23 +379,18 @@ class WindowFrameProvider:
         mask_decoder = self._make_mask_decoder()
         try:
             for global_index, generated_frame in enumerate(resized_generated):
-                if global_index == 0 and self.reference_offset == 1:
-                    assert self._reference_frame is not None
-                    original_frame = self._reference_frame.copy()
-                    raw_mask = Image.new("L", self.frame_size, 0)
-                else:
-                    original_frame = video_decoder.read_next()
-                    raw_mask = mask_decoder.read_next()
-                    if original_frame is None or raw_mask is None:
-                        raise RuntimeError(
-                            "Unexpected end of input while paste-back streaming "
-                            f"at global index {global_index}"
-                        )
+                original_frame = video_decoder.read_next()
+                raw_mask = mask_decoder.read_next()
+                if original_frame is None or raw_mask is None:
+                    raise RuntimeError(
+                        "Unexpected end of input while paste-back streaming "
+                        f"at global index {global_index}"
+                    )
                 expanded_mask = expand_mask_frame(
                     raw_mask,
                     dilate_px=self.dilate_px,
                     scale=self.mask_scale,
-                    force_zero=global_index == 0,
+                    force_zero=False,
                 )
                 cropped_mask = crop_frame(expanded_mask, self.bbox)
                 result.append(

@@ -63,6 +63,42 @@ logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
 
+def _explicit_norm_scale_shift(
+    norm: nn.Module,
+    hidden_states: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Match Diffusers Wan's explicit FP32 modulation order."""
+    return (
+        norm(hidden_states.float()) * (1 + scale) + shift
+    ).type_as(hidden_states)
+
+
+def _videoedit_rms_norm(norm: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Use the native FP32 reduction order from Diffusers in strict mode."""
+    forward_native = getattr(norm, "forward_native", None)
+    if forward_native is not None:
+        return forward_native(hidden_states)
+    return norm(hidden_states)
+
+
+def _videoedit_apply_rotary_emb(
+    hidden_states: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> torch.Tensor:
+    """Match Diffusers Wan's eager pairwise RoPE and BF16 writeback order."""
+    if freqs_cos.ndim == 2:
+        freqs_cos = freqs_cos.unsqueeze(0).unsqueeze(-2)
+        freqs_sin = freqs_sin.unsqueeze(0).unsqueeze(-2)
+    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    out = torch.empty_like(hidden_states)
+    out[..., 0::2] = x1 * freqs_cos - x2 * freqs_sin
+    out[..., 1::2] = x1 * freqs_sin + x2 * freqs_cos
+    return out.type_as(hidden_states)
+
+
 def _normalize_encoder_hidden_states_image(
     encoder_hidden_states_image: torch.Tensor | list[torch.Tensor] | None,
 ) -> torch.Tensor | None:
@@ -562,7 +598,13 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        strict_videoedit_math = getattr(self, "strict_videoedit_math", False)
+        if strict_videoedit_math:
+            norm_hidden_states = _explicit_norm_scale_shift(
+                self.norm1.norm, hidden_states, shift_msa, scale_msa
+            )
+        else:
+            norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -570,11 +612,15 @@ class WanTransformerBlock(nn.Module):
         if self.norm_q is not None:
             if self.tp_rmsnorm:
                 query = tensor_parallel_rms_norm(query, self.norm_q)
+            elif strict_videoedit_math:
+                query = _videoedit_rms_norm(self.norm_q, query)
             else:
                 query = self.norm_q(query)
         if self.norm_k is not None:
             if self.tp_rmsnorm:
                 key = tensor_parallel_rms_norm(key, self.norm_k)
+            elif strict_videoedit_math:
+                key = _videoedit_rms_norm(self.norm_k, key)
             else:
                 key = self.norm_k(key)
         query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
@@ -583,7 +629,10 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
+        if strict_videoedit_math:
+            query = _videoedit_apply_rotary_emb(query, cos, sin)
+            key = _videoedit_apply_rotary_emb(key, cos, sin)
+        elif _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -603,31 +652,53 @@ class WanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
-        )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        if strict_videoedit_math:
+            hidden_states = (
+                hidden_states.float() + attn_output * gate_msa
+            ).type_as(hidden_states)
+            norm_hidden_states = self.self_attn_residual_norm.norm(
+                hidden_states.float()
+            ).type_as(hidden_states)
+        else:
+            null_shift = null_scale = torch.zeros(
+                (1,), device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            norm_hidden_states, hidden_states = self.self_attn_residual_norm(
+                hidden_states, attn_output, gate_msa, null_shift, null_scale
+            )
+            norm_hidden_states, hidden_states = norm_hidden_states.to(
+                orig_dtype
+            ), hidden_states.to(orig_dtype)
 
         # 2. Cross-attention
         attn_output = self.attn2(
             norm_hidden_states, context=encoder_hidden_states, context_lens=None
         )
-        norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
-            hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
-        )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        if strict_videoedit_math:
+            hidden_states = hidden_states + attn_output
+            norm_hidden_states = _explicit_norm_scale_shift(
+                self.cross_attn_residual_norm.norm,
+                hidden_states,
+                c_shift_msa,
+                c_scale_msa,
+            )
+        else:
+            norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
+                hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
+            )
+            norm_hidden_states, hidden_states = norm_hidden_states.to(
+                orig_dtype
+            ), hidden_states.to(orig_dtype)
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
-        hidden_states = hidden_states.to(orig_dtype)
+        if strict_videoedit_math:
+            hidden_states = (
+                hidden_states.float() + ff_output.float() * c_gate_msa
+            ).type_as(hidden_states)
+        else:
+            hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
+            hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
 
@@ -1179,7 +1250,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # batch_size, inner_dim
             shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
-        hidden_states = self.norm_out(hidden_states, shift, scale)
+        if getattr(self, "strict_videoedit_math", False):
+            hidden_states = _explicit_norm_scale_shift(
+                self.norm_out.norm, hidden_states, shift, scale
+            )
+        else:
+            hidden_states = self.norm_out(hidden_states, shift, scale)
         hidden_states, _ = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(

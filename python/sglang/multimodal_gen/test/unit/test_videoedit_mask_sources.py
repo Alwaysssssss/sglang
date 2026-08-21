@@ -70,19 +70,35 @@ class TestVideoEditMaskSources(unittest.TestCase):
             self.assert_binary_frames(frames)
             self.assertGreater(np.asarray(frames[2]).sum(), 0)
 
-    def test_num_frames_minus_one_uses_shorter_numpy_mask(self):
+    def test_num_frames_minus_one_rejects_shorter_numpy_mask(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = Path(temp_dir) / "video.avi"
             mask_path = Path(temp_dir) / "mask.npy"
             _write_test_video(video_path, 8)
             np.save(mask_path, np.zeros((5, 8, 8), dtype=np.uint8))
 
-            self.assertEqual(
-                resolve_videoedit_num_frames(-1, str(video_path), str(mask_path)),
-                5,
-            )
+            with self.assertRaisesRegex(ValueError, "length mismatch"):
+                resolve_videoedit_num_frames(
+                    -1, str(video_path), str(mask_path)
+                )
 
-    def test_prepare_global_inputs_prepends_reference_frame_and_mask(self):
+    def test_explicit_limit_still_rejects_original_length_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "video.avi"
+            mask_path = Path(temp_dir) / "mask.npy"
+            _write_test_video(video_path, 8)
+            np.save(mask_path, np.ones((5, 8, 8), dtype=np.uint8))
+
+            with self.assertRaisesRegex(ValueError, "length mismatch"):
+                prepare_global_inputs(
+                    str(video_path),
+                    str(mask_path),
+                    num_frames=3,
+                    dilate_px=0,
+                    mask_scale=1.0,
+                )
+
+    def test_prepare_global_inputs_keeps_reference_out_of_band(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = Path(temp_dir) / "video.avi"
             mask_path = Path(temp_dir) / "mask.npy"
@@ -101,13 +117,15 @@ class TestVideoEditMaskSources(unittest.TestCase):
                 mask_scale=1.0,
             )
 
-            self.assertEqual(data["num_frames"], 4)
+            self.assertEqual(data["num_frames"], 3)
             self.assertEqual(data["original_frames"][0].size, (8, 8))
-            self.assertEqual(np.asarray(data["original_frames"][0])[0, 0, 0], 200)
-            self.assertEqual(np.asarray(data["original_frames"][1])[0, 0, 0], 0)
-            self.assertEqual(int(np.asarray(data["dilated_cropped_masks"][0]).sum()), 0)
-            self.assertEqual(int(np.asarray(data["resized_masks"][0]).sum()), 0)
-            self.assertGreater(int(np.asarray(data["dilated_cropped_masks"][1]).sum()), 0)
+            self.assertEqual(np.asarray(data["original_frames"][0])[0, 0, 0], 0)
+            self.assertGreater(int(np.asarray(data["dilated_cropped_masks"][0]).sum()), 0)
+            self.assertGreater(int(np.asarray(data["resized_masks"][0]).sum()), 0)
+            self.assertIsNotNone(data["resized_reference"])
+            self.assertEqual(
+                int(np.asarray(data["resized_reference"])[0, 0, 0]), 200
+            )
 
     def test_load_current_coco_rle_json(self):
         with tempfile.TemporaryDirectory() as temp_dir:

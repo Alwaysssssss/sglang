@@ -93,16 +93,14 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
     "callbackUrl": "callback_url",
     "videoUrl": "video_url",
     "maskUrl": "mask_url",
+    "referenceImagePath": "reference_image_path",
     "referenceImageUrl": "reference_image_url",
+    "refFrameIdx": "ref_frame_idx",
+    "bridgeOverlap": "bridge_overlap",
     "decodeMode": "decode_mode",
     "bboxExpandScale": "bbox_expand_scale",
     "useClip": "use_clip",
-    "useRepairedContext": "use_repaired_context",
-    "varySeedByWindow": "vary_seed_by_window",
-    "initLatentMode": "init_latent_mode",
-    "maskDownsampleMode": "mask_downsample_mode",
-    "overlapCommitMode": "overlap_commit_mode",
-    "tailPaddingMode": "tail_padding_mode",
+    "clipPreprocess": "clip_preprocess",
     "teacacheThresh": "teacache_thresh",
     "teacacheStartSkipping": "teacache_start_skipping",
     "teacacheEndSkipping": "teacache_end_skipping",
@@ -425,11 +423,104 @@ def _validate_video_repair_request(req: VideoRepairRequest) -> None:
         raise ValueError("videoUrl or video_input_path is required")
     if not (req.mask_input_path or req.mask_url):
         raise ValueError("maskUrl or mask_input_path is required")
+    if not (req.reference_image_path or req.reference_image_url):
+        raise ValueError(
+            "referenceImageUrl or reference_image_path is required"
+        )
+    if req.num_frames is not None and (
+        req.num_frames == 0 or req.num_frames < -1
+    ):
+        raise ValueError("num_frames must be a positive integer or -1")
+    if req.ref_frame_idx < 0:
+        raise ValueError("ref_frame_idx must be non-negative")
+    if (
+        req.num_frames is not None
+        and req.num_frames > 0
+        and req.ref_frame_idx >= req.num_frames
+    ):
+        raise ValueError("ref_frame_idx must be smaller than num_frames")
+    if req.infer_len < 1 or (req.infer_len - 1) % 4 != 0:
+        raise ValueError("infer_len must be >= 1 and satisfy (infer_len - 1) % 4 == 0")
+    if not (0 <= req.overlap < req.infer_len):
+        raise ValueError("overlap must be in [0, infer_len)")
+    if req.bridge_overlap < 1 or (req.bridge_overlap - 1) % 4 != 0:
+        raise ValueError(
+            "bridge_overlap must be >= 1 and satisfy (bridge_overlap - 1) % 4 == 0"
+        )
     if req.minio_config is None and (
         req.output_storage == "s3" or req.output_object_key is not None
     ):
         if not cloud_storage.is_enabled():
             raise ValueError("minioConfig is required for S3 output")
+
+
+def _video_repair_sampling_kwargs(
+    req: VideoRepairRequest,
+    *,
+    request_id: str,
+    timeout_deadline: float | None,
+    request_cancel_path: str,
+    video_input_path: str,
+    mask_input_path: str,
+    reference_image_path: str,
+    output_dir: str,
+    output_file_name: str,
+    resolved_num_frames: int,
+    progress_path: str,
+) -> Dict[str, Any]:
+    """Build the one-to-one OpenAI repair to VideoEdit sampling contract."""
+    return {
+        "request_id": request_id,
+        "request_timeout_deadline": timeout_deadline,
+        "request_cancel_path": request_cancel_path,
+        "prompt": req.prompt,
+        "negative_prompt": req.negative_prompt,
+        "video_input_path": video_input_path,
+        "mask_input_path": mask_input_path,
+        "reference_image_path": reference_image_path,
+        "output_path": output_dir,
+        "output_file_name": output_file_name,
+        "num_frames": resolved_num_frames,
+        "ref_frame_idx": req.ref_frame_idx,
+        "bridge_overlap": req.bridge_overlap,
+        "infer_len": req.infer_len,
+        "overlap": req.overlap,
+        "num_inference_steps": req.num_inference_steps,
+        "guidance_scale": req.guidance_scale,
+        "seed": req.seed,
+        "dtype": req.dtype,
+        "dynamic_cfg": req.dynamic_cfg,
+        "dynamic_cfg_max_step": req.dynamic_cfg_max_step,
+        "dynamic_cfg_min": req.dynamic_cfg_min,
+        "bbox_padding": req.bbox_padding,
+        "bbox_expand_scale": req.bbox_expand_scale,
+        "dilate_px": req.dilate_px,
+        "mask_scale": req.mask_scale,
+        "feather_px": req.feather_px,
+        "adain_boundary_dilate": req.adain_boundary_dilate,
+        "enable_paste_back": req.enable_paste_back,
+        "save_crop_only": req.save_crop_only,
+        "use_clip": req.use_clip,
+        "clip_preprocess": req.clip_preprocess,
+        "decode_mode": req.decode_mode,
+        "enable_teacache": req.enable_teacache,
+        "teacache_params": build_videoedit_teacache_params(
+            teacache_thresh=req.teacache_thresh,
+            start_skipping=req.teacache_start_skipping,
+            end_skipping=req.teacache_end_skipping,
+        ),
+        "enable_frame_interpolation": req.enable_frame_interpolation,
+        "frame_interpolation_exp": req.frame_interpolation_exp,
+        "frame_interpolation_scale": req.frame_interpolation_scale,
+        "frame_interpolation_model_path": req.frame_interpolation_model_path,
+        "enable_upscaling": req.enable_upscaling,
+        "upscaling_model_path": req.upscaling_model_path,
+        "upscaling_scale": req.upscaling_scale,
+        "output_quality": req.output_quality,
+        "output_compression": req.output_compression,
+        "perf_dump_path": req.perf_dump_path,
+        "progress_path": progress_path,
+    }
 
 
 def _build_video_sampling_params(
@@ -956,7 +1047,7 @@ async def create_video_repair(request: Request):
 
         video_input_path = req.video_input_path
         mask_input_path = req.mask_input_path
-        reference_image_path = None
+        reference_image_path = req.reference_image_path
         if req.video_url:
             target_path = os.path.join(uploads_dir, f"{request_id}_video")
             if request_storage is not None:
@@ -993,16 +1084,14 @@ async def create_video_repair(request: Request):
             raise ValueError("maskUrl or mask_input_path is required")
 
         resolved_num_frames = resolve_videoedit_num_frames(
-            req.num_frames,
+            -1 if req.num_frames is None else req.num_frames,
             video_input_path,
             mask_input_path,
         )
-        has_reference_image = bool(reference_image_path)
-        effective_drop_reference_frame = (
-            req.drop_reference_frame
-            if req.drop_reference_frame is not None
-            else has_reference_image
-        )
+        if not reference_image_path:
+            raise ValueError(
+                "referenceImageUrl or reference_image_path is required"
+            )
 
         output_dir, output_file_name = _split_output_path(
             req.output_path,
@@ -1020,63 +1109,19 @@ async def create_video_repair(request: Request):
 
         sampling_params = WanVideoEditSamplingParams.from_user_kwargs(
             server_args,
-            request_id=request_id,
-            request_timeout_deadline=timeout_deadline,
-            request_cancel_path=request_cancel_path,
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            video_input_path=video_input_path,
-            mask_input_path=mask_input_path,
-            reference_image_path=reference_image_path,
-            output_path=output_dir,
-            output_file_name=output_file_name,
-            num_frames=resolved_num_frames,
-            infer_len=req.infer_len,
-            overlap=req.overlap,
-            strength=req.strength,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            generator_device=req.generator_device,
-            dtype=req.dtype,
-            dynamic_cfg=req.dynamic_cfg,
-            dynamic_cfg_max_step=req.dynamic_cfg_max_step,
-            dynamic_cfg_min=req.dynamic_cfg_min,
-            bbox_padding=req.bbox_padding,
-            bbox_expand_scale=req.bbox_expand_scale,
-            dilate_px=req.dilate_px,
-            mask_scale=req.mask_scale,
-            feather_px=req.feather_px,
-            adain_boundary_dilate=req.adain_boundary_dilate,
-            enable_paste_back=req.enable_paste_back,
-            save_crop_only=req.save_crop_only,
-            drop_reference_frame=effective_drop_reference_frame,
-            keep_intermediate_windows=req.keep_intermediate_windows,
-            use_clip=req.use_clip,
-            use_repaired_context=req.use_repaired_context,
-            vary_seed_by_window=req.vary_seed_by_window,
-            init_latent_mode=req.init_latent_mode,
-            mask_downsample_mode=req.mask_downsample_mode,
-            overlap_commit_mode=req.overlap_commit_mode,
-            tail_padding_mode=req.tail_padding_mode,
-            decode_mode=req.decode_mode,
-            enable_teacache=req.enable_teacache,
-            teacache_params=build_videoedit_teacache_params(
-                teacache_thresh=req.teacache_thresh,
-                start_skipping=req.teacache_start_skipping,
-                end_skipping=req.teacache_end_skipping,
+            **_video_repair_sampling_kwargs(
+                req,
+                request_id=request_id,
+                timeout_deadline=timeout_deadline,
+                request_cancel_path=request_cancel_path,
+                video_input_path=video_input_path,
+                mask_input_path=mask_input_path,
+                reference_image_path=reference_image_path,
+                output_dir=output_dir,
+                output_file_name=output_file_name,
+                resolved_num_frames=resolved_num_frames,
+                progress_path=progress_path,
             ),
-            enable_frame_interpolation=req.enable_frame_interpolation,
-            frame_interpolation_exp=req.frame_interpolation_exp,
-            frame_interpolation_scale=req.frame_interpolation_scale,
-            frame_interpolation_model_path=req.frame_interpolation_model_path,
-            enable_upscaling=req.enable_upscaling,
-            upscaling_model_path=req.upscaling_model_path,
-            upscaling_scale=req.upscaling_scale,
-            output_quality=req.output_quality,
-            output_compression=req.output_compression,
-            perf_dump_path=req.perf_dump_path,
-            progress_path=progress_path,
         )
         output_object_key = None
         if (
@@ -1112,7 +1157,8 @@ async def create_video_repair(request: Request):
             resolved={
                 "request_id": request_id,
                 "num_frames": resolved_num_frames,
-                "drop_reference_frame": effective_drop_reference_frame,
+                "ref_frame_idx": req.ref_frame_idx,
+                "bridge_overlap": req.bridge_overlap,
                 "video_input_path": video_input_path,
                 "mask_input_path": mask_input_path,
                 "reference_image_path": reference_image_path,
