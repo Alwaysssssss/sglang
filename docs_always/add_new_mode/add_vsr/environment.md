@@ -3,8 +3,8 @@
 本文记录两端（基线 `vsr` 与 SGLang）实际可运行的环境、模型权重、输入数据和命令行。
 版本一律以实际导入的解释器为准，不采信系统 Python、另一环境的 `pip list` 或旧文档结论。
 
-最近核实：2026-09-20。历史环境信息保留如下；本次恢复的解释器见 [本次验收记录](acceptance_20260920.md#环境恢复)。
-旧 `/home/root/uv-envs/sglang-llm-diffusion/bin/python` 当前不存在，改用 `$SGLANG_REPO/output_results/vsr/migration_env/bin/python`。
+最近核实：2026-09-20。**当前 VSR 默认环境为 torch2.10/cu126**，使用 `$SGLANG_REPO/output_results/vsr/migration_env210/bin/python`，见 [运行环境与启动命令](runtime210.md)。
+以下 torch2.9.1 环境版本和 M0/M1 差异保留为历史验收记录；旧环境 `migration_env` 仍可使用。
 
 ## 1. 两套环境
 
@@ -29,10 +29,10 @@ VSR_PYTHON=/mnt/shanhai-ai/envs/conda/envs/swiftvr/bin/python
 | Transformers | 5.2.0 |
 | Safetensors | 0.7.0 |
 
-### 1.2 SGLang 环境（uv）
+### 1.2 SGLang 环境（旧 torch2.9.1 记录；当前入口为2.10）
 
 ```bash
-export VE_SGLANG_PYTHON="$SGLANG_REPO/output_results/vsr/migration_env/bin/python"
+export VE_SGLANG_PYTHON="$SGLANG_REPO/output_results/vsr/migration_env210/bin/python"
 # 2026-09-18 原路径 /home/root/uv-envs/sglang-llm-diffusion/bin/python 已不存在。
 ```
 

@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import subprocess
@@ -7,9 +8,16 @@ from pathlib import Path
 
 import torch
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--output-dir", default="output_results/vsr/migration_20260920")
+parser.add_argument(
+    "--reference-environment", choices=["sglang", "swiftvr"], default="sglang"
+)
+options = parser.parse_args()
+reference_env = options.reference_environment
 root = Path.cwd()
 out = root / "output_results/vsr"
-run = out / "migration_20260920"
+run = Path(options.output_dir).resolve()
 run.mkdir(exist_ok=True)
 py = sys.executable
 repo = root.parent / "vsr"
@@ -44,6 +52,7 @@ def cmd(args, log):
 
 results = []
 for name, inp, target, color in configs:
+    started = time.perf_counter()
     print(time.strftime("%H:%M:%S"), name, "start", flush=True)
     dump = run / name
     video = run / (name + ".mp4")
@@ -74,7 +83,7 @@ for name, inp, target, color in configs:
     ]
     (run / (name + "_command.json")).write_text(json.dumps(args, indent=2))
     cmd(args, run / (name + ".log"))
-    ref = out / "dumps" / ("EPS_" + name + "_sglang")
+    ref = out / "dumps" / ("EPS_" + name + "_" + reference_env)
     a = sorted((ref / "retired").glob("*.pt"))
     b = sorted((dump / "retired").glob("*.pt"))
     assert a and len(a) == len(b), (name, "parts")
@@ -88,7 +97,7 @@ for name, inp, target, color in configs:
             y,
         )
         counts.append(tx.shape[0])
-    same = sha(video) == sha(out / ("EPS_" + name + "_sglang.mp4"))
+    same = sha(video) == sha(out / ("EPS_" + name + "_" + reference_env + ".mp4"))
     assert same, (name, "mp4 mismatch")
     # Exact identity to the measured same-environment reference transfers its
     # cross-environment metrics without recomputing lossy video comparisons.
@@ -96,13 +105,18 @@ for name, inp, target, color in configs:
         layer: json.loads((out / "reports" / f"EPS_{name}_{layer}.json").read_text())
         for layer in ["frames", "mp4", "structural"]
     }
+    if reference_env != "sglang":
+        reports = {}  # The old EPS reports measure a different environment pair.
     result = {
         "case": name,
+        "elapsed_with_verification_s": time.perf_counter() - started,
+        "torch": torch.__version__,
+        "reference_environment": reference_env,
         "frames": sum(counts),
         "parts": counts,
         "frames_bitwise_equal": True,
         "mp4_sha256": sha(video),
-        "reference_mp4_sha256": sha(out / f"EPS_{name}_sglang.mp4"),
+        "reference_mp4_sha256": sha(out / f"EPS_{name}_{reference_env}.mp4"),
         "input_sha256": sha(inp),
         "reference_reports": reports,
     }
