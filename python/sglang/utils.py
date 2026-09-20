@@ -34,6 +34,12 @@ logger = logging.getLogger(__name__)
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+    # VSR checkpoints are not diffusers-layout trees: the DiT comes from
+    # `<checkpoint>/transformer_ema`, the VAE encoder from a separate base
+    # Wan2.2 directory, and the decoder is a bare state dict. Matching on the
+    # checkpoint's path keeps `ServerArgs.from_kwargs` working without a
+    # synthetic model_index.json.
+    "swiftvr": "WanVSRPipeline",
 }
 
 

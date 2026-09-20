@@ -50,6 +50,7 @@ class ModelTaskType(Enum):
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
     VIDEO_EDIT = auto()  # Video + Mask to Video
+    VSR = auto()  # Video Super-Resolution / Restoration (no text, no sampler)
 
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
@@ -615,12 +616,14 @@ class PipelineConfig:
 
         # If model_path is a safetensors file and pipeline_class_name is specified,
         # try to get PipelineConfig from the registry first
-        if is_safetensors_file and pipeline_class_name:
+        if pipeline_class_name and (
+            is_safetensors_file or pipeline_class_name == "WanVSRPipeline"
+        ):
             config_classes = get_pipeline_config_classes(pipeline_class_name)
             if config_classes is not None:
                 pipeline_config_cls, _ = config_classes
                 logger.info(
-                    f"Detected safetensors file with {pipeline_class_name}, "
+                    f"Selected {pipeline_class_name}, "
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:

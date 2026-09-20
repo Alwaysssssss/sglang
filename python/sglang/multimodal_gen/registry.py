@@ -40,6 +40,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanT2V480PConfig,
     WanT2V720PConfig,
     WanVideoEditPipelineConfig,
+    WanVSRPipelineConfig,
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
@@ -116,6 +117,9 @@ from sglang.multimodal_gen.configs.sample.wan import (
 )
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.vsr import (
+    WanVRSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
@@ -293,11 +297,37 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
 
 @lru_cache(maxsize=1)
 def _get_config_info(
-    model_path: str, model_id: Optional[str] = None
+    model_path: str,
+    model_id: Optional[str] = None,
+    pipeline_class_name: Optional[str] = None,
 ) -> Optional[ConfigInfo]:
     """
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
+    # 0a. An already-resolved pipeline class short-circuits everything below.
+    #     Callers arrive with one when the model path matched a registered
+    #     non-diffusers pattern (KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS),
+    #     which exists precisely for model directories that are *not* diffusers
+    #     layout. Insisting on a model_index.json after that makes the hook
+    #     unusable -- which is what used to happen here: the file read below
+    #     raised before the detector loop further down could ever run.
+    if pipeline_class_name:
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            pipeline_config_cls, sampling_param_cls = config_classes
+            logger.debug(
+                f"Resolved config for '{model_path}' from pipeline class "
+                f"'{pipeline_class_name}', without a model_index.json."
+            )
+            return ConfigInfo(
+                sampling_param_cls=sampling_param_cls,
+                pipeline_config_cls=pipeline_config_cls,
+            )
+        logger.debug(
+            f"Pipeline class '{pipeline_class_name}' has no registered configuration "
+            "classes; falling back to path-based detection."
+        )
+
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
     # 0. Explicit model_id override: match by short name
@@ -561,8 +591,14 @@ def get_model_info(
             )
             return None
 
-    # 3. Get configuration classes (sampling, pipeline config)
-    config_info = _get_config_info(model_path, model_id=model_id)
+    # 3. Get configuration classes (sampling, pipeline config).
+    #    `pipeline_class_name` is already resolved at this point (from the
+    #    non-diffusers pattern table or from model_index.json), so hand it over:
+    #    for a non-diffusers directory it is the only thing that can resolve the
+    #    config, and for a diffusers one it is a harmless shortcut.
+    config_info = _get_config_info(
+        model_path, model_id=model_id, pipeline_class_name=pipeline_class_name
+    )
     if not config_info:
         if backend == Backend.AUTO:
             logger.warning(
@@ -724,6 +760,15 @@ def _register_configs():
             lambda hf_id: "videoedit" in hf_id.lower(),
             lambda hf_id: "wanvideoeditpipeline" in hf_id.lower(),
         ],
+    )
+    # VSR. Deliberately no `hf_model_paths` and no `model_detectors`: the
+    # checkpoint is not a diffusers `model_index.json` tree (the DiT, the VAE
+    # encoder and the fine-tuned decoder live in three different places), so
+    # there is nothing to auto-detect. It is selected explicitly with
+    # `--pipeline-class-name WanVSRPipeline`. See requirements.md §5.1.
+    register_configs(
+        sampling_param_cls=WanVRSamplingParams,
+        pipeline_config_cls=WanVSRPipelineConfig,
     )
     # MOVA
     register_configs(
