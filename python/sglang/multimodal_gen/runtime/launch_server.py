@@ -69,6 +69,9 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     logger.info("Starting server...")
 
     num_gpus = server_args.num_gpus
+    # VSR has one scheduler plus child processes for independent tile replicas.
+    # A multiprocessing daemon cannot create those children.
+    tile_workers = bool(getattr(server_args.pipeline_config, "tile_devices", None))
     processes = []
 
     # Pipes for master to talk to slaves
@@ -110,7 +113,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     result_pipes_from_slaves_r,
                 ),
                 name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
+                daemon=not tile_workers,
             )
         else:  # Slave workers
             process = mp.Process(
@@ -127,7 +130,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     result_pipes_from_slaves_w[i - 1],
                 ),
                 name=f"sglang-diffusionWorker-{i}",
-                daemon=True,
+                daemon=not tile_workers,
             )
         scheduler_pipe_readers.append(reader)
         process.start()

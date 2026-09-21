@@ -17,12 +17,14 @@ sees a ``Req`` (``requirements.md`` §5.2).
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from sglang.multimodal_gen.configs.sample.vsr import WanVRSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.vsr.geometry import (
     parse_resolution,
@@ -101,6 +103,7 @@ class VSRRestoreStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         params = _vsr_params(batch)
+        check_request_timeout(batch)
 
         input_path = params.video_input_path
         if not input_path:
@@ -149,6 +152,11 @@ class VSRRestoreStage(PipelineStage):
                 else self.config.color_ref_samples
             ),
             crf=params.crf if params.crf is not None else self.config.crf,
+            gpu_postprocess=(
+                params.gpu_postprocess
+                if params.gpu_postprocess is not None
+                else self.config.gpu_postprocess
+            ),
             read_queue=(
                 params.read_queue
                 if params.read_queue is not None
@@ -160,6 +168,7 @@ class VSRRestoreStage(PipelineStage):
                 else self.config.write_queue
             ),
             save_tiles_dir=params.save_tiles_dir,
+            check_interrupt=partial(check_request_timeout, batch),
         )
 
         params.runtime_frames_written = written

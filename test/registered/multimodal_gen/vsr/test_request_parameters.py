@@ -59,6 +59,12 @@ class RequestParametersTest(unittest.TestCase):
             params.dtype = "bfloat16"
             self.assertIs(stage.forward(batch, None), batch)
             self.assertEqual(params.runtime_frames_written, 33)
+            params.gpu_postprocess = True
+            stage.forward(batch, None)
+            self.assertTrue(restore.call_args.kwargs["gpu_postprocess"])
+            params.gpu_postprocess = False
+            stage.forward(batch, None)
+            self.assertFalse(restore.call_args.kwargs["gpu_postprocess"])
 
     def test_native_cli_loads_requested_precision(self):
         class ReachedLoader(Exception):
@@ -85,11 +91,44 @@ class RequestParametersTest(unittest.TestCase):
                     "/tmp/output.mp4",
                     "--dtype",
                     "float32",
+                    "--cudnn-benchmark",
+                    "--channels-last-3d",
+                    "--compile-decoder",
+                    "--compile-encoder",
+                    "--decoder-implicit-padding",
+                    "--cache-dit-condition",
                 ]
             )
         self.assertEqual(
             load.call_args.kwargs["server_args"].pipeline_config.precision, "float32"
         )
+
+        config = load.call_args.kwargs["server_args"].pipeline_config
+        self.assertTrue(config.cudnn_benchmark)
+        self.assertTrue(config.channels_last_3d)
+        self.assertTrue(config.compile_decoder)
+        self.assertTrue(config.compile_encoder)
+        self.assertTrue(config.decoder_implicit_padding)
+        self.assertTrue(config.cache_dit_condition)
+
+    def test_cudnn_setting_restored_on_failure(self):
+        from sglang.multimodal_gen.runtime.vsr.model import VSRRestorer
+
+        model = VSRRestorer.__new__(VSRRestorer)
+        torch.nn.Module.__init__(model)
+        previous = torch.backends.cudnn.benchmark
+        model.cudnn_benchmark = not previous
+
+        def fail(window):
+            self.assertEqual(torch.backends.cudnn.benchmark, not previous)
+            raise RuntimeError("inference failure")
+
+        with (
+            patch.object(model, "_restore_window", side_effect=fail),
+            self.assertRaisesRegex(RuntimeError, "inference failure"),
+        ):
+            model.restore_window(None)
+        self.assertEqual(torch.backends.cudnn.benchmark, previous)
 
 
 if __name__ == "__main__":

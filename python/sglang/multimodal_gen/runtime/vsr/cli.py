@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -108,7 +109,51 @@ def _add_restore_args(parser: argparse.ArgumentParser) -> None:
 
     m_group = parser.add_argument_group("compute / output")
     m_group.add_argument("--device", default="cuda")
+    m_group.add_argument(
+        "--tile-devices",
+        nargs="+",
+        default=None,
+        help="Direct path: full-model tile workers, e.g. cuda:0 cuda:1. "
+        "Indices are relative to CUDA_VISIBLE_DEVICES; first device also blends.",
+    )
+    m_group.add_argument(
+        "--cache-dit-condition",
+        action="store_true",
+        help="Cache the fixed VSR timestep/text and single-token cross-attention output.",
+    )
+    m_group.add_argument(
+        "--decoder-implicit-padding",
+        action="store_true",
+        help="Use convolution spatial padding in the VAE decoder.",
+    )
     m_group.add_argument("--dtype", default="bfloat16", choices=list(DTYPES))
+    m_group.add_argument(
+        "--gpu-postprocess",
+        action="store_true",
+        help="Experimental GPU blending and colour correction; uses more VRAM.",
+    )
+    m_group.add_argument(
+        "--compile-encoder",
+        action="store_true",
+        help="Compile the VAE encoder; warm up before timing. May change rounding.",
+    )
+    m_group.add_argument(
+        "--compile-decoder",
+        action="store_true",
+        help="Compile the VAE decoder; warm up before timing. May change rounding.",
+    )
+    m_group.add_argument(
+        "--cudnn-benchmark",
+        action="store_true",
+        help="Search cuDNN convolution algorithms; warm up before timing. "
+        "May change floating-point rounding.",
+    )
+    m_group.add_argument(
+        "--channels-last-3d",
+        action="store_true",
+        help="Use channels_last_3d for VAE Conv3d weights. "
+        "May change floating-point rounding.",
+    )
     m_group.add_argument(
         "--crf", type=int, default=5, help="x264 quality; lower is better"
     )
@@ -177,33 +222,48 @@ def restore_cmd(args: argparse.Namespace) -> int:
         f"-> target H={target_h} W={target_w}"
     )
 
-    restorer = VSRRestorer.from_pretrained(
-        checkpoint_dir=args.checkpoint_dir,
-        wan_root=args.wan_root,
-        device=args.device,
-        dtype=DTYPES[args.dtype],
-        tile_t=args.tile_t,
-        tile_h=args.tile_h,
-        tile_w=args.tile_w,
-        t_overlap=args.temporal_overlap,
-        s_overlap=args.spatial_overlap,
-    )
+    model_kwargs = {
+        "checkpoint_dir": args.checkpoint_dir,
+        "wan_root": args.wan_root,
+        "dtype": DTYPES[args.dtype],
+        "cudnn_benchmark": args.cudnn_benchmark,
+        "channels_last_3d": args.channels_last_3d,
+        "compile_decoder": args.compile_decoder,
+        "compile_encoder": args.compile_encoder,
+        "decoder_implicit_padding": args.decoder_implicit_padding,
+        "cache_dit_condition": args.cache_dit_condition,
+        "tile_t": args.tile_t,
+        "tile_h": args.tile_h,
+        "tile_w": args.tile_w,
+        "t_overlap": args.temporal_overlap,
+        "s_overlap": args.spatial_overlap,
+    }
 
-    written = stream_restore(
-        restorer,
-        input_path,
-        output_path,
-        target_h=target_h,
-        target_w=target_w,
-        fps=fps,
-        total_frames=total_frames,
-        color_ref=args.color_ref,
-        color_samples=args.color_ref_samples,
-        crf=args.crf,
-        read_queue=args.read_queue,
-        write_queue=args.write_queue,
-        save_tiles_dir=args.save_tiles_dir,
-    )
+    with ExitStack() as stack:
+        if args.tile_devices:
+            from sglang.multimodal_gen.runtime.vsr.parallel import ParallelVSRRestorer
+
+            restorer = stack.enter_context(
+                ParallelVSRRestorer(args.tile_devices, **model_kwargs)
+            )
+        else:
+            restorer = VSRRestorer.from_pretrained(device=args.device, **model_kwargs)
+        written = stream_restore(
+            restorer,
+            input_path,
+            output_path,
+            target_h=target_h,
+            target_w=target_w,
+            fps=fps,
+            total_frames=total_frames,
+            color_ref=args.color_ref,
+            color_samples=args.color_ref_samples,
+            crf=args.crf,
+            gpu_postprocess=args.gpu_postprocess,
+            read_queue=args.read_queue,
+            write_queue=args.write_queue,
+            save_tiles_dir=args.save_tiles_dir,
+        )
     print(
         f"[vsr] done. {written} frames restored at {target_h}x{target_w} -> {output_path}"
     )
@@ -228,7 +288,15 @@ def restore_via_pipeline(args: argparse.Namespace) -> int:
     server_args = ServerArgs.from_kwargs(
         model_path=args.checkpoint_dir,
         pipeline_class_name="WanVSRPipeline",
-        pipeline_config=WanVSRPipelineConfig(precision=args.dtype),
+        pipeline_config=WanVSRPipelineConfig(
+            precision=args.dtype,
+            cudnn_benchmark=args.cudnn_benchmark,
+            channels_last_3d=args.channels_last_3d,
+            compile_decoder=args.compile_decoder,
+            compile_encoder=args.compile_encoder,
+            decoder_implicit_padding=args.decoder_implicit_padding,
+            cache_dit_condition=args.cache_dit_condition,
+        ),
         backend=Backend.SGLANG,
         # `wan_root` is a genuine weight location (the base VAE encoder lives
         # there), so it belongs in component_paths rather than in the sampling
@@ -256,6 +324,7 @@ def restore_via_pipeline(args: argparse.Namespace) -> int:
         color_ref_samples=args.color_ref_samples,
         dtype=args.dtype,
         crf=args.crf,
+        gpu_postprocess=args.gpu_postprocess,
         read_queue=args.read_queue,
         write_queue=args.write_queue,
         save_tiles_dir=args.save_tiles_dir,
@@ -275,6 +344,8 @@ def restore_via_pipeline(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.tile_devices and args.via_pipeline:
+        raise SystemExit("--tile-devices currently requires the direct restore path")
     if args.command == "restore":
         return restore_via_pipeline(args) if args.via_pipeline else restore_cmd(args)
     raise SystemExit(f"unknown command: {args.command}")

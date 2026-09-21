@@ -31,9 +31,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.vsr import (
     VSRRestoreStage,
+    resolve_output_path,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
@@ -74,17 +75,30 @@ class WanVSRPipeline(LoRAPipeline, ComposedPipelineBase):
             )
 
         cfg = server_args.pipeline_config
-        self.restorer = VSRRestorer.from_pretrained(
-            checkpoint_dir=self.model_path,
-            wan_root=wan_root,
-            device="cuda",
-            dtype=_DTYPES[cfg.precision],
-            tile_t=cfg.tile_t,
-            tile_h=cfg.tile_h,
-            tile_w=cfg.tile_w,
-            t_overlap=cfg.temporal_overlap,
-            s_overlap=cfg.spatial_overlap,
-        )
+        model_kwargs = {
+            "checkpoint_dir": self.model_path,
+            "wan_root": wan_root,
+            "dtype": _DTYPES[cfg.precision],
+            "cudnn_benchmark": cfg.cudnn_benchmark,
+            "channels_last_3d": cfg.channels_last_3d,
+            "compile_decoder": cfg.compile_decoder,
+            "compile_encoder": cfg.compile_encoder,
+            "decoder_implicit_padding": cfg.decoder_implicit_padding,
+            "cache_dit_condition": cfg.cache_dit_condition,
+            "tile_t": cfg.tile_t,
+            "tile_h": cfg.tile_h,
+            "tile_w": cfg.tile_w,
+            "t_overlap": cfg.temporal_overlap,
+            "s_overlap": cfg.spatial_overlap,
+        }
+        if cfg.tile_devices:
+            if server_args.num_gpus != 1:
+                raise ValueError("VSR tile replicas require one scheduler (num_gpus=1)")
+            from sglang.multimodal_gen.runtime.vsr.parallel import ParallelVSRRestorer
+
+            self.restorer = ParallelVSRRestorer(cfg.tile_devices, **model_kwargs)
+        else:
+            self.restorer = VSRRestorer.from_pretrained(device="cuda", **model_kwargs)
         # Deliberately *not* calling super().load_modules(): that implementation
         # exists to read a diffusers `model_index.json` and to pull components
         # from it (falling back to a Hub download). A VSR checkpoint is not a
@@ -96,11 +110,19 @@ class WanVSRPipeline(LoRAPipeline, ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stages([VSRRestoreStage(self.restorer, server_args.pipeline_config)])
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         if self.executor is None:
             raise RuntimeError("WanVSRPipeline requires a pipeline executor")
         with self.executor.profile_execution(batch, dump_rank=0):
-            return self.executor.execute_with_profiling(self.stages, batch, server_args)
+            result = self.executor.execute_with_profiling(
+                self.stages, batch, server_args
+            )
+            return OutputBatch(
+                output_file_paths=[
+                    str(resolve_output_path(result.sampling_params).resolve())
+                ],
+                metrics=result.metrics,
+            )
 
 
 EntryClass = WanVSRPipeline

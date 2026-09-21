@@ -40,15 +40,31 @@ from __future__ import annotations
 import queue
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
-from sglang.multimodal_gen.runtime.vsr.blending import temporal_weight, tiled_restore_rect
-from sglang.multimodal_gen.runtime.vsr.color import match_color, match_color_to_stats, scan_color_reference
-from sglang.multimodal_gen.runtime.vsr.geometry import ALIGN, compute_tile_positions, pad_hw_to_multiple, reflect_pad_time, resize_video
-from sglang.multimodal_gen.runtime.vsr.video_io import WindowReader, open_video_writer, probe_video, to_uint8_hwc
+from sglang.multimodal_gen.runtime.vsr.blending import (
+    temporal_weight,
+    tiled_restore_rect,
+)
+from sglang.multimodal_gen.runtime.vsr.color import (
+    match_color,
+    match_color_to_stats,
+    scan_color_reference,
+)
+from sglang.multimodal_gen.runtime.vsr.geometry import (
+    ALIGN,
+    compute_tile_positions,
+    pad_hw_to_multiple,
+    reflect_pad_time,
+    resize_video,
+)
+from sglang.multimodal_gen.runtime.vsr.video_io import (
+    WindowReader,
+    open_video_writer,
+    probe_video,
+    to_uint8_hwc,
+)
 
 #: ``global`` keeps the whole-volume path's colour semantics via a cheap
 #: pre-pass; ``chunk`` matches every chunk against its own input (pure
@@ -78,9 +94,20 @@ def _drain(q: queue.Queue) -> None:
         pass
 
 
+def _put_read_item(read_q, item, stop_evt):
+    """Allow request cancellation to release a reader blocked by backpressure."""
+    while not stop_evt.is_set():
+        try:
+            read_q.put(item, timeout=0.1)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
 def _reader_worker(
     path,
-    t_pos: List[Tuple[int, int]],
+    t_pos: list[tuple[int, int]],
     target_h: int,
     target_w: int,
     padded_h: int,
@@ -109,15 +136,16 @@ def _reader_worker(
                 # Pad right / bottom only, so nothing shifts and a plain crop
                 # undoes it.
                 x = F.pad(x, (0, pad_w, 0, pad_h, 0, 0), mode="replicate")
-            read_q.put((i, ts, te, x.contiguous()))   # blocks when full = backpressure
+            if not _put_read_item(read_q, (i, ts, te, x.contiguous()), stop_evt):
+                return
             del x
 
-        read_q.put(None)
-    except BaseException as exc:  # relayed to the main thread, never raised here
-        read_q.put(_WorkerError(exc))
+        _put_read_item(read_q, None, stop_evt)
+    except BaseException as exc:  # noqa: BLE001 - relay worker failures to caller
+        _put_read_item(read_q, _WorkerError(exc), stop_evt)
 
 
-def _writer_worker(writer, write_q: queue.Queue, errors: List[BaseException]) -> None:
+def _writer_worker(writer, write_q: queue.Queue, errors: list[BaseException]) -> None:
     """Append uint8 ``[n, H, W, C]`` batches in order until the None sentinel.
 
     Encoding is inherently sequential, so this stays a single thread. After a
@@ -133,7 +161,7 @@ def _writer_worker(writer, write_q: queue.Queue, errors: List[BaseException]) ->
         try:
             for frame in item:
                 writer.append_data(frame)
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - relay worker failures to caller
             errors.append(exc)
 
 
@@ -145,16 +173,18 @@ def stream_restore(
     *,
     target_h: int,
     target_w: int,
-    fps: Optional[float] = None,
-    total_frames: Optional[int] = None,
+    fps: float | None = None,
+    total_frames: int | None = None,
     color_ref: str = "global",
     color_samples: int = 64,
     crf: int = 5,
     read_queue: int = 2,
     write_queue: int = 4,
+    gpu_postprocess: bool = False,
     align: int = ALIGN,
     show_progress: bool = True,
-    save_tiles_dir: Optional[str] = None,
+    save_tiles_dir: str | None = None,
+    check_interrupt=None,
 ) -> int:
     """Restore ``input_path`` to ``output_path`` with memory independent of length.
 
@@ -167,6 +197,8 @@ def stream_restore(
         color_samples: frames sampled by the ``global`` pre-pass; 0 = all.
         read_queue: decoded chunks held in flight -- the memory knob.
         write_queue: encoded (uint8) batches held in flight.
+        gpu_postprocess: keep spatial/colour/temporal operations on the model device.
+            Uses additional memory proportional to one spatial chunk.
         save_tiles_dir: debug aid; each chunk's tiles land in ``chunkNNN/``.
 
     Returns:
@@ -226,7 +258,7 @@ def stream_restore(
     read_q: queue.Queue = queue.Queue(maxsize=max(1, read_queue))
     write_q: queue.Queue = queue.Queue(maxsize=max(1, write_queue))
     stop_evt = threading.Event()
-    writer_errors: List[BaseException] = []
+    writer_errors: list[BaseException] = []
 
     reader_t = threading.Thread(
         target=_reader_worker, name="vsr-stream-reader", daemon=True,
@@ -262,8 +294,10 @@ def stream_restore(
             tile_dir = (str(Path(save_tiles_dir) / f"chunk{i:03d}")
                         if save_tiles_dir is not None else None)
             restored = tiled_restore_rect(
-                chunk,
+                chunk.to(restorer.device) if gpu_postprocess else chunk,
                 restorer.restore_window,
+                check_interrupt=check_interrupt,
+                restore_windows_fn=getattr(restorer, "restore_windows", None),
                 tile_t=chunk.shape[2],
                 t_overlap=0,
                 tile_h=restorer.tile_h,
@@ -301,7 +335,7 @@ def stream_restore(
             # the frames still in play. Both buffers stay un-normalised until a
             # frame retires, so a frame covered by three windows is averaged,
             # not faded twice.
-            w = temporal_weight(tile_t, ov_prev, ov_next, restored.dtype)
+            w = temporal_weight(tile_t, ov_prev, ov_next, restored.dtype).to(restored.device)
             restored.mul_(w.view(1, 1, tile_t, 1, 1))
             if ov_prev > 0:
                 if live_acc is None or live_acc.shape[2] != ov_prev:

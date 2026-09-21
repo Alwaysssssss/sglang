@@ -61,6 +61,7 @@ class WanVRSamplingParams(SamplingParams):
     # for a performance comparison to be comparable (requirements.md §5.1).
     read_queue: int | None = None
     write_queue: int | None = None
+    gpu_postprocess: bool | None = None
 
     # --- debug ---------------------------------------------------------------
     save_tiles_dir: str | None = None
@@ -72,7 +73,7 @@ class WanVRSamplingParams(SamplingParams):
     runtime_target_w: int | None = None
 
     @classmethod
-    def from_user_kwargs(cls, server_args, *args, **kwargs) -> "WanVRSamplingParams":
+    def from_user_kwargs(cls, server_args, *args, **kwargs) -> WanVRSamplingParams:
         """Build params from caller kwargs, then let the base class normalise.
 
         Each model family defines its own — this mirrors the VideoEdit one. The

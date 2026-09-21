@@ -12,14 +12,13 @@ The one non-obvious rule here is in :func:`to_uint8_hwc` -- see its docstring.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
 
 import torch
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 
-def probe_video(path) -> Tuple[float, int, int, int]:
+def probe_video(path) -> tuple[float, int, int, int]:
     """Read ``(fps, T, H, W)`` without decoding the whole file.
 
     The streaming path needs the geometry up front to plan windows but must not
@@ -65,8 +64,8 @@ def to_uint8_hwc(video_bcthw: torch.Tensor):
     if video_bcthw.dim() == 5:
         video_bcthw = video_bcthw.squeeze(0)
     out = video_bcthw.permute(1, 2, 3, 0).float()
-    out = (out * 0.5 + 0.5).clamp(0, 1).cpu()
-    return (out * 255).clamp(0, 255).to(torch.uint8).numpy()
+    out = (out * 0.5 + 0.5).clamp(0, 1)
+    return (out * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
 
 class WindowReader:

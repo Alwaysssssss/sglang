@@ -31,6 +31,14 @@ class WanVSRPipelineConfig(Wan2_2_TI2V_5B_Config):
     """
 
     task_type: ModelTaskType = ModelTaskType.VSR
+    cudnn_benchmark: bool = False
+    channels_last_3d: bool = False
+    compile_decoder: bool = False
+    compile_encoder: bool = False
+    decoder_implicit_padding: bool = False
+    cache_dit_condition: bool = False
+    # One scheduler owns these full-model CUDA replicas (visible-device indices).
+    tile_devices: list[str] | None = None
 
     # --- tiling: must match training (the reference's configs/default.yaml)
     tile_t: int = 33
@@ -44,6 +52,7 @@ class WanVSRPipelineConfig(Wan2_2_TI2V_5B_Config):
     color_ref_samples: int = 64
 
     # --- streaming / encoding
+    gpu_postprocess: bool = False
     read_queue: int = 2
     write_queue: int = 4
     crf: int = 5

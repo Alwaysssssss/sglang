@@ -24,7 +24,7 @@ in is phase 2 (``requirements.md`` §1).
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 #: The rectified-flow endpoint the reference evaluates at. It is a *timestep
 #: condition*, not an iteration count and not a frame index.
@@ -44,7 +44,7 @@ class VSRAutoencoder(nn.Module):
     ``.sample()``: deterministic, and it is what the reference measures against.
     """
 
-    def __init__(self, vae, decoder_state_path: str = None):
+    def __init__(self, vae, decoder_state_path: str | None = None):
         super().__init__()
         self.vae = vae
         if decoder_state_path is not None:
@@ -124,6 +124,12 @@ class VSRRestorer(nn.Module):
         tile_w: int = 640,
         t_overlap: int = 5,
         s_overlap: int = 32,
+        cudnn_benchmark: bool = False,
+        channels_last_3d: bool = False,
+        compile_decoder: bool = False,
+        compile_encoder: bool = False,
+        decoder_implicit_padding: bool = False,
+        cache_dit_condition: bool = False,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -133,9 +139,38 @@ class VSRRestorer(nn.Module):
         self.tile_w = tile_w
         self.t_overlap = t_overlap
         self.s_overlap = s_overlap
+        self.cudnn_benchmark = cudnn_benchmark
 
         self.vae = vae.to(device, dtype=dtype).eval()
+        if channels_last_3d:
+            torch.nn.utils.convert_conv3d_weight_memory_format(
+                self.vae, torch.channels_last_3d
+            )
         self.dit = dit.to(device, dtype=dtype).eval()
+        if cache_dit_condition:
+            from sglang.multimodal_gen.runtime.vsr.condition_cache import (
+                cache_fixed_vsr_condition,
+            )
+
+            cache_fixed_vsr_condition(self.dit)
+        if decoder_implicit_padding:
+            from sglang.multimodal_gen.runtime.vsr.compile import (
+                use_implicit_decoder_padding,
+            )
+
+            use_implicit_decoder_padding(self.vae.vae)
+        if compile_encoder:
+            from sglang.multimodal_gen.runtime.vsr.compile import (
+                compile_encoder as compile_vae_encoder,
+            )
+
+            compile_vae_encoder(self.vae.vae)
+        if compile_decoder:
+            from sglang.multimodal_gen.runtime.vsr.compile import (
+                compile_decoder as compile_vae_decoder,
+            )
+
+            compile_vae_decoder(self.vae.vae)
 
         # Zero text conditioning. Deliberately a zero tensor and not the
         # embedding of an empty string: the reference loads no text encoder at
@@ -147,6 +182,18 @@ class VSRRestorer(nn.Module):
 
     @torch.no_grad()
     def restore_window(self, window: torch.Tensor) -> torch.Tensor:
+        """Restore one pixel window using this model's convolution settings."""
+        # Backend flags are process-global: restore the caller's setting even
+        # on failure. Like the VAE's mutable causal cache, this requires serial
+        # model execution within a worker process.
+        previous = torch.backends.cudnn.benchmark
+        try:
+            torch.backends.cudnn.benchmark = self.cudnn_benchmark
+            return self._restore_window(window)
+        finally:
+            torch.backends.cudnn.benchmark = previous
+
+    def _restore_window(self, window: torch.Tensor) -> torch.Tensor:
         """FM one-step restore of ``[B, C, tile_t, H, W]``.
 
         ``z_hq = z_lq - v(z_lq, t=1000)`` -- the rectified-flow sigma=1 endpoint.
@@ -179,7 +226,13 @@ class VSRRestorer(nn.Module):
         t_overlap: int = 5,
         s_overlap: int = 32,
         verbose: bool = True,
-    ) -> "VSRRestorer":
+        cudnn_benchmark: bool = False,
+        channels_last_3d: bool = False,
+        compile_decoder: bool = False,
+        compile_encoder: bool = False,
+        decoder_implicit_padding: bool = False,
+        cache_dit_condition: bool = False,
+    ) -> VSRRestorer:
         """Load a Stage-3 checkpoint.
 
         Args:
@@ -190,7 +243,9 @@ class VSRRestorer(nn.Module):
         """
         from diffusers import AutoencoderKLWan, WanTransformer3DModel
 
-        transformer_path, decoder_path, variant = _resolve_weights(checkpoint_dir, wan_root)
+        transformer_path, decoder_path, variant = _resolve_weights(
+            checkpoint_dir, wan_root
+        )
         if verbose:
             print(f"[vsr] transformer: {transformer_path} ({variant})")
             if decoder_path:
@@ -212,4 +267,10 @@ class VSRRestorer(nn.Module):
             tile_w=tile_w,
             t_overlap=t_overlap,
             s_overlap=s_overlap,
+            cudnn_benchmark=cudnn_benchmark,
+            channels_last_3d=channels_last_3d,
+            compile_decoder=compile_decoder,
+            compile_encoder=compile_encoder,
+            decoder_implicit_padding=decoder_implicit_padding,
+            cache_dit_condition=cache_dit_condition,
         )

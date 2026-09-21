@@ -31,6 +31,20 @@ parser.add_argument(
     choices=["default", "max-autotune-no-cudagraphs"],
 )
 parser.add_argument("--vae-fp16", action="store_true")
+parser.add_argument(
+    "--experiment",
+    default="baseline",
+    choices=[
+        "baseline",
+        "cat_once",
+        "outer_compile",
+        "condition",
+        "cross_constant",
+        "graph",
+        "implicit_pad",
+        "combined",
+    ],
+)
 args = parser.parse_args()
 root = Path.cwd()
 sys.path.insert(0, str(root.parent / "vsr"))
@@ -84,6 +98,11 @@ if args.compile_decoder and args.decoder_mode != "default":
     model.vae.vae.decoder.forward = torch.compile(
         eager_decoder, fullgraph=True, dynamic=False, mode=args.decoder_mode
     )
+from round4_experiments import apply, capture
+
+apply(model, args.experiment)
+if args.experiment == "graph":
+    capture(model, window)
 torch.cuda.synchronize()
 torch.cuda.reset_peak_memory_stats()
 warmup_s = []
@@ -150,6 +169,7 @@ if args.profile:
     ) as profiler:
         result = forward(window)
         torch.cuda.synchronize()
+    profiler.export_chrome_trace(str(Path(args.report).with_suffix(".trace.json")))
     ops = sorted(
         profiler.key_averages(), key=lambda e: e.self_device_time_total, reverse=True
     )

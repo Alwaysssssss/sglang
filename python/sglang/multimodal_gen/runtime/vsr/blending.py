@@ -143,6 +143,8 @@ def tiled_restore_rect(
     tile_fps: float = 24.0,
     chunk_label: Optional[str] = None,
     show_progress: bool = True,
+    restore_windows_fn=None,
+    check_interrupt=None,
 ) -> torch.Tensor:
     """Restore ``[B, C, T, H, W]`` through overlapping rectangular 3D tiles.
 
@@ -152,7 +154,9 @@ def tiled_restore_rect(
     Args:
         restore_window_fn: maps ``[B, C, tile_t, tile_h, tile_w]`` -> same shape.
             It moves the window to the compute device itself; the result is
-            brought back to ``frames.device`` so accumulation stays off the GPU.
+            brought back to ``frames.device`` for accumulation.
+        restore_windows_fn: optional ordered iterator mapping for parallel workers.
+            It consumes padded windows and yields outputs in exactly input order.
         save_dir: debug only -- each restored tile lands there as an mp4, before
             blending.
         chunk_label: overrides the per-chunk progress label. The streaming caller
@@ -185,18 +189,22 @@ def tiled_restore_rect(
                   f"({len(h_pos)}x{len(w_pos)})")
         pbar = _progress(n_patches, label if chunk_label else f"chunk {ti + 1}/{len(t_pos)}",
                          show_progress)
+        def windows(ts=ts, te=te):
+            for hs, he in h_pos:
+                for ws, we in w_pos:
+                    if check_interrupt is not None:
+                        check_interrupt()
+                    window = frames[:, :, ts:te, hs:he, ws:we]
+                    pad = (0, tile_w - (we - ws), 0, tile_h - (he - hs),
+                           0, tile_t - (te - ts))
+                    yield F.pad(window, pad, mode=pad_mode) if any(pad) else window
+
+        results = (restore_windows_fn(windows()) if restore_windows_fn is not None
+                   else map(restore_window_fn, windows()))
         for hi, (hs, he) in enumerate(h_pos):
             for wi, (ws, we) in enumerate(w_pos):
-                window = frames[:, :, ts:te, hs:he, ws:we]
                 ct, ch, cw = te - ts, he - hs, we - ws
-
-                # Pad small edge windows up to a full tile for the model; the
-                # padding is cropped off the result immediately below.
-                pad = (0, tile_w - cw, 0, tile_h - ch, 0, tile_t - ct)
-                if any(pad):
-                    window = F.pad(window, pad, mode=pad_mode)
-
-                restored = restore_window_fn(window)
+                restored = next(results)
                 restored = restored[:, :, :ct, :ch, :cw].to(device=device, dtype=torch.float32)
 
                 if save_dir is not None:
