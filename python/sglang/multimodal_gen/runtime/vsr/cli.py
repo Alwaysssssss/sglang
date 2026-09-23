@@ -109,6 +109,11 @@ def _add_restore_args(parser: argparse.ArgumentParser) -> None:
 
     m_group = parser.add_argument_group("compute / output")
     m_group.add_argument("--device", default="cuda")
+    m_group.add_argument("--vae-cpu-offload", action="store_true")
+    offload = m_group.add_mutually_exclusive_group()
+    offload.add_argument("--dit-cpu-offload", action="store_true")
+    offload.add_argument("--dit-layerwise-offload", action="store_true")
+    m_group.add_argument("--dit-offload-prefetch-size", type=float, default=0.0)
     m_group.add_argument(
         "--tile-devices",
         nargs="+",
@@ -226,6 +231,10 @@ def restore_cmd(args: argparse.Namespace) -> int:
         "checkpoint_dir": args.checkpoint_dir,
         "wan_root": args.wan_root,
         "dtype": DTYPES[args.dtype],
+        "vae_cpu_offload": args.vae_cpu_offload,
+        "dit_cpu_offload": args.dit_cpu_offload,
+        "dit_layerwise_offload": args.dit_layerwise_offload,
+        "dit_offload_prefetch_size": args.dit_offload_prefetch_size,
         "cudnn_benchmark": args.cudnn_benchmark,
         "channels_last_3d": args.channels_last_3d,
         "compile_decoder": args.compile_decoder,
@@ -305,6 +314,10 @@ def restore_via_pipeline(args: argparse.Namespace) -> int:
         component_paths={"wan_root": args.wan_root},
         output_path=str(Path(args.output).parent),
         num_gpus=1,
+        vae_cpu_offload=args.vae_cpu_offload,
+        dit_cpu_offload=args.dit_cpu_offload,
+        dit_layerwise_offload=args.dit_layerwise_offload,
+        dit_offload_prefetch_size=args.dit_offload_prefetch_size,
         trust_remote_code=True,
     )
 

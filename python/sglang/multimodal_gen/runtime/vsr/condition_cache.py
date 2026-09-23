@@ -95,3 +95,11 @@ def cache_fixed_vsr_condition(dit):
     for module, cross in modules:
         if not isinstance(module.forward, _FixedForward):
             module.forward = _FixedForward(module, cross_attention=cross)
+
+
+def clear_fixed_vsr_condition(model):
+    """Drop cached GPU tensors before moving weights or releasing DiT blocks."""
+    for module in model.modules():
+        if isinstance(module.forward, _FixedForward):
+            cached = module.forward
+            cached.key = cached.value = cached.references = cached.value_versions = None

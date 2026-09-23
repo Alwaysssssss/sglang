@@ -326,6 +326,16 @@ class ServerArgs:
             )
 
     def _adjust_offload(self):
+        from sglang.multimodal_gen.configs.pipeline_configs.vsr import (
+            WanVSRPipelineConfig,
+        )
+
+        if isinstance(self.pipeline_config, WanVSRPipelineConfig):
+            # VSR offload is opt-in, including on small-memory GPUs.
+            for name in ("vae_cpu_offload", "dit_cpu_offload", "dit_layerwise_offload"):
+                if getattr(self, name) is None:
+                    setattr(self, name, False)
+            return
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info("Enabling all offloading for GPU with low device memory")

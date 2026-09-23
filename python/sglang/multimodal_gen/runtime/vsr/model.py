@@ -23,6 +23,9 @@ in is phase 2 (``requirements.md`` §1).
 
 from __future__ import annotations
 
+import math
+from contextlib import contextmanager, nullcontext
+
 import torch
 from torch import nn
 
@@ -130,6 +133,11 @@ class VSRRestorer(nn.Module):
         compile_encoder: bool = False,
         decoder_implicit_padding: bool = False,
         cache_dit_condition: bool = False,
+        vae_cpu_offload: bool = False,
+        dit_cpu_offload: bool = False,
+        dit_layerwise_offload: bool = False,
+        dit_offload_prefetch_size: float = 0.0,
+        pin_cpu_memory: bool = True,
     ):
         super().__init__()
         self.device = torch.device(device)
@@ -141,12 +149,61 @@ class VSRRestorer(nn.Module):
         self.s_overlap = s_overlap
         self.cudnn_benchmark = cudnn_benchmark
 
-        self.vae = vae.to(device, dtype=dtype).eval()
+        if dit_cpu_offload and dit_layerwise_offload:
+            raise ValueError(
+                "DiT whole-module and layerwise offload are mutually exclusive"
+            )
+        if (
+            not math.isfinite(dit_offload_prefetch_size)
+            or dit_offload_prefetch_size < 0
+        ):
+            raise ValueError(
+                "dit_offload_prefetch_size must be finite and non-negative"
+            )
+        if dit_layerwise_offload and self.device.type != "cuda":
+            raise ValueError("VSR layerwise offload requires CUDA")
+        self.vae_cpu_offload = vae_cpu_offload
+        self.dit_cpu_offload = dit_cpu_offload
+        self.dit_offload_manager = None
+        self.vae = vae.to("cpu" if vae_cpu_offload else device, dtype=dtype).eval()
         if channels_last_3d:
             torch.nn.utils.convert_conv3d_weight_memory_format(
                 self.vae, torch.channels_last_3d
             )
-        self.dit = dit.to(device, dtype=dtype).eval()
+        self.dit = dit.to(
+            "cpu" if dit_cpu_offload or dit_layerwise_offload else device, dtype=dtype
+        ).eval()
+        if dit_layerwise_offload:
+            from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+                LayerwiseOffloadManager,
+            )
+
+            num_layers = len(self.dit.blocks)
+            if not num_layers:
+                raise ValueError("DiT layerwise offload requires nonempty blocks")
+            prefetch = (
+                1 + round(dit_offload_prefetch_size * (num_layers - 1))
+                if dit_offload_prefetch_size < 1
+                else int(dit_offload_prefetch_size)
+            )
+            # Initialize directly from CPU weights to avoid a full-DiT GPU peak.
+            with torch.cuda.device(self.device):
+                self.dit_offload_manager = LayerwiseOffloadManager(
+                    self.dit,
+                    layers_attr_str="blocks",
+                    num_layers=num_layers,
+                    enabled=True,
+                    pin_cpu_memory=pin_cpu_memory,
+                    prefetch_size=prefetch,
+                )
+                self.dit_offload_manager.release_all()
+                for name, child in self.dit.named_children():
+                    if name != "blocks":
+                        child.to(self.device)
+                for tensor in list(self.dit.parameters(recurse=False)) + list(
+                    self.dit.buffers(recurse=False)
+                ):
+                    tensor.data = tensor.data.to(self.device)
         if cache_dit_condition:
             from sglang.multimodal_gen.runtime.vsr.condition_cache import (
                 cache_fixed_vsr_condition,
@@ -164,13 +221,13 @@ class VSRRestorer(nn.Module):
                 compile_encoder as compile_vae_encoder,
             )
 
-            compile_vae_encoder(self.vae.vae)
+            compile_vae_encoder(self.vae.vae, offload=vae_cpu_offload)
         if compile_decoder:
             from sglang.multimodal_gen.runtime.vsr.compile import (
                 compile_decoder as compile_vae_decoder,
             )
 
-            compile_vae_decoder(self.vae.vae)
+            compile_vae_decoder(self.vae.vae, offload=vae_cpu_offload)
 
         # Zero text conditioning. Deliberately a zero tensor and not the
         # embedding of an empty string: the reference loads no text encoder at
@@ -189,9 +246,35 @@ class VSRRestorer(nn.Module):
         previous = torch.backends.cudnn.benchmark
         try:
             torch.backends.cudnn.benchmark = self.cudnn_benchmark
-            return self._restore_window(window)
+            with (
+                torch.cuda.device(self.device)
+                if self.device.type == "cuda"
+                else nullcontext()
+            ):
+                return self._restore_window(window)
         finally:
             torch.backends.cudnn.benchmark = previous
+
+    @contextmanager
+    def _on_device(self, module, offload=False, manager=None):
+        try:
+            if offload:
+                module.to(self.device)
+            yield
+        finally:
+            if offload or manager is not None:
+                from sglang.multimodal_gen.runtime.vsr.condition_cache import (
+                    clear_fixed_vsr_condition,
+                )
+
+                clear_fixed_vsr_condition(module)
+                # Wan keeps temporal features outside registered buffers.
+                if module is self.vae and hasattr(self.vae.vae, "clear_cache"):
+                    self.vae.vae.clear_cache()
+                if manager is not None:
+                    manager.release_all()
+                if offload:
+                    module.to("cpu")
 
     def _restore_window(self, window: torch.Tensor) -> torch.Tensor:
         """FM one-step restore of ``[B, C, tile_t, H, W]``.
@@ -201,17 +284,20 @@ class VSRRestorer(nn.Module):
         window = window.to(self.device, dtype=self.dtype)
         B = window.shape[0]
 
-        z_lq = self.vae.encode(window)
+        with self._on_device(self.vae, self.vae_cpu_offload):
+            z_lq = self.vae.encode(window)
         t = torch.full((B,), FM_TIMESTEP, device=self.device, dtype=torch.float32)
         prompt = self.empty_prompt.expand(B, -1, -1)
-        velocity = self.dit(
-            hidden_states=z_lq,
-            timestep=t,
-            encoder_hidden_states=prompt,
-            return_dict=False,
-        )[0]
+        with self._on_device(self.dit, self.dit_cpu_offload, self.dit_offload_manager):
+            velocity = self.dit(
+                hidden_states=z_lq,
+                timestep=t,
+                encoder_hidden_states=prompt,
+                return_dict=False,
+            )[0]
         z_hq = z_lq - velocity
-        return self.vae.decode(z_hq)
+        with self._on_device(self.vae, self.vae_cpu_offload):
+            return self.vae.decode(z_hq)
 
     @classmethod
     def from_pretrained(
@@ -232,6 +318,11 @@ class VSRRestorer(nn.Module):
         compile_encoder: bool = False,
         decoder_implicit_padding: bool = False,
         cache_dit_condition: bool = False,
+        vae_cpu_offload: bool = False,
+        dit_cpu_offload: bool = False,
+        dit_layerwise_offload: bool = False,
+        dit_offload_prefetch_size: float = 0.0,
+        pin_cpu_memory: bool = True,
     ) -> VSRRestorer:
         """Load a Stage-3 checkpoint.
 
@@ -273,4 +364,9 @@ class VSRRestorer(nn.Module):
             compile_encoder=compile_encoder,
             decoder_implicit_padding=decoder_implicit_padding,
             cache_dit_condition=cache_dit_condition,
+            vae_cpu_offload=vae_cpu_offload,
+            dit_cpu_offload=dit_cpu_offload,
+            dit_layerwise_offload=dit_layerwise_offload,
+            dit_offload_prefetch_size=dit_offload_prefetch_size,
+            pin_cpu_memory=pin_cpu_memory,
         )

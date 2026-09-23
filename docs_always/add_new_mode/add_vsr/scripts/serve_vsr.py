@@ -18,6 +18,11 @@ def main():
     parser.add_argument("--port", type=int, default=30176)
     parser.add_argument("--output-dir", default="output_results/vsr/server_api")
     parser.add_argument("--tile-devices", nargs="+", default=None)
+    parser.add_argument("--vae-cpu-offload", action="store_true")
+    offload = parser.add_mutually_exclusive_group()
+    offload.add_argument("--dit-cpu-offload", action="store_true")
+    offload.add_argument("--dit-layerwise-offload", action="store_true")
+    parser.add_argument("--dit-offload-prefetch-size", type=float, default=0.0)
     args = parser.parse_args()
     config = WanVSRPipelineConfig(
         precision="bfloat16",
@@ -39,9 +44,10 @@ def main():
         num_gpus=1,
         trust_remote_code=True,
         output_path=args.output_dir,
-        dit_cpu_offload=False,
-        dit_layerwise_offload=False,
-        vae_cpu_offload=False,
+        dit_cpu_offload=args.dit_cpu_offload,
+        dit_layerwise_offload=args.dit_layerwise_offload,
+        vae_cpu_offload=args.vae_cpu_offload,
+        dit_offload_prefetch_size=args.dit_offload_prefetch_size,
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
     )

@@ -97,6 +97,10 @@ class RequestParametersTest(unittest.TestCase):
                     "--compile-encoder",
                     "--decoder-implicit-padding",
                     "--cache-dit-condition",
+                    "--vae-cpu-offload",
+                    "--dit-layerwise-offload",
+                    "--dit-offload-prefetch-size",
+                    "2",
                 ]
             )
         self.assertEqual(
@@ -110,6 +114,11 @@ class RequestParametersTest(unittest.TestCase):
         self.assertTrue(config.compile_encoder)
         self.assertTrue(config.decoder_implicit_padding)
         self.assertTrue(config.cache_dit_condition)
+        server_args = load.call_args.kwargs["server_args"]
+        self.assertTrue(server_args.vae_cpu_offload)
+        self.assertTrue(server_args.dit_layerwise_offload)
+        self.assertFalse(server_args.dit_cpu_offload)
+        self.assertEqual(server_args.dit_offload_prefetch_size, 2)
 
     def test_cudnn_setting_restored_on_failure(self):
         from sglang.multimodal_gen.runtime.vsr.model import VSRRestorer
@@ -118,6 +127,7 @@ class RequestParametersTest(unittest.TestCase):
         torch.nn.Module.__init__(model)
         previous = torch.backends.cudnn.benchmark
         model.cudnn_benchmark = not previous
+        model.device = torch.device("cpu")
 
         def fail(window):
             self.assertEqual(torch.backends.cudnn.benchmark, not previous)

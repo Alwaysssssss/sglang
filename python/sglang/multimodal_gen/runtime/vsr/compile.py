@@ -46,7 +46,7 @@ def _upsample3d_forward(self, x, feat_cache=None, feat_idx=None):
     return x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
 
 
-def compile_decoder(vae):
+def compile_decoder(vae, *, offload=False):
     """Compile only the decoder, leaving the temporal cache loop in Python."""
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanResample
 
@@ -54,13 +54,21 @@ def compile_decoder(vae):
     for module in decoder.modules():
         if isinstance(module, WanResample) and module.mode == "upsample3d":
             module.forward = MethodType(_upsample3d_forward, module)
-    decoder.forward = torch.compile(decoder.forward, fullgraph=True, dynamic=False)
+    decoder.forward = torch.compile(
+        decoder.forward,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False} if offload else None,
+    )
 
 
-def compile_encoder(vae):
+def compile_encoder(vae, *, offload=False):
     """Compile the encoder block while preserving the outer causal loop."""
     vae.encoder.forward = torch.compile(
-        vae.encoder.forward, fullgraph=True, dynamic=False
+        vae.encoder.forward,
+        fullgraph=True,
+        dynamic=False,
+        options={"triton.cudagraphs": False} if offload else None,
     )
 
 
