@@ -52,6 +52,10 @@ def _add_restore_args(parser: argparse.ArgumentParser) -> None:
         "--input", required=True, help="Input video path (single file)"
     )
     io_group.add_argument("--output", required=True, help="Output video path")
+    io_group.add_argument(
+        "--preserve-audio", action=argparse.BooleanOptionalAction, default=True,
+        help="Preserve all source audio tracks (incompatible codecs become AAC)",
+    )
 
     w_group = parser.add_argument_group("weights")
     w_group.add_argument(
@@ -268,6 +272,7 @@ def restore_cmd(args: argparse.Namespace) -> int:
             color_ref=args.color_ref,
             color_samples=args.color_ref_samples,
             crf=args.crf,
+            preserve_audio=args.preserve_audio,
             gpu_postprocess=args.gpu_postprocess,
             read_queue=args.read_queue,
             write_queue=args.write_queue,
@@ -337,6 +342,7 @@ def restore_via_pipeline(args: argparse.Namespace) -> int:
         color_ref_samples=args.color_ref_samples,
         dtype=args.dtype,
         crf=args.crf,
+        preserve_audio=args.preserve_audio,
         gpu_postprocess=args.gpu_postprocess,
         read_queue=args.read_queue,
         write_queue=args.write_queue,

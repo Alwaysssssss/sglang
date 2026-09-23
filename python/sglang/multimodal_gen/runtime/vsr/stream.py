@@ -43,6 +43,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from sglang.multimodal_gen.runtime.vsr.audio import video_output
 from sglang.multimodal_gen.runtime.vsr.blending import (
     temporal_weight,
     tiled_restore_rect,
@@ -165,8 +166,32 @@ def _writer_worker(writer, write_q: queue.Queue, errors: list[BaseException]) ->
             errors.append(exc)
 
 
-@torch.no_grad()
 def stream_restore(
+    restorer,
+    input_path,
+    output_path,
+    *,
+    preserve_audio: bool = True,
+    check_interrupt=None,
+    **kwargs,
+) -> int:
+    """Restore and atomically publish a video, preserving all source audio by default.
+
+    Geometry, tiling and encoding options are forwarded to ``_stream_restore_video``.
+    Cancellation and deadlines cover both inference and audio finalization.
+    """
+    with video_output(
+        input_path, output_path, preserve_audio=preserve_audio,
+        check_interrupt=check_interrupt,
+    ) as video_path:
+        written = _stream_restore_video(
+            restorer, input_path, video_path, check_interrupt=check_interrupt, **kwargs,
+        )
+    return written
+
+
+@torch.no_grad()
+def _stream_restore_video(
     restorer,
     input_path,
     output_path,

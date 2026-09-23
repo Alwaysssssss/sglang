@@ -37,6 +37,10 @@ def test_aliases_and_tiling_validation():
         }
     )
     assert req.task_id == "my-task"
+    assert req.preserve_audio is True
+    assert vsr_api.VideoRestorationRequest.model_validate(
+        {"video_input_path": "/a", "preserve_audio": False}
+    ).preserve_audio is False
     vsr_api._validate_tiling(req, WanVSRPipelineConfig())
     req.spatial_overlap = 320
     with pytest.raises(ValueError):
@@ -89,8 +93,12 @@ def test_admission_duplicate_and_recovery(monkeypatch, tmp_path):
             duplicate = await client.post(url, json=payload)
             assert duplicate.json()["code"] == 1
             assert not vsr_api._VSR_SEMAPHORE.locked()
-            success = await client.post(url, json={**payload, "taskId": "second"})
+            success = await client.post(
+                url, json={**payload, "taskId": "second", "preserve_audio": False}
+            )
             assert success.json()["code"] == 0
+            assert registered[0][0][3].preserve_audio is True
+            assert registered[1][0][3].preserve_audio is False
             vsr_api._VSR_SEMAPHORE.release()
 
     asyncio.run(scenario())
@@ -191,6 +199,11 @@ def test_pipeline_tile_worker_configuration(monkeypatch, scheduler_count):
         pipeline_config=config,
         num_gpus=scheduler_count,
         component_paths={"wan_root": "/fake/wan"},
+        vae_cpu_offload=False,
+        dit_cpu_offload=False,
+        dit_layerwise_offload=False,
+        dit_offload_prefetch_size=0.0,
+        pin_cpu_memory=True,
     )
     pipeline = SimpleNamespace(model_path="/fake/checkpoint")
     if scheduler_count == 2:

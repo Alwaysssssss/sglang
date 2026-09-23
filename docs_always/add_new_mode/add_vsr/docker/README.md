@@ -51,7 +51,7 @@ bash docs_always/add_new_mode/add_vsr/docker/build.sh
 
 构建需要联网拉取基础镜像和 Python 依赖。核心算法版本固定；其余依赖允许指定范围内解析，**不是完整锁定的离线环境**。原环境存在 requests 开发版、compressed-tensors 预发布版等拼接依赖，这里不复制它们，而由 pip 求解服务依赖；其 API 兼容性需要首次 Docker 构建与验收确认。构建会运行 `pip check`、核心版本断言以及 VSR 服务/模型导入检查，失败会终止。成功后的完整版本写在镜像 `/opt/vsr/installed-requirements.txt`，建议保留镜像 digest 和该文件，后续直接分发同一镜像。
 
-源码通过 `PYTHONPATH` 使用，不执行 `pip install .[diffusion]`，避免仓库通用依赖中的 torch 2.9.1 覆盖本环境。该镜像只面向 VSR，不保证其他 SGLang 模型或音频能力。
+源码通过 `PYTHONPATH` 使用，不执行 `pip install .[diffusion]`，避免仓库通用依赖中的 torch 2.9.1 覆盖本环境。该镜像只面向 VSR，不保证其他 SGLang 模型能力。系统安装 `ffmpeg/ffprobe` 以支持 VSR 默认保留源音轨，构建时检查命令可用性；音频开关及限制见 [音频保留](../audio.md)。
 
 ## 启动单卡
 

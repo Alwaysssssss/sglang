@@ -7,6 +7,7 @@
 不加载额外的独立推理模型，也不为每个请求重启 Python。
 
 VSR pipeline 返回已生成的 `OutputBatch.output_file_paths`，服务层不会二次编码。
+默认保留全部源音轨；音频合并结束后才返回最终文件、完成任务并触发上传／成功回调。音轨不兼容时转 AAC，其他合并错误使任务失败。依赖及同步限制见 [音频保留](audio.md)。
 每个 tile 开始前检查取消标记／超时；GPU 推理结束或报错后才释放接单权限，避免前一个请求还在运行时并发访问因果缓存。
 
 ## 单卡启动
@@ -51,9 +52,10 @@ curl --noproxy '*' http://127.0.0.1:30176/v1/videos/restorations \
 | temporal_overlap / spatial_overlap | 默认5/32，须小于对应 tile |
 | color_ref / color_ref_samples | global（默认）/chunk/none；全局颜色采样数默认64 |
 | crf | 默认5，允许0～51 |
+| preserve_audio | 默认 true，保留全部源音轨；false 输出无声视频 |
 | read_queue / write_queue | 默认2/4，API允许1～16 |
 | gpu_postprocess | 可选，默认继承启动配置 |
-| timeout | 默认-1不设期限；正数为推理期限秒数，在 tile 边界响应 |
+| timeout | 默认-1不设期限；正数为处理期限秒数，在 tile 边界响应，媒体探测／音频合并期间每0.2秒检查 |
 | minioConfig / minio_config | 可选，复用视频编辑的 RequestCloudStorage；包括 endpoint、bucket_name、access_key、secret_key、secure 等 |
 | outputObjectKey / output_object_key | 配合 minioConfig；不填使用任务 ID.mp4 |
 | output_bucket | 可选存储桶覆盖 |

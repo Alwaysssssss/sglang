@@ -38,6 +38,8 @@ def main():
     )
 
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-version"], check=True)
+    for executable in ("ffmpeg", "ffprobe"):
+        subprocess.run([executable, "-version"], check=True, capture_output=True)
     if args.gpu:
         if not torch.cuda.is_available() or torch.cuda.device_count() != args.devices:
             raise RuntimeError(f"Expected exactly {args.devices} visible CUDA devices")

@@ -152,6 +152,7 @@ class VSRRestoreStage(PipelineStage):
                 else self.config.color_ref_samples
             ),
             crf=params.crf if params.crf is not None else self.config.crf,
+            preserve_audio=params.preserve_audio,
             gpu_postprocess=(
                 params.gpu_postprocess
                 if params.gpu_postprocess is not None

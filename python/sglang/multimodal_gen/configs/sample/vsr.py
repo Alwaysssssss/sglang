@@ -55,6 +55,7 @@ class WanVRSamplingParams(SamplingParams):
     # --- precision / encoding ------------------------------------------------
     dtype: str | None = None
     crf: int | None = None
+    preserve_audio: bool = True
 
     # --- streaming -----------------------------------------------------------
     # The memory knobs. They do not change the output, but they must be settable

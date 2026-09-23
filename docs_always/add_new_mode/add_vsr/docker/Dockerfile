@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/cache/huggingface \
     VSR_MODE=single VSR_PORT=30176
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates libnuma1 libibverbs1 libglib2.0-0 libgl1 \
+    build-essential ca-certificates libnuma1 libibverbs1 libglib2.0-0 libgl1 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/sglang
 COPY docs_always/add_new_mode/add_vsr/docker/requirements.txt /opt/vsr/requirements.txt

@@ -61,6 +61,7 @@ class VideoRestorationRequest(BaseModel):
     color_ref: Literal["global", "chunk", "none"] | None = None
     color_ref_samples: int | None = Field(default=None, ge=0)
     crf: int | None = Field(default=None, ge=0, le=51)
+    preserve_audio: bool = True
     read_queue: int | None = Field(default=None, ge=1, le=16)
     write_queue: int | None = Field(default=None, ge=1, le=16)
     gpu_postprocess: bool | None = None
