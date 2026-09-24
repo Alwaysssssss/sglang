@@ -5,7 +5,9 @@ import sys
 from pathlib import Path
 
 repo = Path(__file__).resolve().parents[1]
-work = repo / "outputs/videoedit-forward-92f-40s-ref0-20260924"
+ref = int(os.environ.get("VE_TEST_REF", "0"))
+assert ref in (0, 44), "Only the two validated full-window layouts are supported"
+work = repo / "outputs" / ("videoedit-forward-92f-40s-ref0-20260924" if ref == 0 else "videoedit-middle-92f-40s-ref44-20260924")
 snapshot = repo / "outputs/videoedit-root-cause-20260924/reference_snapshot"
 side = sys.argv[1]
 assert side in ("reference", "sglang", "compare")
@@ -22,7 +24,7 @@ replacements = {
 for old, new in replacements.items():
     assert old in script, old
     script = script.replace(old, new)
-env = dict(os.environ, VE_FRAMES="92", VE_STEPS="40", VE_REF="0",
+env = dict(os.environ, VE_FRAMES="92", VE_STEPS="40", VE_REF=str(ref),
            VE_MASTER_PORT="30305", VE_SCHEDULER_PORT="5865",
            VE_FORWARD_SIDE=side, VE_FORWARD_CAPTURE=str(work / "raw" / side),
            VE_FORWARD_REFERENCE=str(snapshot))
