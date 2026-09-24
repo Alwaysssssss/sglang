@@ -216,6 +216,12 @@ class VideoRepairRequest(BaseModel):
     mask_scale: float = 1.0
     feather_px: int = 8
     adain_boundary_dilate: int = 0
+    crop_edge_feather: int = Field(default=0, ge=0)
+    chunk_bbox_mode: Literal["tight", "fixed_size", "global"] = "tight"
+    stabilize_mask_union: bool = False
+    stabilize_mask_shape: bool = False
+    stabilize_smooth_window: int = Field(default=5, ge=1)
+    preserve_audio: bool = True
     enable_paste_back: bool = True
     save_crop_only: bool = False
     use_clip: bool = True

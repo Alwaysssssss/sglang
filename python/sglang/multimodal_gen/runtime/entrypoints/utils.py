@@ -352,6 +352,7 @@ def save_outputs(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
     video_reference_path: Optional[str] = None,
+    preserve_source_audio: bool = True,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -377,6 +378,7 @@ def save_outputs(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
             video_reference_path=video_reference_path,
+            preserve_source_audio=preserve_source_audio,
         )
 
         if samples_out is not None:
@@ -413,6 +415,7 @@ def post_process_sample(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
     video_reference_path: Optional[str] = None,
+    preserve_source_audio: bool = True,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
@@ -520,6 +523,13 @@ def post_process_sample(
                     if os.path.splitext(save_file_path)[1].lower() == ".mp4":
                         mimsave_kwargs["format"] = data_type.get_default_extension()
                     imageio.mimsave(save_file_path, frames, **mimsave_kwargs)
+
+                if video_reference_path and preserve_source_audio:
+                    from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import mux_source_audio
+
+                    # Audio preservation is a completion requirement, never swallowed
+                    # by the reference-profile fallback above.
+                    mux_source_audio(save_file_path, video_reference_path, len(frames) / fps)
 
                 _maybe_mux_audio_into_mp4(
                     save_file_path=save_file_path,

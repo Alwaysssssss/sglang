@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from fractions import Fraction
 from typing import Any
 
@@ -243,6 +244,7 @@ def save_video_frames_like_reference(
     loglevel: str = "warning",
     bit_rate: int | None = None,
     copy_color_metadata: bool = True,
+    preserve_audio: bool = False,
 ) -> str:
     if not frames:
         raise ValueError("No video frames to save")
@@ -316,4 +318,55 @@ def save_video_frames_like_reference(
 
     if return_code != 0:
         _raise_ffmpeg_error("ffmpeg failed while saving video", return_code, stderr)
+    if preserve_audio:
+        mux_source_audio(output_path, refer_file, len(frames) / output_fps)
     return output_path
+
+
+def mux_source_audio(output_path: str, source_path: str, duration: float) -> bool:
+    """Copy original audio tracks onto a finished, chronological edit atomically.
+
+    No shortest-stream truncation: a short audio track must not remove video frames.
+    Incompatible containers fail explicitly instead of silently dropping audio.
+    """
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", source_path],
+        check=True, capture_output=True, text=True,
+    )
+    streams = json.loads(result.stdout)["streams"]
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        return False
+    video = next(s for s in streams if s.get("codec_type") == "video")
+    # The RGB encoder has a constant frame cadence. Refuse to silently put
+    # unchanged audio on a VFR timeline whose individual frame times moved.
+    validate_audio_timeline(source_path, video)
+    start = float(video.get("start_time", 0))
+    with tempfile.TemporaryDirectory(
+        prefix=".videoedit-audio-", dir=os.path.dirname(os.path.abspath(output_path))
+    ) as work:
+        merged = os.path.join(work, "muxed" + os.path.splitext(output_path)[1])
+        command = [
+            "ffmpeg", "-v", "error", "-y", "-copyts", "-i", output_path,
+            "-itsoffset", str(-start), "-i", source_path,
+            "-map", "0:v:0", "-map", "1:a", "-c", "copy",
+            "-t", str(duration), "-avoid_negative_ts", "disabled", merged,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f"Could not preserve source audio: {result.stderr}")
+        os.replace(merged, output_path)
+    return True
+
+
+def validate_audio_timeline(source_path: str, video: dict) -> None:
+    fps = _parse_fps(video.get("avg_frame_rate"))
+    if not fps:
+        raise ValueError("Cannot preserve audio without a valid video frame rate")
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_frames",
+        "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", source_path,
+    ], check=True, capture_output=True, text=True)
+    frames = json.loads(result.stdout)["frames"]
+    timestamps = [float(frame["best_effort_timestamp_time"]) for frame in frames]
+    if any(abs(t - timestamps[0] - i / fps) > 0.001 for i, t in enumerate(timestamps)):
+        raise ValueError("Preserving source audio currently requires constant-frame-rate video; normalize VFR input first")
