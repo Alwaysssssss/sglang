@@ -62,6 +62,12 @@ class WanVideoEditSamplingParams(SamplingParams):
     mask_scale: float = 1.0
     feather_px: int = 8
     adain_boundary_dilate: int = 0
+    crop_edge_feather: int = 0
+    chunk_bbox_mode: str = "tight"
+    stabilize_mask_union: bool = False
+    stabilize_mask_shape: bool = False
+    stabilize_smooth_window: int = 5
+    preserve_audio: bool = True
 
     enable_paste_back: bool = True
     save_crop_only: bool = False
@@ -191,6 +197,15 @@ class WanVideoEditSamplingParams(SamplingParams):
         self._validate_videoedit()
 
     def _validate_videoedit(self) -> None:
+        if self.chunk_bbox_mode not in ("tight", "fixed_size", "global"):
+            raise ValueError("chunk_bbox_mode must be tight, fixed_size, or global")
+        if self.stabilize_mask_union and self.stabilize_mask_shape:
+            raise ValueError("Choose at most one mask stabilization mode")
+        for name in ("feather_px", "crop_edge_feather", "adain_boundary_dilate"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.stabilize_smooth_window < 1:
+            raise ValueError("stabilize_smooth_window must be positive")
         if (
             isinstance(self.infer_len, bool)
             or not isinstance(self.infer_len, int)

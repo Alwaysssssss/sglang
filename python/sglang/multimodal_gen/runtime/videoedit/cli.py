@@ -60,6 +60,12 @@ def _add_common_repair_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mask-scale", type=float, default=1.0)
     parser.add_argument("--feather-px", type=int, default=8)
     parser.add_argument("--adain-boundary-dilate", type=int, default=0)
+    parser.add_argument("--crop-edge-feather", type=int, default=0)
+    parser.add_argument("--chunk-bbox-mode", choices=["tight", "fixed_size", "global"], default="tight")
+    parser.add_argument("--stabilize-mask-union", action="store_true")
+    parser.add_argument("--stabilize-mask-shape", action="store_true")
+    parser.add_argument("--stabilize-smooth-window", type=int, default=5)
+    parser.add_argument("--preserve-audio", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-paste-back", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-crop-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-clip", action=argparse.BooleanOptionalAction, default=True)
@@ -251,6 +257,12 @@ def repair_cmd(args: argparse.Namespace) -> int:
         mask_scale=args.mask_scale,
         feather_px=args.feather_px,
         adain_boundary_dilate=args.adain_boundary_dilate,
+        crop_edge_feather=args.crop_edge_feather,
+        chunk_bbox_mode=args.chunk_bbox_mode,
+        stabilize_mask_union=args.stabilize_mask_union,
+        stabilize_mask_shape=args.stabilize_mask_shape,
+        stabilize_smooth_window=args.stabilize_smooth_window,
+        preserve_audio=args.preserve_audio,
         enable_paste_back=args.enable_paste_back,
         save_crop_only=args.save_crop_only,
         use_clip=args.use_clip,

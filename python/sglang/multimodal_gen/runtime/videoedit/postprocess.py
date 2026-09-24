@@ -4,6 +4,7 @@ import numpy as np
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.videoedit.preprocess import resize_frames
+from sglang.multimodal_gen.runtime.videoedit.composite import paste_back_frame as composite_frame
 
 
 def _ensure_2d(mask: np.ndarray) -> np.ndarray:
@@ -44,7 +45,6 @@ def paste_back(
     feather_px: int = 12,
     adain_boundary_dilate: int = 15,
 ) -> list[Image.Image]:
-    del adain_boundary_dilate
     gen_resized = resize_frames(generated_frames, crop_h, crop_w)
     result_frames: list[Image.Image] = []
     for orig, gen, mask in zip(original_frames, gen_resized, mask_frames, strict=False):
@@ -55,6 +55,7 @@ def paste_back(
                 mask_frame=mask,
                 bbox=bbox,
                 feather_px=feather_px,
+                adain_boundary_dilate=adain_boundary_dilate,
             )
         )
     return result_frames
@@ -66,23 +67,12 @@ def paste_back_frame(
     mask_frame,
     bbox: tuple[int, int, int, int],
     feather_px: int = 12,
+    adain_boundary_dilate: int = 0,
+    crop_edge_feather: int = 0,
 ) -> Image.Image:
-    x_min, y_min, _, _ = bbox
-    orig_np = np.array(original_frame).astype(np.float32)
-    gen_np = np.array(generated_frame).astype(np.float32)
-    mask_np = _to_float_mask(mask_frame)
-    h_full, w_full = orig_np.shape[:2]
-    y_end = min(y_min + gen_np.shape[0], h_full)
-    x_end = min(x_min + gen_np.shape[1], w_full)
-    h = y_end - y_min
-    w = x_end - x_min
-    if h <= 0 or w <= 0:
-        return original_frame
-    gen_np = cv2.resize(gen_np, (w, h))
-    mask_np = cv2.resize(mask_np, (w, h))
-    mask_bin = (mask_np > 0.5).astype(np.float32)
-    orig_crop = orig_np[y_min:y_end, x_min:x_end]
-    blended = _edge_feather_blend(orig_crop, gen_np, mask_bin, feather_px=feather_px)
-    result_np = orig_np.copy()
-    result_np[y_min:y_end, x_min:x_end] = blended
-    return Image.fromarray(result_np.astype(np.uint8))
+    return Image.fromarray(composite_frame(
+        original_frame, generated_frame, mask_frame, bbox,
+        generated_frame.height, generated_frame.width,
+        feather_px=feather_px, adain_boundary_dilate=adain_boundary_dilate,
+        crop_edge_feather=crop_edge_feather,
+    ))

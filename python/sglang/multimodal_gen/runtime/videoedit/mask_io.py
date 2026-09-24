@@ -258,6 +258,14 @@ def probe_mask_frame_count(mask_path: str) -> int:
 
         return probe_video_frame_count(mask_path)
     if mask_type == "numpy":
+        try:
+            array = np.load(mask_path, mmap_mode="r", allow_pickle=False)
+        except ValueError:
+            array = None
+        if isinstance(array, np.ndarray):
+            return 1 if array.ndim == 2 else int(array.shape[0])
+        if array is not None:
+            array.close()
         return int(_load_numpy_mask_array(mask_path).shape[0])
     if mask_type == "coco":
         return len(_load_coco_records(mask_path))

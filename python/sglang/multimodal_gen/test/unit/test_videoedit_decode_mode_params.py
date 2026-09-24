@@ -33,6 +33,39 @@ from sglang.multimodal_gen.runtime.videoedit.cli import build_parser
 
 
 class TestVideoEditDecodeModeParams(unittest.TestCase):
+    def test_streaming_options_aliases_and_sampling_contract(self):
+        payload = _normalize_video_repair_payload({
+            "prompt": "repair", "chunkBboxMode": "fixed_size",
+            "stabilizeMaskShape": True, "stabilizeSmoothWindow": 7,
+            "cropEdgeFeather": 4, "preserveAudio": False,
+        })
+        request = VideoRepairRequest(**payload)
+        kwargs = _video_repair_sampling_kwargs(
+            request, request_id="stream-test", timeout_deadline=None,
+            request_cancel_path="cancel", video_input_path="video.mp4",
+            mask_input_path="mask.mp4", reference_image_path="reference.png",
+            output_dir="output", output_file_name="result.mp4",
+            resolved_num_frames=20, progress_path="progress.json",
+        )
+        self.assertEqual(kwargs["chunk_bbox_mode"], "fixed_size")
+        self.assertTrue(kwargs["stabilize_mask_shape"])
+        self.assertFalse(kwargs["stabilize_mask_union"])
+        self.assertEqual(kwargs["stabilize_smooth_window"], 7)
+        self.assertEqual(kwargs["crop_edge_feather"], 4)
+        self.assertFalse(kwargs["preserve_audio"])
+
+    def test_streaming_options_defaults_and_validation(self):
+        params = WanVideoEditSamplingParams()
+        self.assertTrue(params.preserve_audio)
+        self.assertEqual(params.chunk_bbox_mode, "tight")
+        for overrides in (
+            {"stabilize_mask_shape": True, "stabilize_mask_union": True},
+            {"chunk_bbox_mode": "invalid"}, {"stabilize_smooth_window": 0},
+            {"crop_edge_feather": -1}, {"adain_boundary_dilate": -1},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                WanVideoEditSamplingParams(**overrides)
+
     def test_sampling_params_accept_default_stream_decode_mode(self):
         params = WanVideoEditSamplingParams()
         self.assertEqual(params.decode_mode, "stream")
@@ -232,6 +265,10 @@ class TestVideoEditDecodeModeParams(unittest.TestCase):
             "reference_image_path": "/tmp/reference.png",
         }
         invalid = (
+            (
+                {"stabilize_mask_union": True, "stabilize_mask_shape": True},
+                "mask stabilization",
+            ),
             ({"ref_frame_idx": -1}, "ref_frame_idx"),
             ({"num_frames": 8, "ref_frame_idx": 8}, "ref_frame_idx"),
             ({"bridge_overlap": 2}, "bridge_overlap"),
