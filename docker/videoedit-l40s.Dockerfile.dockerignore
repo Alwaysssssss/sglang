@@ -1,0 +1,19 @@
+# Only send source and service scripts; exclude models, data and credentials.
+**
+!README.md
+!LICENSE
+!python/
+!python/**
+!scripts/
+!scripts/videoedit_dual_service/
+!scripts/videoedit_dual_service/**
+!scripts/start_videoedit_container.sh
+!docker/
+!docker/videoedit-l40s.Dockerfile
+!docker/videoedit-l40s.Dockerfile.dockerignore
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/.env
+**/.venv/
+scripts/videoedit_dual_service/config.*.env

@@ -103,13 +103,17 @@ start_backend() {
   local nccl_port="$6"
   local pid_file="$7"
   local log_file="$8"
+  local backend_command=("$SGLANG_BIN" serve)
+  if [[ "${VIDEOEDIT_DISABLE_THP:-false}" == "true" ]]; then
+    backend_command=("$PYTHON_BIN" "$SCRIPT_DIR/disable_thp_exec.py" "${backend_command[@]}")
+  fi
 
   nohup env \
     PYTHONPATH="$PYTHONPATH" \
     VIDEOEDIT_QUEUE_CAPACITY="$VIDEOEDIT_QUEUE_CAPACITY" \
     SGLANG_USE_RUNAI_MODEL_STREAMER="$SGLANG_USE_RUNAI_MODEL_STREAMER" \
     CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
-    "$SGLANG_BIN" serve \
+    "${backend_command[@]}" \
       --model-type diffusion \
       --backend sglang \
       --model-path "$BASE_MODEL" \
