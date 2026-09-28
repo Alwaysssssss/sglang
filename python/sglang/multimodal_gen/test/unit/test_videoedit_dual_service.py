@@ -25,9 +25,11 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.videoedit.dual_service_gateway import (
     GatewayConfig,
     GatewayRuntime,
+    create_app,
     resolve_variant,
 )
 from sglang.multimodal_gen.runtime.videoedit.dual_service_store import (
+    BusyTaskError,
     DuplicateTaskError,
     DualServiceStore,
 )
@@ -46,59 +48,71 @@ class DualServiceStoreTest(unittest.TestCase):
     def payload(task_id, model):
         return {"task_id": task_id, "model": model, "prompt": "test"}
 
-    def enqueue(self, task_id, variant):
+    def admit(self, task_id, variant):
         model = "videoedit-normal" if variant == "normal" else "videoedit-dmd"
-        return self.store.enqueue(
+        return self.store.admit(
             task_id=task_id,
             variant=variant,
             backend_url=f"http://127.0.0.1/{variant}",
             request_payload=self.payload(task_id, model),
         )
 
-    def test_fifo_and_single_active_constraint(self):
-        self.enqueue("first", "normal")
-        self.enqueue("second", "dmd")
-        first = self.store.claim_next()
-        self.assertEqual(first["task_id"], "first")
-        self.assertIsNone(self.store.claim_next())
-
+    def test_busy_rejected_until_terminal(self):
+        first = self.admit("first", "normal")
+        self.assertEqual(first["status"], "dispatching")
+        for status in ("dispatching", "running", "cancelling"):
+            self.store.update_task("first", status=status)
+            with self.assertRaises(BusyTaskError):
+                self.admit("second", "dmd")
+            self.assertIsNone(self.store.get("second"))
         self.store.mark_terminal("first", "completed")
-        second = self.store.claim_next()
-        self.assertEqual(second["task_id"], "second")
+        self.assertEqual(self.admit("second", "dmd")["status"], "dispatching")
+        self.assertEqual(self.store.counts()["queued"], 0)
 
-    def test_two_store_instances_cannot_claim_two_tasks(self):
-        self.enqueue("first", "normal")
-        self.enqueue("second", "dmd")
+    def test_two_store_instances_cannot_admit_two_tasks(self):
         stores = [DualServiceStore(self.db_path), DualServiceStore(self.db_path)]
         barrier = threading.Barrier(2)
         results = []
 
-        def claim(store):
+        def admit(store, task_id):
             barrier.wait()
-            results.append(store.claim_next())
+            try:
+                results.append(
+                    store.admit(
+                        task_id=task_id,
+                        variant="normal",
+                        backend_url="http://normal",
+                        request_payload=self.payload(task_id, "normal"),
+                    )
+                )
+            except BusyTaskError:
+                results.append(None)
 
-        threads = [threading.Thread(target=claim, args=(store,)) for store in stores]
+        threads = [
+            threading.Thread(target=admit, args=(store, str(i)))
+            for i, store in enumerate(stores)
+        ]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
-
-        claimed = [task for task in results if task is not None]
-        self.assertEqual(len(claimed), 1)
-        self.assertEqual(claimed[0]["task_id"], "first")
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sum(task is not None for task in results), 1)
+        self.assertEqual(len(self.store.list_tasks()), 1)
 
     def test_duplicate_task_is_rejected(self):
-        self.enqueue("duplicate", "normal")
+        self.admit("duplicate", "normal")
         with self.assertRaises(DuplicateTaskError):
-            self.enqueue("duplicate", "dmd")
+            self.admit("duplicate", "dmd")
 
-    def test_cancel_queued_does_not_touch_active(self):
-        self.enqueue("active", "normal")
-        self.enqueue("queued", "dmd")
-        self.store.claim_next()
-        self.assertTrue(self.store.cancel_queued("queued"))
-        self.assertFalse(self.store.cancel_queued("active"))
-        self.assertEqual(self.store.get("queued")["status"], "cancelled")
+    def test_upgrade_cancels_legacy_queue_and_preserves_active(self):
+        self.admit("legacy", "dmd")
+        self.store.update_task("legacy", status="queued")
+        self.admit("active", "normal")
+        reopened = DualServiceStore(self.db_path)
+        self.assertEqual(reopened.get("legacy")["status"], "cancelled")
+        self.assertIsNotNone(reopened.get("legacy")["completed_at"])
+        self.assertEqual(reopened.get_active()["task_id"], "active")
 
     def test_database_permissions_are_private(self):
         self.assertEqual(os.stat(self.db_path).st_mode & 0o777, 0o600)
@@ -202,16 +216,16 @@ class GatewayDispatcherTest(unittest.IsolatedAsyncioTestCase):
         await self.runtime.close()
         self.temp_dir.cleanup()
 
-    def enqueue(self, task_id, variant):
+    def admit(self, task_id, variant):
         model = "videoedit-normal" if variant == "normal" else "videoedit-dmd"
-        self.runtime.store.enqueue(
+        self.runtime.store.admit(
             task_id=task_id,
             variant=variant,
             backend_url=self.config.backend_url(variant),
             request_payload={"task_id": task_id, "model": model, "prompt": "test"},
         )
 
-    async def test_enqueue_enforces_dmd_no_cfg_policy_only_for_dmd(self):
+    async def test_admit_enforces_dmd_no_cfg_policy_only_for_dmd(self):
         common = {
             "prompt": "test",
             "video_input_path": "/tmp/video.mp4",
@@ -222,7 +236,7 @@ class GatewayDispatcherTest(unittest.IsolatedAsyncioTestCase):
             "dynamic_cfg": True,
             "negative_prompt": "low quality",
         }
-        dmd = await self.runtime.enqueue(
+        dmd = await self.runtime.admit(
             {"task_id": "dmd-policy", "model": "videoedit-dmd", **common}
         )
         dmd_request = dmd["request_json"]
@@ -231,7 +245,8 @@ class GatewayDispatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(dmd_request["dynamic_cfg"])
         self.assertIsNone(dmd_request["negative_prompt"])
 
-        normal = await self.runtime.enqueue(
+        self.runtime.store.mark_terminal("dmd-policy", "completed")
+        normal = await self.runtime.admit(
             {"task_id": "normal-policy", "model": "videoedit-normal", **common}
         )
         normal_request = normal["request_json"]
@@ -240,24 +255,50 @@ class GatewayDispatcherTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(normal_request["dynamic_cfg"])
         self.assertEqual(normal_request["negative_prompt"], "low quality")
 
-    async def test_dispatcher_serializes_normal_and_dmd(self):
-        self.enqueue("normal-task", "normal")
-        self.enqueue("dmd-task", "dmd")
-
-        task = self.runtime.store.claim_next()
-        await self.runtime._advance(task)
+    async def test_dispatcher_uses_single_slot_for_normal_and_dmd(self):
+        self.admit("normal-task", "normal")
+        with self.assertRaises(BusyTaskError):
+            self.admit("dmd-task", "dmd")
+        await self.runtime._advance(self.runtime.store.get_active())
         self.assertEqual(self.runtime.store.get("normal-task")["status"], "running")
-        self.assertEqual(self.runtime.store.get("dmd-task")["status"], "queued")
-
         self.backend_status["normal"] = "completed"
-        task = self.runtime.store.get_active()
-        await self.runtime._advance(task)
-        self.assertEqual(self.runtime.store.get("normal-task")["status"], "completed")
-        self.assertEqual(self.runtime.store.get("dmd-task")["status"], "queued")
-
-        task = self.runtime.store.claim_next()
-        await self.runtime._advance(task)
+        await self.runtime._advance(self.runtime.store.get_active())
+        self.admit("dmd-task", "dmd")
+        await self.runtime._advance(self.runtime.store.get_active())
         self.assertEqual(self.runtime.store.get("dmd-task")["status"], "running")
+
+    async def test_api_rejects_busy_without_storing_request(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.videoedit.dual_service_gateway.GatewayRuntime",
+            return_value=self.runtime,
+        ):
+            app = create_app(self.config)
+        payload = {
+            "task_id": "first",
+            "prompt": "test",
+            "model": "normal",
+            "video_input_path": "/tmp/video.mp4",
+            "mask_input_path": "/tmp/mask.mp4",
+            "reference_image_path": "/tmp/reference.png",
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+        ) as client:
+            first = await client.post("/v1/videos/repairs", json=payload)
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json()["code"], 0)
+            self.assertEqual(first.json()["status"], "dispatching")
+            duplicate = await client.post("/v1/videos/repairs", json=payload)
+            self.assertEqual(duplicate.status_code, 409)
+            payload.update(task_id="second", model="dmd")
+            busy = await client.post("/v1/videos/repairs", json=payload)
+            self.assertEqual(busy.status_code, 200)
+            self.assertEqual(busy.json()["code"], 2)
+            self.assertIsNone(self.runtime.store.get("second"))
+            self.runtime.store.mark_terminal("first", "completed")
+            second = await client.post("/v1/videos/repairs", json=payload)
+            self.assertEqual(second.json()["code"], 0)
+            self.assertEqual(self.runtime.store.counts()["queued"], 0)
 
     async def test_health_reports_normal_only_degradation(self):
         async def health_backend(request):

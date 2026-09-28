@@ -18,12 +18,16 @@ class DuplicateTaskError(ValueError):
     pass
 
 
+class BusyTaskError(ValueError):
+    pass
+
+
 class TaskNotFoundError(KeyError):
     pass
 
 
 class DualServiceStore:
-    """Small process-safe queue store.
+    """Process-safe store with one global execution slot.
 
     Connections are deliberately short lived. SQLite serializes writers and a
     partial unique index makes the global active-task invariant durable even if
@@ -91,6 +95,14 @@ class DualServiceStore:
                 ON tasks ((1))
                 WHERE status IN ('dispatching', 'running', 'cancelling');
                 """)
+            # Queued requests from older versions must not execute after upgrade.
+            connection.execute(
+                """
+                UPDATE tasks SET status = 'cancelled', completed_at = ?, error = ?
+                WHERE status = 'queued'
+                """,
+                (time.time(), "Task queue disabled; resubmit when the service is idle"),
+            )
 
     @staticmethod
     def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -106,7 +118,7 @@ class DualServiceStore:
                     pass
         return task
 
-    def enqueue(
+    def admit(
         self,
         *,
         task_id: str,
@@ -118,11 +130,21 @@ class DualServiceStore:
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone():
+                    raise DuplicateTaskError(f"Task already exists: {task_id}")
+                if connection.execute(
+                    "SELECT 1 FROM tasks WHERE status IN "
+                    "('dispatching', 'running', 'cancelling') LIMIT 1"
+                ).fetchone():
+                    raise BusyTaskError("A task is running.")
                 connection.execute(
                     """
                     INSERT INTO tasks (
-                        task_id, variant, backend_url, request_json, status, created_at
-                    ) VALUES (?, ?, ?, ?, 'queued', ?)
+                        task_id, variant, backend_url, request_json, status,
+                        created_at, started_at
+                    ) VALUES (?, ?, ?, ?, 'dispatching', ?, ?)
                     """,
                     (
                         task_id,
@@ -132,13 +154,12 @@ class DualServiceStore:
                             request_payload, ensure_ascii=False, separators=(",", ":")
                         ),
                         now,
+                        now,
                     ),
                 )
                 connection.commit()
         except sqlite3.IntegrityError as error:
-            if "tasks.task_id" in str(error) or "UNIQUE constraint failed" in str(
-                error
-            ):
+            if "tasks.task_id" in str(error):
                 raise DuplicateTaskError(f"Task already exists: {task_id}") from error
             raise
         task = self.get(task_id)
@@ -165,49 +186,6 @@ class DualServiceStore:
                 ACTIVE_STATUSES,
             ).fetchone()
         return self._decode_row(row)
-
-    def claim_next(self) -> dict[str, Any] | None:
-        """Atomically claim one task only when no active task exists."""
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            active = connection.execute("""
-                SELECT task_id FROM tasks
-                WHERE status IN ('dispatching', 'running', 'cancelling')
-                LIMIT 1
-                """).fetchone()
-            if active is not None:
-                connection.rollback()
-                return None
-
-            row = connection.execute("""
-                SELECT task_id FROM tasks
-                WHERE status = 'queued'
-                ORDER BY created_at, rowid
-                LIMIT 1
-                """).fetchone()
-            if row is None:
-                connection.rollback()
-                return None
-
-            now = time.time()
-            try:
-                changed = connection.execute(
-                    """
-                    UPDATE tasks
-                    SET status = 'dispatching', started_at = ?, error = NULL
-                    WHERE task_id = ? AND status = 'queued'
-                    """,
-                    (now, row["task_id"]),
-                ).rowcount
-                if changed != 1:
-                    connection.rollback()
-                    return None
-                connection.commit()
-            except sqlite3.IntegrityError:
-                connection.rollback()
-                return None
-
-        return self.get(row["task_id"])
 
     def update_task(self, task_id: str, **updates: Any) -> dict[str, Any]:
         unknown = set(updates) - self._UPDATABLE_FIELDS

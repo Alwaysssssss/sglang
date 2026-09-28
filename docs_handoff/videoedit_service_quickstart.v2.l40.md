@@ -404,7 +404,7 @@ print(json.dumps({
 PY
 ```
 
-返回 `queued` 仅代表入队。在同一个终端查询：
+返回 `code: 0`、`status: "dispatching"` 代表任务已接收。normal 和 DMD 共享一个执行名额，不支持排队；忙碌时返回 HTTP 200、`code: 2`，请稍后重试。在同一个终端查询：
 
 ```bash
 curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool

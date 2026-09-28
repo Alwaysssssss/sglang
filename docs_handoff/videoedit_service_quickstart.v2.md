@@ -158,9 +158,9 @@ curl --noproxy '*' -sS \
 ```json
 {
   "code": 0,
-  "message": "queued",
+  "message": "accepted",
   "task_id": "videoedit-normal-local-001",
-  "status": "queued",
+  "status": "dispatching",
   "variant": "normal"
 }
 ```
@@ -279,7 +279,7 @@ curl --noproxy '*' -sS \
   | python3 -m json.tool
 ```
 
-取消排队中或运行中的任务：
+取消当前任务：
 
 ```bash
 curl --noproxy '*' -sS \
@@ -287,7 +287,7 @@ curl --noproxy '*' -sS \
   | python3 -m json.tool
 ```
 
-队列是持久化且全局单并发的：一个 normal 或 DMD 任务运行时，其他任务保持 `queued`。重复提交同一个 `task_id` 返回 HTTP 409；目标 backend 不健康时返回 HTTP 503。接口定义见 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L425)。
+任务记录持久化，normal 和 DMD 共享一个执行名额，不支持排队。任务处于 `dispatching`、`running` 或 `cancelling` 时，新请求返回 HTTP 200、`code: 2`、`message: "A task is running."`，不保存新任务；空闲时返回 `code: 0`、`status: "dispatching"`。升级时，旧数据库里的 `queued` 任务会被标记为 `cancelled`，需要空闲后使用新 `task_id` 重新提交。重复提交同一个 `task_id` 返回 HTTP 409；目标 backend 不健康时返回 HTTP 503。接口定义见 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L425)。
 
 Gateway 不代理 backend 的 `/content` 下载接口。本地输出完成后读取响应中的 `file_path`；S3/MinIO 输出读取 `url` 或 `output_object_key`。
 
@@ -361,9 +361,9 @@ docker exec videoedit_reset \
 
 normal 仍可用，但 `videoedit-dmd` 请求会返回 HTTP 503。检查 DMD checkpoint 校验结果、`dmd.log`、`dmd-resource.log` 和 `dual-idle-gate.json`。
 
-### 请求一直 queued
+### 请求返回 code: 2
 
-Gateway 会串行调度 normal 和 DMD。先查询 `/admin/queue` 和当前 active 任务，再查看对应 backend 日志。不要同时直接调用内部 `31100/32100` 端口绕过 Gateway。
+Gateway 忙碌时拒绝新任务，不会自动排队。先查询 `/admin/queue` 和当前 active 任务，再查看对应 backend 日志。不要同时直接调用内部 `31100/32100` 端口绕过 Gateway。
 
 ### 长视频主机内存过高
 
