@@ -1,0 +1,3 @@
+# 拉取下来的素材（视频/mask/图，数十 MB）不入库，用 fetch_videoedit_assets.py 复现
+*
+!.gitignore

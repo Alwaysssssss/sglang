@@ -119,6 +119,8 @@ diffusion = [
   "scikit-image==0.25.2",
   "trimesh>=4.0.0",
   "xatlas",
+  "boto3==1.43.102",
+  "minio==7.2.20",
 ]
 
 ray = [

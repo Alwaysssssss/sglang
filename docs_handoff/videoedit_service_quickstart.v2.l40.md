@@ -408,11 +408,16 @@ PY
 
 ```bash
 curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool
-curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/${TASK_ID}/progress" | python3 -m json.tool
-curl --noproxy '*' -fsS 'http://127.0.0.1:5402/admin/queue?limit=20' | python3 -m json.tool
+curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/ae9587cb-d003-4961-86ad-a2e2b9b7cfb7/progress" | python3 -m json.tool
+curl --noproxy '*' -fsS 'http://127.0.0.1:5402/admin/queue?limit=100' | python3 -m json.tool
+
+curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool
 
 # 仅在需要取消该任务时执行。
 curl --noproxy '*' -fsS -X DELETE "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool
+
+curl --noproxy '*' -fsS -X DELETE "http://127.0.0.1:5402/v1/videos/6b502ac2-43ad-4cc5-a341-cbb1b786ce9a" | python3 -m json.tool
+curl --noproxy '*' -fsS -X DELETE "http://127.0.0.1:5402/v1/videos/b4877ed1-7d4e-48e5-89e9-06d506085367" | python3 -m json.tool
 ```
 
 normal 完成后，将请求中的 `model` 改为 `videoedit-dmd`，重新生成任务 ID 后再提交；DMD 参数覆盖规则按 v2 文档执行。验收要求两种模型均完成任务，返回的输出文件存在，并通过 `ffprobe` 及播放检查。
