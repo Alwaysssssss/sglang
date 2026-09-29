@@ -52,7 +52,7 @@
 export IMAGE_NAME=sglang-videoedit-dev-v2:l40s
 export CONTAINER_NAME=videoedit_l40s-v1
 export HOST_PORT=5403 CONTAINER_PORT=30000
-export HOST_GPUS=0,1,2,3 
+export HOST_GPUS=0,1,2,3
 export CONTAINER_CUDA_VISIBLE_DEVICES=0,1,2,3
 export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l40s.0123.env"
 export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l40s.0123.env
@@ -60,12 +60,22 @@ export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dua
 
 ```bash
 export IMAGE_NAME=sglang-videoedit-dev-v2:l40s
-export CONTAINER_NAME=videoedit_l40s-v1
+export CONTAINER_NAME=videoedit_l40s
 export HOST_PORT=5402 CONTAINER_PORT=30000
-export HOST_GPUS=4,5,6,7 
-export CONTAINER_CUDA_VISIBLE_DEVICES=0,1,2,3
-export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l40s.4567.env"
-export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l40s.4567.env
+export HOST_GPUS=7
+export CONTAINER_CUDA_VISIBLE_DEVICES=0
+export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l40s.0.env"
+export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l40s.0.env
+```
+
+```bash
+export IMAGE_NAME=sglang-videoedit-dev-v2:l40s
+export CONTAINER_NAME=videoedit_l40s-01
+export HOST_PORT=5402 CONTAINER_PORT=30000
+export HOST_GPUS=0,1
+export CONTAINER_CUDA_VISIBLE_DEVICES=0
+export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l40s.0.1.env"
+export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l40s.0.1.env
 ```
 
 上述容器路径对应脚本默认的 `CONTAINER_REPO_DIR=/sgl-workspace/sglang`；自定义挂载目标时一并调整。确认 Docker 可用、GPU 分配正确，并检查配置中的模型和目录路径。
@@ -99,13 +109,25 @@ docker build --pull=false --network=host \
 
 ### 3.3 启动或重建容器
 
+启动脚本不设置 Docker 的 `--memory` 或 `--memory-swap`，已取消原先的 300 GiB 容器内存上限及禁用 swap 的设置。实际可用内存和 swap 仍受宿主及上层 cgroup 配置约束；已有容器的创建参数不会随脚本修改自动更新。
+
 ```bash
 RECREATE=1 bash scripts/start_videoedit_container.sh
 ```
 
 **该命令会删除并重建同名容器。** 已有服务时先按 §7 确认没有 active 任务。脚本未设置 `RECREATE=1` 时也可能重建，不能把它当作删除保护开关。
 
-配置随仓库挂载进入容器，启动顺序为 normal → DMD → Gateway。每个后端的启动监测超时默认 `900` 秒；normal 失败会启动失败，DMD checkpoint 或资源检查失败可能降级为 normal-only。
+配置随仓库挂载进入容器，默认 `ENABLE_DMD=true`，启动顺序为 normal → DMD → Gateway。设置 `ENABLE_DMD=false` 时仅启动 normal 和 Gateway。启用 DMD 时，权重校验、资源检查或任一后端启动失败均会报错退出，不会自动降级；容器内 DMD 运行中退出也会停止整个服务栈。`SKIP_SECOND_SERVICE_RESOURCE_GATE` 只控制启动前的资源预判，不是 DMD 开关。
+
+可在所选配置文件中设置开关，或在创建容器时显式覆盖（需要重建容器，不能在有 active 任务时执行）：
+
+```bash
+ENABLE_DMD=true RECREATE=1 bash scripts/start_videoedit_container.sh   # 开启（默认）
+# 或：
+ENABLE_DMD=false RECREATE=1 bash scripts/start_videoedit_container.sh  # 手动关闭
+```
+
+直接启动脚本同样支持 `ENABLE_DMD=false VIDEOEDIT_DUAL_CONFIG=... bash scripts/videoedit_dual_service/start.sh`。Docker 启动时显式传入的开关会保存在容器环境中，切换该值需要重建容器。
 
 ### 3.4 检查状态
 
@@ -115,7 +137,7 @@ docker exec "$CONTAINER_NAME" bash scripts/videoedit_dual_service/status.sh
 docker logs --tail 100 "$CONTAINER_NAME"
 ```
 
-`ok` 表示两个后端健康；`degraded_normal_only` 表示仅 normal 健康；`unavailable` 表示 normal 不健康。三种状态均返回 HTTP 200，须检查响应内容。健康通过后按 §4–5 分别提交 normal 和 DMD 请求验收。
+`ok` 表示两个后端健康；`normal_only` 表示用户显式关闭 DMD 且 normal 健康；`unavailable` 表示某个已启用的后端不健康。三种状态均返回 HTTP 200，须检查响应内容。健康通过后按 §4–5 分别提交 normal 和 DMD 请求验收。
 
 ### 3.5 重启和停止
 
@@ -321,7 +343,7 @@ curl --noproxy '*' -sS \
 
 ```bash
 curl --noproxy '*' -sS \
-  'http://127.0.0.1:5402/admin/queue?limit=20' \
+  'http://127.0.0.1:5402/admin/queue?limit=200' \
   | python3 -m json.tool
 ```
 
@@ -403,9 +425,9 @@ docker exec videoedit_l40s \
 
 删除 `drop_reference_frame`、`dropReferenceFrame`、`chunks`、`generator_device`、`strength` 等已移除字段。这些语义已经固定在服务端，不再允许请求覆盖。
 
-### health 是 degraded_normal_only
+### health 是 normal_only 或 unavailable
 
-normal 仍可用，但 `videoedit-dmd` 请求会返回 HTTP 503。检查 DMD checkpoint 校验结果、`dmd.log`、`dmd-resource.log` 和 `dual-idle-gate.json`。
+`normal_only` 表示配置了 `ENABLE_DMD=false`，DMD 请求返回 HTTP 503。默认启用 DMD 时，DMD 故障不会自动切为 normal-only；检查权重校验结果、`dmd.log`、`dmd-resource.log`、`second-service-gate.json` 和 `dual-idle-gate.json`。容器脚本会在已启用的 DMD 进程退出后停止整个服务栈，Docker 根据 restart 策略处理后续重启。
 
 ### 请求返回 code: 2
 
@@ -432,7 +454,7 @@ stream 缓存淘汰可能触发重复从头解码，需要结合视频长度实�
 ## 10. 主要实现依据
 
 - 容器生命周期与挂载：[`start_videoedit_container.sh`](../scripts/start_videoedit_container.sh)
-- 双 backend 启动和降级：[`videoedit_dual_service/start.sh`](../scripts/videoedit_dual_service/start.sh)
+- 双 backend 启动与开关：[`videoedit_dual_service/start.sh`](../scripts/videoedit_dual_service/start.sh)
 - Gateway 路由、串行队列和任务接口：[`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py)
 - API 字段、默认值和删除字段：[`protocol.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/protocol.py)
 - 请求校验、下载、输出和回调：[`video_api.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py)
