@@ -684,7 +684,11 @@ class VideoEditDenoisingStage(DenoisingStage):
                             infer_len=params.infer_len,
                             overlap=params.overlap,
                             total_windows=len(params.runtime_window_specs or [None]),
-                            current_window_index=params.runtime_window_index,
+                            current_window_index=(
+                                params.runtime_progress_window_index
+                                if params.runtime_progress_window_index is not None
+                                else params.runtime_window_index
+                            ),
                             current_step_index=i,
                             steps_per_window=len(timesteps),
                         ),

@@ -108,6 +108,8 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_dilated_cropped_masks: list[Any] | None = field(default=None, init=False, repr=False)
     runtime_frame_provider: Any | None = field(default=None, init=False, repr=False)
     runtime_window_specs: list[Any] | None = field(default=None, init=False, repr=False)
+    # Task-wide progress ordinal; local window indices restart for each pass.
+    runtime_progress_window_index: int | None = field(default=None, init=False, repr=False)
     runtime_window_materialize_metadata: list[dict[str, Any]] | None = field(
         default=None, init=False, repr=False
     )

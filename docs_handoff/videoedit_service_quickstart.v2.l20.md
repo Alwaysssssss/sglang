@@ -1,4 +1,4 @@
-# VideoEdit 双模型服务快速使用说明（v2）
+# VideoEdit 双模型服务快速使用说明（v2 / L20）
 
 > 适用范围：`cos` 分支，基于 `HEAD 5e4e5e915` 及 2026-08-21 当前工作区的 VideoEdit 对齐改动。
 >
@@ -16,99 +16,130 @@
 
 ## 2. 服务拓扑与配置
 
-默认拓扑如下：
-
-| 组件 | 地址/端口 | 作用 |
-| --- | --- | --- |
-| Gateway | `0.0.0.0:30000` | 对外统一入口、持久队列、normal/DMD 路由 |
-| normal backend | `127.0.0.1:31100` | normal checkpoint 推理 |
-| DMD backend | `127.0.0.1:32100` | DMD checkpoint 推理 |
-
-容器默认把宿主 GPU `2,3` 映射为容器内 `0,1`；两个 backend 都用容器内两张卡，并启用 2-way Ulysses、DiT 逐层 offload，以及 T5、CLIP、VAE CPU offload。只有 Gateway 的 `30000` 端口发布到宿主机。全局串行只限制任务执行，normal 和 DMD 的模型仍会同时驻留在这两张卡及主存中。启动参数来源见 [`start.sh`](../scripts/videoedit_dual_service/start.sh#L99) 和 [`config.env`](../scripts/videoedit_dual_service/config.env)。
-
-当前 dual-service 脚本硬编码 `--num-gpus 2 --sp-degree 2 --ulysses-degree 2`，不能仅把 `CUDA_DEVICES` 改成单卡。需要单卡时必须另行调整服务拓扑和并行参数，不能直接套用本文的双模型 Gateway 启动方式。
-
-启动前检查 [`config.env`](../scripts/videoedit_dual_service/config.env) 中至少以下配置：
-
-| 字段 | 当前含义 |
+| 组件 | 地址/端口 |
 | --- | --- |
-| `BASE_MODEL` | 包含 `model_index.json` 的 VideoEdit 基础模型目录 |
-| `NORMAL_TRANSFORMER` | normal Transformer checkpoint 目录 |
-| `DMD_TRANSFORMER` | DMD Transformer checkpoint 目录 |
-| `CUDA_DEVICES` | backend 进程可见的容器内 GPU，默认 `0,1` |
-| `OUTPUT_DIR` | 未在请求中指定 `output_path` 时的服务输出根目录 |
-| `INPUT_DIR` | URL 输入下载后的保存目录 |
-| `QUEUE_DB` | Gateway 持久队列 SQLite 文件 |
+| Gateway | 容器 `0.0.0.0:30000` → 宿主 `30000`，唯一对外入口 |
+| normal backend | 容器内 `127.0.0.1:31100` |
+| DMD backend | 容器内 `127.0.0.1:32100` |
 
-Transformer 启动前会校验 `config.json`、`_class_name=WanVideoEditTransformer3DModel`、`in_channels=36`、`out_channels=16` 和 safetensors 权重。normal checkpoint 无效会导致启动失败；DMD checkpoint 无效时会降级为 normal-only。校验实现见 [`resource_probe.py`](../scripts/videoedit_dual_service/resource_probe.py#L246)。
+两个 backend 共用 2 张 GPU，由 Gateway 串行执行任务；模型同时驻留在 GPU 和主存。
 
-## 3. 启动、检查与停止
+本指南使用 [`config.l20.env`](../scripts/videoedit_dual_service/config.l20.env)。启动前按本机情况检查其中的配置：
 
-### 3.1 重建容器
+| 配置 | 本文设置 / 含义 |
+| --- | --- |
+| `CUDA_DEVICES` | `0,1`，容器内 GPU 编号 |
+| `NUM_GPUS` / `SP_DEGREE` / `ULYSSES_DEGREE` / `RING_DEGREE` | `2 / 2 / 2 / 1` |
+| `PROJECT_ROOT` | 容器内可见的源码仓库绝对路径 |
+| `BASE_MODEL` / `NORMAL_TRANSFORMER` / `DMD_TRANSFORMER` | 基础模型及两个 checkpoint 的绝对路径 |
+| `RUNTIME_DIR` / `LOG_DIR` / `PID_DIR` / `QUEUE_DB` | 运行数据、日志、PID 和持久队列 |
+| `INPUT_DIR` / `OUTPUT_DIR` | 后端实际使用的输入、输出根目录 |
+| `GATEWAY_PORT` | `30000`，与 Docker 的 `CONTAINER_PORT` 一致 |
 
-推荐显式重建，确保镜像、挂载、GPU 和环境变量口径一致：
+脚本根据自身位置推导宿主仓库目录，并将仓库父目录同路径挂载进容器；配置中的模型、素材和运行目录须在挂载范围内。迁移机器时仍需修改配置文件中的绝对路径。容器脚本的 `PROJECT_ROOT` 表示挂载根，服务配置中的同名字段表示源码根。
 
-```bash
-RECREATE=1 bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
-```
+**配置不会按机型自动选择。** 当前默认读取的 `config.env` 已不存在，需按 §3 显式选择配置。Docker 启动时，`DUAL_SERVICE_CONFIG_HOST` 用于检查宿主配置文件，`DUAL_SERVICE_CONFIG_CONTAINER` 被传入容器的 `VIDEOEDIT_DUAL_CONFIG`；容器入口以及 `start.sh`、`status.sh`、`stop.sh` 均通过 `source` 加载该配置。文件由仓库挂载提供，不会自动挂载任意外部配置。
 
-当前脚本在已有同名容器且未指定 `RESTART_EXISTING=1` 时也会删除并重建；`RECREATE=1` 用于明确表达这一意图。要更换宿主 GPU，可在重建时覆盖：
+直接调用 `start.sh` 时，外部 `CUDA_DEVICES` 和四个并行参数优先于文件中的值；通过容器入口启动时，请在配置文件中设置它们，外层脚本尚未透传这些并行参数。`HOST_GPUS` 是宿主 GPU 编号，与配置中的容器内编号分开设置。
 
-```bash
-RECREATE=1 HOST_GPUS=0,1 \
-  bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
-```
+## 3. 构建、启动、检查与停止
 
-默认镜像是 `sglang-mgtv:1.0`，容器是 `videoedit_reset`。变量及重建逻辑见 [`start_videoedit_container.sh`](../scripts/start_videoedit_container.sh#L12)。
+以下步骤在**宿主 Bash 终端、仓库根目录**执行，并沿用同一个终端的变量。
 
-### 3.2 只重启现有容器
-
-```bash
-RESTART_EXISTING=1 bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
-```
-
-这会复用已有容器配置。代码和 `config.env` 位于绑定挂载中，进程重启后会重新加载；但镜像、端口映射、GPU 映射和 `docker run -e` 环境变量不会因此改变，这些情况应重建容器。
-
-### 3.3 健康检查与状态
+### 3.1 选择配置
 
 ```bash
-curl --noproxy '*' -sS http://127.0.0.1:30000/health \
-  | python3 -m json.tool
-
-docker exec videoedit_reset \
-  bash scripts/videoedit_dual_service/status.sh
+export IMAGE_NAME=sglang-videoedit-src:l20
+export CONTAINER_NAME=videoedit_reset
+export HOST_PORT=30000 CONTAINER_PORT=30000
+export HOST_GPUS=2,3  # 示例：替换为实际分配的 2 张宿主 GPU
+export CONTAINER_CUDA_VISIBLE_DEVICES=0,1
+export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l20.env"
+export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l20.env
 ```
 
-Gateway 健康状态含义：
+上述容器路径对应脚本默认的 `CONTAINER_REPO_DIR=/sgl-workspace/sglang`；自定义挂载目标时一并调整。确认 Docker 可用、GPU 分配正确，并检查配置中的模型和目录路径。
 
-- `ok`：normal 和 DMD 都可用；
-- `degraded_normal_only`：normal 可用、DMD 不可用；
-- `unavailable`：normal 不可用，此时不能接单。
+### 3.2 构建镜像
 
-`/health` 在上述三种状态下都会返回 HTTP 200，因此不能只看 `curl` 的退出码，必须检查响应中的 `status` 和 `backends`。
-
-启动流程会先保证 normal 健康，再尝试启动 DMD；DMD 启动失败或空闲资源门禁失败时，会保留 normal 服务。实现见 [`start.sh`](../scripts/videoedit_dual_service/start.sh#L169) 和 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L108)。
-
-### 3.4 停止
-
-停止整个容器：
+在 `sglang` 仓库根目录执行，Dockerfile 和构建上下文均使用 `.devcontainer`：
 
 ```bash
-docker stop videoedit_reset
+docker build -f .devcontainer/Dockerfile -t "$IMAGE_NAME" .devcontainer
 ```
 
-停止容器内服务进程：
+L20 / L40S 共用 [`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile)，分别沿用 §3.1 的镜像标签和机型配置。默认 `BASE_IMAGE` 固定为 `lmsysorg/sglang:nightly-dev-cu13-20260601-373cadc9` 及其 SHA256 digest；在基础镜像上补充 `ftfy==6.3.1`、`boto3==1.43.102`、`minio==7.2.20`、系统工具及开发工具。源码和服务配置在启动时由宿主挂载；此构建入口不执行本仓库 `python[diffusion]` 的完整安装。
+
+若已将同一 digest 的基础镜像导入为本地标签 `sglang-base:20260601-local`，可通过 `BASE_IMAGE` 参数构建。以下命令适用于代理运行在宿主 `127.0.0.1:10808` 的情况；`--network=host` 使构建步骤能访问该代理：
 
 ```bash
-docker exec videoedit_reset \
-  bash scripts/videoedit_dual_service/stop.sh
+docker build --pull=false --network=host \
+  --build-arg BASE_IMAGE=sglang-base:20260601-local \
+  --build-arg HTTP_PROXY=http://127.0.0.1:10808 \
+  --build-arg HTTPS_PROXY=http://127.0.0.1:10808 \
+  --build-arg NO_PROXY=localhost,127.0.0.1 \
+  -f .devcontainer/Dockerfile -t "$IMAGE_NAME" .devcontainer
 ```
 
-容器主进程会监控 normal 和 Gateway；执行上述命令后，主进程会随之退出，容器也会停止。日常停服直接使用 `docker stop` 更清晰。
+本地标签须已存在且对应指定基础镜像；`--pull=false` 不能替代预先导入。上述代理参数供构建中的 `apt`、`pip`、`curl` 等使用，不会替 Docker daemon 配置拉取代理。已有兼容的最终镜像时可跳过构建，将 `IMAGE_NAME` 改为实际镜像名。
+
+构建成功后同名标签指向新镜像，现有容器不会自动更新或重启。依赖说明、导入检查和本次 L40S 构建记录见 [L40S 指南附录 B](./videoedit_service_quickstart.v2.l40.md#附录-b-devcontainer-镜像说明与检查)；L20 仍需独立完成健康检查和推理验收。
+
+`rebuild_image_create_videoedit_container.sh` 构建后启动的是单后端，不读取这两份配置；本文双模型部署使用上述构建命令和下面的启动脚本。
+
+### 3.3 启动或重建容器
+
+```bash
+RECREATE=1 bash scripts/start_videoedit_container.sh
+```
+
+**该命令会删除并重建同名容器。** 已有服务时先按 §7 确认没有 active 任务。脚本未设置 `RECREATE=1` 时也可能重建，不能把它当作删除保护开关。
+
+配置随仓库挂载进入容器，启动顺序为 normal → DMD → Gateway。每个后端的启动监测超时默认 `900` 秒；normal 失败会启动失败，DMD checkpoint 或资源检查失败可能降级为 normal-only。
+
+### 3.4 检查状态
+
+```bash
+curl --noproxy '*' -fsS "http://127.0.0.1:$HOST_PORT/health" | python3 -m json.tool
+docker exec "$CONTAINER_NAME" bash scripts/videoedit_dual_service/status.sh
+docker logs --tail 100 "$CONTAINER_NAME"
+```
+
+`ok` 表示两个后端健康；`degraded_normal_only` 表示仅 normal 健康；`unavailable` 表示 normal 不健康。三种状态均返回 HTTP 200，须检查响应内容。健康通过后按 §4–5 分别提交 normal 和 DMD 请求验收。
+
+### 3.5 重启和停止
+
+按需执行：
+
+```bash
+# 重新读取已选配置文件和挂载的源码。
+docker restart "$CONTAINER_NAME"
+
+# 停止整个容器。
+docker stop "$CONTAINER_NAME"
+
+# 启动已停止的容器。
+docker start "$CONTAINER_NAME"
+```
+
+修改已选配置文件的内容后，重启即可读取；**切换配置文件、镜像、GPU、端口或挂载时，需要重跑 §3.1 和 §3.3 重建容器**。`docker restart` 不会更新这些容器创建参数。修改 GPU 数时，同时调整 `HOST_GPUS`、`CONTAINER_CUDA_VISIBLE_DEVICES` 和配置中的 GPU / 并行参数。
+
+### 3.6 可选：直接管理服务进程
+
+已有 Python / CUDA 环境、无需 Docker 时，使用 `VIDEOEDIT_DUAL_CONFIG`。以下命令为启动、状态和停止，按需执行：
+
+```bash
+export VIDEOEDIT_DUAL_CONFIG="$PWD/scripts/videoedit_dual_service/config.l20.env"
+bash scripts/videoedit_dual_service/start.sh
+bash scripts/videoedit_dual_service/status.sh
+bash scripts/videoedit_dual_service/stop.sh
+```
+
+直接在宿主运行时，`CUDA_DEVICES` 应填写该环境实际可见的 GPU 编号。在已创建的容器中，`VIDEOEDIT_DUAL_CONFIG` 已设置，`docker exec` 无需重复指定。日常停止容器使用 `docker stop`；仅停止内部进程可能触发容器自动重启。
 
 ## 4. 本地 normal 请求：请求侧对齐口径
 
-本地输入路径必须在容器内可读，输出目录也应位于持久挂载中。默认 `/root/VideoEdit` 会以相同路径挂载进容器。
+本地输入路径必须在容器内可读，输出目录也应位于持久挂载中。以下示例沿用 L20 的 `/root/VideoEdit` 路径；迁移机器或修改容器名、端口时，请同步替换请求和日志示例。
 
 ```bash
 curl --noproxy '*' -sS \
@@ -189,7 +220,7 @@ curl --noproxy '*' -sS \
 
 视频和 mask 的总帧数必须相等，否则请求在预处理阶段失败；`num_frames=-1` 会解析为完整源帧数。实现见 [`preprocess.py`](../python/sglang/multimodal_gen/runtime/videoedit/preprocess.py#L97)。
 
-normal 请求使用客户端给出的采样参数。DMD 请求则由 Gateway 覆盖为固定 4 步策略，因此不要用 DMD 结果验证 normal 的 40 步 golden。
+normal 请求使用客户端给出的采样参数。normal 完成后，使用新的 `task_id`，将 `model` 改为 `videoedit-dmd` 再提交；分别检查任务完成、输出文件及视频解码。DMD 请求由 Gateway 覆盖为固定 4 步策略，因此不要用 DMD 结果验证 normal 的 40 步 golden。
 
 ## 6. 远程输入与 S3/MinIO 输出
 
@@ -348,7 +379,7 @@ docker exec videoedit_reset \
 
 ```bash
 docker exec videoedit_reset \
-  ls -lt /root/VideoEdit/tmp/sglang-videoedit-request-logs
+  bash -lc 'ls -lt "$VIDEOEDIT_REQUEST_LOG_DIR"'
 ```
 
 ## 9. 常见问题

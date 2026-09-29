@@ -1,17 +1,451 @@
-# VideoEdit 双模型容器部署指南（本机 L40S / 5402）
+# VideoEdit 双模型服务快速使用说明（v2 / L40S）
 
-> 更新日期：2026-09-21。仓库：`/home/zhouhao6/VideoEdit/sglang`，分支：`cos_l40s`。
+> 章节和操作流程与 [L20 快速说明](./videoedit_service_quickstart.v2.l20.md) 保持一致。命令在宿主 Bash 终端执行；L40S 使用独立配置、容器 `videoedit_l40s`，默认入口为 `http://127.0.0.1:5402`。
 >
-> 服务已于 2026-09-21 在本机启动，并通过 normal / DMD 短视频冒烟测试。算法与请求参数规则参见 [v2 文档](./videoedit_service_quickstart.v2.md)。
+> 本文按当前工作区整理配置；没有重新启动服务或执行推理。2026-09-21 的双卡部署与测试记录保留在附录 A，不能作为当前四卡配置的验收结果。
 
-## 0. 本次部署与测试结果（2026-09-21 UTC）
+## 1. 当前版本必须先知道的变化
 
-- 容器：`videoedit_l40s`，保持运行；旧容器 `videoedit_reset` 保留，未删除。
+1. `strict_videoedit_math` 已在 VideoEdit 模型和所有 Transformer block 中固定为 `False`，不是 API 参数。当前 case0008、step_47500 的 crop/full golden 在该配置下均通过；客户端不要尝试发送这个字段。实现见 [`wan_videoedit.py`](../python/sglang/multimodal_gen/runtime/models/dits/wan_videoedit.py#L84)，验证证据见 [`performance-impact-review.md`](../docs_always/video-edit-compare/performance-impact-review.md#41-已关闭但保留对照严格-dit-数学路径)。
+2. `drop_reference_frame` 已从请求协议删除，发送它或 `dropReferenceFrame` 会直接校验失败。当前算法语义固定为不删除参考帧。完整删除字段列表见 [`protocol.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/protocol.py#L130)。
+3. 请求接口默认 `num_inference_steps=40`、`decode_mode=stream`、`save_crop_only=false`、`enable_teacache=true`。数值 golden 请求应显式设置 `save_crop_only=true`、`enable_teacache=false`；默认值见 [`protocol.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/protocol.py#L167)。
+4. `videoedit-normal` 和 `videoedit-dmd` 共用配置指定的 GPU，并由网关全局串行调度；它们不是两个可并发执行的 GPU 服务。路由和队列实现见 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L34) 与 [`start_videoedit_container.sh`](../scripts/start_videoedit_container.sh#L5)。
+5. DMD 请求会被网关固定改为 4 步、`guidance_scale=1.0`、关闭 dynamic CFG，并清空 negative prompt；请求体中的对应值不会生效。实现见 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L73)。
+
+当前双服务 [`start.sh`](../scripts/videoedit_dual_service/start.sh#L99) 没有显式传入 `--attention-backend`。在支持 FlashAttention 的 CUDA 环境中会自动优先选择 FA，而现有 strict-false golden 是用 `torch_sdpa` 采集的。因此，下文请求可复现 API 侧参数，但不能单独保证完整 golden 环境；需要复现 golden 时，还应给两个 backend 的 `sglang serve` 命令增加 `--attention-backend torch_sdpa` 并重启。自动选择逻辑见 [`selector.py`](../python/sglang/multimodal_gen/runtime/layers/attention/selector.py#L115) 和 [`cuda.py`](../python/sglang/multimodal_gen/runtime/platforms/cuda.py#L381)。
+
+## 2. 服务拓扑与配置
+
+| 组件 | 地址/端口 |
+| --- | --- |
+| Gateway | 容器 `0.0.0.0:30000` → 宿主 `5402`，唯一对外入口 |
+| normal backend | 容器内 `127.0.0.1:31100` |
+| DMD backend | 容器内 `127.0.0.1:32100` |
+
+两个 backend 共用 4 张 GPU，由 Gateway 串行执行任务；模型同时驻留在 GPU 和主存。
+
+本指南使用 [`videoedit-l40s.0123.env`](../scripts/videoedit_dual_service/videoedit-l40s.0123.env)。启动前按本机情况检查其中的配置：
+
+| 配置 | 本文设置 / 含义 |
+| --- | --- |
+| `CUDA_DEVICES` | `0,1,2,3`，容器内 GPU 编号 |
+| `NUM_GPUS` / `SP_DEGREE` / `ULYSSES_DEGREE` / `RING_DEGREE` | `4 / 4 / 4 / 1` |
+| `PROJECT_ROOT` | 容器内可见的源码仓库绝对路径 |
+| `BASE_MODEL` / `NORMAL_TRANSFORMER` / `DMD_TRANSFORMER` | 基础模型及两个 checkpoint 的绝对路径 |
+| `RUNTIME_DIR` / `LOG_DIR` / `PID_DIR` / `QUEUE_DB` | 运行数据、日志、PID 和持久队列 |
+| `INPUT_DIR` / `OUTPUT_DIR` | 后端实际使用的输入、输出根目录 |
+| `GATEWAY_PORT` | `30000`，与 Docker 的 `CONTAINER_PORT` 一致 |
+
+脚本根据自身位置推导宿主仓库目录，并将仓库父目录同路径挂载进容器；配置中的模型、素材和运行目录须在挂载范围内。迁移机器时仍需修改配置文件中的绝对路径。容器脚本的 `PROJECT_ROOT` 表示挂载根，服务配置中的同名字段表示源码根。
+
+**配置不会按机型自动选择。** 当前默认读取的 `config.env` 已不存在，需按 §3 显式选择配置。Docker 启动时，`DUAL_SERVICE_CONFIG_HOST` 用于检查宿主配置文件，`DUAL_SERVICE_CONFIG_CONTAINER` 被传入容器的 `VIDEOEDIT_DUAL_CONFIG`；容器入口以及 `start.sh`、`status.sh`、`stop.sh` 均通过 `source` 加载该配置。文件由仓库挂载提供，不会自动挂载任意外部配置。
+
+直接调用 `start.sh` 时，外部 `CUDA_DEVICES` 和四个并行参数优先于文件中的值；通过容器入口启动时，请在配置文件中设置它们，外层脚本尚未透传这些并行参数。`HOST_GPUS` 是宿主 GPU 编号，与配置中的容器内编号分开设置。
+
+## 3. 构建、启动、检查与停止
+
+以下步骤在**宿主 Bash 终端、仓库根目录**执行，并沿用同一个终端的变量。
+
+### 3.1 选择配置
+
+```bash
+export IMAGE_NAME=sglang-videoedit-dev-v2:l40s
+export CONTAINER_NAME=videoedit_l40s-v1
+export HOST_PORT=5403 CONTAINER_PORT=30000
+export HOST_GPUS=0,1,2,3 
+export CONTAINER_CUDA_VISIBLE_DEVICES=0,1,2,3
+export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l40s.0123.env"
+export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l40s.0123.env
+```
+
+```bash
+export IMAGE_NAME=sglang-videoedit-dev-v2:l40s
+export CONTAINER_NAME=videoedit_l40s-v1
+export HOST_PORT=5402 CONTAINER_PORT=30000
+export HOST_GPUS=4,5,6,7 
+export CONTAINER_CUDA_VISIBLE_DEVICES=0,1,2,3
+export DUAL_SERVICE_CONFIG_HOST="$PWD/scripts/videoedit_dual_service/config.l40s.4567.env"
+export DUAL_SERVICE_CONFIG_CONTAINER=/sgl-workspace/sglang/scripts/videoedit_dual_service/config.l40s.4567.env
+```
+
+上述容器路径对应脚本默认的 `CONTAINER_REPO_DIR=/sgl-workspace/sglang`；自定义挂载目标时一并调整。确认 Docker 可用、GPU 分配正确，并检查配置中的模型和目录路径。
+
+### 3.2 构建镜像
+
+在 `sglang` 仓库根目录执行，Dockerfile 和构建上下文均使用 `.devcontainer`：
+
+```bash
+docker build -f .devcontainer/Dockerfile -t "$IMAGE_NAME" .devcontainer
+```
+
+L20 / L40S 共用 [`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile)，分别沿用 §3.1 的镜像标签和机型配置。默认 `BASE_IMAGE` 固定为 `lmsysorg/sglang:nightly-dev-cu13-20260601-373cadc9` 及其 SHA256 digest；在基础镜像上补充 `ftfy==6.3.1`、`boto3==1.43.102`、`minio==7.2.20`、系统工具及开发工具。源码和服务配置在启动时由宿主挂载；此构建入口不执行本仓库 `python[diffusion]` 的完整安装。
+
+若已将同一 digest 的基础镜像导入为本地标签 `sglang-base:20260601-local`，可通过 `BASE_IMAGE` 参数构建。以下命令适用于代理运行在宿主 `127.0.0.1:10808` 的情况；`--network=host` 使构建步骤能访问该代理：
+
+```bash
+docker build --pull=false --network=host \
+  --build-arg BASE_IMAGE=sglang-base:20260601-local \
+  --build-arg HTTP_PROXY=http://127.0.0.1:10808 \
+  --build-arg HTTPS_PROXY=http://127.0.0.1:10808 \
+  --build-arg NO_PROXY=localhost,127.0.0.1 \
+  -f .devcontainer/Dockerfile -t "$IMAGE_NAME" .devcontainer
+```
+
+本地标签须已存在且对应指定基础镜像；`--pull=false` 不能替代预先导入。上述代理参数供构建中的 `apt`、`pip`、`curl` 等使用，不会替 Docker daemon 配置拉取代理。已有兼容的最终镜像时可跳过构建，将 `IMAGE_NAME` 改为实际镜像名。
+
+构建成功后同名标签指向新镜像，现有容器不会自动更新或重启。依赖说明、导入检查和本次 L40S 构建记录见 [L40S 指南附录 B](./videoedit_service_quickstart.v2.l40.md#附录-b-devcontainer-镜像说明与检查)；L20 仍需独立完成健康检查和推理验收。
+
+`rebuild_image_create_videoedit_container.sh` 构建后启动的是单后端，不读取这两份配置；本文双模型部署使用上述构建命令和下面的启动脚本。
+
+### 3.3 启动或重建容器
+
+```bash
+RECREATE=1 bash scripts/start_videoedit_container.sh
+```
+
+**该命令会删除并重建同名容器。** 已有服务时先按 §7 确认没有 active 任务。脚本未设置 `RECREATE=1` 时也可能重建，不能把它当作删除保护开关。
+
+配置随仓库挂载进入容器，启动顺序为 normal → DMD → Gateway。每个后端的启动监测超时默认 `900` 秒；normal 失败会启动失败，DMD checkpoint 或资源检查失败可能降级为 normal-only。
+
+### 3.4 检查状态
+
+```bash
+curl --noproxy '*' -fsS "http://127.0.0.1:$HOST_PORT/health" | python3 -m json.tool
+docker exec "$CONTAINER_NAME" bash scripts/videoedit_dual_service/status.sh
+docker logs --tail 100 "$CONTAINER_NAME"
+```
+
+`ok` 表示两个后端健康；`degraded_normal_only` 表示仅 normal 健康；`unavailable` 表示 normal 不健康。三种状态均返回 HTTP 200，须检查响应内容。健康通过后按 §4–5 分别提交 normal 和 DMD 请求验收。
+
+### 3.5 重启和停止
+
+按需执行：
+
+```bash
+# 重新读取已选配置文件和挂载的源码。
+docker restart "$CONTAINER_NAME"
+
+# 停止整个容器。
+docker stop "$CONTAINER_NAME"
+
+# 启动已停止的容器。
+docker start "$CONTAINER_NAME"
+```
+
+修改已选配置文件的内容后，重启即可读取；**切换配置文件、镜像、GPU、端口或挂载时，需要重跑 §3.1 和 §3.3 重建容器**。`docker restart` 不会更新这些容器创建参数。修改 GPU 数时，同时调整 `HOST_GPUS`、`CONTAINER_CUDA_VISIBLE_DEVICES` 和配置中的 GPU / 并行参数。
+
+### 3.6 可选：直接管理服务进程
+
+已有 Python / CUDA 环境、无需 Docker 时，使用 `VIDEOEDIT_DUAL_CONFIG`。以下命令为启动、状态和停止，按需执行：
+
+```bash
+export VIDEOEDIT_DUAL_CONFIG="$PWD/scripts/videoedit_dual_service/config.l40s.0123.env"
+bash scripts/videoedit_dual_service/start.sh
+bash scripts/videoedit_dual_service/status.sh
+bash scripts/videoedit_dual_service/stop.sh
+
+export VIDEOEDIT_DUAL_CONFIG="$PWD/scripts/videoedit_dual_service/config.l40s.4567.env"
+bash scripts/videoedit_dual_service/start.sh
+bash scripts/videoedit_dual_service/status.sh
+bash scripts/videoedit_dual_service/stop.sh
+```
+
+直接在宿主运行时，`CUDA_DEVICES` 应填写该环境实际可见的 GPU 编号。在已创建的容器中，`VIDEOEDIT_DUAL_CONFIG` 已设置，`docker exec` 无需重复指定。日常停止容器使用 `docker stop`；仅停止内部进程可能触发容器自动重启。
+
+## 4. 本地 normal 请求：请求侧对齐口径
+
+本地输入路径必须在容器内可读，输出目录也应位于持久挂载中。下面素材路径沿用本机 `/home/zhouhao6/VideoEdit/test/`，迁移时替换为实际路径；修改 §3.1 的端口或容器名时，也须同步替换后续示例。首次请求前确认视频、mask 和参考图存在且可解码。
+
+```bash
+curl --noproxy '*' -sS \
+  -X POST http://127.0.0.1:5402/v1/videos/repairs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "task_id": "videoedit-normal-local-001",
+    "model": "videoedit-normal",
+    "timeout": -1,
+    "prompt": "一个男人站在舞台中央演讲，背后有两排巨大的立体文字。",
+    "video_input_path": "/home/zhouhao6/VideoEdit/test/1080.mp4",
+    "mask_input_path": "/home/zhouhao6/VideoEdit/test/mask_1080_merged.mp4",
+    "reference_image_path": "/home/zhouhao6/VideoEdit/test/local.png",
+    "output_storage": "local",
+    "output_path": "/home/zhouhao6/VideoEdit/test/output_normal_001.mp4",
+    "num_frames": -1,
+    "ref_frame_idx": 0,
+    "bridge_overlap": 5,
+    "infer_len": 49,
+    "overlap": 5,
+    "num_inference_steps": 40,
+    "guidance_scale": 5.0,
+    "dynamic_cfg": true,
+    "dynamic_cfg_max_step": 15,
+    "dynamic_cfg_min": 1.0,
+    "seed": 42,
+    "dtype": "bf16",
+    "bbox_padding": 0,
+    "bbox_expand_scale": 0.3,
+    "dilate_px": 8,
+    "mask_scale": 1.0,
+    "feather_px": 8,
+    "adain_boundary_dilate": 0,
+    "enable_paste_back": true,
+    "save_crop_only": false,
+    "use_clip": true,
+    "clip_preprocess": "diffuser",
+    "decode_mode": "stream",
+    "enable_teacache": false,
+    "enable_frame_interpolation": false,
+    "enable_upscaling": false
+  }' | python3 -m json.tool
+```
+
+成功入队的 Gateway 响应类似：
+
+```json
+{
+  "code": 0,
+  "message": "accepted",
+  "task_id": "videoedit-normal-local-001",
+  "status": "dispatching",
+  "variant": "normal"
+}
+```
+
+如果显式设置 `save_crop_only=true`，会在主输出外额外生成 `/home/zhouhao6/VideoEdit/test/output_normal_001_crop_only.mp4`；这会增加一次 resize、视频编码、I/O 和磁盘占用。命名和写盘逻辑见 [`wan_videoedit_pipeline.py`](../python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py#L592)。
+
+服务还会写 `/home/zhouhao6/VideoEdit/test/output_normal_001.videoedit.json`，记录 bbox、帧数和窗口物化信息。元数据写盘逻辑见 [`wan_videoedit_pipeline.py`](../python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py#L528)。
+
+`output_path` 可以是文件或目录：传视频文件名时使用其目录和基名，但最终扩展名优先跟随源视频；传目录时生成 `<task_id><源视频扩展名>`。未传时写入对应 backend 的 `OUTPUT_DIR/{normal,dmd}`。解析逻辑见 [`video_api.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py#L825)。每次重复执行示例前请更换 `task_id`，因为 Gateway 会拒绝数据库中已存在的 ID。
+
+## 5. 请求参数口径
+
+| 参数 | 当前行为 |
+| --- | --- |
+| `model` | `videoedit`、`videoedit-normal`、`normal` 路由 normal；`videoedit-dmd`、`dmd` 路由 DMD |
+| `timeout` | `-1` 表示不限时；也可用正整数秒；`0` 或小于 `-1` 非法 |
+| `num_frames` | `-1`/`null` 处理完整视频；正数取请求值与源帧数的较小值 |
+| `ref_frame_idx` | 任意非负参考帧索引；显式 `num_frames>0` 时必须小于 `num_frames` |
+| `infer_len` | 必须 `>=1` 且满足 `(infer_len - 1) % 4 == 0` |
+| `overlap` | 必须满足 `0 <= overlap < infer_len` |
+| `bridge_overlap` | 必须 `>=1` 且满足 `(bridge_overlap - 1) % 4 == 0` |
+| `decode_mode` | 默认 `stream`，降低输入侧主存；`eager` 一次性解码全视频，但可避免 backward pass 缓存缺失时重复解码 |
+| `enable_teacache` | API 默认 `true`；追求当前 golden 对齐时必须显式设为 `false` |
+| `save_crop_only` | 默认 `false`；需要额外保存 crop sidecar 时显式设为 `true` |
+| Attention backend | 不是 repair API 字段；由服务启动参数决定，当前双服务脚本未固定，完整 golden 需启动时指定 `torch_sdpa` |
+
+视频和 mask 的总帧数必须相等，否则请求在预处理阶段失败；`num_frames=-1` 会解析为完整源帧数。实现见 [`preprocess.py`](../python/sglang/multimodal_gen/runtime/videoedit/preprocess.py#L97)。
+
+normal 请求使用客户端给出的采样参数。normal 完成后，使用新的 `task_id`，将 `model` 改为 `videoedit-dmd` 再提交；分别检查任务完成、输出文件及视频解码。DMD 请求由 Gateway 覆盖为固定 4 步策略，因此不要用 DMD 结果验证 normal 的 40 步 golden。
+
+## 6. 远程输入与 S3/MinIO 输出
+
+远程输入使用 URL，输出上传到 S3/MinIO。独立部署时应随请求提供 `minio_config`：
+
+```bash
+curl --noproxy '*' -sS \
+  -X POST http://127.0.0.1:5402/v1/videos/repairs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "task_id": "videoedit-normal-remote-001",
+    "model": "videoedit-normal",
+    "timeout": -1,
+    "prompt": "一个男人站在舞台中央演讲，背后有两排巨大的立体文字。",
+    "video_url": "http://minio.example.com:9000/flowcut/input/1080.mp4",
+    "mask_url": "http://minio.example.com:9000/flowcut/input/mask_1080.mp4",
+    "reference_image_url": "http://minio.example.com:9000/flowcut/input/local.png",
+    "minio_config": {
+      "endpoint": "minio.example.com:9000",
+      "bucket_name": "flowcut",
+      "access_key": "your-access-key",
+      "secret_key": "your-secret-key",
+      "secure": false,
+      "region": "us-east-1"
+    },
+    "output_storage": "s3",
+    "output_bucket": "flowcut",
+    "output_object_key": "test/output/remote_001.mp4",
+    "num_frames": -1,
+    "ref_frame_idx": 0,
+    "bridge_overlap": 5,
+    "infer_len": 49,
+    "overlap": 5,
+    "num_inference_steps": 40,
+    "guidance_scale": 5.0,
+    "dynamic_cfg": true,
+    "dynamic_cfg_max_step": 15,
+    "dynamic_cfg_min": 1.0,
+    "seed": 42,
+    "dtype": "bf16",
+    "decode_mode": "stream",
+    "save_crop_only": false,
+    "enable_teacache": false,
+    "enable_paste_back": true
+  }' | python3 -m json.tool
+```
+
+注意：
+
+- 未配置全局云存储时，`output_storage=s3` 或传入 `output_object_key` 都要求 `minio_config`；
+- 未传 `output_object_key` 时，默认生成 `YYYY/MM/DD/HHMMSS_{task_id}.{源视频扩展名}`；MP4 输入对应 `.mp4`；
+- `output_bucket` 未传时使用 `minio_config.bucket_name`；
+- 当前上传流程只上传并清理主输出；如果生成了 `*_crop_only.mp4`，它和 `*.videoedit.json` sidecar 都仍保留在 backend 本地输出目录；
+- 示例使用 snake_case。接口只兼容协议中明确列出的少量 camelCase 别名，不要假设所有字段都能自动转成驼峰。
+
+存储校验和默认 object key 见 [`video_api.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py#L419) 与 [`protocol.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/protocol.py#L159)。
+
+## 7. 查询进度、队列和取消任务
+
+设置任务 ID：
+
+```bash
+TASK_ID=videoedit-normal-local-001
+```
+
+查询完整任务：
+
+```bash
+curl --noproxy '*' -sS \
+  "http://127.0.0.1:5402/v1/videos/${TASK_ID}" \
+  | python3 -m json.tool
+```
+
+只查询进度：
+
+```bash
+curl --noproxy '*' -sS \
+  "http://127.0.0.1:5402/v1/videos/${TASK_ID}/progress" \
+  | python3 -m json.tool
+```
+
+查看 Gateway 队列：
+
+```bash
+curl --noproxy '*' -sS \
+  'http://127.0.0.1:5402/admin/queue?limit=20' \
+  | python3 -m json.tool
+```
+
+取消当前任务：
+
+```bash
+curl --noproxy '*' -sS \
+  -X DELETE "http://127.0.0.1:5402/v1/videos/${TASK_ID}" \
+  | python3 -m json.tool
+```
+
+任务记录持久化，normal 和 DMD 共享一个执行名额，不支持排队。任务处于 `dispatching`、`running` 或 `cancelling` 时，新请求返回 HTTP 200、`code: 2`、`message: "A task is running."`，不保存新任务；空闲时返回 `code: 0`、`status: "dispatching"`。升级时，旧数据库里的 `queued` 任务会被标记为 `cancelled`，需要空闲后使用新 `task_id` 重新提交。重复提交同一个 `task_id` 返回 HTTP 409；目标 backend 不健康时返回 HTTP 503。接口定义见 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L425)。
+
+Gateway 不代理 backend 的 `/content` 下载接口。本地输出完成后读取响应中的 `file_path`；S3/MinIO 输出读取 `url` 或 `output_object_key`。
+
+不要在 active 任务存在时重启服务。Gateway 队列保存在 SQLite 中，但 backend 任务状态保存在进程内存；重启后 Gateway 可能找不到原 backend 任务并暂停队列，以避免重复执行。操作前先检查 `/admin/queue`；遇到 stale active 记录时，应先备份 `QUEUE_DB` 再人工处置，不要直接删除生产队列文件。恢复保护见 [`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py#L273)。
+
+## 8. 日志与请求审计
+
+查看容器聚合日志：
+
+```bash
+docker logs -f videoedit_l40s
+```
+
+分别查看组件日志：
+
+```bash
+docker exec videoedit_l40s \
+  tail -f /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/normal.log
+
+docker exec videoedit_l40s \
+  tail -f /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/dmd.log
+
+docker exec videoedit_l40s \
+  tail -f /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/gateway.log
+```
+
+启动资源监控日志：
+
+```bash
+docker exec videoedit_l40s \
+  tail -f /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/normal-resource.log
+
+docker exec videoedit_l40s \
+  tail -f /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/dmd-resource.log
+```
+
+资源与启动门禁记录位于：
+
+```text
+/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/normal-startup.json
+/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/dmd-startup.json
+/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/dual-idle-gate.json
+```
+
+### 8.1 开启逐请求审计
+
+当前 `ServerArgs` 默认关闭请求审计。虽然容器启动脚本创建并传入了 `VIDEOEDIT_REQUEST_LOG_DIR` 环境变量，但 [`start.sh`](../scripts/videoedit_dual_service/start.sh#L99) 尚未把该环境变量映射为 `sglang serve` 参数，因此只设置环境变量不会生成审计文件。
+
+如需开启，在 `start_backend()` 的 `sglang serve` 命令中加入：
+
+```text
+--videoedit-request-log-dir "$VIDEOEDIT_REQUEST_LOG_DIR"
+```
+
+然后重启或重建容器。默认会脱敏 access key、secret key 等字段。生产环境不建议添加 `--videoedit-request-log-sensitive-values true`；审计开关定义见 [`server_args.py`](../python/sglang/multimodal_gen/runtime/server_args.py#L861)，脱敏实现见 [`request_audit.py`](../python/sglang/multimodal_gen/runtime/videoedit/request_audit.py#L43)。
+
+查看审计文件：
+
+```bash
+docker exec videoedit_l40s \
+  bash -lc 'ls -lt "$VIDEOEDIT_REQUEST_LOG_DIR"'
+```
+
+## 9. 常见问题
+
+### 请求立即失败并提示 removed fields
+
+删除 `drop_reference_frame`、`dropReferenceFrame`、`chunks`、`generator_device`、`strength` 等已移除字段。这些语义已经固定在服务端，不再允许请求覆盖。
+
+### health 是 degraded_normal_only
+
+normal 仍可用，但 `videoedit-dmd` 请求会返回 HTTP 503。检查 DMD checkpoint 校验结果、`dmd.log`、`dmd-resource.log` 和 `dual-idle-gate.json`。
+
+### 请求返回 code: 2
+
+Gateway 忙碌时拒绝新任务，不会自动排队。先查询 `/admin/queue` 和当前 active 任务，再查看对应 backend 日志。不要同时直接调用内部 `31100/32100` 端口绕过 Gateway。
+
+### 长视频主机内存过高
+
+`stream` 和关闭 crop sidecar 已是默认值；若仍然过高，应检查请求是否显式覆盖为
+`decode_mode=eager` 或 `save_crop_only=true`。注意任意参考帧导致 backward pass 时，
+stream 缓存淘汰可能触发重复从头解码，需要结合视频长度实测时延。
+
+### 只需要生产输出，不需要对齐 sidecar
+
+设置：
+
+```json
+{
+  "save_crop_only": false
+}
+```
+
+这不会关闭主视频的 paste-back；主输出是否 paste-back 由 `enable_paste_back` 控制。
+
+## 10. 主要实现依据
+
+- 容器生命周期与挂载：[`start_videoedit_container.sh`](../scripts/start_videoedit_container.sh)
+- 双 backend 启动和降级：[`videoedit_dual_service/start.sh`](../scripts/videoedit_dual_service/start.sh)
+- Gateway 路由、串行队列和任务接口：[`dual_service_gateway.py`](../python/sglang/multimodal_gen/runtime/videoedit/dual_service_gateway.py)
+- API 字段、默认值和删除字段：[`protocol.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/protocol.py)
+- 请求校验、下载、输出和回调：[`video_api.py`](../python/sglang/multimodal_gen/runtime/entrypoints/openai/video_api.py)
+- 当前 strict 配置：[`wan_videoedit.py`](../python/sglang/multimodal_gen/runtime/models/dits/wan_videoedit.py#L84)
+
+## 附录 A. 历史部署与测试记录（2026-09-21 UTC）
+
+- 当时容器：`videoedit_l40s`；旧容器 `videoedit_reset` 保留，未删除。以下状态均为当日记录。
 - 镜像：`sglang-videoedit-src:l40s`，ID `sha256:da597cfcbcfa9628bafd63ab9963353dfe2d325a0d0f1ec1ffd951ceefbdb8b9`。镜像由用户提前构建，本次完成启动与验收。
 - GPU：宿主 4、5（容器内 0、1）；测试结束每卡占用 11134 MiB、空闲 34326 MiB。
 - 入口：`http://127.0.0.1:5402`；宿主端口实际映射 `0.0.0.0:5402 → 30000`，同时有 IPv6 映射。
 - 最终健康：`status=ok`，`normal=true`、`dmd=true`；队列 `completed=2`、`failed=0`、`queued=0`、`running=0`。
-- 本机启动参数保存在 [start-container.sh](../.local/videoedit-l40s/start-container.sh)，配置为 [config.l40s.env](../scripts/videoedit_dual_service/config.l40s.env)。启动脚本有同名容器保护；已有容器日常使用 `docker start/restart videoedit_l40s`。
+- 本机启动参数保存在 [start-container.sh](../.local/videoedit-l40s/start-container.sh)，配置为 [videoedit-l40s.0123.env](../scripts/videoedit_dual_service/videoedit-l40s.0123.env)  [videoedit-l40s.4567.env](../scripts/videoedit_dual_service/videoedit-l40s.4567.env)。启动脚本有同名容器保护；已有容器日常使用 `docker start/restart videoedit_l40s`。
 
 | 模型 | 测试任务 ID | 接口报告推理耗时 | 结果 |
 | --- | --- | --- | --- |
@@ -31,7 +465,7 @@ docker exec videoedit_l40s python3 -u \
 
 `.local/` 包含缓存、日志、队列和测试输出，应作为本机运行数据保留，不应整体提交到 Git。
 
-### 0.1 105 帧任务停在 99% 的修复与完整复测
+### A.1 105 帧任务停在 99% 的修复与完整复测
 
 任务 `videoedit-normal-l40s-3aae5381c0244f139d98398a52f4be55` 的最后一次去噪于
 13:37:01 完成、VAE 解码于 13:38:09 完成、贴回后的元数据于 13:38:23 写出。
@@ -42,7 +476,7 @@ docker exec videoedit_l40s python3 -u \
 
 - 文件输出且关闭插帧、超分时，只由 rank 0 将 PIL 帧交给视频编码器，直接返回
   `OutputBatch.output_file_paths`，不再整段构造 float32 视频张量。其余调用保留张量路径。
-- 本机 `config.l40s.env` 设置 `VIDEOEDIT_DISABLE_THP=true`。启动脚本通过
+- 本机 `videoedit-l40s.0123.env` 设置 `VIDEOEDIT_DISABLE_THP=true`。启动脚本通过
   `disable_thp_exec.py` 调用 Linux `PR_SET_THP_DISABLE`，仅影响新启动的后端及其
   Python worker、FFmpeg 子进程，不修改宿主 `/sys` 设置。通用配置示例默认关闭此选项。
 
@@ -71,388 +505,57 @@ stream decode 和 paste-back 参数完成一次完整 normal 请求：
 推理期间每 3 分钟轮询一次，此次轮询直接从 92% 到完成，因此 99% 后耗时采用日志计算，
 不声称轮询精确测得了 99% 的停留时间。未来重启仍会中断在途任务，不能从内存结果断点续跑。
 
-## 1. 本机核对结果
 
-| 项目 | 本次确认结果 |
+## 附录 B. Devcontainer 镜像说明与检查
+
+L20 / L40S 均使用 [`.devcontainer/Dockerfile`](../.devcontainer/Dockerfile)，构建命令见 §3.2。
+
+| 项目 | 来源 / 设置 |
 | --- | --- |
-| 双模型入口 | `scripts/start_videoedit_container.sh` 存在，默认镜像为 `sglang-mgtv:1.0` |
-| 服务配置 | `scripts/videoedit_dual_service/config.env` 存在，路径仍为原机器 `/root/VideoEdit` |
-| 本机专用文件 | 已新增 `docker/videoedit-l40s.Dockerfile` 及专用构建上下文过滤文件；`config.l40s.env` 已按 §4 生成 |
-| 模型 | 基础模型及两个 transformer 已成功加载并完成推理 |
-| 本地素材 | `/home/zhouhao6/VideoEdit/test/` 下已有 `1080.mp4`、`mask_1080_merged.mp4`、`local.png`；视频与 mask 均已确认 1920×1080、25 fps、105 帧 |
-| 运行状态 | 经宿主访问权限验证：容器运行、GPU 正常、5402 双后端健康，见 §0 |
+| 基础镜像 | `lmsysorg/sglang:nightly-dev-cu13-20260601-373cadc9`，默认固定 digest，支持 `BASE_IMAGE` 覆盖 |
+| 基础镜像 digest | `sha256:0068fe3bf3f78f42d3d18314e8b0b6d7a721a4968b37a7d689257a6ea3915d36` |
+| Python 依赖 | 继承基础镜像，额外安装 `ftfy==6.3.1`、`boto3==1.43.102`、`minio==7.2.20` |
+| 安装环境 | 切换用户前通过基础镜像的 `python3 -m pip` 安装；不创建 `/opt/venv` |
+| 系统工具 | sudo、ffmpeg / ffprobe、curl、flock（util-linux）、procps、zsh |
+| 开发工具 | 在 `devuser` 下安装 uv、Rust |
+| 镜像默认用户 | `devuser`；服务启动脚本默认使用 `--user root` |
+| 构建参数 | `HOST_UID` / `HOST_GID` 默认均为 `1003`；`BASE_IMAGE` 默认如上 |
+| 源码及配置 | 此 Dockerfile 不复制宿主源码及机型配置；启动时由宿主绑定挂载 |
 
-不沿用旧版中未经本次核实的“已上线”“镜像冒烟全绿”“GPU 4/5 空闲”等结论。下文命令均在具备 Docker 权限的**宿主 Bash 终端**执行。
+2026-09-28 使用本地基础镜像 `sglang-base:20260601-local` 构建成功，最终镜像为 `sglang-videoedit-dev-v2:l40s`，ID 为 `sha256:5a738194cb3b16f3dcc7ab3760500ac660ac9743f93076398082068c6f9d2fe6`。实测依赖为 PyTorch `2.11.0+cu130`、`sglang-kernel 0.4.3`；挂载当前源码后，`fp8_blockwise_scaled_mm` 导入和 pipeline 模块查找均通过。检查中出现 `torchao` Tensor 对象导入警告，未进行模型加载或推理验收；现有服务容器未重启。该记录不代表 L20 已验收，也不代表镜像使用了 `sglang-kernel 0.4.2.post2`。
 
-## 2. 部署前检查
-
-```bash
-cd /home/zhouhao6/VideoEdit/sglang
-id
-docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
-docker image ls
-nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv
-free -h
-df -h .
-ss -ltn '( sport = :5402 )'
-```
-
-确认 Docker 可访问、宿主驱动正常、5402 可用，并确认分配给服务的两张 GPU。本文使用 `4,5` 作为示例，不表示这些卡目前空闲或已获分配。
-
-若 Docker 报权限不足，检查登录用户的组权限。仅在用户已经获 docker 组权限、当前会话尚未刷新时，可重新登录或运行 `sg docker` 进入具有该组身份的 shell。不能据此宣称所有会话都无需提权。
-
-### 2.1 拓扑与路径
-
-| 项目 | 配置 |
-| --- | --- |
-| 容器名 | `videoedit_l40s` |
-| Gateway | 容器 `0.0.0.0:30000` → 宿主 `5402`，唯一对外入口 |
-| normal 后端 | 容器内 `127.0.0.1:31100` |
-| DMD 后端 | 容器内 `127.0.0.1:32100` |
-| GPU | 宿主示例 `4,5`，容器内 `0,1`；两个后端共用两张卡 |
-| 本机运行数据 | 仓库内 `.local/videoedit-l40s/`，隔离历史队列 |
-
-Gateway 串行调度请求。两后端均使用 `--num-gpus 2 --sp-degree 2 --ulysses-degree 2 --ring-degree 1`，开启 DiT 逐层 offload 和 T5 / CLIP / VAE CPU offload。不能只改 GPU 列表就切换到单卡运行。
-
-启动脚本将 `/home/zhouhao6/VideoEdit` 同路径挂载进容器，并额外挂载仓库到 `/sgl-workspace/sglang`。请求可以直接使用挂载范围内的宿主绝对路径。内部通信端口不映射到宿主。
-
-注意：启动脚本的 `PROJECT_ROOT` 是 `/home/zhouhao6/VideoEdit`（挂载根），服务配置文件中的 `PROJECT_ROOT` 是 `/home/zhouhao6/VideoEdit/sglang`（源码根）。
-
-## 3. 准备镜像
+构建完成后，先挂载当前源码检查 CUDA 导入路径，无需加载模型：
 
 ```bash
-# 后续命令沿用本终端中的变量；镜像名称按实际情况修改。
-export IMAGE_NAME=sglang-mgtv:1.0
-export HOST_GPUS=4,5
-export CONTAINER_NAME=videoedit_l40s
-docker image inspect "$IMAGE_NAME" --format '{{.Id}}'
-```
-
-若镜像不存在，先从原部署机器导出并导入，或从实际持有镜像的内部仓库获取。导出 / 导入示例：
-
-```bash
-# 在原部署机器的仓库目录执行，然后将归档传到本机仓库目录。
-docker save -o sglang-mgtv-1.0.tar sglang-mgtv:1.0
-
-# 在本机仓库目录执行。
-docker load -i sglang-mgtv-1.0.tar
-docker image inspect "$IMAGE_NAME" --format '{{.Id}}'
-```
-
-当前 `python/pyproject.toml` 声明 `torch==2.9.1`、`sglang-kernel==0.4.1`、`flashinfer_python==0.6.7.post2` 和 `flashinfer_cubin==0.6.7.post2`。镜像名称不能证明兼容性，必须执行 §4 的检查。
-
-### 3.1 基于当前源码构建（无需原服务镜像）
-
-使用本次新增的 [videoedit-l40s.Dockerfile](../docker/videoedit-l40s.Dockerfile)。它从 CUDA 开发镜像安装本地 `python[diffusion]`，包含当前工作区未提交的 Python 改动。这里的“源码构建”指 SGLang 使用当前源码，PyTorch 和 sglang-kernel 等依赖仍优先使用发行 wheel，不是将全部依赖从 C++ 源码编译。
-
-构建配置：
-
-| 项目 | 设置 |
-| --- | --- |
-| 基础镜像 | `nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04`，可用 `BASE_IMAGE` 覆盖 |
-| Python | Ubuntu 24.04 的 Python 3.12，虚拟环境 `/opt/venv` |
-| PyTorch | 先从 cu129 索引安装 `torch==2.9.1`、`torchaudio==2.9.1` |
-| 应用依赖 | 安装当前 `python/pyproject.toml` 的 `diffusion` extra，不手工删减依赖 |
-| CUDA 扩展 | `TORCH_CUDA_ARCH_LIST=8.9`，`MAX_JOBS=4`；面向 L40S |
-| 媒体和进程工具 | ffmpeg / ffprobe、curl、flock、procps |
-| CLI | 提供 `/usr/local/bin/sglang`，兼容当前服务配置 |
-
-在仓库根目录执行：
-
-```bash
-cd /home/zhouhao6/VideoEdit/sglang
-export IMAGE_NAME=sglang-videoedit-src:l40s
-export HOST_GPUS=4,5  # 先核实实际分配
-export CONTAINER_NAME=videoedit_l40s
-mkdir -p .local/videoedit-l40s/build
-# 记录工作区状态：revision 标签只记录 HEAD，不包含未提交改动。
-git rev-parse HEAD > .local/videoedit-l40s/build/source-revision.txt
-git status --short > .local/videoedit-l40s/build/source-status.txt
-(
-  set -euo pipefail
-  docker build --progress=plain \
-    -f docker/videoedit-l40s.Dockerfile \
-    --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
-    -t "$IMAGE_NAME" . \
-    2>&1 | tee .local/videoedit-l40s/build/build.log
-)
-```
-
-专用 `.dockerignore` 只发送 Python 源码和服务脚本，不发送模型、运行数据库和测试视频。本机 `config.l40s.env` 也不烘焙进镜像，启动时由宿主挂载。构建不需要把 GPU 传入 Docker；扩展仍可能进行较长时间的 CUDA 编译。
-
-如果需要使用可访问的镜像仓库或包索引，可在上述 `docker build` 增加：
-
-```text
---build-arg BASE_IMAGE=<可访问仓库中的同版本CUDA镜像>
---build-arg PIP_INDEX_URL=<可访问的Python包索引/simple>
---build-arg TORCH_INDEX_URL=<提供torch-2.9.1-cu129的索引>
-```
-
-这些是占位参数，不要原样执行。本指南没有验证任何代理站点的可达性。Docker 拉取基础镜像的代理由 Docker daemon 配置；构建步骤内的下载代理可通过 Docker 的 `HTTP_PROXY` / `HTTPS_PROXY` 构建参数传入。使用宿主回环代理时还需按实际构建器配置网络，不能假设容器的 `127.0.0.1` 就是宿主。
-
-构建结束先检查**镜像自身**，本步骤不挂载宿主源码，防止挂载掩盖镜像打包问题：
-
-```bash
-docker run --rm "$IMAGE_NAME" bash -lc '
-  set -euo pipefail
-  python3 -m pip check
-  python3 -c "import sglang; print(sglang.__file__)"
-  test -x /usr/local/bin/sglang
-  /usr/local/bin/sglang serve --help
-  ffmpeg -version
-  ffprobe -version
+docker run --rm --user root --gpus "\"device=${HOST_GPUS}\"" \
+  -v "$PWD:/sgl-workspace/sglang:ro" \
+  -e PYTHONPATH=/sgl-workspace/sglang/python \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  --entrypoint python3 "$IMAGE_NAME" -B -c '
+import importlib.util
+import torch
+import sgl_kernel
+import sglang
+print("source:", sglang.__file__)
+print("torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("sgl_kernel:", sgl_kernel.__version__)
+from sgl_kernel import fp8_blockwise_scaled_mm
+spec = importlib.util.find_spec("sglang.multimodal_gen.runtime.pipelines.wan_videoedit_pipeline")
+assert spec is not None
+print(spec)
 '
-docker image inspect "$IMAGE_NAME" --format '{{.Id}}'
-docker run --rm "$IMAGE_NAME" cat /opt/videoedit-build/pip-freeze.txt \
+```
+
+检查必须通过后再重建服务容器。`fp8_blockwise_scaled_grouped_mm` 是另一接口，不能根据 ImportError 的名称提示直接替换。也不要只在 CUDA 13 的 dev 镜像内降级 kernel：PyTorch、CUDA 扩展和其余依赖需要一起匹配。服务健康和双模型推理仍须按 §3.4、§4–5 验收。
+
+需要保存环境记录时：
+
+```bash
+mkdir -p .local/videoedit-l40s/build
+docker image inspect "$IMAGE_NAME" --format '{{.Id}}' \
+  > .local/videoedit-l40s/build/image-id.txt
+docker run --rm --user root "$IMAGE_NAME" python3 -m pip freeze \
   > .local/videoedit-l40s/build/pip-freeze.txt
 ```
 
-然后依次执行 **§4 配置与 GPU / 模型预检 → §5 启动 → §6 健康检查 → §7 双模型推理验收**，保持 `IMAGE_NAME=sglang-videoedit-src:l40s`。
-
-如果替换已有容器，先按 §8 清空任务并停止、删除旧容器，再执行 §5；单纯 `docker restart` 不会切换到新镜像。构建新镜像本身不会修改正在运行的容器。
-
-### 3.2 源码构建的边界与排错
-
-- 镜像由用户构建；本次已验证当前镜像的源码导入、GPU 可见性及双模型推理，见 §0。新构建产物仍须重新预检和验收。
-- 当前依赖包含 `st_attn`、`vsa` 等扩展。Dockerfile 先安装 torch，再用 `--no-build-isolation` 安装应用依赖，使扩展能找到 torch；这不保证所有扩展在 L40S 上都有可用内核。若失败，保留首次构建错误并检查对应包，不要用 `--no-deps` 跳过后认定成功。
-- `pyproject.toml` 中部分依赖没有固定版本，因此相同源码在不同日期构建可能解析出不同依赖。`pip-freeze.txt` 记录实际环境，但不是带哈希的完整锁文件；稳定部署后应保存镜像 digest / 归档及依赖记录。
-- 当前启动脚本会将宿主仓库挂载到镜像源码路径上。线上实际运行的是宿主源码；若修改依赖声明，需要重建镜像，只有 Python 代码变化时通常可重启生效。
-- `.devcontainer/Dockerfile` 使用浮动的 `lmsysorg/sglang:dev`；`scripts/rebuild_image_create_videoedit_container.sh` 启动单后端，均不作为本文双模型重建入口。
-
-## 4. 本机配置与镜像预检
-
-生成本机配置副本，保留通用 `config.env`。运行文件全部放在仓库内；若本机配置已存在，下面的命令保留它，请人工检查路径：
-
-```bash
-cd /home/zhouhao6/VideoEdit/sglang
-python3 - <<'PY'
-from pathlib import Path
-repo = Path.cwd()
-source = repo / 'scripts/videoedit_dual_service/config.env'
-target = source.with_name('config.l40s.env')
-if target.exists():
-    print(f'保留已有配置，请检查：{target}')
-else:
-    config = source.read_text().replace('/root/VideoEdit', '/home/zhouhao6/VideoEdit')
-    config = config.replace('/home/zhouhao6/VideoEdit/tmp/sglang-videoedit-dual', str(repo / '.local/videoedit-l40s/dual'))
-    config = config.replace('/home/zhouhao6/VideoEdit/tmp/sglang-videoedit-outputs', str(repo / '.local/videoedit-l40s/outputs'))
-    target.write_text(config)
-    print(f'已生成：{target}')
-PY
-mkdir -p .local/videoedit-l40s/{dual,inputs,outputs,request-logs,cache}
-cat scripts/videoedit_dual_service/config.l40s.env
-```
-
-模型路径应为：
-
-```text
-BASE_MODEL=/home/zhouhao6/VideoEdit/model/DifusserEdit/pretrain_models/VideoEdit-diffusers-model
-NORMAL_TRANSFORMER=/home/zhouhao6/VideoEdit/model/DifusserEdit/pretrain_models/VideoEdit-diffusers-model/transformer
-DMD_TRANSFORMER=/home/zhouhao6/VideoEdit/model/DifusserEdit/merged_dit_lightx2v_lora_scale_1p0
-```
-
-使用选定镜像检查源码导入、GPU、媒体工具和模型，不启动推理服务：
-
-```bash
-docker run --rm -i --gpus "\"device=${HOST_GPUS}\"" --user root \
-  -v /home/zhouhao6/VideoEdit:/home/zhouhao6/VideoEdit \
-  -w /home/zhouhao6/VideoEdit/sglang \
-  -e PYTHONPATH=/home/zhouhao6/VideoEdit/sglang/python \
-  "$IMAGE_NAME" bash -s <<'CHECK'
-set -euo pipefail
-source scripts/videoedit_dual_service/config.l40s.env
-nvidia-smi
-command -v "$PYTHON_BIN"
-test -x "$SGLANG_BIN"
-command -v curl
-command -v flock
-command -v ffmpeg
-command -v ffprobe
-ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'libx264|libx265'
-"$PYTHON_BIN" - <<'PY'
-import torch
-import sglang
-from importlib.metadata import version
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
-import sglang.multimodal_gen.runtime.pipelines.wan_videoedit_pipeline
-import sglang.multimodal_gen.runtime.videoedit.dual_service_gateway
-print('sglang:', sglang.__file__)
-for name in ('torch', 'sglang-kernel', 'flashinfer-python', 'flashinfer-cubin'):
-    print(name, version(name))
-assert torch.cuda.is_available()
-assert torch.cuda.device_count() == 2
-PY
-"$SGLANG_BIN" serve --help
-"$PYTHON_BIN" scripts/videoedit_dual_service/resource_probe.py validate-transformer "$NORMAL_TRANSFORMER"
-"$PYTHON_BIN" scripts/videoedit_dual_service/resource_probe.py validate-transformer "$DMD_TRANSFORMER"
-test -r "$BASE_MODEL/model_index.json"
-CHECK
-```
-
-确认帮助包含 `--dit-layerwise-offload`、`--num-gpus`、`--sp-degree`、`--ulysses-degree`、`--ring-degree`。若 CLI 不在 `/usr/local/bin/sglang`，将本机配置的 `SGLANG_BIN` 改为镜像中的实际绝对路径，`PYTHON_BIN` 也须对应同一 Python 环境。
-
-GPU、依赖或权重检查失败时先修复再启动。预检通过仅表示具备基本启动条件，不代表推理通过。
-
-## 5. 启动容器
-
-**脚本默认会删除同名容器，即使没有设置 `RECREATE=1`。** 首次启动命令增加了同名容器检查；已有容器时先按 §8 查看队列，再决定重启或重建。
-
-```bash
-cd /home/zhouhao6/VideoEdit/sglang
-(
-  set -euo pipefail
-  : "${IMAGE_NAME:?先完成镜像准备}"
-  : "${HOST_GPUS:?先确认两张GPU的分配}"
-  : "${CONTAINER_NAME:?先设置容器名}"
-  docker image inspect "$IMAGE_NAME" >/dev/null
-  test -r scripts/videoedit_dual_service/config.l40s.env
-  existing="$(docker ps -aq -f "name=^/${CONTAINER_NAME}$")"
-  if [ -n "$existing" ]; then
-    echo '同名容器已存在，请先按第8节检查队列并决定重启或重建。' >&2
-    exit 1
-  fi
-  env \
-    IMAGE_NAME="$IMAGE_NAME" CONTAINER_NAME="$CONTAINER_NAME" \
-    PROJECT_ROOT=/home/zhouhao6/VideoEdit \
-    HOST_REPO_DIR=/home/zhouhao6/VideoEdit/sglang \
-    WORKDIR_IN_CONTAINER=/home/zhouhao6/VideoEdit/sglang \
-    DUAL_SERVICE_DIR_HOST=/home/zhouhao6/VideoEdit/sglang/scripts/videoedit_dual_service \
-    DUAL_SERVICE_CONFIG_HOST=/home/zhouhao6/VideoEdit/sglang/scripts/videoedit_dual_service/config.l40s.env \
-    DUAL_SERVICE_CONFIG_CONTAINER=/home/zhouhao6/VideoEdit/sglang/scripts/videoedit_dual_service/config.l40s.env \
-    HOST_GPUS="$HOST_GPUS" CONTAINER_CUDA_VISIBLE_DEVICES=0,1 \
-    HOST_PORT=5402 CONTAINER_PORT=30000 \
-    INPUT_SAVE_DIR=/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/inputs \
-    VIDEOEDIT_OUTPUT_DIR=/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/outputs \
-    VIDEOEDIT_REQUEST_LOG_DIR=/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/request-logs \
-    VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES=false \
-    CACHE_DIR=/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/cache \
-    bash scripts/start_videoedit_container.sh
-)
-```
-
-`FLASHINFER_WORKSPACE_BASE` 和 `XDG_CACHE_HOME` 默认由 `CACHE_DIR` 派生。容器以 root 运行，生成文件可能属于 root。
-
-启动顺序是 normal → DMD → Gateway。`STARTUP_TIMEOUT=900` 是每个后端的启动监测超时，不是整个服务的总超时；等待期间查看日志，不要反复重建。
-
-normal 失败会导致启动失败；DMD 失败时降级为 normal-only。配置默认跳过第二服务的预测门禁，但保留双服务空闲门禁：GPU 余量 4 GiB、宿主和 cgroup 余量各 40 GiB。门禁通过不保证所有分辨率的推理都不会 OOM。
-
-## 6. 健康验收与日志
-
-以下命令按默认容器名编写，若自定义了名称，请一并替换。
-
-```bash
-curl --noproxy '*' -fsS --max-time 10 http://127.0.0.1:5402/health | python3 -m json.tool
-docker exec videoedit_l40s bash scripts/videoedit_dual_service/status.sh
-docker exec videoedit_l40s nvidia-smi
-docker logs --tail 200 videoedit_l40s
-```
-
-| `status` | 含义 |
-| --- | --- |
-| `ok` | normal 和 DMD 均健康，下一步执行推理验收 |
-| `degraded_normal_only` | 仅 normal 健康，尚未完成双模型部署 |
-| `unavailable` | normal 不健康，不可验收 |
-
-三种状态均返回 HTTP 200，不能只看 curl 退出码，须检查 `status` 和 `backends`。
-
-```bash
-docker exec videoedit_l40s tail -n 100 /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/normal.log
-docker exec videoedit_l40s tail -n 100 /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/dmd.log
-docker exec videoedit_l40s tail -n 100 /home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/dual/logs/gateway.log
-```
-
-脚本将 5402 发布到宿主所有接口。另从访问方机器请求 `http://<宿主IP>:5402/health` 验证网络；本地成功、远端失败时检查监听、路由和防火墙。
-
-## 7. 本地推理验收
-
-先检查视频与 mask 可解码、帧数一致，并确认参考图有效：
-
-```bash
-for name in 1080.mp4 mask_1080_merged.mp4; do
-  docker exec videoedit_l40s ffprobe -v error -select_streams v:0 \
-    -count_frames -show_entries stream=width,height,r_frame_rate,nb_read_frames \
-    -of json "/home/zhouhao6/VideoEdit/test/$name"
-done
-```
-
-下面根据 v2 的 normal 示例提交本机素材；自动生成唯一任务 ID，输出写入仓库运行目录。`num_frames=-1` 处理完整视频，执行前应了解素材长度和资源需求。
-
-```bash
-TASK_ID="videoedit-normal-l40s-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-export TASK_ID
-python3 - <<'PY' | curl --noproxy '*' -fsS \
-  -X POST http://127.0.0.1:5402/v1/videos/repairs \
-  -H 'Content-Type: application/json' --data-binary @-
-import json
-import os
-print(json.dumps({
-    'task_id': os.environ['TASK_ID'],
-    'model': 'videoedit-normal',
-    'timeout': -1,
-    'prompt': '两行字幕固定在人物后方。',
-    'video_input_path': '/home/zhouhao6/VideoEdit/test/0008/video.mp4',
-    'mask_input_path': '/home/zhouhao6/VideoEdit/test/0008/mask.json',
-    'reference_image_path': '/home/zhouhao6/VideoEdit/test/0008/reference.png',
-    'output_storage': 'local',
-    'output_path': '/home/zhouhao6/VideoEdit/sglang/.local/videoedit-l40s/outputs/' + os.environ['TASK_ID'] + '.mp4',
-    'num_frames': -1, 'ref_frame_idx': 0,
-    'num_inference_steps': 40, 
-    'seed': 1785978278, 
-    'bbox_expand_scale': 0.3,
-    'dilate_px': 8, 'mask_scale': 1.0, 'feather_px': 8
-}))
-PY
-```
-
-返回 `code: 0`、`status: "dispatching"` 代表任务已接收。normal 和 DMD 共享一个执行名额，不支持排队；忙碌时返回 HTTP 200、`code: 2`，请稍后重试。在同一个终端查询：
-
-```bash
-curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool
-curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/ae9587cb-d003-4961-86ad-a2e2b9b7cfb7/progress" | python3 -m json.tool
-curl --noproxy '*' -fsS 'http://127.0.0.1:5402/admin/queue?limit=100' | python3 -m json.tool
-
-curl --noproxy '*' -fsS "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool
-
-# 仅在需要取消该任务时执行。
-curl --noproxy '*' -fsS -X DELETE "http://127.0.0.1:5402/v1/videos/${TASK_ID}" | python3 -m json.tool
-
-curl --noproxy '*' -fsS -X DELETE "http://127.0.0.1:5402/v1/videos/6b502ac2-43ad-4cc5-a341-cbb1b786ce9a" | python3 -m json.tool
-curl --noproxy '*' -fsS -X DELETE "http://127.0.0.1:5402/v1/videos/b4877ed1-7d4e-48e5-89e9-06d506085367" | python3 -m json.tool
-```
-
-normal 完成后，将请求中的 `model` 改为 `videoedit-dmd`，重新生成任务 ID 后再提交；DMD 参数覆盖规则按 v2 文档执行。验收要求两种模型均完成任务，返回的输出文件存在，并通过 `ffprobe` 及播放检查。
-
-远程输入、`output_storage=s3` 和 `minio_config` 使用 v2 文档示例，将入口端口替换为 5402，并填写实际存储配置。不要在文档中保存密钥。
-
-## 8. 停止、重启和重建
-
-先查看 `/admin/queue`，确认没有执行中或待处理任务。Gateway 的 SQLite 队列持久化，后端任务状态在内存中；执行中重启可能导致队列暂停。不要删除数据库来绕过问题，也不要复用历史队列作为首次部署配置。
-
-```bash
-# 停止整个容器。
-docker stop videoedit_l40s
-
-# 启动已停止的容器。
-docker start videoedit_l40s
-
-# 重启并重新读取挂载的源码和服务配置。
-docker restart videoedit_l40s
-```
-
-修改挂载的 Python 代码或服务配置通常只需重启；修改镜像、端口、GPU、挂载或容器环境变量需要重建。重建前完成预检、记录旧镜像 ID 和部署参数，确认队列已清空，再明确执行 `docker rm -f videoedit_l40s`，随后重跑 §5。运行数据保存在宿主目录中，不随容器删除。
-
-脚本使用 `--restart unless-stopped`。正常停止使用 `docker stop`；仅杀容器内进程可能触发自动重启。
-
-## 9. 常见问题与验证边界
-
-| 现象 | 检查与处理 |
-| --- | --- |
-| 镜像不存在 | 按 §3 准备镜像，不能只改名称假定镜像可用 |
-| 导入失败 / CLI 不识别参数 | 按 §4 检查 Python、CLI 路径与依赖版本 |
-| GPU 容器启动失败 | 检查宿主驱动和 NVIDIA runtime；若 CDI 引用了不存在的驱动库，由宿主管理者检查并刷新 CDI。当前脚本不支持 `GPU_MODE=legacy` |
-| DMD 降级 | 查看 `dmd.log`、`dmd-resource.log`、`dual-idle-gate.json`，检查权重与资源门禁 |
-| Gateway 长时间不可达 | 查看后端加载日志、启动超时与容器是否反复重启 |
-| 请求审计目录为空 | 当前 `start.sh` 未传入 `--videoedit-request-log-dir`，仅设置环境变量不会开启审计；开启需另行修改启动参数，并保持敏感值记录关闭 |
-| 与历史 golden 不一致 | 当前脚本未固定 attention backend；依赖、后端和算法参数需另行核对，健康检查不证明数值等价 |
-
-本次已完成源码与路径核对、GPU 检查、宿主 5402 健康验证及双模型短视频端到端测试；完整视频、正式步数和画质验收仍需另行执行，范围见 §0。
+附录 A 是旧镜像的历史测试记录，不能作为此构建入口的验收结果。构建镜像不会更新现有容器；使用新镜像需按 §3.3 重建。

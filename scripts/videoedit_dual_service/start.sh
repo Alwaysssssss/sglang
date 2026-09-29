@@ -8,8 +8,32 @@ if [[ ! -r "$CONFIG_FILE" ]]; then
   echo "Copy ${SCRIPT_DIR}/config.env.example to config.env first." >&2
   exit 1
 fi
+# Environment overrides take precedence over assignments in config.env.
+# Example: CUDA_DEVICES=0,1 NUM_GPUS=2 SP_DEGREE=2 ULYSSES_DEGREE=2 RING_DEGREE=1 bash scripts/videoedit_dual_service/start.sh
+declare -A gpu_overrides=()
+for name in CUDA_DEVICES NUM_GPUS SP_DEGREE ULYSSES_DEGREE RING_DEGREE; do
+  if [[ -v "$name" ]]; then
+    gpu_overrides["$name"]="${!name}"
+  fi
+done
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+for name in "${!gpu_overrides[@]}"; do
+  printf -v "$name" '%s' "${gpu_overrides[$name]}"
+done
+unset gpu_overrides
+
+NUM_GPUS="${NUM_GPUS:-4}"
+SP_DEGREE="${SP_DEGREE:-${NUM_GPUS}}"
+ULYSSES_DEGREE="${ULYSSES_DEGREE:-${SP_DEGREE}}"
+RING_DEGREE="${RING_DEGREE:-1}"
+for name in NUM_GPUS SP_DEGREE ULYSSES_DEGREE RING_DEGREE; do
+  if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$name must be a positive integer; got: ${!name}" >&2
+    exit 1
+  fi
+done
+unset name
 
 export PYTHONPATH="${PROJECT_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
 PROBE="${SCRIPT_DIR}/resource_probe.py"
@@ -125,10 +149,10 @@ start_backend() {
       --nccl-port "$nccl_port" \
       --scheduler-response-timeout "$SCHEDULER_RESPONSE_TIMEOUT" \
       --strict-ports true \
-      --num-gpus 2 \
-      --sp-degree 2 \
-      --ulysses-degree 2 \
-      --ring-degree 1 \
+      --num-gpus "$NUM_GPUS" \
+      --sp-degree "$SP_DEGREE" \
+      --ulysses-degree "$ULYSSES_DEGREE" \
+      --ring-degree "$RING_DEGREE" \
       --dit-layerwise-offload true \
       --dit-offload-prefetch-size 0 \
       --dit-cpu-offload false \

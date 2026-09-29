@@ -6,13 +6,19 @@ import cv2
 import numpy as np
 import pytest
 from PIL import Image
+from sglang.multimodal_gen.runtime.videoedit import streaming
+from sglang.multimodal_gen.runtime.videoedit.progress import (
+    build_window_progress_payload,
+    read_videoedit_progress,
+    write_videoedit_progress,
+)
 from sglang.multimodal_gen.runtime.videoedit.streaming import run_streaming_edit
 
 
 @pytest.mark.parametrize("reference_index", [0, 3, 7])
 @pytest.mark.parametrize("bbox_mode", ["tight", "fixed_size", "global"])
 def test_streaming_output_keeps_source_order_and_excludes_conditioning(
-    tmp_path, reference_index, bbox_mode
+    tmp_path, reference_index, bbox_mode, monkeypatch
 ):
     video, mask = tmp_path / "input.mp4", tmp_path / "mask.npy"
     writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 5, (64, 64))
@@ -45,18 +51,52 @@ def test_streaming_output_keeps_source_order_and_excludes_conditioning(
         enable_paste_back=True,
         save_crop_only=True,
         preserve_audio=True,
+        num_inference_steps=2,
+        progress_path=str(tmp_path / "progress.json"),
         decode_mode="eager"
         if bbox_mode == "fixed_size" and reference_index == 3
         else "stream",
     )
     output = tmp_path / "result.mp4"
+    updates = []
+
+    def record_progress(path, payload):
+        write_videoedit_progress(path, payload)
+        updates.append(read_videoedit_progress(path))
+
+    monkeypatch.setattr(streaming, "write_videoedit_progress", record_progress)
 
     def identity_model(frames, masks, spec, chunk):
         assert len(frames) == 5
         assert not np.asarray(masks[0]).any()
+        # Model-free denoising updates interleaved with real window boundaries.
+        for step in range(params.num_inference_steps):
+            record_progress(
+                params.progress_path,
+                build_window_progress_payload(
+                    stage="denoising",
+                    total_frames=params.runtime_num_input_frames,
+                    infer_len=params.infer_len,
+                    overlap=params.overlap,
+                    total_windows=len(params.runtime_window_specs),
+                    current_window_index=getattr(
+                        params, "runtime_progress_window_index", spec.window_index
+                    ),
+                    current_step_index=step,
+                    steps_per_window=params.num_inference_steps,
+                ),
+            )
         return frames
 
     metadata = run_streaming_edit(params, identity_model, str(output))
+    progress = [update["progress"] for update in updates]
+    assert progress == sorted(progress), updates
+    assert progress[0] == 1
+    assert progress[-1] == 99
+    done = [update for update in updates if update["stage"] == "window_done"]
+    assert [update["completed_windows"] for update in done] == list(
+        range(1, len(metadata["window_specs"]) + 1)
+    )
     capture = cv2.VideoCapture(str(output))
     means = []
     while True:

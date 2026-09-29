@@ -180,6 +180,8 @@ def run_streaming_edit(
             clip.seq_idx, params.infer_len, params.overlap
         )
     ]
+    total_windows = len(params.runtime_window_specs)
+    steps_per_window = max(1, int(getattr(params, "num_inference_steps", 1)))
     check_cancel()
     with MaskReader(
         params.mask_input_path, (width, height), [(0, min(total, 32))]
@@ -272,14 +274,16 @@ def run_streaming_edit(
                         )
                 for chunk, spec in zip(clip.chunks, specs, strict=True):
                     check_cancel()
+                    params.runtime_progress_window_index = len(records)
                     if write_output:
                         payload = build_window_progress_payload(
                             stage="window_start",
                             total_frames=total,
                             infer_len=params.infer_len,
                             overlap=params.overlap,
-                            total_windows=sum(len(p.chunks) for p in clips),
+                            total_windows=total_windows,
                             current_window_index=len(records),
+                            steps_per_window=steps_per_window,
                         )
                         payload["pass"] = clip.label
                         write_videoedit_progress(
@@ -414,7 +418,17 @@ def run_streaming_edit(
                     )
                     carry = next_carry
                     if write_output:
-                        payload["stage"] = "window_done"
+                        payload = build_window_progress_payload(
+                            stage="window_done",
+                            total_frames=total,
+                            infer_len=params.infer_len,
+                            overlap=params.overlap,
+                            total_windows=total_windows,
+                            current_window_index=len(records) - 1,
+                            current_step_index=steps_per_window - 1,
+                            steps_per_window=steps_per_window,
+                        )
+                        payload["pass"] = clip.label
                         write_videoedit_progress(
                             getattr(params, "progress_path", None), payload
                         )

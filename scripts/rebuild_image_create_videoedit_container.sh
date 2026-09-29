@@ -3,25 +3,27 @@ set -euo pipefail
 
 # Build the devcontainer image, create a fresh VideoEdit container, and start serve.
 # Override any variable at invocation time, for example:
-#   HOST_GPUS=2,3 IMAGE_NAME=sglang-videoedit-reset:latest bash docs_tyx/scrips/rebuild_image_create_videoedit_container.sh
+#   HOST_GPUS=2,3 IMAGE_NAME=sglang-videoedit-reset:latest bash scripts/rebuild_image_create_videoedit_container.sh
 
-HOST_PROJECT_ROOT="${HOST_PROJECT_ROOT:-/root/VideoEdit}"
-HOST_REPO_DIR="${HOST_REPO_DIR:-/root/VideoEdit/sglang}"
+# Resolve defaults relative to this script, independent of the caller's directory.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST_REPO_DIR="$(cd -- "${HOST_REPO_DIR:-${SCRIPT_DIR}/..}" && pwd)"
+HOST_PROJECT_ROOT="$(cd -- "${HOST_PROJECT_ROOT:-${HOST_REPO_DIR}/..}" && pwd)"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-${HOST_REPO_DIR}/.devcontainer/Dockerfile}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-${HOST_REPO_DIR}}"
 
 IMAGE_NAME="${IMAGE_NAME:-sglang-videoedit-reset:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-videoedit_reset}"
 
-CONTAINER_PROJECT_ROOT="${CONTAINER_PROJECT_ROOT:-/root/VideoEdit}"
+CONTAINER_PROJECT_ROOT="${CONTAINER_PROJECT_ROOT:-${HOST_PROJECT_ROOT}}"
 CONTAINER_REPO_DIR="${CONTAINER_REPO_DIR:-/sgl-workspace/sglang}"
 WORKDIR_IN_CONTAINER="${WORKDIR_IN_CONTAINER:-${CONTAINER_REPO_DIR}}"
 
-MODEL_PATH="${MODEL_PATH:-/root/VideoEdit/model/DifusserEdit/pretrain_models/VideoEdit-diffusers-model}"
+MODEL_PATH="${MODEL_PATH:-${HOST_PROJECT_ROOT}/model/DifusserEdit/pretrain_models/VideoEdit-diffusers-model}"
 TRANSFORMER_PATH="${TRANSFORMER_PATH:-${MODEL_PATH}/transformer}"
 
-INPUT_SAVE_DIR="${INPUT_SAVE_DIR:-/root/VideoEdit/tmp/sglang-videoedit-cloud-inputs}"
-CACHE_DIR="${CACHE_DIR:-/root/VideoEdit/tmp/sglang-cache}"
+INPUT_SAVE_DIR="${INPUT_SAVE_DIR:-${HOST_PROJECT_ROOT}/tmp/sglang-videoedit-cloud-inputs}"
+CACHE_DIR="${CACHE_DIR:-${HOST_PROJECT_ROOT}/tmp/sglang-cache}"
 FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${CACHE_DIR}/flashinfer}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-${CACHE_DIR}/xdg}"
 

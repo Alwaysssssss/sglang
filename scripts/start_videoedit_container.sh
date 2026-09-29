@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Start the existing VideoEdit normal+DMD dual-service stack in one container.
 # Override any variable at invocation time, for example:
-#   RECREATE=1 HOST_GPUS=2,3 bash /root/VideoEdit/sglang/scripts/start_videoedit_container.sh
+#   RECREATE=1 HOST_GPUS=2,3 bash scripts/start_videoedit_container.sh
 # Both backends use both GPUs; the gateway serializes requests on port 30000.
 # If the container already exists, the default is to remove and recreate it.
 # Set RESTART_EXISTING=1 to restart the existing container instead.
@@ -11,19 +11,21 @@ set -euo pipefail
 IMAGE_NAME="${IMAGE_NAME:-sglang-mgtv:1.0}"
 CONTAINER_NAME="${CONTAINER_NAME:-videoedit_reset}"
 
-PROJECT_ROOT="${PROJECT_ROOT:-/root/VideoEdit}"
-HOST_REPO_DIR="${HOST_REPO_DIR:-/root/VideoEdit/sglang}"
+# Resolve defaults relative to this script, independent of the caller's directory.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST_REPO_DIR="$(cd -- "${HOST_REPO_DIR:-${SCRIPT_DIR}/..}" && pwd)"
+PROJECT_ROOT="$(cd -- "${PROJECT_ROOT:-${HOST_REPO_DIR}/..}" && pwd)"
 CONTAINER_REPO_DIR="${CONTAINER_REPO_DIR:-/sgl-workspace/sglang}"
-WORKDIR_IN_CONTAINER="${WORKDIR_IN_CONTAINER:-/root/VideoEdit/sglang}"
+WORKDIR_IN_CONTAINER="${WORKDIR_IN_CONTAINER:-${CONTAINER_REPO_DIR}}"
 DUAL_SERVICE_DIR_HOST="${DUAL_SERVICE_DIR_HOST:-${HOST_REPO_DIR}/scripts/videoedit_dual_service}"
 DUAL_SERVICE_CONFIG_HOST="${DUAL_SERVICE_CONFIG_HOST:-${DUAL_SERVICE_DIR_HOST}/config.env}"
 DUAL_SERVICE_CONFIG_CONTAINER="${DUAL_SERVICE_CONFIG_CONTAINER:-${CONTAINER_REPO_DIR}/scripts/videoedit_dual_service/config.env}"
 
-INPUT_SAVE_DIR="${INPUT_SAVE_DIR:-/root/VideoEdit/tmp/sglang-videoedit-cloud-inputs}"
-VIDEOEDIT_OUTPUT_DIR="${VIDEOEDIT_OUTPUT_DIR:-/root/VideoEdit/tmp/sglang-videoedit-outputs}"
-VIDEOEDIT_REQUEST_LOG_DIR="${VIDEOEDIT_REQUEST_LOG_DIR:-/root/VideoEdit/tmp/sglang-videoedit-request-logs}"
+INPUT_SAVE_DIR="${INPUT_SAVE_DIR:-${PROJECT_ROOT}/tmp/sglang-videoedit-cloud-inputs}"
+VIDEOEDIT_OUTPUT_DIR="${VIDEOEDIT_OUTPUT_DIR:-${PROJECT_ROOT}/tmp/sglang-videoedit-outputs}"
+VIDEOEDIT_REQUEST_LOG_DIR="${VIDEOEDIT_REQUEST_LOG_DIR:-${PROJECT_ROOT}/tmp/sglang-videoedit-request-logs}"
 VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES="${VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES:-true}"
-CACHE_DIR="${CACHE_DIR:-/root/VideoEdit/tmp/sglang-cache}"
+CACHE_DIR="${CACHE_DIR:-${PROJECT_ROOT}/tmp/sglang-cache}"
 FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${CACHE_DIR}/flashinfer}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-${CACHE_DIR}/xdg}"
 
@@ -31,6 +33,9 @@ HOST_GPUS="${HOST_GPUS:-2,3}"
 CONTAINER_CUDA_VISIBLE_DEVICES="${CONTAINER_CUDA_VISIBLE_DEVICES:-0,1}"
 HOST_PORT="${HOST_PORT:-30000}"
 CONTAINER_PORT="${CONTAINER_PORT:-30000}"
+# Bound host RAM usage; equal memory and memory-swap limits disable swap.
+CONTAINER_MEMORY="${CONTAINER_MEMORY:-300g}"
+CONTAINER_MEMORY_SWAP="${CONTAINER_MEMORY_SWAP:-${CONTAINER_MEMORY}}"
 AWS_REQUEST_CHECKSUM_CALCULATION="${AWS_REQUEST_CHECKSUM_CALCULATION:-WHEN_REQUIRED}"
 AWS_RESPONSE_CHECKSUM_VALIDATION="${AWS_RESPONSE_CHECKSUM_VALIDATION:-WHEN_REQUIRED}"
 
@@ -89,7 +94,6 @@ fi
 require_path "$PROJECT_ROOT"
 require_path "$HOST_REPO_DIR"
 require_path "$HOST_REPO_DIR/python/sglang/multimodal_gen/runtime/pipelines/wan_videoedit_pipeline.py"
-require_path "$WORKDIR_IN_CONTAINER"
 require_path "$DUAL_SERVICE_DIR_HOST/start.sh"
 require_path "$DUAL_SERVICE_DIR_HOST/status.sh"
 require_path "$DUAL_SERVICE_DIR_HOST/stop.sh"
@@ -102,6 +106,7 @@ docker_gpu_arg="\"device=${HOST_GPUS}\""
 echo "Starting container '$CONTAINER_NAME' from image '$IMAGE_NAME'"
 echo "Host GPUs: ${HOST_GPUS}; container CUDA_VISIBLE_DEVICES: ${CONTAINER_CUDA_VISIBLE_DEVICES}"
 echo "Unified gateway URL: http://0.0.0.0:${HOST_PORT}"
+echo "Container memory limit: ${CONTAINER_MEMORY}; memory+swap limit: ${CONTAINER_MEMORY_SWAP}"
 echo "Both normal and DMD backends use both GPUs; requests are serialized by the gateway"
 echo "Request logs: ${VIDEOEDIT_REQUEST_LOG_DIR}"
 echo "Log sensitive request values: ${VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES}"
@@ -110,6 +115,8 @@ echo "S3 checksum mode: request=${AWS_REQUEST_CHECKSUM_CALCULATION}, response=${
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
+  --memory "$CONTAINER_MEMORY" \
+  --memory-swap "$CONTAINER_MEMORY_SWAP" \
   --gpus "$docker_gpu_arg" \
   --ipc=host \
   --user "$RUN_AS_USER" \
