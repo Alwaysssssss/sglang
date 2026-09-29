@@ -4,7 +4,7 @@ set -euo pipefail
 # Start the existing VideoEdit normal+DMD dual-service stack in one container.
 # Override any variable at invocation time, for example:
 #   RECREATE=1 HOST_GPUS=2,3 bash scripts/start_videoedit_container.sh
-# Both backends use both GPUs; the gateway serializes requests on port 30000.
+# Both backends share the selected GPUs; the gateway serializes requests on port 30000.
 # If the container already exists, the default is to remove and recreate it.
 # Set RESTART_EXISTING=1 to restart the existing container instead.
 
@@ -107,7 +107,7 @@ echo "Starting container '$CONTAINER_NAME' from image '$IMAGE_NAME'"
 echo "Host GPUs: ${HOST_GPUS}; container CUDA_VISIBLE_DEVICES: ${CONTAINER_CUDA_VISIBLE_DEVICES}"
 echo "Unified gateway URL: http://0.0.0.0:${HOST_PORT}"
 echo "Container memory limit: ${CONTAINER_MEMORY}; memory+swap limit: ${CONTAINER_MEMORY_SWAP}"
-echo "Both normal and DMD backends use both GPUs; requests are serialized by the gateway"
+echo "Normal and DMD backends share the selected GPUs; requests are serialized by the gateway"
 echo "Request logs: ${VIDEOEDIT_REQUEST_LOG_DIR}"
 echo "Log sensitive request values: ${VIDEOEDIT_REQUEST_LOG_SENSITIVE_VALUES}"
 echo "S3 checksum mode: request=${AWS_REQUEST_CHECKSUM_CALCULATION}, response=${AWS_RESPONSE_CHECKSUM_VALIDATION}"
