@@ -180,6 +180,8 @@ class GPUWorker:
                         )
             trim_layerwise_offload_device_cache(self.rank)
 
+        self.pipeline.prepare_service()
+
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )

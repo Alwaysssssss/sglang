@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.videoedit_wan import (
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.models.schedulers.videoedit_flow_match import (
     VideoEditFlowMatchScheduler,
 )
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.videoedit_wan import (
     VideoEditConditionEncodingStage,
+    VideoEditConditioningEncodingStage,
     VideoEditDecodingStage,
     VideoEditDenoisingStage,
     VideoEditImageEncodingStage,
@@ -35,9 +37,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VideoEditWindowPostprocessStage,
     VideoEditWindowValidationStage,
 )
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.readonly_model_residency import (
+    close_encoder_prefetch,
+)
 from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import (
     save_video_frames_like_reference,
 )
@@ -62,7 +67,6 @@ from sglang.multimodal_gen.runtime.videoedit.windowing import (
     VideoEditPassPlan,
     build_videoedit_pass_window_specs,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -215,18 +219,31 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        text_stage = VideoEditTextEncodingStage(
+            text_encoder=self.get_module("text_encoder"),
+            tokenizer=self.get_module("tokenizer"),
+            transformer=self.get_module("transformer"),
+            next_image_encoder=self.get_module("image_encoder", None),
+        )
+        image_stage = VideoEditImageEncodingStage(
+            image_encoder=self.get_module("image_encoder", None),
+            image_processor=self.get_module("image_processor", None),
+            transformer=self.get_module("transformer"),
+        )
+        parallel_conditioning = os.environ.get(
+            "SGLANG_VIDEOEDIT_PARALLEL_CONDITIONING", "1"
+        ) == "1"
+        conditioning_stages = [text_stage, image_stage]
+        if parallel_conditioning:
+            conditioning = VideoEditConditioningEncodingStage(
+                text_stage=text_stage,
+                image_stage=image_stage,
+            )
+            conditioning_stages = [conditioning]
+
         self.videoedit_stages = [
             VideoEditWindowValidationStage(),
-            VideoEditTextEncodingStage(
-                text_encoder=self.get_module("text_encoder"),
-                tokenizer=self.get_module("tokenizer"),
-                transformer=self.get_module("transformer"),
-            ),
-            VideoEditImageEncodingStage(
-                image_encoder=self.get_module("image_encoder", None),
-                image_processor=self.get_module("image_processor", None),
-                transformer=self.get_module("transformer"),
-            ),
+            *conditioning_stages,
             VideoEditConditionEncodingStage(vae=self.get_module("vae")),
             VideoEditLatentPreparationStage(),
             VideoEditTimestepPreparationStage(scheduler=self.get_module("scheduler")),
@@ -240,6 +257,26 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             VideoEditWindowPostprocessStage(),
         ]
         self.add_stages(self.videoedit_stages)
+        self._startup_conditioning = conditioning if parallel_conditioning else None
+
+    def prepare_service(self) -> None:
+        if self._startup_conditioning is None:
+            return
+
+        # This hook runs after GPUWorker configures layerwise offload.  Release
+        # its prefetched DiT layers so UMT5 can use that memory during startup.
+        transformer = self.get_module("transformer")
+        for manager in getattr(transformer, "layerwise_offload_managers", []):
+            manager.release_all()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            self._startup_conditioning.precompute_default_negative(self.server_args)
+        finally:
+            # The cached embedding lives on CPU. Return unused encoder memory
+            # to CUDA so a second backend can load on these same devices.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _prepare_global_videoedit_context(
         self, params: WanVideoEditSamplingParams, batch: Req
@@ -461,7 +498,10 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 previous_output_frames=previous_output_frames,
             )
             check_request_timeout(batch)
-            self.executor.execute_with_profiling(self.stages, batch, server_args)
+            try:
+                self.executor.execute_with_profiling(self.stages, batch, server_args)
+            finally:
+                close_encoder_prefetch(params)
             check_request_timeout(batch)
             window_output_frames = params.runtime_window_output_frames
             if window_output_frames is None:
@@ -687,6 +727,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
     def _forward_streaming(self, batch, params, server_args):
         from sglang.multimodal_gen.runtime.videoedit.streaming import run_streaming_edit
 
+        params.reset_request_runtime()
         return_frames = not (batch.save_output and batch.return_file_paths_only) or (
             batch.enable_frame_interpolation or batch.enable_upscaling
         )
@@ -702,7 +743,10 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             params.runtime_bbox = chunk.bbox
             params.runtime_crop_h, params.runtime_crop_w = chunk.crop_h, chunk.crop_w
             params.runtime_aligned_h, params.runtime_aligned_w = chunk.aligned_h, chunk.aligned_w
-            self.executor.execute_with_profiling(self.stages, batch, server_args)
+            try:
+                self.executor.execute_with_profiling(self.stages, batch, server_args)
+            finally:
+                close_encoder_prefetch(params)
             check_request_timeout(batch)
             return params.runtime_window_output_frames
 
@@ -729,6 +773,7 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 # Last-window tensors must not remain attached to the request.
                 if params.runtime_window_spec is not None:
                     params.reset_window_runtime(params.runtime_window_spec)
+                params.reset_request_runtime()
         if return_frames:
             batch.output = _pil_frames_to_video_tensor(output_frames) if output_frames else None
             return batch

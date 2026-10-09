@@ -4,12 +4,11 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
     VIDEO_OUTPUT_EXTENSIONS,
+    SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.configs.sample.wan_teacache import _wan_14b_coefficients
-
 
 DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
@@ -139,6 +138,17 @@ class WanVideoEditSamplingParams(SamplingParams):
     runtime_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
     runtime_negative_prompt_embeds: Any | None = field(default=None, init=False, repr=False)
     runtime_image_embeds: Any | None = field(default=None, init=False, repr=False)
+    # CPU copies live for the whole request.  Window cleanup only drops the
+    # device copies consumed by the current denoising stage.
+    runtime_request_prompt_embeds: Any | None = field(
+        default=None, init=False, repr=False
+    )
+    runtime_request_negative_prompt_embeds: Any | None = field(
+        default=None, init=False, repr=False
+    )
+    # Per-instance assignment below; exclude the worker/Future from asdict and
+    # request logging, which must not deepcopy thread locks or CUDA handles.
+    runtime_encoder_prefetch: ClassVar[Any | None] = None
     runtime_do_cfg: bool = field(default=False, init=False, repr=False)
     runtime_masked_video_tensor: Any | None = field(default=None, init=False, repr=False)
     runtime_raw_video_tensor: Any | None = field(default=None, init=False, repr=False)
@@ -303,6 +313,10 @@ class WanVideoEditSamplingParams(SamplingParams):
         return params
 
     def reset_window_runtime(self, window_spec: Any) -> None:
+        handle = self.runtime_encoder_prefetch
+        self.runtime_encoder_prefetch = None
+        if handle is not None:
+            handle.close()
         self.runtime_window_spec = window_spec
         self.runtime_window_index = window_spec.window_index
         self.runtime_window_frames = None
@@ -336,3 +350,15 @@ class WanVideoEditSamplingParams(SamplingParams):
         self.runtime_decoded_video_tensor = None
         self.runtime_window_output_frames = None
         self.runtime_window_metadata = None
+
+    def reset_request_runtime(self) -> None:
+        """Release request-scoped conditioning without touching service caches."""
+        handle = self.runtime_encoder_prefetch
+        self.runtime_encoder_prefetch = None
+        if handle is not None:
+            handle.close()
+        self.runtime_request_prompt_embeds = None
+        self.runtime_request_negative_prompt_embeds = None
+        self.runtime_prompt_embeds = None
+        self.runtime_negative_prompt_embeds = None
+        self.runtime_image_embeds = None

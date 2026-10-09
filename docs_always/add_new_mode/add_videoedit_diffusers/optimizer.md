@@ -1,5 +1,7 @@
 # VideoEdit 优化方案
 
+新增记录：[L40S 内存与通信优化及双卡实测（2026-10-04）](./memory_optimization_20261004.md)。该轮为 49 帧/40 步的小尺寸测试，与本文历史方案口径不同。
+
 本文档记录 VideoEdit-diffusers 接入 SGLang 后的性能优化路线。命令参考
 [`cli.md`](./cli.md) 和 [`README.md`](./README.md)，优化时必须先固定基线，再按顺序逐步累加优化项。
 
@@ -884,3 +886,7 @@ python python/sglang/multimodal_gen/runtime/videoedit/compare.py \
 - 条件 latent 缓存：只先缓存完全相同窗口；overlap 区域 latent 复用需要额外验证 temporal boundary。
 
 代码级优化必须重新生成 perf JSON 和 compare JSON，不能沿用本文件里的无代码优化结论。
+
+尺寸感知自动驻留开发与测试见 [2026-10-04 自动驻留记录](./adaptive_residency_20261004.md)。
+
+请求级文本复用、文本/CLIP owner 分工、VAE 空间并行及线上 GPU 7 对比见 [2026-10-04 双卡阶段并行实测](./parallel_optimization_results_20261004.md)。

@@ -65,6 +65,10 @@ fi
 
 existing_container_id="$(docker ps -aq -f "name=^/${CONTAINER_NAME}$")"
 if [[ -n "$existing_container_id" ]]; then
+  if [[ "${REFUSE_EXISTING_CONTAINER:-0}" == "1" ]]; then
+    echo "Container '$CONTAINER_NAME' already exists; refusing to replace or restart it." >&2
+    exit 1
+  fi
   existing_status="$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME")"
   if [[ "$RESTART_EXISTING" == "1" ]]; then
     if [[ "$existing_status" == "running" ]]; then

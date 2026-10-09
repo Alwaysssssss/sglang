@@ -180,10 +180,10 @@ bash scripts/videoedit_dual_service/stop.sh
 
 ```bash
 curl --noproxy '*' -sS \
-  -X POST http://127.0.0.1:5402/v1/videos/repairs \
+  -X POST http://127.0.0.1:5403/v1/videos/repairs \
   -H 'Content-Type: application/json' \
   -d '{
-    "task_id": "videoedit-normal-local-001",
+    "task_id": "videoedit-normal-local-1l40s-00001",
     "model": "videoedit-normal",
     "timeout": -1,
     "prompt": "一个男人站在舞台中央演讲，背后有两排巨大的立体文字。",
@@ -215,7 +215,7 @@ curl --noproxy '*' -sS \
     "use_clip": true,
     "clip_preprocess": "diffuser",
     "decode_mode": "stream",
-    "enable_teacache": false,
+    "enable_teacache": true,
     "enable_frame_interpolation": false,
     "enable_upscaling": false
   }' | python3 -m json.tool
@@ -265,7 +265,7 @@ normal 请求使用客户端给出的采样参数。normal 完成后，使用新
 
 ```bash
 curl --noproxy '*' -sS \
-  -X POST http://127.0.0.1:5402/v1/videos/repairs \
+  -X POST http://127.0.0.1:5403/v1/videos/repairs \
   -H 'Content-Type: application/json' \
   -d '{
     "task_id": "videoedit-normal-remote-001",

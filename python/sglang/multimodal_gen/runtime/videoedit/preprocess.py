@@ -791,6 +791,7 @@ def prepare_window_inputs(
     dtype: torch.dtype,
     mask_downsample_mode: str = "nearest",
     preserve_first_frame: bool = True,
+    return_intermediates: bool = True,
 ) -> dict:
     if len(window_video) != len(window_masks):
         raise ValueError("Window video and mask length mismatch")
@@ -820,8 +821,13 @@ def prepare_window_inputs(
     cond_masks = cond_masks.transpose(1, 2).contiguous().to(device=device, dtype=dtype)
     return {
         "masked_video_tensor": masked_video_tensor,
-        "mask_video_tensor": mask_video_tensor.to(device=device, dtype=dtype),
+        "mask_video_tensor": (
+            mask_video_tensor.to(device=device, dtype=dtype) if return_intermediates else None
+        ),
         "cond_masks": cond_masks,
-        "video_tensor": frames_to_tensor(window_video, normalize=True).to(device=device, dtype=dtype),
+        "video_tensor": (
+            frames_to_tensor(window_video, normalize=True).to(device=device, dtype=dtype)
+            if return_intermediates else None
+        ),
         "num_frames": len(window_video),
     }
