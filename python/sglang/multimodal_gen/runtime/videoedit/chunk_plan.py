@@ -302,14 +302,31 @@ def _pad_bbox(bbox: BBox, H: int, W: int, padding: int) -> BBox:
     return out
 
 
-def _recentre(bbox: BBox, H: int, W: int, target_w: int, target_h: int) -> BBox:
-    """A `target_w` x `target_h` box centred on `bbox`, shifted to stay in frame."""
+def _recentre(
+    bbox: BBox,
+    H: int,
+    W: int,
+    target_w: int,
+    target_h: int,
+    keep: BBox | None = None,
+) -> BBox:
+    """Centre a box in frame, sliding it to contain the inclusive mask box `keep`.
+
+    Alignment can shrink the expanded box below the frame size (1080 to 1072,
+    for example). Preserve a mask touching the frame edge whenever it fits.
+    """
     target_w = min(target_w, W)
     target_h = min(target_h, H)
     cx = (bbox[0] + bbox[2]) / 2.0
     cy = (bbox[1] + bbox[3]) / 2.0
     x0 = int(round(cx - target_w / 2.0))
     y0 = int(round(cy - target_h / 2.0))
+    if keep is not None:
+        # Mask maxima are inclusive; crop maxima are exclusive.
+        if keep[2] - keep[0] + 1 <= target_w:
+            x0 = min(max(x0, keep[2] + 1 - target_w), keep[0])
+        if keep[3] - keep[1] + 1 <= target_h:
+            y0 = min(max(y0, keep[3] + 1 - target_h), keep[1])
     x0 = max(0, min(x0, W - target_w))
     y0 = max(0, min(y0, H - target_h))
     return (x0, y0, x0 + target_w, y0 + target_h)
@@ -384,9 +401,9 @@ def assign_chunk_bboxes(
     * ``global`` — one box for every chunk, from the union over all frames. Reproduces
       the pre-streaming geometry exactly; kept for A/B comparison.
 
-    ``fixed_size`` and ``tight`` make the crop box itself a multiple of ``align``, so
-    the crop is fed to the model without a resample. ``global`` keeps the old
-    crop-then-resize so it stays comparable frame for frame.
+    ``fixed_size`` and ``tight`` normally make the crop box a multiple of ``align``.
+    If that would clip the mask, keep the full frame extent in that direction and
+    resize to the aligned size. ``global`` keeps the old crop-then-resize behavior.
 
     ``bbox_padding`` grows the mask box before the expand step, matching where
     ``get_mask_bbox`` applies it on the whole-video path.
@@ -441,19 +458,41 @@ def assign_chunk_bboxes(
         for chunk in clip.chunks:
             key = (clip.label, chunk.w_idx)
             if mode == "fixed_size":
-                box = _recentre(grown[key], H, W, target_w, target_h)
+                box = _recentre(
+                    grown[key], H, W, target_w, target_h, keep=tights[key]
+                )
             else:
                 g = grown[key]
                 h, w = get_aligned_size(g[3] - g[1], g[2] - g[0], align)
                 box = _recentre(
-                    g, H, W, min(w, (W // align) * align), min(h, (H // align) * align)
+                    g,
+                    H,
+                    W,
+                    min(w, (W // align) * align),
+                    min(h, (H // align) * align),
+                    keep=tights[key],
                 )
+            tight = tights[key]
+            # A mask spanning more than the aligned-down frame size cannot fit.
+            # Keep that direction's full extent and resize rather than cut it off.
+            x0, y0, x1, y1 = box
+            if tight[0] < x0 or tight[2] >= x1:
+                x0, x1 = 0, W
+            if tight[1] < y0 or tight[3] >= y1:
+                y0, y1 = 0, H
+            resampled = (x0, y0, x1, y1) != box
+            box = (x0, y0, x1, y1)
             _check_margin(
-                tights[key], box, H, W, feather_px, f"{clip.label} chunk {chunk.w_idx}"
+                tight, box, H, W, feather_px, f"{clip.label} chunk {chunk.w_idx}"
             )
             chunk.bbox = box
-            chunk.crop_w = chunk.aligned_w = box[2] - box[0]
-            chunk.crop_h = chunk.aligned_h = box[3] - box[1]
+            chunk.crop_w, chunk.crop_h = box[2] - box[0], box[3] - box[1]
+            if resampled:
+                chunk.aligned_h, chunk.aligned_w = get_aligned_size(
+                    chunk.crop_h, chunk.crop_w, align
+                )
+            else:
+                chunk.aligned_w, chunk.aligned_h = chunk.crop_w, chunk.crop_h
 
     if mode == "tight":
         # Each chunk generating at its own resolution is the point of `tight`, but a

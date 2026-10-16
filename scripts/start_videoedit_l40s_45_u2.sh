@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SERVICE_DIR="$REPO_DIR/.local/videoedit-l40s.45-u2-5403"
 export IMAGE_NAME=sglang-videoedit-dev-v2:l40s
-export CONTAINER_NAME=videoedit_l40s_45_u2_5403
-export HOST_PORT=5403 CONTAINER_PORT=30000
+export CONTAINER_NAME=videoedit_l40s_45_u2_5402
+export HOST_PORT=5402 CONTAINER_PORT=30000
 export HOST_GPUS=4,5 CONTAINER_CUDA_VISIBLE_DEVICES=0,1
 export HOST_REPO_DIR="$REPO_DIR"
 export PROJECT_ROOT="$(dirname -- "$REPO_DIR")"
