@@ -3,6 +3,7 @@
 import argparse
 import importlib.metadata
 import json
+import os
 import subprocess
 
 import torch
@@ -26,8 +27,15 @@ def main():
         "decord": "0.6.0",
         "sglang-kernel": "0.4.1",
     }
+    cuda_version = "12.6"
+    if os.environ.get("VSR_RUNTIME_PROFILE") == "videoedit-l40s":
+        expected.update(torch="2.9.1+cu129", torchvision="0.24.1", triton="3.5.1")
+        expected["accelerate"] = "1.12.0"
+        import accelerate  # noqa: F401
+
+        cuda_version = "12.9"
     versions = {name: importlib.metadata.version(name) for name in expected}
-    if versions != expected or torch.version.cuda != "12.6":
+    if versions != expected or torch.version.cuda != cuda_version:
         raise RuntimeError(f"Runtime drift: {versions}; CUDA={torch.version.cuda}")
     import imageio_ffmpeg
     from diffusers import AutoencoderKLWan, WanTransformer3DModel  # noqa: F401

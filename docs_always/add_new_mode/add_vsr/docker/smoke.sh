@@ -5,7 +5,7 @@ container=${VSR_CONTAINER:-vsr-api}
 cmd=(docker exec "$container" bash -c '
     set -euo pipefail
     resolution=320x640
-    if [[ ${VSR_MODE:-single} == dual ]]; then resolution=320x1216; fi
+    if [[ ${VSR_NUM_GPUS:-1} -gt 1 || ${VSR_MODE:-single} == dual ]]; then resolution=320x1216; fi
     python /opt/vsr/warmup.py --input "$1"
     exec python /opt/vsr/test_server_api.py \
         --base-url "http://127.0.0.1:${VSR_PORT:-30176}" \

@@ -1,5 +1,7 @@
 # VSR 原生 API Docker 部署
 
+基于现有 `sglang-videoedit-src:l40s` 镜像的流程见 [L40S 构建与部署](videoedit_l40s.md)，支持 `VSR_NUM_GPUS=N` 和指定卡号。下文记录原始 Torch 2.10 构建路线及其历史验证范围。
+
 本目录提供当前 VSR 服务的镜像构建、单卡/双卡启动和 HTTP 验收脚本。**当前机器不能使用 Docker，因此尚未验证镜像构建、容器启动或容器内性能。** 已验证的是原宿主环境的算法/API；本次仅在宿主机做脚本语法、命令生成、版本和无 GPU 导入检查。
 
 ## 环境与文件
@@ -12,7 +14,7 @@
 | 视频 | decord 0.6.0 / imageio 2.36.0 / imageio-ffmpeg 0.6.0 |
 | Kernel | 本地针对 torch 2.10 编译的 sglang-kernel 0.4.1；FA3/FlashMLA 关闭 |
 | API | `POST /v1/videos/restorations`，异步任务、查询、下载、回调 |
-| 默认设备 | 单卡物理 GPU7；双卡物理 GPU6、GPU7 |
+| 默认设备 | 从 GPU0 开始；可用 `VSR_GPUS` 显式指定 |
 
 `Dockerfile` 使用 Python Debian 基础镜像，CUDA 12.6 用户态库由官方 PyTorch cu126 wheel 安装，不依赖容器内另装完整 CUDA toolkit。保留 C/C++ 编译器供 torch.compile 使用；NVIDIA 驱动由宿主机提供。目标运行机需要能运行 torch 2.10/cu126 的 NVIDIA 驱动、Docker 和 NVIDIA Container Toolkit。当前 kernel 在原有 H20 环境验证，其他 GPU 型号需要重新验收。
 

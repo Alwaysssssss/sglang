@@ -41,26 +41,102 @@ curl --noproxy '*' http://127.0.0.1:30176/v1/videos/restorations \
 `target_resolution` 为 **高度×宽度**；上例输出宽2160、高3840。
 返回 `{"code":0,"message":"Task submitted","id":"vsr-demo-001"}`。code=1 表示校验／提交失败，code=2 表示忙碌。与视频编辑一样，业务拒绝通过 JSON code 表达。
 
-| 参数 | 说明 |
-|---|---|
-| taskId / task_id | 可选；不填自动生成。只允许字母、数字、下划线和连字符，最长128字符；重复 ID 拒绝 |
-| video_input_path | 服务端可读的本地视频路径 |
-| videoUrl / video_url | HTTP(S) 地址或既有下载器支持的源；与本地路径二选一 |
-| callbackUrl / callback_url | 可选 HTTP(S) 终态回调 |
-| target_resolution / long_edge | 固定 HxW 或最长边；未指定使用 pipeline 默认值 |
-| tile_t / tile_h / tile_w | 默认33/320/640；T须4n+1，H/W须32倍数 |
-| temporal_overlap / spatial_overlap | 默认5/32，须小于对应 tile |
-| color_ref / color_ref_samples | global（默认）/chunk/none；全局颜色采样数默认64 |
-| crf | 默认5，允许0～51 |
-| preserve_audio | 默认 true，保留全部源音轨；false 输出无声视频 |
-| read_queue / write_queue | 默认2/4，API允许1～16 |
-| gpu_postprocess | 可选，默认继承启动配置 |
-| timeout | 默认-1不设期限；正数为处理期限秒数，在 tile 边界响应，媒体探测／音频合并期间每0.2秒检查 |
-| minioConfig / minio_config | 可选，复用视频编辑的 RequestCloudStorage；包括 endpoint、bucket_name、access_key、secret_key、secure 等 |
-| outputObjectKey / output_object_key | 配合 minioConfig；不填使用任务 ID.mp4 |
-| output_bucket | 可选存储桶覆盖 |
+### 完整请求参数
 
-输出路径由服务控制，保存在 `--output-dir/vsr/<id>.mp4`。模型精度和编译选项在启动时设定，不逐请求改变。
+输入视频必须且只能提供本地路径或远程地址，其余参数均可选。表中的处理默认值来自 `WanVSRPipelineConfig`，服务启动配置可以覆盖它们；请求省略时继承服务配置。`preserve_audio` 和 `timeout` 的默认值由请求模型直接设置。
+
+| 参数 | 类型 | 默认值与约束 |
+| --- | --- | --- |
+| `taskId / task_id` | string | 可选，自动生成；仅允许字母、数字、下划线、连字符，长度 1～128；不能重复 |
+| `video_input_path` | string | 服务端可读的本地路径；Docker 部署填写容器路径 |
+| `videoUrl / video_url` | string | 远程视频地址或既有下载器支持的源；与 video_input_path 必须且只能提供一个 |
+| `target_resolution` | string | 默认 null；格式为高×宽（HxW），高、宽必须为正偶数；横向 1920×1080 填 1080x1920 |
+| `long_edge` | int | 默认 3840；正整数，按最长边等比缩放；同时指定时优先使用 target_resolution；两者省略时先使用服务固定分辨率，否则使用服务最长边 |
+| `tile_t` | int | 默认 33；时间分块帧数，必须为正整数且满足 4n+1 |
+| `tile_h` | int | 默认 320；空间分块高度，必须为正的 32 倍数 |
+| `tile_w` | int | 默认 640；空间分块宽度，必须为正的 32 倍数 |
+| `temporal_overlap` | int | 默认 5；时间重叠帧数，≥0 且小于 tile_t |
+| `spatial_overlap` | int | 默认 32；空间重叠像素，≥0 且小于 min(tile_h, tile_w) |
+| `color_ref` | string | 默认 global；允许 global（全局参考）、chunk（分块参考）、none（不使用颜色参考） |
+| `color_ref_samples` | int | 默认 64；全局颜色参考采样数，≥0 |
+| `crf` | int | 默认 5；编码质量参数，范围 0～51，越小质量越高 |
+| `preserve_audio` | bool | 默认 true；保留全部源音轨，false 输出无声视频 |
+| `read_queue` | int | 默认 2；读取队列容量，范围 1～16 |
+| `write_queue` | int | 默认 4；写入队列容量，范围 1～16 |
+| `gpu_postprocess` | bool | 省略时继承启动配置；代码默认 false，本文启动脚本启用此项 |
+| `timeout` | int | 默认 -1 不设期限；正数为处理期限秒数，在 tile 边界响应，媒体探测／音频合并期间每 0.2 秒检查 |
+| `callbackUrl / callback_url` | string | 可选 HTTP(S) 终态回调地址，须从服务端／容器内可访问 |
+| `minioConfig / minio_config` | object | 可选对象存储配置，字段见下表 |
+| `outputObjectKey / output_object_key` | string | 必须配合 minioConfig；省略时使用 <任务 ID>.mp4 |
+| `output_bucket` | string | 可选，覆盖对象存储配置中的输出桶 |
+
+### 补全处理参数的 curl 示例
+
+以下使用容器内测试视频；每次提交使用新的任务 ID。示例显式设置 `gpu_postprocess` 为 `false`，如需继承服务启动配置可删除该字段。
+
+```bash
+curl --noproxy '*' -fsS http://127.0.0.1:30176/v1/videos/restorations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "taskId": "vsr-demo-001",
+    "video_input_path": "/input/smoke-generated.mp4",
+    "target_resolution": "256x256",
+    "timeout": -1,
+    "tile_t": 33,
+    "tile_h": 320,
+    "tile_w": 640,
+    "temporal_overlap": 5,
+    "spatial_overlap": 32,
+    "color_ref": "global",
+    "color_ref_samples": 64,
+    "crf": 5,
+    "preserve_audio": true,
+    "read_queue": 2,
+    "write_queue": 4,
+    "gpu_postprocess": false
+  }'
+```
+
+按最长边等比缩放时，将 `"target_resolution": "256x256"` 替换为 `"long_edge": 3840`。使用远程输入时，将 `video_input_path` 替换为 `videoUrl`，不要同时提供二者。
+
+### 可选回调与对象存储配置
+
+需要回调或上传时，将相应字段合并到上述请求 JSON，替换示例地址和凭据；不使用时省略对应字段。
+
+```json
+{
+  "callbackUrl": "http://your-callback-server/vsr/callback",
+  "minioConfig": {
+    "endpoint": "minio.example.com:9000",
+    "bucket_name": "videos",
+    "access_key": "YOUR_ACCESS_KEY",
+    "secret_key": "YOUR_SECRET_KEY",
+    "secure": false,
+    "region": "us-east-1",
+    "provider": "minio",
+    "prefix": "vsr"
+  },
+  "outputObjectKey": "vsr-demo-001.mp4",
+  "output_bucket": "videos"
+}
+```
+
+`minioConfig` 完整字段：
+
+| 字段 | 类型 | 必填／默认值与说明 |
+| --- | --- | --- |
+| `endpoint` | string | 必填，存储端点，可包含 HTTP(S) 协议 |
+| `bucket_name` | string | 必填，默认桶；也支持 `bucket` / `bucketName` |
+| `access_key` | string | 必填，访问密钥；也支持 `accessKey` / `rootUser` |
+| `secret_key` | string | 必填，私有密钥；也支持 `secretKey` / `rootPass` |
+| `secure` | bool | 默认 false；端点未写协议时决定使用 HTTP 或 HTTPS；也支持 `useSSL` |
+| `region` | string | 默认 us-east-1 |
+| `provider` | string | 可选；cos 启用 COS 处理，minio 使用通用 S3 兼容处理；省略时依据端点识别 COS |
+| `prefix` | string | 可选，输出对象键前缀 |
+
+容器中的 `127.0.0.1` 指容器自身，远程输入、回调和存储端点须从容器内可访问。对象存储复用既有实现，真实外部上传尚未验收。
+
+输出路径由服务控制，保存在 `--output-dir/vsr/<id>.mp4`。模型精度和编译选项在启动时设定，不逐请求改变。接口拒绝未定义的顶层字段，如 `prompt`、`seed`、`dtype`、`output_path`。
 FPS、帧数取自源视频；通用采样元数据要求整数 FPS，但 VSR 实际编码会重新读取并保留源视频真实 FPS。
 
 ## 状态、下载、取消

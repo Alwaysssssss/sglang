@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
-mode=${VSR_MODE:-single}
-case "$mode" in
-    single) devices=${VSR_GPUS:-7}; count=1 ;;
-    dual) devices=${VSR_GPUS:-6,7}; count=2 ;;
-    *) echo 'VSR_MODE must be single or dual' >&2; exit 2 ;;
-esac
-IFS=, read -r -a gpu_ids <<< "$devices"
-[[ ${#gpu_ids[@]} == "$count" ]] || { echo "Mode $mode requires $count GPU IDs" >&2; exit 2; }
-for gpu in "${gpu_ids[@]}"; do
-    [[ $gpu =~ ^[0-9]+$ ]] || { echo 'Use numeric host GPU IDs, e.g. 7 or 6,7' >&2; exit 2; }
-done
-if [[ $count == 2 && ${gpu_ids[0]} == "${gpu_ids[1]}" ]]; then
-    echo 'Dual mode requires two different GPUs' >&2; exit 2
+[[ $# == 0 || ( $# == 1 && $1 == --dry-run ) ]] || { echo 'Usage: run.sh [--dry-run]' >&2; exit 2; }
+count=${VSR_NUM_GPUS:-}
+if [[ -z $count ]]; then
+    case ${VSR_MODE:-} in
+        single) count=1 ;;
+        dual) count=2 ;;
+        "") if [[ -n ${VSR_GPUS:-} ]]; then
+                IFS=, read -r -a selected <<< "$VSR_GPUS"
+                count=${#selected[@]}
+            else count=1; fi ;;
+        *) echo 'Use VSR_NUM_GPUS, or VSR_MODE=single/dual' >&2; exit 2 ;;
+    esac
 fi
+[[ $count =~ ^[1-9][0-9]*$ && ${#count} -le 3 ]] || { echo 'VSR_NUM_GPUS must be a positive integer (1..999)' >&2; exit 2; }
+devices=${VSR_GPUS:-}
+if [[ -z $devices ]]; then
+    for ((i=0; i<count; i++)); do devices+="${devices:+,}$i"; done
+fi
+[[ $devices =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo 'Use numeric host GPU IDs, e.g. 0 or 2,3' >&2; exit 2; }
+IFS=, read -r -a gpu_ids <<< "$devices"
+[[ ${#gpu_ids[@]} == "$count" ]] || { echo "Expected $count GPU IDs, got $devices" >&2; exit 2; }
+declare -A seen=()
+for gpu in "${gpu_ids[@]}"; do
+    [[ $gpu == 0 || $gpu =~ ^[1-9][0-9]*$ ]] || { echo 'GPU IDs must not have leading zeroes' >&2; exit 2; }
+    [[ -z ${seen[$gpu]:-} ]] || { echo 'GPU IDs must be distinct' >&2; exit 2; }
+    seen[$gpu]=1
+done
+mode=multi
+if [[ $count == 1 ]]; then mode=single; elif [[ $count == 2 ]]; then mode=dual; fi
 : "${VSR_CHECKPOINT_HOST:?Set VSR_CHECKPOINT_HOST to checkpoint-1300}"
 : "${VSR_WAN_HOST:?Set VSR_WAN_HOST to the directory containing vae/}"
 : "${VSR_INPUT_HOST:?Set VSR_INPUT_HOST to the input directory}"
@@ -28,7 +43,7 @@ done
 cmd=(docker run -d --init --name "${VSR_CONTAINER:-vsr-api}" --gpus "\"device=$devices\""
     --shm-size "${VSR_SHM_SIZE:-16g}" --stop-timeout 60
     -p "${VSR_BIND_IP:-127.0.0.1}:${VSR_HOST_PORT:-30176}:30176"
-    -e "VSR_MODE=$mode" -e VSR_PORT=30176
+    -e "VSR_MODE=$mode" -e "VSR_NUM_GPUS=$count" -e VSR_PORT=30176
     --mount "type=bind,src=$VSR_CHECKPOINT_HOST,dst=/models/checkpoint,readonly"
     --mount "type=bind,src=$VSR_WAN_HOST,dst=/models/wan,readonly"
     --mount "type=bind,src=$VSR_INPUT_HOST,dst=/input,readonly"

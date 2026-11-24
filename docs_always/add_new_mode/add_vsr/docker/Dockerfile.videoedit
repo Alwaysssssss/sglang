@@ -1,0 +1,25 @@
+ARG BASE_IMAGE=sglang-videoedit-src:l40s
+FROM ${BASE_IMAGE}
+USER root
+ENV PYTHONUNBUFFERED=1 PYTHONPATH=/opt/sglang/python \
+    VSR_RUNTIME_PROFILE=videoedit-l40s VSR_PORT=30176 \
+    TORCHINDUCTOR_CACHE_DIR=/cache/inductor TRITON_CACHE_DIR=/cache/triton \
+    HF_HOME=/cache/huggingface
+WORKDIR /opt/sglang
+# Reuse the base image's matching Torch/cu129/native kernel stack.
+RUN python -m pip install --no-cache-dir --no-deps \
+    decord==0.6.0 imageio==2.36.0 imageio-ffmpeg==0.6.0 accelerate==1.12.0
+COPY python/ /opt/sglang/python/
+COPY docs_always/add_new_mode/add_vsr/scripts/serve_vsr.py /opt/vsr/serve_vsr.py
+COPY docs_always/add_new_mode/add_vsr/scripts/test_server_api.py /opt/vsr/test_server_api.py
+COPY docs_always/add_new_mode/add_vsr/docker/check_runtime.py /opt/vsr/check_runtime.py
+COPY docs_always/add_new_mode/add_vsr/docker/warmup.py /opt/vsr/warmup.py
+COPY docs_always/add_new_mode/add_vsr/docker/entrypoint.sh /opt/vsr/entrypoint.sh
+RUN python /opt/vsr/check_runtime.py \
+    && python -m pip freeze > /opt/vsr/installed-requirements.txt \
+    && chmod +x /opt/vsr/entrypoint.sh && mkdir -p /output /cache
+EXPOSE 30176
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --retries=5 \
+    CMD python -c "import os,urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:'+os.environ.get('VSR_PORT','30176')+'/health',timeout=3)"
+ENTRYPOINT ["/opt/vsr/entrypoint.sh"]
+CMD []
