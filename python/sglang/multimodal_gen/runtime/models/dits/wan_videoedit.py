@@ -4,6 +4,7 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.wan_videoedit import (
     WanVideoEditConfig,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
     WanI2VCrossAttention,
     WanTransformer3DModel,
@@ -13,6 +14,15 @@ from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+class VideoEditRMSNorm(torch.nn.RMSNorm):
+    """Use the same PyTorch reduction as the reference VideoEdit model."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__(hidden_size, eps=eps)
+        # The tensor-parallel fallback reads this attribute from SGLang RMSNorm.
+        self.variance_epsilon = eps
 
 
 class WanVideoEditCrossAttention(WanI2VCrossAttention):
@@ -82,6 +92,7 @@ class WanVideoEditTransformer3DModel(WanTransformer3DModel):
         )
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
         self.strict_videoedit_math = False
+        self.videoedit_fp32_output_modulation = True
         for i, block in enumerate(self.blocks):
             block.strict_videoedit_math = False
             block.attn2 = WanVideoEditCrossAttention(
@@ -95,11 +106,22 @@ class WanVideoEditTransformer3DModel(WanTransformer3DModel):
                 },
                 quant_config=quant_config,
             )
+            # Keep parameter names and weights unchanged for checkpoint loading.
+            # Limit the PyTorch RMSNorm path to VideoEdit, including self-attention.
+            for attention in (block, block.attn2):
+                for name in ("norm_q", "norm_k", "norm_added_k"):
+                    norm = getattr(attention, name, None)
+                    if isinstance(norm, RMSNorm):
+                        replacement = VideoEditRMSNorm(
+                            norm.hidden_size, norm.variance_epsilon
+                        )
+                        replacement.weight = norm.weight
+                        setattr(attention, name, replacement)
         logger.warning(
             "[WanVideoEditTransformer3DModel] replaced attn2 with "
             "WanVideoEditCrossAttention for %d blocks.",
             len(self.blocks),
-        )        
+        )
 
 
 EntryClass = WanVideoEditTransformer3DModel
