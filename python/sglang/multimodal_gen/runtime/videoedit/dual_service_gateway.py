@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.videoedit.dual_service_store import (
     ACTIVE_STATUSES,
+    BusyTaskError,
     DuplicateTaskError,
     DualServiceStore,
 )
@@ -155,7 +156,7 @@ class GatewayRuntime:
             "queue": counts,
         }
 
-    async def enqueue(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def admit(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = _normalize_video_repair_payload(payload)
         task_id = str(
             normalized.get("task_id") or f"videoedit-{uuid.uuid4().hex}"
@@ -179,7 +180,7 @@ class GatewayRuntime:
         request_payload = request_model.model_dump(mode="json")
         try:
             task = await self._store_call(
-                "enqueue",
+                "admit",
                 task_id=task_id,
                 variant=variant,
                 backend_url=backend_url,
@@ -194,8 +195,6 @@ class GatewayRuntime:
         while not self._stopping.is_set():
             try:
                 active = await self._store_call("get_active")
-                if active is None:
-                    active = await self._store_call("claim_next")
                 if active is None:
                     self._wake.clear()
                     try:
@@ -294,7 +293,7 @@ class GatewayRuntime:
                 "update_task",
                 task_id,
                 error=(
-                    "Backend has no task record after submission; queue is paused "
+                    "Backend has no task record after submission; service is busy "
                     "to avoid duplicate execution"
                 ),
             )
@@ -430,12 +429,15 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Invalid JSON body") from error
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="JSON body must be an object")
-        task = await runtime.enqueue(payload)
+        try:
+            task = await runtime.admit(payload)
+        except BusyTaskError:
+            return {"code": 2, "message": "A task is running."}
         return {
             "code": 0,
-            "message": "queued",
+            "message": "accepted",
             "task_id": task["task_id"],
-            "status": "queued",
+            "status": task["status"],
             "variant": task["variant"],
         }
 

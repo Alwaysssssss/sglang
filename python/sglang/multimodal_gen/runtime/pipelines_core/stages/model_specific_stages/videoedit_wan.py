@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-from contextlib import nullcontext
 import math
+import os
+import time
 import weakref
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import numpy as np
@@ -11,9 +13,13 @@ import torch
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
+    DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT,
     WanVideoEditSamplingParams,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_group,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -28,12 +34,75 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.readonly_model_residency import (
+    StagePrefetch,
+    close_encoder_prefetch,
+    readonly_model_on_device,
+)
+from sglang.multimodal_gen.runtime.utils.videoedit_memory import (
+    VideoEditResidencyPlanner,
+    common_weight_budget,
+    decoded_frames_to_images,
+    env_nonnegative_int,
+)
+from sglang.multimodal_gen.runtime.videoedit.distributed import (
+    broadcast_tensor_from_owner,
+)
 from sglang.multimodal_gen.runtime.videoedit.preprocess import prepare_window_inputs
 from sglang.multimodal_gen.runtime.videoedit.progress import (
     build_window_progress_payload,
     write_videoedit_progress,
 )
+from sglang.multimodal_gen.runtime.videoedit.vae_spatial import (
+    distributed_tiled_decode,
+    distributed_tiled_encode,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+
+logger = init_logger(__name__)
+
+
+def _conditioning_group():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    return get_sp_group()
+
+
+def _device_total_bytes() -> int:
+    """Optimistic pre-flight headroom: the whole device, before any measurement.
+
+    The window validation stage only proves that a shape cannot possibly fit;
+    the denoise stage re-plans against real headroom. Zero on non-CUDA hosts
+    keeps the geometry checks running without a memory verdict.
+    """
+    if current_platform.device_type != "cuda":
+        return 0
+    return int(torch.cuda.mem_get_info(get_local_torch_device())[1])
+
+
+def _stage_owner(name: str, default: int, world_size: int) -> int:
+    env_name = f"SGLANG_VIDEOEDIT_{name.upper()}_OWNER"
+    raw = os.environ.get(env_name, str(default))
+    try:
+        owner = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{env_name} must be an integer, got {raw!r}") from exc
+    if not 0 <= owner < world_size:
+        raise ValueError(f"{env_name} must be in [0, {world_size}), got {owner}")
+    return owner
+
+
+def _collect_parallel_error(group, local_error: str | None, operation: str) -> None:
+    if group is None or group.world_size == 1:
+        if local_error is not None:
+            raise RuntimeError(f"{operation} failed: {local_error}")
+        return
+    errors: list[str | None] = [None] * group.world_size
+    torch.distributed.all_gather_object(errors, local_error, group=group.cpu_group)
+    failures = [f"rank {rank}: {error}" for rank, error in enumerate(errors) if error]
+    if failures:
+        raise RuntimeError(f"{operation} failed; " + "; ".join(failures))
 
 
 def _videoedit_params(batch: Req) -> WanVideoEditSamplingParams:
@@ -118,6 +187,59 @@ def _move_vae_for_videoedit(
     if getattr(vae, "_sglang_videoedit_native_vae", False):
         return vae.to(device=device)
     return vae.to(device=device, dtype=dtype)
+
+
+def _keep_stage_tensors():
+    return os.environ.get("SGLANG_VIDEOEDIT_KEEP_STAGE_TENSORS") == "1"
+
+
+@contextmanager
+def _videoedit_vae_residency(vae, device, dtype, server_args):
+    """Stage-scoped VAE weights, with causal feature caches cleared on failure."""
+    offload = getattr(server_args, "vae_cpu_offload", False)
+    if offload:
+        # Normalize a preloaded GPU VAE once; subsequent stages restore CPU refs.
+        if any(t.device.type != "cpu" for t in (*vae.parameters(), *vae.buffers())):
+            vae.to("cpu")
+        target_dtype = None if getattr(vae, "_sglang_videoedit_native_vae", False) else dtype
+        residency = readonly_model_on_device(vae, device, dtype=target_dtype)
+    else:
+        residency = nullcontext()
+    with residency:
+        try:
+            yield vae
+        finally:
+            clear_cache = getattr(vae, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+
+
+def _videoedit_vae_sp_enabled(server_args: ServerArgs, operation: str) -> bool:
+    if not getattr(server_args.pipeline_config, "vae_sp", False):
+        return False
+    mode = os.environ.get("SGLANG_VIDEOEDIT_VAE_SP_MODE", "both").lower()
+    if mode not in {"encode", "decode", "both"}:
+        raise ValueError(
+            "SGLANG_VIDEOEDIT_VAE_SP_MODE must be encode, decode, or both, "
+            f"got {mode!r}"
+        )
+    group = _conditioning_group()
+    return group is not None and group.world_size > 1 and mode in {operation, "both"}
+
+
+def _uses_spatial_tiles(vae, tensor: torch.Tensor, *, latent: bool) -> bool:
+    height, width = tensor.shape[-2:]
+    if latent:
+        ratio = vae.spatial_compression_ratio
+        height *= ratio
+        width *= ratio
+    return bool(
+        getattr(vae, "use_tiling", False)
+        and (
+            width > vae.tile_sample_min_width
+            or height > vae.tile_sample_min_height
+        )
+    )
 
 
 def _decode_vae_for_videoedit(
@@ -225,7 +347,6 @@ def _prepare_clip_pixel_values(
 
 class VideoEditWindowValidationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        del server_args
         params = _videoedit_params(batch)
         frames = params.runtime_window_frames
         masks = params.runtime_window_masks
@@ -252,6 +373,18 @@ class VideoEditWindowValidationStage(PipelineStage):
                 f"VideoEdit window size must be divisible by 16, got {width}x{height}"
             )
 
+        if os.environ.get("SGLANG_VIDEOEDIT_AUTO_RESIDENCY") == "1":
+            if not getattr(server_args, "dit_layerwise_offload", False):
+                raise ValueError("AUTO_RESIDENCY requires dit_layerwise_offload=true")
+            # Reject impossible geometry before loading encoders or running VAE.
+            # infer_len varies per request, so the window length is bounded by the
+            # device rather than by a fixed frame count; the denoise stage re-plans
+            # the same shape against measured headroom and its resident-layer budget.
+            VideoEditResidencyPlanner().plan(
+                (1, 16, (len(frames) - 1) // 4 + 1, height // 8, width // 8),
+                _device_total_bytes(), sp_degree=int(server_args.sp_degree),
+            )
+
         params.runtime_height = height
         params.runtime_width = width
         params.runtime_num_frames = len(frames)
@@ -263,11 +396,70 @@ class VideoEditWindowValidationStage(PipelineStage):
 
 
 class VideoEditTextEncodingStage(PipelineStage):
-    def __init__(self, text_encoder: torch.nn.Module, tokenizer: Any, transformer: torch.nn.Module):
+    def __init__(self, text_encoder: torch.nn.Module, tokenizer: Any,
+                 transformer: torch.nn.Module, next_image_encoder=None):
         super().__init__()
         self.text_encoder = text_encoder
         self.text_stage = TextEncodingStage([text_encoder], [tokenizer])
         self.transformer = transformer
+        self.next_image_encoder = next_image_encoder
+        self.cached_negative_text: str | None = None
+        self.cached_negative_embeds: torch.Tensor | None = None
+        self.positive_encode_calls = 0
+        self.negative_encode_calls = 0
+
+    @torch.no_grad()
+    def encode_texts_to_cpu(
+        self,
+        texts: list[str],
+        server_args: ServerArgs,
+    ) -> list[torch.Tensor]:
+        """Encode several texts during one model residency interval."""
+        if not texts:
+            return []
+        device = get_local_torch_device()
+        target_dtype = _module_dtype(
+            self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        )
+        autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+        preserve_cpu = (
+            server_args.text_encoder_cpu_offload
+            and os.environ.get("SGLANG_VIDEOEDIT_ENCODER_CPU_MASTER") == "1"
+        )
+        residency = (
+            readonly_model_on_device(self.text_encoder, device)
+            if preserve_cpu
+            else nullcontext()
+        )
+        results = []
+        try:
+            with residency:
+                if not preserve_cpu and hasattr(self.text_encoder, "to"):
+                    self.text_encoder = self.text_encoder.to(device)
+                    self.text_stage.text_encoders[0] = self.text_encoder
+                for text in texts:
+                    with torch.autocast(
+                        device_type=current_platform.device_type,
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        embeds, _, _ = self.text_stage.encode_text(
+                            text,
+                            server_args,
+                            encoder_index=[0],
+                            return_attention_mask=True,
+                            dtype=target_dtype,
+                        )
+                    results.append(embeds[0].detach().to("cpu"))
+        finally:
+            if (
+                not preserve_cpu
+                and server_args.text_encoder_cpu_offload
+                and hasattr(self.text_encoder, "to")
+            ):
+                self.text_encoder = self.text_encoder.to("cpu")
+                self.text_stage.text_encoders[0] = self.text_encoder
+        return results
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -277,43 +469,69 @@ class VideoEditTextEncodingStage(PipelineStage):
             self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         )
         autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+        preserve_cpu = (
+            server_args.text_encoder_cpu_offload
+            and os.environ.get("SGLANG_VIDEOEDIT_ENCODER_CPU_MASTER") == "1"
+        )
+        residency = (
+            readonly_model_on_device(self.text_encoder, device)
+            if preserve_cpu else nullcontext()
+        )
         try:
-            if hasattr(self.text_encoder, "to"):
-                self.text_encoder = self.text_encoder.to(device)
-                self.text_stage.text_encoders[0] = self.text_encoder
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=target_dtype,
-                enabled=autocast_enabled,
-            ):
-                prompt_embeds, _, _ = self.text_stage.encode_text(
-                    params.prompt or " ",
-                    server_args,
-                    encoder_index=[0],
-                    return_attention_mask=True,
-                    dtype=target_dtype,
-                )
-            params.runtime_prompt_embeds = prompt_embeds[0]
-
-            params.runtime_do_cfg = float(params.guidance_scale) > 1.0
-            if params.runtime_do_cfg:
+            with residency:
+                if not preserve_cpu and hasattr(self.text_encoder, "to"):
+                    self.text_encoder = self.text_encoder.to(device)
+                    self.text_stage.text_encoders[0] = self.text_encoder
+                next_encoder = getattr(self, "next_image_encoder", None)
+                if (
+                    next_encoder is not None and device.type == "cuda"
+                    and getattr(params, "use_clip", False)
+                    and getattr(server_args, "image_encoder_cpu_offload", False)
+                    and os.environ.get("SGLANG_VIDEOEDIT_ENCODER_CPU_MASTER") == "1"
+                    and os.environ.get("SGLANG_VIDEOEDIT_PREFETCH_IMAGE_ENCODER") == "1"
+                ):
+                    tensors = list(next_encoder.parameters()) + list(next_encoder.buffers())
+                    required = sum(t.numel() * t.element_size() for t in tensors)
+                    reserve = env_nonnegative_int("SGLANG_VIDEOEDIT_STAGE_PREFETCH_RESERVE_MB", 4096) * 1024**2
+                    free, _ = torch.cuda.mem_get_info(device)
+                    if all(t.device.type == "cpu" for t in tensors) and required + reserve <= free:
+                        params.runtime_encoder_prefetch = StagePrefetch(next_encoder, device)
                 with torch.autocast(
                     device_type=current_platform.device_type,
                     dtype=target_dtype,
                     enabled=autocast_enabled,
                 ):
-                    neg_embeds, _, _ = self.text_stage.encode_text(
-                        params.negative_prompt or "",
+                    prompt_embeds, _, _ = self.text_stage.encode_text(
+                        params.prompt or " ",
                         server_args,
                         encoder_index=[0],
                         return_attention_mask=True,
                         dtype=target_dtype,
                     )
-                params.runtime_negative_prompt_embeds = neg_embeds[0]
-            else:
-                params.runtime_negative_prompt_embeds = None
+                params.runtime_prompt_embeds = prompt_embeds[0]
+
+                params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+                if params.runtime_do_cfg:
+                    with torch.autocast(
+                        device_type=current_platform.device_type,
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        neg_embeds, _, _ = self.text_stage.encode_text(
+                            params.negative_prompt or "",
+                            server_args,
+                            encoder_index=[0],
+                            return_attention_mask=True,
+                            dtype=target_dtype,
+                        )
+                    params.runtime_negative_prompt_embeds = neg_embeds[0]
+                else:
+                    params.runtime_negative_prompt_embeds = None
+        except BaseException:
+            close_encoder_prefetch(params)
+            raise
         finally:
-            if server_args.text_encoder_cpu_offload and hasattr(
+            if not preserve_cpu and server_args.text_encoder_cpu_offload and hasattr(
                 self.text_encoder, "to"
             ):
                 self.text_encoder = self.text_encoder.to("cpu")
@@ -350,40 +568,215 @@ class VideoEditImageEncodingStage(PipelineStage):
             raise ValueError("VideoEdit window must be validated before image encoding")
 
         device = get_local_torch_device()
-        if hasattr(self.image_encoder, "to"):
-            self.image_encoder = self.image_encoder.to(device)
-
-        image = params.runtime_window_frames[0].convert("RGB")
-        image = image.resize((params.runtime_width, params.runtime_height))
-        pixel_values = _prepare_clip_pixel_values(
-            image,
-            clip_preprocess=params.clip_preprocess,
-            image_processor=self.image_processor,
-            device=device,
+        preserve_cpu = (
+            server_args.image_encoder_cpu_offload
+            and os.environ.get("SGLANG_VIDEOEDIT_ENCODER_CPU_MASTER") == "1"
         )
-
-        image_dtype = _module_dtype(self.image_encoder, torch.float32)
-        target_dtype = _module_dtype(
-            self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        )
-        autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+        residency = getattr(params, "runtime_encoder_prefetch", None)
+        params.runtime_encoder_prefetch = None
+        if residency is None:
+            residency = (
+                readonly_model_on_device(self.image_encoder, device)
+                if preserve_cpu else nullcontext()
+            )
         try:
-            # The reference keeps CLIP's parameters in FP32 but calls the whole
-            # pipeline under BF16 autocast, then casts hidden_states[-2].
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=target_dtype,
-                enabled=autocast_enabled,
-            ):
-                outputs = self.image_encoder(
-                    pixel_values=pixel_values.to(dtype=image_dtype),
-                    **server_args.pipeline_config.image_encoder_extra_args,
+            with residency:
+                if not preserve_cpu and hasattr(self.image_encoder, "to"):
+                    self.image_encoder = self.image_encoder.to(device)
+
+                image = params.runtime_window_frames[0].convert("RGB")
+                image = image.resize((params.runtime_width, params.runtime_height))
+                pixel_values = _prepare_clip_pixel_values(
+                    image,
+                    clip_preprocess=params.clip_preprocess,
+                    image_processor=self.image_processor,
+                    device=device,
                 )
-                image_embeds = server_args.pipeline_config.postprocess_image(outputs)
-            params.runtime_image_embeds = image_embeds.to(device=device, dtype=target_dtype)
+
+                image_dtype = _module_dtype(self.image_encoder, torch.float32)
+                target_dtype = _module_dtype(
+                    self.transformer, PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+                )
+                autocast_enabled = target_dtype != torch.float32 and not server_args.disable_autocast
+                # The reference keeps CLIP's parameters in FP32 but calls the whole
+                # pipeline under BF16 autocast, then casts hidden_states[-2].
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
+                ):
+                    outputs = self.image_encoder(
+                        pixel_values=pixel_values.to(dtype=image_dtype),
+                        **server_args.pipeline_config.image_encoder_extra_args,
+                    )
+                    image_embeds = server_args.pipeline_config.postprocess_image(outputs)
+                params.runtime_image_embeds = image_embeds.to(device=device, dtype=target_dtype)
         finally:
-            if server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
+            if not preserve_cpu and server_args.image_encoder_cpu_offload and hasattr(self.image_encoder, "to"):
                 self.image_encoder = self.image_encoder.to("cpu")
+        return batch
+
+
+class VideoEditConditioningEncodingStage(PipelineStage):
+    """Run request text and per-window CLIP on their owners, then distribute."""
+
+    def __init__(
+        self,
+        text_stage: VideoEditTextEncodingStage,
+        image_stage: VideoEditImageEncodingStage,
+    ):
+        super().__init__()
+        self.text_stage = text_stage
+        self.image_stage = image_stage
+        self.startup_negative_seconds: float | None = None
+        self.last_text_seconds: float | None = None
+        self.last_clip_seconds: float | None = None
+
+    @staticmethod
+    def _sync_for_timing() -> None:
+        device = get_local_torch_device()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def precompute_default_negative(self, server_args: ServerArgs) -> None:
+        group = _conditioning_group()
+        world_size = group.world_size if group is not None else 1
+        rank = group.rank_in_group if group is not None else 0
+        text_owner = _stage_owner("text", 0, world_size)
+        value = None
+        local_error = None
+        if rank == text_owner:
+            try:
+                self._sync_for_timing()
+                started = time.perf_counter()
+                value = self.text_stage.encode_texts_to_cpu(
+                    [DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT], server_args
+                )[0]
+                self._sync_for_timing()
+                self.startup_negative_seconds = time.perf_counter() - started
+                self.text_stage.negative_encode_calls += 1
+            except BaseException as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+        _collect_parallel_error(
+            group, local_error, "default VideoEdit negative prompt precomputation"
+        )
+        value = broadcast_tensor_from_owner(
+            group, value, text_owner, "negative_prompt_embeds"
+        )
+        self.text_stage.cached_negative_text = DEFAULT_VIDEOEDIT_NEGATIVE_PROMPT
+        self.text_stage.cached_negative_embeds = value.detach().to("cpu")
+        logger.info(
+            "Precomputed the default VideoEdit negative prompt on text owner rank %s "
+            "in %s seconds",
+            text_owner,
+            self.startup_negative_seconds,
+        )
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        params = _videoedit_params(batch)
+        group = _conditioning_group()
+        world_size = group.world_size if group is not None else 1
+        rank = group.rank_in_group if group is not None else 0
+        text_owner = _stage_owner("text", 0, world_size)
+        clip_owner = _stage_owner("clip", 1 if world_size > 1 else 0, world_size)
+        device = get_local_torch_device()
+        target_dtype = _module_dtype(
+            self.text_stage.transformer,
+            PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision],
+        )
+
+        params.runtime_do_cfg = float(params.guidance_scale) > 1.0
+        prompt_needed = params.runtime_request_prompt_embeds is None
+        negative_text = params.negative_prompt or ""
+        negative_update = bool(
+            params.runtime_do_cfg
+            and (
+                self.text_stage.cached_negative_embeds is None
+                or self.text_stage.cached_negative_text != negative_text
+            )
+        )
+
+        prompt_value = None
+        negative_value = None
+        image_value = None
+        local_error = None
+        self.last_text_seconds = None
+        self.last_clip_seconds = None
+        try:
+            if rank == text_owner and (prompt_needed or negative_update):
+                texts = []
+                if prompt_needed:
+                    texts.append(params.prompt or " ")
+                if negative_update:
+                    texts.append(negative_text)
+                self._sync_for_timing()
+                started = time.perf_counter()
+                encoded = self.text_stage.encode_texts_to_cpu(texts, server_args)
+                self._sync_for_timing()
+                self.last_text_seconds = time.perf_counter() - started
+                cursor = 0
+                if prompt_needed:
+                    prompt_value = encoded[cursor]
+                    self.text_stage.positive_encode_calls += 1
+                    cursor += 1
+                if negative_update:
+                    negative_value = encoded[cursor]
+                    self.text_stage.negative_encode_calls += 1
+
+            if params.use_clip and rank == clip_owner:
+                self._sync_for_timing()
+                started = time.perf_counter()
+                self.image_stage.forward(batch, server_args)
+                self._sync_for_timing()
+                self.last_clip_seconds = time.perf_counter() - started
+                image_value = params.runtime_image_embeds
+        except BaseException as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+            close_encoder_prefetch(params)
+
+        _collect_parallel_error(group, local_error, "VideoEdit text/CLIP preparation")
+
+        if prompt_needed:
+            prompt_value = broadcast_tensor_from_owner(
+                group, prompt_value, text_owner, "prompt_embeds"
+            )
+            params.runtime_request_prompt_embeds = prompt_value.detach().to("cpu")
+        if params.runtime_request_prompt_embeds is None:
+            raise RuntimeError("VideoEdit request prompt embedding was not prepared")
+
+        if params.runtime_do_cfg:
+            if negative_update:
+                negative_value = broadcast_tensor_from_owner(
+                    group, negative_value, text_owner, "negative_prompt_embeds"
+                )
+                # Replace the cache only after encode and distribution both succeed.
+                self.text_stage.cached_negative_text = negative_text
+                self.text_stage.cached_negative_embeds = negative_value.detach().to("cpu")
+            if self.text_stage.cached_negative_embeds is None:
+                raise RuntimeError("VideoEdit negative prompt cache is empty")
+            params.runtime_request_negative_prompt_embeds = (
+                self.text_stage.cached_negative_embeds
+            )
+        else:
+            params.runtime_request_negative_prompt_embeds = None
+
+        params.runtime_prompt_embeds = params.runtime_request_prompt_embeds.to(
+            device=device, dtype=target_dtype
+        )
+        params.runtime_negative_prompt_embeds = (
+            params.runtime_request_negative_prompt_embeds.to(
+                device=device, dtype=target_dtype
+            )
+            if params.runtime_request_negative_prompt_embeds is not None
+            else None
+        )
+        if params.use_clip:
+            params.runtime_image_embeds = broadcast_tensor_from_owner(
+                group, image_value, clip_owner, "image_embeds"
+            ).to(device=device, dtype=target_dtype)
+        else:
+            params.runtime_image_embeds = None
         return batch
 
 
@@ -400,6 +793,7 @@ class VideoEditConditionEncodingStage(PipelineStage):
         vae_dtype: torch.dtype,
         output_dtype: torch.dtype,
         autocast_enabled: bool,
+        use_spatial_parallel: bool = False,
     ) -> torch.Tensor:
         device = get_local_torch_device()
         self.vae = _move_vae_for_videoedit(
@@ -413,8 +807,20 @@ class VideoEditConditionEncodingStage(PipelineStage):
             dtype=output_dtype,
             enabled=autocast_enabled,
         ):
-            encoded = self.vae.encode(video_tensor)
-            latents = _retrieve_latents(encoded)
+            if use_spatial_parallel and _uses_spatial_tiles(
+                self.vae, video_tensor, latent=False
+            ):
+                moments = distributed_tiled_encode(
+                    self.vae, video_tensor, _conditioning_group()
+                )
+                if moments.shape[1] % 2:
+                    raise ValueError(
+                        "VAE encoder moments must contain mean and log-variance channels"
+                    )
+                latents = moments.chunk(2, dim=1)[0]
+            else:
+                encoded = self.vae.encode(video_tensor)
+                latents = _retrieve_latents(encoded)
             latents = _normalize_vae_latents(latents, self.vae)
         return latents.to(device=device, dtype=output_dtype)
 
@@ -434,8 +840,9 @@ class VideoEditConditionEncodingStage(PipelineStage):
             dtype=tensor_dtype,
             mask_downsample_mode=params.mask_downsample_mode,
             preserve_first_frame=True,
+            return_intermediates=_keep_stage_tensors(),
         )
-        params.runtime_masked_video_tensor = prepared["masked_video_tensor"]
+        params.runtime_masked_video_tensor = prepared["masked_video_tensor"] if _keep_stage_tensors() else None
         params.runtime_mask_video_tensor = prepared["mask_video_tensor"]
         params.runtime_cond_masks = prepared["cond_masks"]
 
@@ -445,17 +852,33 @@ class VideoEditConditionEncodingStage(PipelineStage):
             self.vae.disable_tiling()
         autocast_enabled = tensor_dtype != torch.float32 and not server_args.disable_autocast
 
-        masked_video = params.runtime_masked_video_tensor.permute(1, 0, 2, 3).unsqueeze(0)
+        masked_video = prepared["masked_video_tensor"].permute(1, 0, 2, 3).unsqueeze(0)
 
-        params.runtime_cond_latents = self._encode_video_latents(
-            masked_video,
-            vae_dtype=vae_dtype,
-            output_dtype=tensor_dtype,
-            autocast_enabled=autocast_enabled,
-        )
-        params.runtime_condition_latent = torch.cat(
-            [params.runtime_cond_masks, params.runtime_cond_latents], dim=1
-        )
+        try:
+            with _videoedit_vae_residency(self.vae, device, vae_dtype, server_args):
+                params.runtime_cond_latents = self._encode_video_latents(
+                    masked_video,
+                    vae_dtype=vae_dtype,
+                    output_dtype=tensor_dtype,
+                    autocast_enabled=autocast_enabled,
+                    use_spatial_parallel=_videoedit_vae_sp_enabled(
+                        server_args, "encode"
+                    ),
+                )
+            # Denoising consumes the two separate tensors; do not retain a duplicate.
+            params.runtime_condition_latent = (
+                torch.cat([params.runtime_cond_masks, params.runtime_cond_latents], dim=1)
+                if _keep_stage_tensors() else None
+            )
+        except BaseException:
+            if not _keep_stage_tensors():
+                params.runtime_cond_latents = None
+                params.runtime_cond_masks = None
+            raise
+        finally:
+            if not _keep_stage_tensors():
+                params.runtime_masked_video_tensor = None
+                params.runtime_mask_video_tensor = None
         return batch
 
 
@@ -519,6 +942,8 @@ class VideoEditLatentInitStage(PipelineStage):
         params.runtime_latents = params.runtime_noise
         batch.latents = params.runtime_latents
         batch.raw_latent_shape = tuple(params.runtime_latents.shape)
+        if not _keep_stage_tensors():
+            params.runtime_noise = None
         return batch
 
 
@@ -567,6 +992,35 @@ class VideoEditDenoisingStage(DenoisingStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        self._residency_observation = None
+        completed = False
+        try:
+            result = self._forward_denoising(batch, server_args)
+            completed = True
+            return result
+        finally:
+            if completed and self._residency_observation is not None:
+                key, initial_bytes, capacity = self._residency_observation
+                peak = torch.cuda.max_memory_allocated()
+                self.residency_planner.observe(
+                    key, peak_allocated_bytes=peak,
+                    initial_allocated_bytes=initial_bytes, weight_capacity_bytes=capacity,
+                )
+                self.residency_plan["observed_peak_allocated_bytes"] = peak
+            # Stage-scoped weight caches retain their immutable CPU originals.
+            # Release GPU copies rather than copying unchanged weights back.
+            for manager in getattr(self.transformer, "layerwise_offload_managers", []):
+                if getattr(manager, "release_after_denoise", False) or getattr(manager, "auto_residency", False):
+                    manager.release_all()
+            if batch is not None and not _keep_stage_tensors():
+                params = _videoedit_params(batch)
+                for name in ("runtime_cond_masks", "runtime_cond_latents",
+                             "runtime_condition_latent", "runtime_noise",
+                             "runtime_prompt_embeds", "runtime_negative_prompt_embeds",
+                             "runtime_image_embeds"):
+                    setattr(params, name, None)
+
+    def _forward_denoising(self, batch: Req, server_args: ServerArgs) -> Req:
         if server_args.enable_cfg_parallel:
             raise NotImplementedError("VideoEdit MVP does not support CFG parallel yet")
 
@@ -586,6 +1040,57 @@ class VideoEditDenoisingStage(DenoisingStage):
         image_embeds = params.runtime_image_embeds
 
         self._manage_device_placement(self.transformer, None, server_args)
+        managers = [m for m in getattr(self.transformer, "layerwise_offload_managers", [])
+                    if getattr(m, "auto_residency", False) and m.enabled]
+        if managers:
+            if (target_dtype != torch.bfloat16
+                    or getattr(self.transformer, "hidden_size", None) != 5120
+                    or getattr(server_args, "ring_degree", 1) != 1
+                    or str(getattr(server_args, "attention_backend", "")).lower() not in ("fa", "attentionbackendenum.fa")):
+                raise ValueError("AUTO_RESIDENCY currently requires Wan 14B BF16, FA and pure Ulysses")
+            # Release all weights/rolling slots before measuring current headroom.
+            for manager in managers:
+                manager.release_all()
+            torch.cuda.current_stream().synchronize()
+            free, _ = torch.cuda.mem_get_info()
+            initial_bytes = torch.cuda.memory_allocated()
+            reusable = torch.cuda.memory_reserved() - initial_bytes
+            if not hasattr(self, "residency_planner"):
+                self.residency_planner = VideoEditResidencyPlanner()
+            # A rolling schedule still needs one layer resident, so the plan must
+            # leave that much weight budget; infer_len scaling decides the rest.
+            largest_layer = max(
+                (size for manager in managers for size in manager.layer_bytes()),
+                default=0,
+            )
+            key, plan = self.residency_planner.plan(
+                tuple(latents.shape), free + reusable,
+                sp_degree=int(server_args.sp_degree), cfg=params.runtime_do_cfg,
+                teacache=bool(batch.enable_teacache),
+                minimum_reserve_bytes=env_nonnegative_int("SGLANG_VIDEOEDIT_ACTIVATION_RESERVE_MB", 4096) * 1024**2,
+                full_frame_reserve_bytes=env_nonnegative_int("SGLANG_VIDEOEDIT_FULL_FRAME_RESERVE_MB", 16384) * 1024**2,
+                margin_bytes=env_nonnegative_int("SGLANG_VIDEOEDIT_RESIDENCY_MARGIN_MB", 2048) * 1024**2,
+                weight_limit_bytes=env_nonnegative_int("SGLANG_VIDEOEDIT_WEIGHT_BUDGET_MB") * 1024**2,
+                minimum_weight_bytes=largest_layer,
+            )
+            cpu_group = None
+            if torch.distributed.is_initialized():
+                from sglang.multimodal_gen.runtime.distributed import get_sp_group
+                cpu_group = get_sp_group().cpu_group
+            budget = common_weight_budget(plan["local_weight_budget_bytes"], cpu_group)
+            plan["common_weight_budget_bytes"] = budget
+            total = sum(m.cpu_weight_bytes for m in managers)
+            for manager in managers:
+                share = budget * manager.cpu_weight_bytes // max(1, total)
+                manager.configure_memory_budget(share)
+            capacity = sum(m.weight_capacity_bytes for m in managers)
+            plan["weight_capacity_bytes"] = capacity
+            plan["resident_layers"] = [m.resident_layers for m in managers]
+            plan["prefetch_layers"] = [m.prefetch_size for m in managers]
+            self.residency_plan = plan
+            self._residency_observation = (key, initial_bytes, capacity)
+            torch.cuda.reset_peak_memory_stats()
+            logger.info("VideoEdit adaptive residency: %s", plan)
         batch.do_classifier_free_guidance = bool(params.runtime_do_cfg)
         batch.is_cfg_negative = False
         self._maybe_enable_cache_dit(params.runtime_effective_num_inference_steps, batch)
@@ -684,7 +1189,11 @@ class VideoEditDenoisingStage(DenoisingStage):
                             infer_len=params.infer_len,
                             overlap=params.overlap,
                             total_windows=len(params.runtime_window_specs or [None]),
-                            current_window_index=params.runtime_window_index,
+                            current_window_index=(
+                                params.runtime_progress_window_index
+                                if params.runtime_progress_window_index is not None
+                                else params.runtime_window_index
+                            ),
                             current_step_index=i,
                             steps_per_window=len(timesteps),
                         ),
@@ -707,40 +1216,44 @@ class VideoEditDecodingStage(PipelineStage):
             raise ValueError("VideoEdit denoised latents must be prepared")
         device = get_local_torch_device()
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = _move_vae_for_videoedit(
-            self.vae,
-            device=device,
-            dtype=vae_dtype,
-        )
-        if server_args.pipeline_config.vae_tiling:
-            self.vae.enable_tiling()
-        latents = params.runtime_latents.to(device=device).to(dtype=vae_dtype)
-        autocast_enabled = vae_dtype != torch.float32 and not server_args.disable_autocast
-        previous_use_feature_cache = getattr(self.vae, "use_feature_cache", None)
-        if server_args.pipeline_config.vae_tiling and previous_use_feature_cache is not None:
-            self.vae.use_feature_cache = False
         try:
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
-                enabled=autocast_enabled,
-            ):
-                latents = _denormalize_vae_latents(latents, self.vae)
-                decoded = _decode_vae_for_videoedit(self.vae, latents)
+            with _videoedit_vae_residency(self.vae, device, vae_dtype, server_args):
+                self.vae = _move_vae_for_videoedit(self.vae, device=device, dtype=vae_dtype)
+                if server_args.pipeline_config.vae_tiling:
+                    self.vae.enable_tiling()
+                latents = params.runtime_latents.to(device=device, dtype=vae_dtype)
+                autocast_enabled = vae_dtype != torch.float32 and not server_args.disable_autocast
+                previous_use_feature_cache = getattr(self.vae, "use_feature_cache", None)
+                if server_args.pipeline_config.vae_tiling and previous_use_feature_cache is not None:
+                    self.vae.use_feature_cache = False
+                try:
+                    with torch.autocast(
+                        device_type=current_platform.device_type,
+                        dtype=vae_dtype,
+                        enabled=autocast_enabled,
+                    ):
+                        latents = _denormalize_vae_latents(latents, self.vae)
+                        if _videoedit_vae_sp_enabled(
+                            server_args, "decode"
+                        ) and _uses_spatial_tiles(self.vae, latents, latent=True):
+                            decoded = distributed_tiled_decode(
+                                self.vae, latents, _conditioning_group()
+                            )
+                        else:
+                            decoded = _decode_vae_for_videoedit(self.vae, latents)
+                finally:
+                    if previous_use_feature_cache is not None:
+                        self.vae.use_feature_cache = previous_use_feature_cache
+            decoded_frames = (decoded / 2 + 0.5).clamp(0, 1)[0].permute(1, 0, 2, 3)
+            del decoded, latents
+            params.runtime_decoded_video_tensor = decoded_frames if _keep_stage_tensors() else None
+            transfer_batch = env_nonnegative_int("SGLANG_VIDEOEDIT_DECODE_TRANSFER_FRAMES", 4)
+            params.runtime_window_output_frames = decoded_frames_to_images(decoded_frames, transfer_batch)
         finally:
-            if previous_use_feature_cache is not None:
-                self.vae.use_feature_cache = previous_use_feature_cache
-        decoded_frames = (decoded / 2 + 0.5).clamp(0, 1)[0].permute(1, 0, 2, 3)
-        params.runtime_decoded_video_tensor = decoded_frames
-
-        video = decoded_frames.detach().float().cpu()
-        frames = []
-        for frame in video.permute(0, 2, 3, 1):
-            arr = (frame.clamp(0, 1).numpy() * 255.0).astype("uint8")
-            from PIL import Image
-
-            frames.append(Image.fromarray(arr))
-        params.runtime_window_output_frames = frames
+            if not _keep_stage_tensors():
+                params.runtime_decoded_video_tensor = None
+                params.runtime_latents = None
+                batch.latents = None
         return batch
 
 

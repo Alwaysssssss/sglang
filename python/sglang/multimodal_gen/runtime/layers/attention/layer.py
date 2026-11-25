@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import os
 from typing import Type
 
 import torch
@@ -26,7 +27,9 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_bac
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
     _usp_output_all_to_all,
+    _usp_qkv_input_all_to_all,
     ring_attn,
+    ulysses_attention_pipelined,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
@@ -392,6 +395,10 @@ class USPAttention(nn.Module):
         self.dropout_p = dropout_rate
 
         self.skip_sequence_parallel = skip_sequence_parallel
+        self.fuse_qkv_exchange = os.environ.get("SGLANG_VIDEOEDIT_FUSED_QKV") == "1"
+        self.ulysses_chunks = int(os.environ.get("SGLANG_VIDEOEDIT_USP_CHUNKS", "1"))
+        if self.ulysses_chunks < 1:
+            raise ValueError("SGLANG_VIDEOEDIT_USP_CHUNKS must be a positive integer")
 
     def forward(
         self,
@@ -440,12 +447,36 @@ class USPAttention(nn.Module):
                 q, k, v, ctx_attn_metadata, num_replicated_suffix
             )
 
+        if (
+            self.ulysses_chunks > 1
+            and sp_size > 1
+            and get_ring_parallel_world_size() == 1
+            and self.backend == AttentionBackendEnum.FA
+            and self.dropout_p == 0
+            and not torch.is_grad_enabled()
+            and q.is_cuda
+            and q.shape == k.shape == v.shape
+            and q.dtype == k.dtype == v.dtype
+            and q.device == k.device == v.device
+            and q.shape[2] % (sp_size * self.ulysses_chunks) == 0
+        ):
+            return ulysses_attention_pipelined(
+                q,
+                k,
+                v,
+                lambda cq, ck, cv: self.attn_impl.forward(cq, ck, cv, ctx_attn_metadata),
+                self.ulysses_chunks,
+            )
+
         # Ulysses-style All-to-All for sequence/head sharding
         if sp_size > 1:
             # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            if self.fuse_qkv_exchange:
+                q, k, v = _usp_qkv_input_all_to_all(q, k, v, head_dim=2)
+            else:
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:

@@ -1239,23 +1239,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 hidden_states = hidden_states[:, :seq_len_orig, :]
 
         # 5. Output norm, projection & unpatchify
-        if temb.dim() == 3:
-            # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
-            shift, scale = (
-                self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)
-            ).chunk(2, dim=2)
-            shift = shift.squeeze(2)
-            scale = scale.squeeze(2)
-        else:
-            # batch_size, inner_dim
-            shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
-
-        if getattr(self, "strict_videoedit_math", False):
-            hidden_states = _explicit_norm_scale_shift(
-                self.norm_out.norm, hidden_states, shift, scale
-            )
-        else:
-            hidden_states = self.norm_out(hidden_states, shift, scale)
+        hidden_states = self._modulate_output(hidden_states, temb)
         hidden_states, _ = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
@@ -1272,6 +1256,38 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
 
         return output
+
+    def _modulate_output(
+        self, hidden_states: torch.Tensor, temb: torch.Tensor
+    ) -> torch.Tensor:
+        fp32_output_modulation = getattr(
+            self, "videoedit_fp32_output_modulation", False
+        )
+        # Cast locally rather than changing parameter dtype: residency code uses
+        # the model's parameter dtype to select the input/compute dtype.
+        output_table = self.scale_shift_table
+        output_temb = temb
+        if fp32_output_modulation:
+            output_table = output_table.float()
+            output_temb = output_temb.float()
+        if temb.dim() == 3:
+            # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
+            shift, scale = (
+                output_table.unsqueeze(0) + output_temb.unsqueeze(2)
+            ).chunk(2, dim=2)
+            shift = shift.squeeze(2)
+            scale = scale.squeeze(2)
+        else:
+            # batch_size, inner_dim
+            shift, scale = (output_table + output_temb.unsqueeze(1)).chunk(2, dim=1)
+
+        if fp32_output_modulation or getattr(self, "strict_videoedit_math", False):
+            hidden_states = _explicit_norm_scale_shift(
+                self.norm_out.norm, hidden_states, shift, scale
+            )
+        else:
+            hidden_states = self.norm_out(hidden_states, shift, scale)
+        return hidden_states
 
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor

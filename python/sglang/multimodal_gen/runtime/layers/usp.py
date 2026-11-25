@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.distributed._functional_collectives as ft_c
@@ -34,16 +34,16 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+    return _maybe_wait(_usp_all_to_all_single_async(x)).reshape(x.shape)
+
+
+def _usp_all_to_all_single_async(x: torch.Tensor) -> torch.Tensor:
+    """Launch without consuming the result on the compute stream."""
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
-    x_shape = x.shape
-    x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
+    return ft_c.all_to_all_single(
+        x.flatten(), output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
     )
-    x = _maybe_wait(x)
-    x = x.reshape(x_shape)
-    return x
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
@@ -102,6 +102,25 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+def _usp_qkv_input_all_to_all(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, head_dim: int = 2
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack the batch axis to exchange equal-layout Q/K/V in one collective.
+
+    GQA and mixed dtypes retain the existing separate exchanges.
+    """
+    if get_ulysses_parallel_world_size() <= 1:
+        return q, k, v
+    if not (
+        q.shape == k.shape == v.shape
+        and q.dtype == k.dtype == v.dtype
+        and q.device == k.device == v.device
+    ):
+        return tuple(_usp_input_all_to_all(x, head_dim=head_dim) for x in (q, k, v))
+    packed = _usp_input_all_to_all(torch.cat((q, k, v), dim=0), head_dim=head_dim)
+    return packed.chunk(3, dim=0)
+
+
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
@@ -156,6 +175,75 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         x = x.permute(2, 1, 0, 3, 4).contiguous().reshape(b, s_local, h_global, d)
 
     return x
+
+
+@torch.compiler.disable
+def ulysses_attention_pipelined(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention: Callable,
+    chunks: int,
+) -> torch.Tensor:
+    """Overlap head-chunk all-to-all with independent attention computation.
+
+    Inference-only BSHD, equal Q/K/V layouts, no Ring or replicated tokens.
+    Every chunk still attends to the entire global sequence. The caller must
+    use identical chunk counts on all ranks and a head-independent backend.
+    Functional collectives retain their send buffers until NCCL completes.
+    """
+    world = get_ulysses_parallel_world_size()
+    assert q.ndim == 4 and q.shape == k.shape == v.shape
+    assert q.dtype == k.dtype == v.dtype and q.device == k.device == v.device
+    b, s, heads, d = q.shape
+    assert chunks > 1 and heads % (world * chunks) == 0
+    chunk_heads = heads // chunks
+    local_heads = chunk_heads // world
+
+    def start_input(index):
+        start = index * chunk_heads
+        # Pack directly in destination-head order, avoiding an intermediate
+        # full QKV concatenation followed by a second contiguous copy.
+        packed = torch.cat(
+            [
+                x[:, :, start : start + chunk_heads].permute(2, 0, 1, 3)
+                for x in (q, k, v)
+            ],
+            dim=1,
+        )
+        return _usp_all_to_all_single_async(packed)
+
+    def finish_input(pending):
+        packed = _maybe_wait(pending).reshape(world, local_heads, 3 * b, s, d)
+        packed = packed.permute(2, 0, 3, 1, 4).contiguous()
+        return packed.reshape(3 * b, world * s, local_heads, d).chunk(3, dim=0)
+
+    output = torch.empty_like(q, memory_format=torch.contiguous_format)
+
+    def finish_output(pending, index):
+        received = _maybe_wait(pending).reshape(world, s, b, local_heads, d)
+        received = received.permute(2, 1, 0, 3, 4).reshape(b, s, chunk_heads, d)
+        output[:, :, index * chunk_heads : (index + 1) * chunk_heads].copy_(received)
+
+    next_input = start_input(0)
+    previous_output = None
+    for index in range(chunks):
+        # Enqueue the next transfer before waiting for the current one, so it
+        # can run while the current chunk's attention kernels execute.
+        current_input = next_input
+        next_input = start_input(index + 1) if index + 1 < chunks else None
+        cq, ck, cv = finish_input(current_input)
+        attended = attention(cq, ck, cv)
+        pending_output = _usp_all_to_all_single_async(
+            attended.permute(1, 0, 2, 3).contiguous()
+        )
+        # Drain the preceding output only after enqueueing this chunk's compute.
+        if previous_output is not None:
+            finish_output(previous_output, index - 1)
+        previous_output = pending_output
+        del cq, ck, cv, attended, current_input
+    finish_output(previous_output, chunks - 1)
+    return output
 
 
 def ring_attn(

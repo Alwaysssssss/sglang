@@ -1,3 +1,4 @@
+import os
 import re
 from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
@@ -7,6 +8,11 @@ import torch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.videoedit_memory import (
+    PinnedStagingPool,
+    env_nonnegative_int,
+    select_weight_budget,
+)
 
 logger = init_logger(__name__)
 
@@ -77,6 +83,29 @@ class LayerwiseOffloadManager:
         self.num_layers = num_layers
         self.pin_cpu_memory = pin_cpu_memory
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
+        self.prefetch_cap = self.prefetch_size
+        # Opt-in while validated against the VideoEdit workload. Removing the
+        # copy->compute stream dependency requires explicit allocation lifetimes.
+        self.overlap_prefetch = (
+            os.environ.get("SGLANG_VIDEOEDIT_OVERLAP_PREFETCH") == "1"
+            and current_platform.device_type == "cuda"
+        )
+        self.auto_residency = (
+            os.environ.get("SGLANG_VIDEOEDIT_AUTO_RESIDENCY") == "1"
+            and current_platform.device_type == "cuda"
+        )
+        self.explicit_overlap_prefetch = self.overlap_prefetch
+        self.overlap_prefetch = self.overlap_prefetch or self.auto_residency
+        # A bounded read-only weight cache; release_all still releases every
+        # layer. Default zero preserves the existing offload policy.
+        self.resident_layers = int(os.environ.get("SGLANG_VIDEOEDIT_RESIDENT_LAYERS", "0"))
+        self.release_after_denoise = (
+            os.environ.get("SGLANG_VIDEOEDIT_RELEASE_AFTER_DENOISE") == "1"
+        )
+        if not 0 <= self.resident_layers <= self.num_layers:
+            raise ValueError(
+                "SGLANG_VIDEOEDIT_RESIDENT_LAYERS must be within the layer count"
+            )
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
@@ -84,6 +113,20 @@ class LayerwiseOffloadManager:
             current_platform.device_type, torch.get_device_module().current_device()
         )
         self.copy_stream = torch.get_device_module().Stream()
+        staging_mb = env_nonnegative_int("SGLANG_VIDEOEDIT_OFFLOAD_PINNED_MB")
+        self.staging_pool = (
+            PinnedStagingPool(staging_mb * 1024**2)
+            if staging_mb and pin_cpu_memory and current_platform.device_type == "cuda"
+            else None
+        )
+
+        self.shared_cpu_dir = os.environ.get("SGLANG_VIDEOEDIT_SHARED_CPU_DIR", "")
+        if self.shared_cpu_dir and self.staging_pool is not None:
+            raise ValueError("Shared CPU weights and bounded offload staging are alternative policies")
+        if self.shared_cpu_dir and current_platform.device_type != "cuda":
+            raise ValueError("Shared CPU offload currently requires CUDA")
+        self._shared_cpu_keys: set[tuple[int, torch.dtype]] = set()
+        self.shared_cpu_weight_bytes = 0
 
         self._layer_name_re = re.compile(
             rf"(^|\.){re.escape(layers_attr_str)}\.(\d+)(\.|$)"
@@ -101,6 +144,14 @@ class LayerwiseOffloadManager:
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
+        self.h2d_weight_bytes = 0
+        self.h2d_layer_loads = 0
+        self._gpu_buffers: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
+        self._strided_gpu_buffers: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Recycle flat staging buffers only after the previous consumer finishes.
+        # A rolling lookahead bounds uniform-layer storage to prefetch_size + 1
+        # slots, plus resident layers, even when Python runs ahead of the GPU.
+        self._retired_gpu_buffers: list[tuple[dict, Any]] = []
         # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
         self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
 
@@ -164,7 +215,8 @@ class LayerwiseOffloadManager:
                     total_numel = sum(t.numel() for _, t in flat_weights)
                     # create concatenated CPU buffer (in pinned memory)
                     cpu_buffer = _empty_cpu_tensor(
-                        (total_numel,), dtype=dtype, pin_memory=self.pin_cpu_memory
+                        (total_numel,), dtype=dtype,
+                        pin_memory=self.pin_cpu_memory and self.staging_pool is None and not self.shared_cpu_dir,
                     )
 
                 # offload weights to the buffer
@@ -189,13 +241,23 @@ class LayerwiseOffloadManager:
                     current_offset += numel
 
                 if cpu_buffer is not None:
+                    if self.shared_cpu_dir:
+                        from sglang.multimodal_gen.runtime.utils.shared_cpu_weights import share_cpu_tensor
+
+                        cpu_buffer = share_cpu_tensor(
+                            cpu_buffer, self.shared_cpu_dir,
+                            pin_memory=self.pin_cpu_memory, device=self.device,
+                        )
+                        self._shared_cpu_keys.add((layer_idx, dtype))
+                        self.shared_cpu_weight_bytes += cpu_buffer.numel() * cpu_buffer.element_size()
                     self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
                 for name, weight in strided_weights:
                     shape = tuple(weight.shape)
                     stride = tuple(weight.stride())
                     cpu_weight = _empty_strided_cpu_tensor(
-                        shape, stride, dtype=dtype, pin_memory=self.pin_cpu_memory
+                        shape, stride, dtype=dtype,
+                        pin_memory=self.pin_cpu_memory and self.staging_pool is None,
                     )
                     cpu_weight.copy_(weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_weight
@@ -210,12 +272,25 @@ class LayerwiseOffloadManager:
 
                     weight.data = self._get_shared_empty_tensor(dtype)
 
+        self.cpu_weight_bytes = sum(
+            t.untyped_storage().nbytes()
+            for group in (self._consolidated_cpu_weights, self._strided_cpu_weights)
+            for tensors in group.values() for t in tensors.values()
+        )
+        self.pinned_weight_bytes = sum(
+            t.untyped_storage().nbytes()
+            for group in (self._consolidated_cpu_weights, self._strided_cpu_weights)
+            for tensors in group.values() for t in tensors.values() if t.is_pinned()
+        )
+        if self.pin_cpu_memory and self.staging_pool is None and self.pinned_weight_bytes < self.cpu_weight_bytes:
+            logger.warning("Some offload masters are pageable: pinned=%d total=%d bytes",
+                           self.pinned_weight_bytes, self.cpu_weight_bytes)
         # prefetch the first layer for warm-up
         self.prepare_for_next_req(non_blocking=False)
 
         self.register_forward_hooks()
         logger.info(
-            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, total num layers: {self.num_layers}"
+            f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, total num layers: {self.num_layers}, overlap_prefetch={self.overlap_prefetch}, resident_layers={self.resident_layers}"
         )
 
     def prepare_for_next_req(self, non_blocking=True):
@@ -251,19 +326,34 @@ class LayerwiseOffloadManager:
             and layer_idx not in self._strided_cpu_weights
         ):
             return
-        self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+        if not self.overlap_prefetch:
+            self.copy_stream.wait_stream(torch.get_device_module().current_stream())
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
         strided_gpu_weights: Dict[str, torch.Tensor] = {}
+        if self.overlap_prefetch and self._retired_gpu_buffers:
+            gpu_buffers, consumed = self._retired_gpu_buffers.pop(0)
+            self.copy_stream.wait_event(consumed)
         with torch.get_device_module().stream(self.copy_stream):
+            cpu_buffers = self._consolidated_cpu_weights.get(layer_idx, {})
+            gpu_buffers = {
+                dtype: tensor
+                for dtype, tensor in gpu_buffers.items()
+                if dtype in cpu_buffers and tensor.shape == cpu_buffers[dtype].shape
+            }
             for dtype, cpu_buffer in self._consolidated_cpu_weights.get(
                 layer_idx, {}
             ).items():
-                gpu_buffer = torch.empty(
-                    cpu_buffer.shape, dtype=dtype, device=self.device
-                )
-                gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
+                gpu_buffer = gpu_buffers.get(dtype)
+                if gpu_buffer is None:
+                    gpu_buffer = torch.empty(
+                        cpu_buffer.shape, dtype=dtype, device=self.device
+                    )
+                if self.staging_pool is not None:
+                    self.staging_pool.copy_to(gpu_buffer, cpu_buffer, self.copy_stream)
+                else:
+                    gpu_buffer.copy_(cpu_buffer, non_blocking=non_blocking)
                 gpu_buffers[dtype] = gpu_buffer
             for name, cpu_weight in self._strided_cpu_weights.get(
                 layer_idx, {}
@@ -272,13 +362,20 @@ class LayerwiseOffloadManager:
                 gpu_weight = _empty_strided_device_tensor(
                     meta["shape"], meta["stride"], meta["dtype"], self.device
                 )
-                gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
+                if self.staging_pool is not None:
+                    self.staging_pool.copy_to(gpu_weight, cpu_weight, self.copy_stream)
+                else:
+                    gpu_weight.copy_(cpu_weight, non_blocking=non_blocking)
                 strided_gpu_weights[name] = gpu_weight
 
         # record the prefetch event of this layer
         event = torch.get_device_module().Event()
         event.record(self.copy_stream)
         self._prefetch_events[layer_idx] = event
+        if self.staging_pool is not None and not non_blocking:
+            # load_all_layers can remove the consuming hooks; preserve its
+            # blocking-copy contract even though staging submits async DMA.
+            event.synchronize()
 
         # restore model's weights by their metadata using gpu buffer
         for name, meta in self._weight_metadata[layer_idx].items():
@@ -294,14 +391,24 @@ class LayerwiseOffloadManager:
                 target.data = strided_gpu_weights[name]
 
         self._gpu_layers.add(layer_idx)
+        self.h2d_layer_loads += 1
+        self.h2d_weight_bytes += sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in chain(gpu_buffers.values(), strided_gpu_weights.values())
+        )
+        if self.overlap_prefetch or self.resident_layers:
+            self._gpu_buffers[layer_idx] = gpu_buffers
+            self._strided_gpu_buffers[layer_idx] = strided_gpu_weights
 
     @torch.compiler.disable
-    def release_layer(self, layer_idx: int) -> None:
+    def release_layer(self, layer_idx: int, *, force: bool = False) -> None:
         """
         lightweight release layer weights
         Basically set the reference count to the gpu weight tensor to zero. The weights on cpu is untouched
         """
         if not self.enabled or self.device is None:
+            return
+        if layer_idx < self.resident_layers and not force:
             return
 
         # clear prefetch event, since it's useless and needs to be reset
@@ -316,6 +423,14 @@ class LayerwiseOffloadManager:
             target.data = self._get_shared_empty_tensor(meta["dtype"])
 
         self._gpu_layers.discard(layer_idx)
+        # record_stream in the consuming pre-hook protects these allocations
+        # until all queued kernels on that stream have finished using them.
+        buffers = self._gpu_buffers.pop(layer_idx, None)
+        if self.overlap_prefetch and buffers and not force:
+            consumed = torch.get_device_module().Event()
+            consumed.record(torch.get_device_module().current_stream())
+            self._retired_gpu_buffers.append((buffers, consumed))
+        self._strided_gpu_buffers.pop(layer_idx, None)
 
     @torch.compiler.disable
     def release_all(self) -> None:
@@ -325,7 +440,37 @@ class LayerwiseOffloadManager:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
         for layer_idx in list(self._gpu_layers):
-            self.release_layer(layer_idx)
+            self.release_layer(layer_idx, force=True)
+        self._retired_gpu_buffers.clear()
+
+    def layer_bytes(self) -> list[int]:
+        """Device bytes each layer occupies once it is resident."""
+        return [sum(
+            t.untyped_storage().nbytes()
+            for group in (self._consolidated_cpu_weights, self._strided_cpu_weights)
+            for t in group.get(index, {}).values()
+        ) for index in range(self.num_layers)]
+
+    def configure_memory_budget(self, budget_bytes: int) -> None:
+        """Reconfigure between denoising stages; excludes activation memory."""
+        if not (self.overlap_prefetch or self.auto_residency):
+            raise ValueError("adaptive residency requires overlap prefetch")
+        sizes = self.layer_bytes()
+        # Small inputs retain the tested full-cache batch schedule. Partial
+        # residency uses one-layer rolling lookahead, leaving more room for
+        # cached weights and avoiding oversized transient prefetch groups.
+        cap = 1 if self.auto_residency else self.prefetch_cap
+        resident, prefetch = select_weight_budget(sizes, budget_bytes, cap)
+        self.release_all()
+        if self.auto_residency:
+            self.overlap_prefetch = self.explicit_overlap_prefetch or resident < self.num_layers
+            if resident == self.num_layers:
+                prefetch = self.prefetch_cap
+        remaining = sorted(sizes[resident:], reverse=True)
+        self.weight_capacity_bytes = sum(sizes[:resident]) + sum(remaining[:prefetch + 1])
+        self.resident_layers, self.prefetch_size = resident, prefetch
+        logger.info("Offload budget=%d bytes: resident=%d prefetch=%d",
+                    budget_bytes, resident, prefetch)
 
     @torch.compiler.disable
     def load_all_layers(self) -> None:
@@ -338,6 +483,23 @@ class LayerwiseOffloadManager:
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
                 self.prefetch_layer(layer_idx, non_blocking=False)
+
+    def _detach_shared_cpu_layer(self, layer_idx: int) -> None:
+        """Detach before refit/LoRA writes; other ranks retain immutable originals."""
+        keys = [key for key in self._shared_cpu_keys if key[0] == layer_idx]
+        if not keys:
+            return
+        self.copy_stream.synchronize()
+        for key in keys:
+            _, dtype = key
+            original = self._consolidated_cpu_weights[layer_idx][dtype]
+            private = _empty_cpu_tensor(tuple(original.shape), dtype, self.pin_cpu_memory)
+            private.copy_(original)
+            self._consolidated_cpu_weights[layer_idx][dtype] = private
+            size = original.numel() * original.element_size()
+            self.shared_cpu_weight_bytes -= size
+            self.pinned_weight_bytes += size * (int(private.is_pinned()) - int(original.is_pinned()))
+            self._shared_cpu_keys.remove(key)
 
     @torch.compiler.disable
     def sync_layer_to_cpu(self, layer_idx: int) -> None:
@@ -352,6 +514,8 @@ class LayerwiseOffloadManager:
 
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+
+        self._detach_shared_cpu_layer(layer_idx)
 
         # Collect current GPU weights and write back to CPU buffer
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
@@ -407,6 +571,10 @@ class LayerwiseOffloadManager:
         if not self.enabled:
             return None
 
+        # CPU masters may still be DMA sources for an outstanding prefetch.
+        # A stream wait alone cannot protect a host-side write to pinned memory.
+        if self.copy_stream is not None:
+            self.copy_stream.synchronize()
         updated_names: Set[str] = set()
         for name, loaded_weight in weight_dict.items():
             layer_idx = self._match_layer_idx(name)
@@ -424,6 +592,7 @@ class LayerwiseOffloadManager:
                     f"loaded={tuple(loaded_weight.shape)}"
                 )
 
+            self._detach_shared_cpu_layer(layer_idx)
             dtype = meta["dtype"]
             if meta["storage"] == "flat":
                 offset = meta["offset"]
@@ -477,17 +646,53 @@ class LayerwiseOffloadManager:
             def hook(module, input):
                 # wait only for the current layer if it's being prefetched
                 if i == 0:
-                    self.prepare_for_next_req(non_blocking=False)
+                    self.prepare_for_next_req(non_blocking=self.overlap_prefetch)
+                if self.overlap_prefetch:
+                    # Demand loading also makes a new forward safe after release_all.
+                    self.prefetch_layer(i, non_blocking=True)
                 if i in self._prefetch_events:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
                     )
+                if self.overlap_prefetch or self.resident_layers:
+                    consumer = torch.get_device_module().current_stream()
+                    for weight in chain(
+                        self._gpu_buffers.get(i, {}).values(),
+                        self._strided_gpu_buffers.get(i, {}).values(),
+                    ):
+                        weight.record_stream(consumer)
 
-                # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                if i % self.prefetch_size == 0:
-                    for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
-                        layer_to_prefetch = j % self.num_layers
+                if self.overlap_prefetch:
+                    # Keep a rolling window of upcoming nonresident layers. Do not
+                    # wrap: TeaCache may skip the next forward entirely.
+                    if self.prefetch_size == 0:
+                        return
+                    scheduled = 0
+                    for j in range(i + 1, self.num_layers):
+                        if j < self.resident_layers and j in self._gpu_layers:
+                            continue
+                        self.prefetch_layer(j, non_blocking=True)
+                        scheduled += 1
+                        if scheduled == self.prefetch_size:
+                            break
+                # Preserve the legacy batch schedule when overlap is disabled.
+                elif i % self.prefetch_size == 0:
+                    scheduled = 0
+                    for offset in range(self.num_layers):
+                        layer_to_prefetch = (
+                            i + self.prefetch_size + offset
+                        ) % self.num_layers
+                        # Reuse cached layers without spending the lookahead
+                        # budget on them. During the cold pass they still load.
+                        if (
+                            layer_to_prefetch < self.resident_layers
+                            and layer_to_prefetch in self._gpu_layers
+                        ):
+                            continue
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+                        scheduled += 1
+                        if scheduled == self.prefetch_size:
+                            break
 
             return hook
 

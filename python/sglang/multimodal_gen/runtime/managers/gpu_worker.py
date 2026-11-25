@@ -180,6 +180,8 @@ class GPUWorker:
                         )
             trim_layerwise_offload_device_cache(self.rank)
 
+        self.pipeline.prepare_service()
+
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
         )
@@ -310,6 +312,7 @@ class GPUWorker:
                         upscaling_model_path=req.upscaling_model_path,
                         upscaling_scale=req.upscaling_scale,
                         video_reference_path=getattr(req, "video_input_path", None),
+                        preserve_source_audio=getattr(req, "preserve_audio", True),
                     )
                     output_batch.output_file_paths = output_paths
 

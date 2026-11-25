@@ -99,6 +99,12 @@ _VIDEO_REPAIR_FIELD_ALIASES = {
     "bridgeOverlap": "bridge_overlap",
     "decodeMode": "decode_mode",
     "bboxExpandScale": "bbox_expand_scale",
+    "chunkBboxMode": "chunk_bbox_mode",
+    "cropEdgeFeather": "crop_edge_feather",
+    "stabilizeMaskUnion": "stabilize_mask_union",
+    "stabilizeMaskShape": "stabilize_mask_shape",
+    "stabilizeSmoothWindow": "stabilize_smooth_window",
+    "preserveAudio": "preserve_audio",
     "useClip": "use_clip",
     "clipPreprocess": "clip_preprocess",
     "teacacheThresh": "teacache_thresh",
@@ -415,6 +421,8 @@ async def _post_video_repair_progress_callbacks(
 
 
 def _validate_video_repair_request(req: VideoRepairRequest) -> None:
+    if req.stabilize_mask_union and req.stabilize_mask_shape:
+        raise ValueError("Choose at most one mask stabilization mode")
     if not req.task_id:
         raise ValueError("taskId is required")
     if req.timeout == 0 or req.timeout < -1:
@@ -498,6 +506,12 @@ def _video_repair_sampling_kwargs(
         "mask_scale": req.mask_scale,
         "feather_px": req.feather_px,
         "adain_boundary_dilate": req.adain_boundary_dilate,
+        "crop_edge_feather": req.crop_edge_feather,
+        "chunk_bbox_mode": req.chunk_bbox_mode,
+        "stabilize_mask_union": req.stabilize_mask_union,
+        "stabilize_mask_shape": req.stabilize_mask_shape,
+        "stabilize_smooth_window": req.stabilize_smooth_window,
+        "preserve_audio": req.preserve_audio,
         "enable_paste_back": req.enable_paste_back,
         "save_crop_only": req.save_crop_only,
         "use_clip": req.use_clip,

@@ -111,6 +111,16 @@ class ComposedPipelineBase(ABC):
         # return SyncExecutor(server_args=server_args)
         return ParallelExecutor(server_args=server_args)
 
+    def prepare_service(self) -> None:
+        """Run pipeline-specific preparation after final model placement.
+
+        GPUWorker calls this hook after CPU/layerwise offload has been configured
+        and before it reports the worker as ready.  Pipelines can therefore do
+        startup work that temporarily needs the memory released by placement.
+        """
+
+        return None
+
     def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
         self.initialize_pipeline(self.server_args)

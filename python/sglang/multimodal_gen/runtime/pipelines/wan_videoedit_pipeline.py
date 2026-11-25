@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.videoedit_wan import (
 from sglang.multimodal_gen.configs.sample.videoedit_wan import (
     WanVideoEditSamplingParams,
 )
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.models.schedulers.videoedit_flow_match import (
     VideoEditFlowMatchScheduler,
 )
@@ -22,9 +23,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.videoedit_wan import (
     VideoEditConditionEncodingStage,
+    VideoEditConditioningEncodingStage,
     VideoEditDecodingStage,
     VideoEditDenoisingStage,
     VideoEditImageEncodingStage,
@@ -35,9 +37,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.v
     VideoEditWindowPostprocessStage,
     VideoEditWindowValidationStage,
 )
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.request_timeout import check_request_timeout
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.readonly_model_residency import (
+    close_encoder_prefetch,
+)
 from sglang.multimodal_gen.runtime.videoedit.ffmpeg_io import (
     save_video_frames_like_reference,
 )
@@ -48,7 +53,6 @@ from sglang.multimodal_gen.runtime.videoedit.io import save_video_frames
 from sglang.multimodal_gen.runtime.videoedit.postprocess import paste_back
 from sglang.multimodal_gen.runtime.videoedit.preprocess import (
     VideoEditSequence,
-    build_videoedit_bridge,
     materialize_videoedit_pass,
     materialize_videoedit_window,
     prepare_global_inputs,
@@ -62,9 +66,7 @@ from sglang.multimodal_gen.runtime.videoedit.progress import (
 from sglang.multimodal_gen.runtime.videoedit.windowing import (
     VideoEditPassPlan,
     build_videoedit_pass_window_specs,
-    plan_videoedit_passes,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -217,18 +219,31 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 )
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
+        text_stage = VideoEditTextEncodingStage(
+            text_encoder=self.get_module("text_encoder"),
+            tokenizer=self.get_module("tokenizer"),
+            transformer=self.get_module("transformer"),
+            next_image_encoder=self.get_module("image_encoder", None),
+        )
+        image_stage = VideoEditImageEncodingStage(
+            image_encoder=self.get_module("image_encoder", None),
+            image_processor=self.get_module("image_processor", None),
+            transformer=self.get_module("transformer"),
+        )
+        parallel_conditioning = os.environ.get(
+            "SGLANG_VIDEOEDIT_PARALLEL_CONDITIONING", "1"
+        ) == "1"
+        conditioning_stages = [text_stage, image_stage]
+        if parallel_conditioning:
+            conditioning = VideoEditConditioningEncodingStage(
+                text_stage=text_stage,
+                image_stage=image_stage,
+            )
+            conditioning_stages = [conditioning]
+
         self.videoedit_stages = [
             VideoEditWindowValidationStage(),
-            VideoEditTextEncodingStage(
-                text_encoder=self.get_module("text_encoder"),
-                tokenizer=self.get_module("tokenizer"),
-                transformer=self.get_module("transformer"),
-            ),
-            VideoEditImageEncodingStage(
-                image_encoder=self.get_module("image_encoder", None),
-                image_processor=self.get_module("image_processor", None),
-                transformer=self.get_module("transformer"),
-            ),
+            *conditioning_stages,
             VideoEditConditionEncodingStage(vae=self.get_module("vae")),
             VideoEditLatentPreparationStage(),
             VideoEditTimestepPreparationStage(scheduler=self.get_module("scheduler")),
@@ -242,6 +257,26 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
             VideoEditWindowPostprocessStage(),
         ]
         self.add_stages(self.videoedit_stages)
+        self._startup_conditioning = conditioning if parallel_conditioning else None
+
+    def prepare_service(self) -> None:
+        if self._startup_conditioning is None:
+            return
+
+        # This hook runs after GPUWorker configures layerwise offload.  Release
+        # its prefetched DiT layers so UMT5 can use that memory during startup.
+        transformer = self.get_module("transformer")
+        for manager in getattr(transformer, "layerwise_offload_managers", []):
+            manager.release_all()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        try:
+            self._startup_conditioning.precompute_default_negative(self.server_args)
+        finally:
+            # The cached embedding lives on CPU. Return unused encoder memory
+            # to CUDA so a second backend can load on these same devices.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _prepare_global_videoedit_context(
         self, params: WanVideoEditSamplingParams, batch: Req
@@ -463,7 +498,10 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
                 previous_output_frames=previous_output_frames,
             )
             check_request_timeout(batch)
-            self.executor.execute_with_profiling(self.stages, batch, server_args)
+            try:
+                self.executor.execute_with_profiling(self.stages, batch, server_args)
+            finally:
+                close_encoder_prefetch(params)
             check_request_timeout(batch)
             window_output_frames = params.runtime_window_output_frames
             if window_output_frames is None:
@@ -684,75 +722,65 @@ class WanVideoEditPipeline(LoRAPipeline, ComposedPipelineBase):
         if self.executor is None:
             raise RuntimeError("WanVideoEditPipeline requires a pipeline executor")
 
-        if self.is_lora_set() and not self.is_lora_effective():
-            logger.warning(
-                "LoRA adapter is set, but not effective. Please make sure the "
-                "LoRA weights are merged"
-            )
+        return self._forward_streaming(batch, params, server_args)
 
-        # Execute each stage
-        if not batch.is_warmup and not batch.suppress_logs:
-            logger.info(
-                "Running pipeline stages: %s",
-                list(self._stage_name_mapping.keys()),
-                main_process_only=True,
-            )
+    def _forward_streaming(self, batch, params, server_args):
+        from sglang.multimodal_gen.runtime.videoedit.streaming import run_streaming_edit
+
+        params.reset_request_runtime()
+        return_frames = not (batch.save_output and batch.return_file_paths_only) or (
+            batch.enable_frame_interpolation or batch.enable_upscaling
+        )
+        output_path = batch.output_file_path()
+        if batch.save_output and not output_path:
+            raise ValueError("Streaming VideoEdit requires an output file path")
+
+        def generate(frames, masks, spec, chunk):
+            check_request_timeout(batch)
+            params.reset_window_runtime(spec)
+            params.runtime_window_frames = frames
+            params.runtime_window_masks = masks
+            params.runtime_bbox = chunk.bbox
+            params.runtime_crop_h, params.runtime_crop_w = chunk.crop_h, chunk.crop_w
+            params.runtime_aligned_h, params.runtime_aligned_w = chunk.aligned_h, chunk.aligned_w
+            try:
+                self.executor.execute_with_profiling(self.stages, batch, server_args)
+            finally:
+                close_encoder_prefetch(params)
+            check_request_timeout(batch)
+            return params.runtime_window_output_frames
 
         with self.executor.profile_execution(batch, dump_rank=0):
-            check_request_timeout(batch)
             try:
-                reference_frame = self._prepare_global_videoedit_context(params, batch)
-                check_request_timeout(batch)
-                sequence_plan = plan_videoedit_passes(
-                    params.runtime_num_input_frames,
-                    params.ref_frame_idx,
-                    params.bridge_overlap,
+                metadata = run_streaming_edit(
+                    params, generate, output_path or "videoedit.mp4",
+                    write_output=_is_output_rank() and batch.save_output,
+                    collect_frames=return_frames and _is_output_rank(),
+                    check_cancel=lambda: check_request_timeout(batch),
                 )
-                generated_by_index: dict[int, Image.Image] = {}
-                window_records: list[tuple[str, Any]] = []
-
-                long_outputs, long_specs = self._run_videoedit_pass(
-                    params,
-                    batch,
-                    server_args,
-                    sequence_plan.long,
-                    reference_frame=reference_frame,
-                    bridge_frames=None,
-                    generated_by_index=generated_by_index,
-                )
-                window_records.extend(("long", spec) for spec in long_specs)
-
-                if sequence_plan.short is not None:
-                    check_request_timeout(batch)
-                    bridge_frames = build_videoedit_bridge(
-                        long_outputs,
-                        sequence_plan.bridge_length,
-                    )
-                    _, short_specs = self._run_videoedit_pass(
-                        params,
-                        batch,
-                        server_args,
-                        sequence_plan.short,
-                        reference_frame=reference_frame,
-                        bridge_frames=bridge_frames,
-                        generated_by_index=generated_by_index,
-                    )
-                    window_records.extend(("short", spec) for spec in short_specs)
-
-                check_request_timeout(batch)
-                params.runtime_window_specs = [spec for _, spec in window_records]
-                output_frames = self._finalize_videoedit_output(
-                    params,
-                    batch,
-                    generated_by_index,
-                    window_records,
-                )
-                check_request_timeout(batch)
-                self._set_final_batch_output(batch, params, output_frames)
+                output_frames = metadata.pop("frames")
+                params.runtime_num_input_frames = metadata["num_input_frames"]
+                params.runtime_fps = batch.fps = metadata["fps"]
+                batch.num_frames = metadata["num_output_frames"]
+                batch.height, batch.width = metadata["height"], metadata["width"]
+                params.runtime_output_video_path = output_path
+                if _is_output_rank() and batch.save_output:
+                    metadata_path = os.path.splitext(output_path)[0] + ".videoedit.json"
+                    with open(metadata_path, "w", encoding="utf-8") as handle:
+                        json.dump(metadata, handle, indent=2)
+                    params.runtime_metadata_path = metadata_path
             finally:
-                self._cleanup_videoedit_context(params)
-
-        return batch
+                # Last-window tensors must not remain attached to the request.
+                if params.runtime_window_spec is not None:
+                    params.reset_window_runtime(params.runtime_window_spec)
+                params.reset_request_runtime()
+        if return_frames:
+            batch.output = _pil_frames_to_video_tensor(output_frames) if output_frames else None
+            return batch
+        return OutputBatch(
+            output_file_paths=[output_path] if _is_output_rank() else None,
+            metrics=batch.metrics,
+        )
 
 
 EntryClass = WanVideoEditPipeline

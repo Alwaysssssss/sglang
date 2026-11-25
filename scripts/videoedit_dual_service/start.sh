@@ -8,10 +8,123 @@ if [[ ! -r "$CONFIG_FILE" ]]; then
   echo "Copy ${SCRIPT_DIR}/config.env.example to config.env first." >&2
   exit 1
 fi
+# Environment overrides take precedence over assignments in config.env.
+# Example: CUDA_DEVICES=0,1 NUM_GPUS=2 SP_DEGREE=2 ULYSSES_DEGREE=2 RING_DEGREE=1 bash scripts/videoedit_dual_service/start.sh
+declare -A gpu_overrides=()
+for name in CUDA_DEVICES NUM_GPUS SP_DEGREE ULYSSES_DEGREE RING_DEGREE; do
+  if [[ -v "$name" ]]; then
+    gpu_overrides["$name"]="${!name}"
+  fi
+done
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+for name in "${!gpu_overrides[@]}"; do
+  printf -v "$name" '%s' "${gpu_overrides[$name]}"
+done
+unset gpu_overrides
+
+NUM_GPUS="${NUM_GPUS:-4}"
+SP_DEGREE="${SP_DEGREE:-${NUM_GPUS}}"
+ULYSSES_DEGREE="${ULYSSES_DEGREE:-${SP_DEGREE}}"
+RING_DEGREE="${RING_DEGREE:-1}"
+for name in NUM_GPUS SP_DEGREE ULYSSES_DEGREE RING_DEGREE; do
+  if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$name must be a positive integer; got: ${!name}" >&2
+    exit 1
+  fi
+done
+unset name
+
+DIT_OFFLOAD_PREFETCH_SIZE="${DIT_OFFLOAD_PREFETCH_SIZE:-0}"
+DIT_LAYERWISE_OFFLOAD="${DIT_LAYERWISE_OFFLOAD:-true}"
+DIT_CPU_OFFLOAD="${DIT_CPU_OFFLOAD:-false}"
+VIDEOEDIT_STAGE_RESIDENT_PROBE="${VIDEOEDIT_STAGE_RESIDENT_PROBE:-false}"
+VIDEOEDIT_VAE_SP="${VIDEOEDIT_VAE_SP:-false}"
+for name in DIT_LAYERWISE_OFFLOAD DIT_CPU_OFFLOAD VIDEOEDIT_STAGE_RESIDENT_PROBE VIDEOEDIT_VAE_SP; do
+  if [[ "${!name}" != true && "${!name}" != false ]]; then
+    echo "$name must be true or false." >&2
+    exit 1
+  fi
+done
+ENABLE_DMD="${ENABLE_DMD:-true}"
+if [[ ! "$DIT_OFFLOAD_PREFETCH_SIZE" =~ ^[0-9]+$ ]]; then
+  echo "DIT_OFFLOAD_PREFETCH_SIZE must be a non-negative integer." >&2
+  exit 1
+fi
+if [[ "$ENABLE_DMD" != "true" && "$ENABLE_DMD" != "false" ]]; then
+  echo "ENABLE_DMD must be true or false." >&2
+  exit 1
+fi
 
 export PYTHONPATH="${PROJECT_ROOT}/python${PYTHONPATH:+:${PYTHONPATH}}"
+export SGLANG_VIDEOEDIT_OVERLAP_PREFETCH="${SGLANG_VIDEOEDIT_OVERLAP_PREFETCH:-0}"
+export SGLANG_VIDEOEDIT_FUSED_QKV="${SGLANG_VIDEOEDIT_FUSED_QKV:-0}"
+export SGLANG_VIDEOEDIT_USP_CHUNKS="${SGLANG_VIDEOEDIT_USP_CHUNKS:-1}"
+export SGLANG_VIDEOEDIT_RESIDENT_LAYERS="${SGLANG_VIDEOEDIT_RESIDENT_LAYERS:-0}"
+export SGLANG_VIDEOEDIT_RELEASE_AFTER_DENOISE="${SGLANG_VIDEOEDIT_RELEASE_AFTER_DENOISE:-0}"
+export SGLANG_VIDEOEDIT_ENCODER_CPU_MASTER="${SGLANG_VIDEOEDIT_ENCODER_CPU_MASTER:-0}"
+export SGLANG_VIDEOEDIT_ASYNC_STAGE_LOAD="${SGLANG_VIDEOEDIT_ASYNC_STAGE_LOAD:-0}"
+export SGLANG_VIDEOEDIT_PREFETCH_IMAGE_ENCODER="${SGLANG_VIDEOEDIT_PREFETCH_IMAGE_ENCODER:-0}"
+export SGLANG_VIDEOEDIT_STAGE_PINNED_MB="${SGLANG_VIDEOEDIT_STAGE_PINNED_MB:-64}"
+export SGLANG_VIDEOEDIT_STAGE_PREFETCH_RESERVE_MB="${SGLANG_VIDEOEDIT_STAGE_PREFETCH_RESERVE_MB:-4096}"
+export SGLANG_VIDEOEDIT_SHARED_CPU_DIR="${SGLANG_VIDEOEDIT_SHARED_CPU_DIR:-}"
+export SGLANG_VIDEOEDIT_OFFLOAD_PINNED_MB="${SGLANG_VIDEOEDIT_OFFLOAD_PINNED_MB:-0}"
+# The measured profile supports only Wan BF16/FA with SP=1 or 2.
+# Existing four-rank and other backend configurations must remain opt-in.
+export SGLANG_VIDEOEDIT_AUTO_RESIDENCY="${SGLANG_VIDEOEDIT_AUTO_RESIDENCY:-0}"
+export SGLANG_VIDEOEDIT_ACTIVATION_RESERVE_MB="${SGLANG_VIDEOEDIT_ACTIVATION_RESERVE_MB:-4096}"
+export SGLANG_VIDEOEDIT_FULL_FRAME_RESERVE_MB="${SGLANG_VIDEOEDIT_FULL_FRAME_RESERVE_MB:-16384}"
+export SGLANG_VIDEOEDIT_RESIDENCY_MARGIN_MB="${SGLANG_VIDEOEDIT_RESIDENCY_MARGIN_MB:-2048}"
+export SGLANG_VIDEOEDIT_WEIGHT_BUDGET_MB="${SGLANG_VIDEOEDIT_WEIGHT_BUDGET_MB:-0}"
+export SGLANG_VIDEOEDIT_DECODE_TRANSFER_FRAMES="${SGLANG_VIDEOEDIT_DECODE_TRANSFER_FRAMES:-4}"
+export SGLANG_VIDEOEDIT_KEEP_STAGE_TENSORS="${SGLANG_VIDEOEDIT_KEEP_STAGE_TENSORS:-0}"
+export SGLANG_VIDEOEDIT_PARALLEL_CONDITIONING="${SGLANG_VIDEOEDIT_PARALLEL_CONDITIONING:-1}"
+export SGLANG_VIDEOEDIT_TEXT_OWNER="${SGLANG_VIDEOEDIT_TEXT_OWNER:-0}"
+default_clip_owner=0
+if (( NUM_GPUS > 1 )); then
+  default_clip_owner=1
+fi
+export SGLANG_VIDEOEDIT_CLIP_OWNER="${SGLANG_VIDEOEDIT_CLIP_OWNER:-$default_clip_owner}"
+unset default_clip_owner
+export SGLANG_VIDEOEDIT_VAE_SP_MODE="${SGLANG_VIDEOEDIT_VAE_SP_MODE:-both}"
+export SGLANG_VIDEOEDIT_VAE_ENCODE_DEGREE="${SGLANG_VIDEOEDIT_VAE_ENCODE_DEGREE:-$NUM_GPUS}"
+export SGLANG_VIDEOEDIT_VAE_DECODE_DEGREE="${SGLANG_VIDEOEDIT_VAE_DECODE_DEGREE:-$NUM_GPUS}"
+if [[ "$SGLANG_VIDEOEDIT_VAE_SP_MODE" != encode && "$SGLANG_VIDEOEDIT_VAE_SP_MODE" != decode && "$SGLANG_VIDEOEDIT_VAE_SP_MODE" != both ]]; then
+  echo "SGLANG_VIDEOEDIT_VAE_SP_MODE must be encode, decode, or both." >&2
+  exit 1
+fi
+for name in SGLANG_VIDEOEDIT_TEXT_OWNER SGLANG_VIDEOEDIT_CLIP_OWNER; do
+  if [[ ! "${!name}" =~ ^[0-9]+$ ]] || (( ${!name} >= NUM_GPUS )); then
+    echo "$name must be an integer in [0, $((NUM_GPUS - 1))]; got: ${!name}" >&2
+    exit 1
+  fi
+done
+for name in SGLANG_VIDEOEDIT_VAE_ENCODE_DEGREE SGLANG_VIDEOEDIT_VAE_DECODE_DEGREE; do
+  if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]] || (( ${!name} > NUM_GPUS )); then
+    echo "$name must be an integer in [1, $NUM_GPUS]; got: ${!name}" >&2
+    exit 1
+  fi
+done
+unset name
+if [[ "$VIDEOEDIT_STAGE_RESIDENT_PROBE" == true ]]; then
+  if [[ "$DIT_LAYERWISE_OFFLOAD" != false || "$DIT_CPU_OFFLOAD" != true ]]; then
+    echo "Stage residency requires DIT_LAYERWISE_OFFLOAD=false and DIT_CPU_OFFLOAD=true." >&2
+    exit 1
+  fi
+  export PYTHONPATH="${SCRIPT_DIR}/../videoedit_benchmark/hooks:$PYTHONPATH"
+  export VIDEOEDIT_SP_BENCH_DIR="${RUNTIME_DIR}/stage-resident-metrics"
+  export VIDEOEDIT_SP_BENCH_RESIDENT=1 VIDEOEDIT_SP_BENCH_GEOMETRY=native
+  mkdir -p "$VIDEOEDIT_SP_BENCH_DIR"
+elif [[ "${VIDEOEDIT_LAYERWISE_PROBE:-false}" == true ]]; then
+  if [[ "$DIT_LAYERWISE_OFFLOAD" != true || "$DIT_CPU_OFFLOAD" != false ]]; then
+    echo "Layerwise measurement requires layerwise=true and dit_cpu_offload=false." >&2
+    exit 1
+  fi
+  export PYTHONPATH="${SCRIPT_DIR}/../videoedit_benchmark/hooks:$PYTHONPATH"
+  export VIDEOEDIT_SP_BENCH_DIR="${RUNTIME_DIR}/prefetch${DIT_OFFLOAD_PREFETCH_SIZE}-metrics"
+  export VIDEOEDIT_SP_BENCH_RESIDENT=0 VIDEOEDIT_SP_BENCH_GEOMETRY=native
+  mkdir -p "$VIDEOEDIT_SP_BENCH_DIR"
+fi
 PROBE="${SCRIPT_DIR}/resource_probe.py"
 LOCK_FILE="${RUNTIME_DIR}/start.lock"
 NORMAL_PID_FILE="${PID_DIR}/normal.pid"
@@ -76,7 +189,10 @@ fi
 }
 validate_transformer "$NORMAL_TRANSFORMER" || exit 1
 dmd_eligible=1
-if ! validate_transformer "$DMD_TRANSFORMER"; then
+if [[ "$ENABLE_DMD" == "false" ]]; then
+  dmd_eligible=0
+  echo "DMD is disabled in this service configuration."
+elif ! validate_transformer "$DMD_TRANSFORMER"; then
   dmd_eligible=0
   echo "DMD checkpoint is not ready; normal-only mode will be used." >&2
 fi
@@ -103,13 +219,21 @@ start_backend() {
   local nccl_port="$6"
   local pid_file="$7"
   local log_file="$8"
+  local backend_command=("$SGLANG_BIN" serve)
+  local attention_args=()
+  if [[ -n "${ATTENTION_BACKEND:-}" ]]; then
+    attention_args=(--attention-backend "$ATTENTION_BACKEND")
+  fi
+  if [[ "${VIDEOEDIT_DISABLE_THP:-false}" == "true" ]]; then
+    backend_command=("$PYTHON_BIN" "$SCRIPT_DIR/disable_thp_exec.py" "${backend_command[@]}")
+  fi
 
   nohup env \
     PYTHONPATH="$PYTHONPATH" \
     VIDEOEDIT_QUEUE_CAPACITY="$VIDEOEDIT_QUEUE_CAPACITY" \
     SGLANG_USE_RUNAI_MODEL_STREAMER="$SGLANG_USE_RUNAI_MODEL_STREAMER" \
     CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
-    "$SGLANG_BIN" serve \
+    "${backend_command[@]}" \
       --model-type diffusion \
       --backend sglang \
       --model-path "$BASE_MODEL" \
@@ -121,16 +245,18 @@ start_backend() {
       --nccl-port "$nccl_port" \
       --scheduler-response-timeout "$SCHEDULER_RESPONSE_TIMEOUT" \
       --strict-ports true \
-      --num-gpus 2 \
-      --sp-degree 2 \
-      --ulysses-degree 2 \
-      --ring-degree 1 \
-      --dit-layerwise-offload true \
-      --dit-offload-prefetch-size 0 \
-      --dit-cpu-offload false \
+      --num-gpus "$NUM_GPUS" \
+      --sp-degree "$SP_DEGREE" \
+      --ulysses-degree "$ULYSSES_DEGREE" \
+      --ring-degree "$RING_DEGREE" \
+      "${attention_args[@]}" \
+      --dit-layerwise-offload "$DIT_LAYERWISE_OFFLOAD" \
+      --dit-offload-prefetch-size "$DIT_OFFLOAD_PREFETCH_SIZE" \
+      --dit-cpu-offload "$DIT_CPU_OFFLOAD" \
       --text-encoder-cpu-offload true \
       --image-encoder-cpu-offload true \
       --vae-cpu-offload true \
+      --vae-sp "$VIDEOEDIT_VAE_SP" \
       --pin-cpu-memory "$PIN_CPU_MEMORY" \
       --warmup false \
       --output-path "$OUTPUT_DIR/$variant" \

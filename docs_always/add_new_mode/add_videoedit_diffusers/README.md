@@ -1,5 +1,7 @@
 # VideoEdit-diffusers 接入 SGLang Diffusion 重构方案
 
+新增记录：[L40S 内存与通信优化及双卡实测（2026-10-04）](./memory_optimization_20261004.md)。该轮为 49 帧/40 步的小尺寸测试，与本文历史方案口径不同。
+
 本文档以当前本机源码为准：
 
 - SGLang：`/mnt/shanhai-ai/shanhai-workspace/zhouhao6/sglang`
@@ -1149,3 +1151,7 @@ CI / nightly 建议：
 - 不复制整份通用 Wan Transformer / Wan VAE；DiT 只新增 VideoEdit 必需的差异入口和 cross-attention 适配。
 - 不把长视频窗口逻辑放进 stage。
 - 不把 stage 中间变量放到 `batch.extra` 或新增一堆 `Req` 顶层字段。
+
+尺寸感知自动驻留开发与测试见 [2026-10-04 自动驻留记录](./adaptive_residency_20261004.md)。
+
+请求级文本复用、文本/CLIP owner 分工、VAE 空间并行及线上 GPU 7 对比见 [2026-10-04 双卡阶段并行实测](./parallel_optimization_results_20261004.md)。

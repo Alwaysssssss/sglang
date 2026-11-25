@@ -307,6 +307,7 @@ class DiffGenerator:
                         upscaling_model_path=req.upscaling_model_path,
                         upscaling_scale=req.upscaling_scale,
                         video_reference_path=getattr(req, "video_input_path", None),
+                        preserve_source_audio=getattr(req, "preserve_audio", True),
                     )
 
                     for idx in range(len(samples_out)):
