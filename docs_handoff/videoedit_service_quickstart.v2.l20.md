@@ -49,7 +49,7 @@
 ### 3.1 选择配置
 
 ```bash
-export IMAGE_NAME=sglang-videoedit-src:l20
+export IMAGE_NAME=sglang-mgtv:1.0
 export CONTAINER_NAME=videoedit_reset
 export HOST_PORT=30000 CONTAINER_PORT=30000
 export HOST_GPUS=2,3  # 示例：替换为实际分配的 2 张宿主 GPU
